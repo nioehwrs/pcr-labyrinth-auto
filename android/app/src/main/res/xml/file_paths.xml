@@ -3,4 +3,6 @@
 <paths>
     <external-files-path name="ext_logs" path="logs/" />
     <files-path name="int_logs" path="logs/" />
+    <!-- ★自动更新（2026-10-25）：下载到私有目录的 APK 要交给系统安装器，必须能通过 FileProvider 暴露 -->
+    <files-path name="updates" path="update/" />
 </paths>

@@ -24,6 +24,7 @@ python tools/release.py --frida-only --upload
 # 其它
 python tools/release.py --local --no-build      # 复用已有 release 产物
 python tools/release.py --upload --dry-run      # 打印要发什么，不动线上
+python tools/release.py --latest-only           # 只推 update/latest.json（放占位，免得 App 检查 404）
 ```
 
 需要什么
@@ -211,8 +212,12 @@ def put_file(path_in_repo, text, message, dry):
     try:
         cur = api("GET", "/repos/%s/%s/contents/%s" % (OWNER, REPO, path_in_repo),
                   query={"ref": BRANCH})
-        data["sha"] = cur.get("sha")
-        method = "PUT"
+        # 文件已存在才回 dict（带 sha）；不存在时 Gitee 可能回 404（抛 SystemExit）或空数组
+        if isinstance(cur, dict) and cur.get("sha"):
+            data["sha"] = cur["sha"]
+            method = "PUT"
+        else:
+            method = "POST"
     except SystemExit:
         method = "POST"
     if dry:
@@ -259,12 +264,13 @@ def build_apk(version, do_build):
 def main():
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
     args = sys.argv[1:]
     version = code = None
     do_build = True
-    upload = local_only = dry = frida_only = False
+    upload = local_only = dry = frida_only = latest_only = False
     pack = False
     i = 0
     while i < len(args):
@@ -283,6 +289,8 @@ def main():
             dry = True
         elif a == "--frida-only":
             frida_only = True
+        elif a == "--latest-only":
+            latest_only = True
         elif a == "--pack-frida":
             pack = True
         elif a in ("-h", "--help"):
@@ -362,6 +370,15 @@ def main():
         json.dump(latest, f, ensure_ascii=False, indent=2)
     say("\n已生成：%s" % os.path.relpath(out_json, ROOT))
     say("App 读的地址：%s" % (RAW % "update/latest.json"))
+
+    # --latest-only：只把 latest.json 推到发布仓库（先放个占位，避免 App 检查更新 404）
+    if latest_only:
+        if not token():
+            raise SystemExit("没有 token：写 tools/.gitee_token 或设环境变量 GITEE_TOKEN")
+        put_file("update/latest.json", json.dumps(latest, ensure_ascii=False, indent=2),
+                 "更新 latest.json（versionCode %d）" % cur_code, dry=dry)
+        say("\n已只更新清单：%s" % (RAW % "update/latest.json"))
+        return 0
 
     if local_only or not upload:
         say("\n（只生成到本地。要发到 Gitee 加 --upload）")

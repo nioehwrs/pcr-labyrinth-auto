@@ -12,6 +12,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- ★应用内自动更新（2026-10-25）：下载完 APK 要拉起系统安装器；Android 8+ 必须声明这条，
+         并且首次要引导用户在系统设置里把"安装未知应用"授权给本应用（无法代码静默安装）。 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
     <!-- ★状态悬浮窗（2026-10-17 用户）：在游戏画面上叠一行"第几局/第几层/当前状态"，不可点不交互。
          这是"特殊应用权限"——装完不会自动给，要在系统设置里手动允许（助手首页有「去授权」入口）。 -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />

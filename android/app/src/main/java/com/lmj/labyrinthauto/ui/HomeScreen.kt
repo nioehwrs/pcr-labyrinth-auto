@@ -45,6 +45,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -88,6 +89,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.lmj.labyrinthauto.core.AppState
 import com.lmj.labyrinthauto.core.LogFile
+import com.lmj.labyrinthauto.core.UpdateChecker
 import com.lmj.labyrinthauto.logic.team.TeamRunLog
 import com.lmj.labyrinthauto.frida.RootCheck
 import com.lmj.labyrinthauto.net.bilibili.CaptchaChallenge
@@ -97,6 +99,7 @@ import com.lmj.labyrinthauto.reroll.RerollSettings
 import com.lmj.labyrinthauto.reroll.RerollUseCase
 import com.lmj.labyrinthauto.service.AutoForegroundService
 import com.lmj.labyrinthauto.ui.theme.StatusColors
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
@@ -135,6 +138,26 @@ fun HomeScreen(
     var logOpen by remember { mutableStateOf(false) }
     // ★应用内「更新记录」（2026-10-23 用户）：内容就是仓库根目录那份 CHANGELOG.md
     var changelogOpen by remember { mutableStateOf(false) }
+    // ★自动更新（2026-10-25 用户）：启动后静默查一次 —— 有新版本才弹窗，失败不打扰；
+    //   手动入口在「版本」弹窗里。debug 包不允许自更新（签名和发布包不同，装了会冲突）。
+    var updateOpen by remember { mutableStateOf(false) }
+    var updateInfo by remember { mutableStateOf<UpdateChecker.Info?>(null) }
+    var newVerCode by remember { mutableStateOf<Int?>(null) }
+    LaunchedEffect(Unit) {
+        delay(6_000)                      // 先让首屏/root 自检跑完，别抢
+        if (UpdateChecker.isDebuggable(context)) return@LaunchedEffect
+        when (val r = UpdateChecker.check(context)) {
+            is UpdateChecker.Check.New ->
+                if (UpdateChecker.skipVersionCode(context) != r.info.versionCode) {
+                    // ★只点亮「版本•」+ 记一行日志，**不自动弹窗** —— 别在跑图时抢走焦点
+                    newVerCode = r.info.versionCode
+                    updateInfo = r.info
+                    AppState.addLog("发现新版本 ${r.info.versionName}（${r.info.versionCode}）→ 右上角「版本•」可更新")
+                }
+            is UpdateChecker.Check.Failed -> AppState.addLog("检查更新失败：${r.message}")
+            else -> Unit
+        }
+    }
     // ★刷开局方式（接口 / 局内）提到首页层：底部「刷开局」按钮要按它决定走哪条路
     var rerollMode by remember { mutableStateOf(RerollSettings.loadRerollMode(context)) }
     // ★悬浮窗可拖动提到首页层（2026-10-20 用户：强制锁定后 UI 开关也要跟着关）
@@ -169,7 +192,8 @@ fun HomeScreen(
                 title = { Text("黎明界自动化", style = MaterialTheme.typography.titleLarge) },
                 actions = {
                     TextButton(onClick = { guideOpen = true }) { Text("说明") }
-                    TextButton(onClick = { changelogOpen = true }) { Text("版本") }
+                    // 有新版时按钮后面点个「•」，不弹横幅打断跑图
+                    TextButton(onClick = { changelogOpen = true }) { Text(if (newVerCode != null) "版本•" else "版本") }
                     TextButton(onClick = { logOpen = !logOpen }) { Text(if (logOpen) "日志▾" else "日志▴") }
                     TextButton(onClick = { onToggleDark(!darkOn) }) { Text(if (darkOn) "浅色" else "深色") }
                 },
@@ -365,7 +389,21 @@ fun HomeScreen(
 
     // ★应用内「更新记录」（2026-10-23 用户）：直接渲染 CHANGELOG.md 原文
     if (changelogOpen) {
-        ChangelogDialog(onDismiss = { changelogOpen = false })
+        ChangelogDialog(
+            onDismiss = { changelogOpen = false },
+            onCheckUpdate = {                    // ★自动更新（2026-10-25）：从「版本」里进
+                changelogOpen = false
+                updateInfo = null
+                updateOpen = true
+            },
+        )
+    }
+    if (updateOpen) {
+        UpdateDialog(
+            ctx = context,
+            initial = updateInfo,
+            onDismiss = { updateOpen = false },
+        )
     }
 }
 
@@ -1470,12 +1508,15 @@ private fun readChangelog(ctx: Context): String = runCatching {
 }.getOrElse { "读不到更新记录（assets/CHANGELOG.md 缺失）：${it.message}" }
 
 @Composable
-private fun ChangelogDialog(onDismiss: () -> Unit) {
+private fun ChangelogDialog(onDismiss: () -> Unit, onCheckUpdate: () -> Unit) {
     val ctx = LocalContext.current
     val text = remember { readChangelog(ctx) }
+    val ver = remember { "${UpdateChecker.versionName(ctx)}（${UpdateChecker.versionCode(ctx)}）" }
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
+        // ★自动更新（2026-10-25 用户）：入口就放在「版本」弹窗里，不占首页空间
+        dismissButton = { TextButton(onClick = onCheckUpdate) { Text("检查更新") } },
         title = { Text("更新记录") },
         text = {
             Column(
@@ -1484,29 +1525,224 @@ private fun ChangelogDialog(onDismiss: () -> Unit) {
                     .heightIn(max = 460.dp)
                     .verticalScroll(rememberScrollState()),
             ) {
-                text.lineSequence().forEach { raw ->
-                    val line = raw.trimEnd()
-                    when {
-                        line.startsWith("# ") -> Unit          // 文件顶部「# 更新日志」不重复显示
-                        line.startsWith("## ") -> Text(
-                            line.removePrefix("## "),
+                Text(
+                    "当前版本 $ver",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(bottom = 4.dp),
+                )
+                MarkdownColumn(text)
+            }
+        },
+    )
+}
+
+/**
+ * 很轻的 Markdown 渲染：`## 版本` / `### 小节` / `- 条目`，其余按正文 ——
+ * 「更新记录」和「检查更新」（新版本说明来自 latest.json 的 notes）共用同一套排版。
+ */
+@Composable
+private fun MarkdownColumn(text: String) {
+    text.lineSequence().forEach { raw ->
+        val line = raw.trimEnd()
+        when {
+            line.startsWith("# ") -> Unit              // 文件顶部「# 更新日志」不重复显示
+            line.startsWith("## ") -> Text(
+                line.removePrefix("## "),
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.padding(top = 12.dp, bottom = 2.dp),
+            )
+            line.startsWith("### ") -> Text(
+                line.removePrefix("### "),
+                style = MaterialTheme.typography.labelLarge,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+            line.startsWith("- ") -> Text(
+                "· " + line.removePrefix("- "),
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(start = 6.dp, bottom = 2.dp),
+            )
+            line.isBlank() -> Spacer(Modifier.height(2.dp))
+            else -> Text(line, style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
+
+/**
+ * ★「检查更新」弹窗（2026-10-25 用户："0.3.0 要带自动更新"）。
+ *
+ * 一个对话框走完全部状态：检查中 → 有新版/已最新/失败 → 下载（进度条）→ 安装（交给系统安装器）。
+ * 之所以不用"先检查再单独弹窗"，是因为伸手点两下才能更新的体验太差。
+ *
+ * 不能静默安装：Android 侧只能拉起系统安装器让用户点「安装」（见 [UpdateChecker.install]）；
+ * 首次还会被引导去打开「安装未知应用」开关。
+ */
+@Composable
+private fun UpdateDialog(ctx: Context, initial: UpdateChecker.Info?, onDismiss: () -> Unit) {
+    val scope = rememberCoroutineScope()
+    val localVer = remember { "${UpdateChecker.versionName(ctx)}（${UpdateChecker.versionCode(ctx)}）" }
+    var info by remember { mutableStateOf(initial) }
+    var phase by remember { mutableStateOf(if (initial != null) "new" else "checking") }
+    var msg by remember { mutableStateOf("") }
+    var pct by remember { mutableIntStateOf(0) }
+    var apkPath by remember { mutableStateOf<String?>(null) }
+
+    fun check() {
+        phase = "checking"
+        msg = ""
+        scope.launch {
+            when (val r = UpdateChecker.check(ctx)) {
+                is UpdateChecker.Check.New -> { info = r.info; phase = "new" }
+                is UpdateChecker.Check.Latest -> { phase = "latest"; msg = "已经是最新版本了" }
+                is UpdateChecker.Check.Failed -> { phase = "failed"; msg = r.message }
+            }
+        }
+    }
+
+    fun download() {
+        val i = info ?: return
+        if (UpdateChecker.isDebuggable(ctx)) {
+            phase = "failed"
+            msg = "这是 debug 构建，签名和发布包不同，装不上（换用发布版 APK 才能自更新）"
+            return
+        }
+        phase = "downloading"
+        pct = 0
+        scope.launch {
+            try {
+                val f = UpdateChecker.download(ctx, i) { p, _, _ -> pct = p }
+                apkPath = f.absolutePath
+                phase = "ready"
+            } catch (t: Throwable) {
+                phase = "failed"
+                msg = "下载失败：${t.message}"
+            }
+        }
+    }
+
+    LaunchedEffect(Unit) { if (initial == null) check() }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("检查更新") },
+        confirmButton = {
+            when (phase) {
+                "new" -> TextButton(onClick = { download() }) { Text("下载更新") }
+                "ready" -> TextButton(onClick = {
+                    val path = apkPath ?: return@TextButton
+                    val err = UpdateChecker.install(ctx, java.io.File(path))
+                    if (err != null) msg = err else onDismiss()
+                }) { Text("安装") }
+                "downloading" -> TextButton(onClick = {}, enabled = false) { Text("下载中…") }
+                else -> TextButton(onClick = onDismiss) { Text("关闭") }
+            }
+        },
+        dismissButton = {
+            Row {
+                if (phase == "new" || phase == "latest" || phase == "failed") {
+                    TextButton(onClick = { check() }) { Text("重新检查") }
+                }
+                if (phase == "new") {
+                    TextButton(onClick = {
+                        info?.let { UpdateChecker.saveSkipVersionCode(ctx, it.versionCode) }
+                        onDismiss()
+                    }) { Text("忽略此版") }
+                }
+                if (phase != "ready" && phase != "downloading") {
+                    TextButton(onClick = onDismiss) { Text("稍后") }
+                }
+            }
+        },
+        text = {
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 460.dp)
+                    .verticalScroll(rememberScrollState()),
+            ) {
+                Text(
+                    "当前版本 $localVer",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(6.dp))
+                when (phase) {
+                    "checking" -> {
+                        Text("正在检查…", style = MaterialTheme.typography.bodySmall)
+                        Spacer(Modifier.height(8.dp))
+                        LinearProgressIndicator(Modifier.fillMaxWidth())
+                    }
+                    "new" -> if (info == null) {
+                        Text("（没有新版本信息，重新检查一下）", style = MaterialTheme.typography.bodySmall)
+                    } else {
+                        val i = info!!
+                        Text(
+                            "发现新版本 ${i.versionName}（${i.versionCode}）",
                             style = MaterialTheme.typography.titleSmall,
                             color = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.padding(top = 12.dp, bottom = 2.dp),
                         )
-                        line.startsWith("### ") -> Text(
-                            line.removePrefix("### "),
-                            style = MaterialTheme.typography.labelLarge,
-                            modifier = Modifier.padding(top = 6.dp),
+                        if (i.isBlocked(UpdateChecker.versionCode(ctx))) {
+                            Text(
+                                "该版本要求最低 versionCode ${i.minVersionCode}，必须更新后才能继续使用",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.padding(top = 4.dp),
+                            )
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        HorizontalDivider()
+                        Spacer(Modifier.height(6.dp))
+                        if (i.notes.isBlank()) {
+                            Text("（这个版本没写更新说明）", style = MaterialTheme.typography.bodySmall)
+                        } else {
+                            MarkdownColumn(i.notes)
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "下载约 ${i.size / 1048576}MB ｜ 下载后校验 sha256 + 签名，再交给系统安装",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
-                        line.startsWith("- ") -> Text(
-                            "· " + line.removePrefix("- "),
-                            style = MaterialTheme.typography.bodySmall,
-                            modifier = Modifier.padding(start = 6.dp, bottom = 2.dp),
-                        )
-                        line.isBlank() -> Spacer(Modifier.height(2.dp))
-                        else -> Text(line, style = MaterialTheme.typography.bodySmall)
                     }
+                    "downloading" -> {
+                        Text("正在下载…$pct%", style = MaterialTheme.typography.bodySmall)
+                        Spacer(Modifier.height(8.dp))
+                        LinearProgressIndicator(progress = { pct / 100f }, modifier = Modifier.fillMaxWidth())
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "下载完成后会校验 sha256 与签名；期间可以继续用应用，别退出即可",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    "ready" -> {
+                        Text(
+                            "下载完成，已通过 sha256 / 签名校验",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            "点「安装」会打开系统安装器 —— 覆盖安装需要你确认一次；" +
+                                "首次可能要先允许「安装未知应用」。",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    else -> Text(msg, style = MaterialTheme.typography.bodySmall)
+                }
+                if (msg.isNotEmpty() && phase != "failed") {
+                    Spacer(Modifier.height(8.dp))
+                    Text(msg, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
+                }
+                if (phase == "failed") {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "更新源：${UpdateChecker.urlOf(ctx)}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
         },
