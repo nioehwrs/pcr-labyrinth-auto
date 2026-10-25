@@ -1,0 +1,171 @@
+package com.lmj.labyrinthauto.reroll
+
+import com.lmj.labyrinthauto.net.labyrinth.LabyrinthApi
+import com.lmj.labyrinthauto.net.labyrinth.LabyrinthEnterRequest
+import com.lmj.labyrinthauto.net.labyrinth.LabyrinthMapNode
+import com.lmj.labyrinthauto.net.labyrinth.LabyrinthOperationResult
+import com.lmj.labyrinthauto.net.labyrinth.LabyrinthResume
+import com.lmj.labyrinthauto.net.labyrinth.LabyrinthTop
+import kotlinx.coroutines.delay
+
+sealed interface RerollResult {
+    data class Success(
+        val enterId: Long,
+        val guildId: Int,
+        val difficulty: Int,
+        val nodes: List<LabyrinthMapNode>,
+        val bossByArea: Map<Int, Int>,
+        val routePerArea: Map<Int, List<Int>>,
+        val actual: Int,
+        val theory: Int,
+        /** ★true = **当前已有开局就合格 ⇒ 直接沿用、一次都没重刷**（PC `reused` 同款，2026-10-16 加）。
+         *  以前没有这个标记 ⇒ 沿用和重刷打同一句"刷到合格开局"，日志看起来像重刷过（用户指出）。 */
+        val reused: Boolean = false,
+    ) : RerollResult
+
+    data class Failure(val message: String) : RerollResult
+}
+
+data class RerollProgress(
+    val attempt: Int,
+    val total: Int,
+    val stage: String,
+    val lastFail: String?,
+)
+
+/**
+ * 刷开局主循环（移植自 PC reroll.py `ensure_opening`）：
+ *  1. 读顶部：若已有未撤离开局 → 先看它的**公会 / 难度**是否与配置一致，再 resume 判定
+ *     Boss 白名单 + 价值偏差；全过才沿用（不撤退、不重刷），任一项不符就 retire；
+ *  2. 循环 enter/retire，直到判定合格或达上限；
+ *  3. 循环至判定合格或达上限（无"同因卡死"保护，按用户要求已移除）。
+ */
+class RerollController(
+    private val api: LabyrinthApi,
+    private val config: RerollConfig,
+    private val onProgress: suspend (RerollProgress) -> Unit,
+    /** ★true = 上一局被「撤退重跑」作废 ⇒ **即使当前局合格也不沿用**，直接废掉重 enter
+     *  （2026-10-19 修：作废局的路线本身就合格 ⇒ 没有这个标记，下一局会"直接沿用"打不过的废局 → 死循环） */
+    private val skipResume: Boolean = false,
+) {
+    suspend fun run(): RerollResult {
+        var top = when (val r = api.top()) {
+            is LabyrinthOperationResult.Success -> r.value
+            is LabyrinthOperationResult.Failure ->
+                return RerollResult.Failure("读取黎明界顶部信息失败：${r.message}")
+        }
+        // ★撤退重跑的下一局：把废局撤掉再走正常流程（此时游戏进程已杀，API 不会被拒）
+        if (skipResume && top.enterId != null) {
+            onProgress(RerollProgress(0, 0, "撤退重跑：上一局已作废 → 不沿用，直接废掉重刷", null))
+            api.retire(top.enterId!!)
+            top = when (val r = api.top()) {
+                is LabyrinthOperationResult.Success -> r.value
+                is LabyrinthOperationResult.Failure ->
+                    return RerollResult.Failure("读取黎明界顶部信息失败：${r.message}")
+            }
+        }
+
+        val maxUnlocked = maxUnlockedDifficulty(top)
+        var difficulty = config.difficulty
+        if (difficulty > maxUnlocked) {
+            onProgress(RerollProgress(0, 0, "目标难度 $difficulty 未解锁，改用 $maxUnlocked", null))
+            difficulty = maxUnlocked
+        }
+        val guild = config.guildId
+
+        if (top.enterId != null) {
+            val eid = top.enterId!!                     // ★var top 之后 smart cast 失效，先落局部
+            onProgress(RerollProgress(0, 0, "读取当前已有开局…", null))
+            when (val r = api.resume(eid)) {
+                is LabyrinthOperationResult.Success -> {
+                    val resume = r.value as LabyrinthResume
+                    val j = RerollJudge.judge(resume.map, config)
+                    // ★已有开局的「公会 / 难度」也必须与配置一致（2026-10-18 用户："公会和难度。加一下吧"）：
+                    //   原来只判 Boss 白名单 + 价值偏差 ⇒ 哪怕开着的是别的公会/别的难度也会直接沿用，
+                    //   跑完才发现"不是我要的那家"。读不到（null）时不拦，避免误撤退。
+                    val curGuild = top.guildId ?: resume.guildId
+                    val curDiff = top.difficulty
+                    val guildOk = curGuild == null || curGuild == guild
+                    val diffOk = curDiff == null || curDiff == difficulty
+                    if (j.ok && guildOk && diffOk) {
+                        return RerollResult.Success(
+                            enterId = eid,
+                            guildId = curGuild ?: guild,
+                            difficulty = curDiff ?: difficulty,
+                            nodes = resume.map,
+                            bossByArea = j.bossByArea,
+                            routePerArea = j.routePerArea,
+                            actual = j.actual,
+                            theory = j.theory,
+                            reused = true,                      // ★沿用：没撤退、没重刷
+                        )
+                    }
+                    if (!guildOk || !diffOk) {
+                        val why = buildList {
+                            if (!guildOk) add("公会 $curGuild ≠ $guild")
+                            if (!diffOk) add("难度 $curDiff ≠ $difficulty")
+                        }.joinToString("、")
+                        onProgress(RerollProgress(0, 0, "当前开局$why → 撤退重刷", null))
+                    }
+                    api.retire(eid)
+                }
+                is LabyrinthOperationResult.Failure -> Unit
+            }
+        }
+
+        val nMax = if (config.maxCount <= 0) Int.MAX_VALUE else config.maxCount
+        var attempt = 0
+        var errStreak = 0
+
+        while (true) {
+            attempt++
+            if (attempt > nMax) {
+                return RerollResult.Failure("重开 $nMax 次仍未刷到合格开局（放宽 max_value_gap / Boss 白名单，或把 max_count 设成 ≤0 = 不限次数）")
+            }
+
+            val enter = when (val r = api.enter(LabyrinthEnterRequest(guild, difficulty))) {
+                is LabyrinthOperationResult.Success -> r.value
+                is LabyrinthOperationResult.Failure -> {
+                    errStreak++
+                    onProgress(RerollProgress(attempt, nMax, "enter 失败（连续 $errStreak 次）：${r.message}", null))
+                    if (errStreak >= 5) return RerollResult.Failure("连续 5 次 enter 失败：${r.message}")
+                    delay(2000)
+                    continue
+                }
+            }
+            errStreak = 0
+
+            val j = RerollJudge.judge(enter.map, config)
+            onProgress(
+                RerollProgress(
+                    attempt,
+                    nMax,
+                    if (j.ok) "命中目标路线开局" else "不满足要求",
+                    j.fail.joinToString("；"),
+                ),
+            )
+
+            if (j.ok) {
+                return RerollResult.Success(
+                    enterId = enter.enterId,
+                    guildId = guild,
+                    difficulty = difficulty,
+                    nodes = enter.map,
+                    bossByArea = j.bossByArea,
+                    routePerArea = j.routePerArea,
+                    actual = j.actual,
+                    theory = j.theory,
+                )
+            }
+
+            api.retire(enter.enterId)
+            delay(config.sleepBetweenMs)
+        }
+    }
+
+    private fun maxUnlockedDifficulty(top: LabyrinthTop): Int {
+        val cleared = top.clearedDifficulties.mapNotNull { it.difficulty }
+        val max = if (cleared.isEmpty()) 1 else (cleared.maxOrNull()!! + 1)
+        return max.coerceAtMost(5)
+    }
+}

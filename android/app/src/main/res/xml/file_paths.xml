@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 日志目录给 FileProvider 分享用（一键把某次日志发出去） -->
+<paths>
+    <external-files-path name="ext_logs" path="logs/" />
+    <files-path name="int_logs" path="logs/" />
+</paths>

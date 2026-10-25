@@ -1,0 +1,1263 @@
+{
+  "guilds": {
+    "1": {
+      "lab_id": 1,
+      "cn": "美食殿",
+      "story_guild_id": 1,
+      "jp": "美食殿",
+      "char_ids": [
+        1058,
+        1059,
+        1060,
+        1064,
+        1075,
+        1076,
+        1078,
+        1118,
+        1119,
+        1120,
+        1155,
+        1207,
+        1210,
+        1211,
+        1253,
+        1272,
+        1279,
+        1351,
+        1804,
+        1805,
+        1806
+      ],
+      "pool": [
+        {
+          "char_cn": "凯露",
+          "char_ids": [
+            1060,
+            1078,
+            1120,
+            1211,
+            1272,
+            1806
+          ],
+          "best": 127201,
+          "forms": [
+            {
+              "unit_id": 127201,
+              "cn": "凯露（插班生）",
+              "en": "Kyaru (Student)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 121101,
+              "cn": "凯露（超负荷）",
+              "en": "Kyaru (Overload)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 112001,
+              "cn": "凯露（新年）",
+              "en": "Kyaru (New Year)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 107801,
+              "cn": "凯露（夏日）",
+              "en": "Kyaru (Summer)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 106001,
+              "cn": "凯露",
+              "en": "Kyaru",
+              "rarity": 1,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "初始"
+            }
+          ]
+        },
+        {
+          "char_cn": "佩可莉姆",
+          "char_ids": [
+            1058,
+            1075,
+            1118,
+            1210,
+            1279,
+            1804
+          ],
+          "best": 127901,
+          "forms": [
+            {
+              "unit_id": 127901,
+              "cn": "佩可莉姆（圣诞节）",
+              "en": "Pecorine (Holiday)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 121001,
+              "cn": "佩可莉姆（超负荷）",
+              "en": "Pecorine (Overload)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 111801,
+              "cn": "佩可莉姆（新年）",
+              "en": "Pecorine (New Year)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 107501,
+              "cn": "佩可莉姆（夏日）",
+              "en": "Pecorine (Summer)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 105801,
+              "cn": "佩可莉姆",
+              "en": "Pecorine",
+              "rarity": 1,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "初始"
+            }
+          ]
+        },
+        {
+          "char_cn": "可可萝",
+          "char_ids": [
+            1059,
+            1076,
+            1119,
+            1155,
+            1253,
+            1805
+          ],
+          "best": 125301,
+          "forms": [
+            {
+              "unit_id": 125301,
+              "cn": "可可萝（游骑兵）",
+              "en": "Kokkoro (Ranger)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 115501,
+              "cn": "可可萝（礼服）",
+              "en": "Kokkoro (Ceremonial)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 111901,
+              "cn": "可可萝（新年）",
+              "en": "Kokkoro (New Year)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 107601,
+              "cn": "可可萝（夏日）",
+              "en": "Kokkoro (Summer)",
+              "rarity": 1,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 105901,
+              "cn": "可可萝",
+              "en": "Kokkoro",
+              "rarity": 1,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "初始"
+            }
+          ]
+        },
+        {
+          "char_cn": "雪菲",
+          "char_ids": [
+            1064,
+            1207,
+            1351
+          ],
+          "best": 135101,
+          "forms": [
+            {
+              "unit_id": 135101,
+              "cn": "雪菲（夏日）",
+              "en": "Sheffy (Summer)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 120701,
+              "cn": "雪菲（新年）",
+              "en": "Sheffy (New Year)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 106401,
+              "cn": "雪菲",
+              "en": "Sheffy",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "常驻"
+            }
+          ]
+        }
+      ],
+      "excluded_fes": [
+        {
+          "unit_id": 180401,
+          "cn": "佩可莉姆（公主）",
+          "en": "Pecorine (Princess)",
+          "rarity": 3,
+          "is_limited": 1,
+          "is_collab": 0,
+          "is_fes": 1,
+          "source": "公主限定"
+        },
+        {
+          "unit_id": 180601,
+          "cn": "凯露（公主）",
+          "en": "Kyaru (Princess)",
+          "rarity": 3,
+          "is_limited": 1,
+          "is_collab": 0,
+          "is_fes": 1,
+          "source": "公主限定"
+        },
+        {
+          "unit_id": 180501,
+          "cn": "可可萝（公主）",
+          "en": "Kokkoro (Princess)",
+          "rarity": 3,
+          "is_limited": 1,
+          "is_collab": 0,
+          "is_fes": 1,
+          "source": "公主限定"
+        }
+      ],
+      "excluded_dual": [],
+      "default_picks": [
+        107501,
+        106001,
+        135101
+      ],
+      "selectable_ids": [
+        105801,
+        105901,
+        106001,
+        106401,
+        107501,
+        107601,
+        107801,
+        111801,
+        111901,
+        112001,
+        115501,
+        120701,
+        121001,
+        121101,
+        125301,
+        127201,
+        127901,
+        135101
+      ]
+    },
+    "2": {
+      "lab_id": 2,
+      "cn": "破晓",
+      "story_guild_id": 2,
+      "jp": "トゥインクルウィッシュ",
+      "char_ids": [
+        1001,
+        1002,
+        1003,
+        1087,
+        1088,
+        1089,
+        1140,
+        1156,
+        1224,
+        1225,
+        1226,
+        1287,
+        1288,
+        1289,
+        1357,
+        1801,
+        1802,
+        1803
+      ],
+      "pool": [
+        {
+          "char_cn": "怜",
+          "char_ids": [
+            1003,
+            1089,
+            1140,
+            1225,
+            1288,
+            1803
+          ],
+          "best": 122501,
+          "forms": [
+            {
+              "unit_id": 122501,
+              "cn": "怜（夏日）",
+              "en": "Rei (Summer)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 114001,
+              "cn": "怜（万圣节）",
+              "en": "Rei (Halloween)",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "常驻"
+            },
+            {
+              "unit_id": 128801,
+              "cn": "怜（星幽）",
+              "en": "Rei (Astral)",
+              "rarity": 1,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 108901,
+              "cn": "怜（新年）",
+              "en": "Rei (New Year)",
+              "rarity": 1,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 100301,
+              "cn": "怜",
+              "en": "Rei",
+              "rarity": 1,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "初始"
+            }
+          ]
+        },
+        {
+          "char_cn": "优衣",
+          "char_ids": [
+            1002,
+            1088,
+            1156,
+            1226,
+            1289,
+            1802
+          ],
+          "best": 128901,
+          "forms": [
+            {
+              "unit_id": 128901,
+              "cn": "优衣（星幽）",
+              "en": "Yui (Astral)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 122601,
+              "cn": "优衣（夏日）",
+              "en": "Yui (Summer)",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "常驻"
+            },
+            {
+              "unit_id": 108801,
+              "cn": "优衣（新年）",
+              "en": "Yui (New Year)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 115601,
+              "cn": "优衣（礼服）",
+              "en": "Yui (Ceremonial)",
+              "rarity": 1,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 100201,
+              "cn": "优衣",
+              "en": "Yui",
+              "rarity": 1,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "初始"
+            }
+          ]
+        },
+        {
+          "char_cn": "日和莉",
+          "char_ids": [
+            1001,
+            1087,
+            1224,
+            1287,
+            1357,
+            1801
+          ],
+          "best": 135701,
+          "forms": [
+            {
+              "unit_id": 135701,
+              "cn": "日和莉（沙漠）",
+              "en": "Hiyori (Salasaria)",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "常驻"
+            },
+            {
+              "unit_id": 128701,
+              "cn": "日和莉（星幽）",
+              "en": "Hiyori (Astral)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 108701,
+              "cn": "日和莉（新年）",
+              "en": "Hiyori (New Year)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 122401,
+              "cn": "日和莉（夏日）",
+              "en": "Hiyori (Summer)",
+              "rarity": 1,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 100101,
+              "cn": "日和莉",
+              "en": "Hiyori",
+              "rarity": 1,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "初始"
+            }
+          ]
+        }
+      ],
+      "excluded_fes": [
+        {
+          "unit_id": 180301,
+          "cn": "怜（公主）",
+          "en": "Rei (Princess)",
+          "rarity": 3,
+          "is_limited": 1,
+          "is_collab": 0,
+          "is_fes": 1,
+          "source": "公主限定"
+        },
+        {
+          "unit_id": 180201,
+          "cn": "优衣（公主）",
+          "en": "Yui (Princess)",
+          "rarity": 3,
+          "is_limited": 1,
+          "is_collab": 0,
+          "is_fes": 1,
+          "source": "公主限定"
+        },
+        {
+          "unit_id": 180101,
+          "cn": "日和莉（公主）",
+          "en": "Hiyori (Princess)",
+          "rarity": 3,
+          "is_limited": 1,
+          "is_collab": 0,
+          "is_fes": 1,
+          "source": "公主限定"
+        }
+      ],
+      "excluded_dual": [],
+      "default_picks": [
+        128801,
+        108901,
+        100101
+      ],
+      "selectable_ids": [
+        100101,
+        100201,
+        100301,
+        108701,
+        108801,
+        108901,
+        114001,
+        115601,
+        122401,
+        122501,
+        122601,
+        128701,
+        128801,
+        128901,
+        135701
+      ]
+    },
+    "3": {
+      "lab_id": 3,
+      "cn": "救济院",
+      "story_guild_id": 9,
+      "jp": "サレンディア救護院",
+      "char_ids": [
+        1021,
+        1023,
+        1025,
+        1028,
+        1077,
+        1085,
+        1086,
+        1103,
+        1121,
+        1145,
+        1213,
+        1232,
+        1275,
+        1308,
+        1335,
+        1809
+      ],
+      "pool": [
+        {
+          "char_cn": "绫音",
+          "char_ids": [
+            1023,
+            1086,
+            1232
+          ],
+          "best": 123201,
+          "forms": [
+            {
+              "unit_id": 123201,
+              "cn": "绫音（探索者）",
+              "en": "Ayane (Explorer)",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "常驻"
+            },
+            {
+              "unit_id": 108601,
+              "cn": "绫音（圣诞节）",
+              "en": "Ayane (Holiday)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 102301,
+              "cn": "绫音",
+              "en": "Ayane",
+              "rarity": 2,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "初始"
+            }
+          ]
+        },
+        {
+          "char_cn": "咲恋",
+          "char_ids": [
+            1028,
+            1103,
+            1145,
+            1275,
+            1335
+          ],
+          "best": 133501,
+          "forms": [
+            {
+              "unit_id": 133501,
+              "cn": "咲恋（新年）",
+              "en": "Saren (New Year)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 127501,
+              "cn": "咲恋（沙漠）",
+              "en": "Saren (Salasaria)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 114501,
+              "cn": "咲恋（圣诞节）",
+              "en": "Saren (Holiday)",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "常驻"
+            },
+            {
+              "unit_id": 110301,
+              "cn": "咲恋（夏日）",
+              "en": "Saren (Summer)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 102801,
+              "cn": "咲恋",
+              "en": "Saren",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "常驻"
+            }
+          ]
+        },
+        {
+          "char_cn": "胡桃",
+          "char_ids": [
+            1021,
+            1085,
+            1213
+          ],
+          "best": 121301,
+          "forms": [
+            {
+              "unit_id": 121301,
+              "cn": "胡桃（舞台）",
+              "en": "Kurumi (Stage)",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "常驻"
+            },
+            {
+              "unit_id": 108501,
+              "cn": "胡桃（圣诞节）",
+              "en": "Kurumi (Holiday)",
+              "rarity": 1,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 102101,
+              "cn": "胡桃",
+              "en": "Kurumi",
+              "rarity": 1,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "初始"
+            }
+          ]
+        },
+        {
+          "char_cn": "铃莓",
+          "char_ids": [
+            1025,
+            1077,
+            1121,
+            1308
+          ],
+          "best": 130801,
+          "forms": [
+            {
+              "unit_id": 130801,
+              "cn": "铃莓（春日）",
+              "en": "Suzume (Spring)",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "常驻"
+            },
+            {
+              "unit_id": 107701,
+              "cn": "铃莓（夏日）",
+              "en": "Suzume (Summer)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 112101,
+              "cn": "铃莓（新年）",
+              "en": "Suzume (New Year)",
+              "rarity": 1,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 102501,
+              "cn": "铃莓",
+              "en": "Suzume",
+              "rarity": 1,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "初始"
+            }
+          ]
+        }
+      ],
+      "excluded_fes": [
+        {
+          "unit_id": 180901,
+          "cn": "秋乃＆咲恋",
+          "en": "Akino & Saren",
+          "rarity": 3,
+          "is_limited": 1,
+          "is_collab": 0,
+          "is_fes": 1,
+          "source": "公主限定"
+        }
+      ],
+      "excluded_dual": [],
+      "default_picks": [
+        110301,
+        102501,
+        130801
+      ],
+      "selectable_ids": [
+        102101,
+        102301,
+        102501,
+        102801,
+        107701,
+        108501,
+        108601,
+        110301,
+        112101,
+        114501,
+        121301,
+        123201,
+        127501,
+        130801,
+        133501
+      ]
+    },
+    "4": {
+      "lab_id": 4,
+      "cn": "骑士团",
+      "story_guild_id": 8,
+      "jp": "王宮騎士団（NIGHTMARE）",
+      "char_ids": [
+        1005,
+        1037,
+        1047,
+        1071,
+        1115,
+        1136,
+        1141,
+        1143,
+        1236,
+        1238,
+        1239,
+        1242,
+        1339
+      ],
+      "pool": [
+        {
+          "char_cn": "茉莉",
+          "char_ids": [
+            1005,
+            1141,
+            1239
+          ],
+          "best": 123901,
+          "forms": [
+            {
+              "unit_id": 123901,
+              "cn": "茉莉（狂野）",
+              "en": "Matsuri (Wild)",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "常驻"
+            },
+            {
+              "unit_id": 100501,
+              "cn": "茉莉",
+              "en": "Matsuri",
+              "rarity": 2,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "初始"
+            },
+            {
+              "unit_id": 114101,
+              "cn": "茉莉（万圣节）",
+              "en": "Matsuri (Halloween)",
+              "rarity": 1,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            }
+          ]
+        },
+        {
+          "char_cn": "智",
+          "char_ids": [
+            1037,
+            1143,
+            1236
+          ],
+          "best": 123601,
+          "forms": [
+            {
+              "unit_id": 123601,
+              "cn": "智（万圣节）",
+              "en": "Tomo (Halloween)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 114301,
+              "cn": "智（魔法少女）",
+              "en": "Tomo (Magical)",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "常驻"
+            },
+            {
+              "unit_id": 103701,
+              "cn": "智",
+              "en": "Tomo",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "常驻"
+            }
+          ]
+        },
+        {
+          "char_cn": "纯",
+          "char_ids": [
+            1047,
+            1136,
+            1242
+          ],
+          "best": 124201,
+          "forms": [
+            {
+              "unit_id": 124201,
+              "cn": "纯（圣诞节）",
+              "en": "Jun (Holiday)",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "常驻"
+            },
+            {
+              "unit_id": 113601,
+              "cn": "纯（夏日）",
+              "en": "Jun (Summer)",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "常驻"
+            },
+            {
+              "unit_id": 104701,
+              "cn": "纯",
+              "en": "Jun",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "常驻"
+            }
+          ]
+        },
+        {
+          "char_cn": "克莉丝提娜",
+          "char_ids": [
+            1071,
+            1115,
+            1238,
+            1339
+          ],
+          "best": 133901,
+          "forms": [
+            {
+              "unit_id": 133901,
+              "cn": "克莉丝提娜（阿尔法）",
+              "en": "Christina (Alpha)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 123801,
+              "cn": "克莉丝提娜（狂野）",
+              "en": "Christina (Wild)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 111501,
+              "cn": "克莉丝提娜（圣诞节）",
+              "en": "Christina (Holiday)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            }
+          ]
+        }
+      ],
+      "excluded_fes": [
+        {
+          "unit_id": 107101,
+          "cn": "克莉丝提娜",
+          "en": "Christina",
+          "rarity": 3,
+          "is_limited": 1,
+          "is_collab": 0,
+          "is_fes": 1,
+          "source": "公主限定"
+        }
+      ],
+      "excluded_dual": [],
+      "default_picks": [
+        113601,
+        133901,
+        111501
+      ],
+      "selectable_ids": [
+        100501,
+        103701,
+        104701,
+        111501,
+        113601,
+        114101,
+        114301,
+        123601,
+        123801,
+        123901,
+        124201,
+        133901
+      ]
+    },
+    "5": {
+      "lab_id": 5,
+      "cn": "拉比林斯",
+      "story_guild_id": 3,
+      "jp": "ラビリンス",
+      "char_ids": [
+        1011,
+        1049,
+        1068,
+        1091,
+        1129,
+        1171,
+        1193,
+        1200,
+        1212,
+        1337,
+        1811
+      ],
+      "pool": [
+        {
+          "char_cn": "静流",
+          "char_ids": [
+            1049,
+            1091,
+            1171,
+            1200
+          ],
+          "best": 120001,
+          "forms": [
+            {
+              "unit_id": 120001,
+              "cn": "静流（黑暗）",
+              "en": "Shizuru (Noir)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 117101,
+              "cn": "静流（夏日）",
+              "en": "Shizuru (Summer)",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "常驻"
+            },
+            {
+              "unit_id": 109101,
+              "cn": "静流（情人节）",
+              "en": "Shizuru (Valentine)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 104901,
+              "cn": "静流",
+              "en": "Shizuru",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "常驻"
+            }
+          ]
+        },
+        {
+          "char_cn": "菈比莉斯塔",
+          "char_ids": [
+            1068,
+            1212,
+            1337
+          ],
+          "best": 133701,
+          "forms": [
+            {
+              "unit_id": 133701,
+              "cn": "菈比莉斯塔（阿尔法）",
+              "en": "Labyrista (Alpha)",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            },
+            {
+              "unit_id": 121201,
+              "cn": "菈比莉斯塔（超负荷）",
+              "en": "Labyrista (Overload)",
+              "rarity": 1,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "限定"
+            }
+          ]
+        },
+        {
+          "char_cn": "璃乃",
+          "char_ids": [
+            1011,
+            1129,
+            1193
+          ],
+          "best": 119301,
+          "forms": [
+            {
+              "unit_id": 119301,
+              "cn": "璃乃（圣诞节）",
+              "en": "Rino (Holiday)",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "常驻"
+            },
+            {
+              "unit_id": 112901,
+              "cn": "璃乃（仙境）",
+              "en": "Rino (Wonderland)",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "常驻"
+            },
+            {
+              "unit_id": 101101,
+              "cn": "璃乃",
+              "en": "Rino",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": "常驻"
+            }
+          ]
+        }
+      ],
+      "excluded_fes": [
+        {
+          "unit_id": 181101,
+          "cn": "静流＆璃乃",
+          "en": "Shizuru & Rino",
+          "rarity": 3,
+          "is_limited": 1,
+          "is_collab": 0,
+          "is_fes": 1,
+          "source": "公主限定"
+        },
+        {
+          "unit_id": 106801,
+          "cn": "菈比莉斯塔",
+          "en": "Labyrista",
+          "rarity": 3,
+          "is_limited": 1,
+          "is_collab": 0,
+          "is_fes": 1,
+          "source": "公主限定"
+        }
+      ],
+      "excluded_dual": [],
+      "default_picks": [
+        101101,
+        120001,
+        109101
+      ],
+      "selectable_ids": [
+        101101,
+        104901,
+        109101,
+        112901,
+        117101,
+        119301,
+        120001,
+        121201,
+        133701
+      ]
+    }
+  }
+}

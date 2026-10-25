@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">黎明界自动化</string>
+
+
+    <string name="notif_channel_name">自动化运行中</string>
+    <!-- 前台服务的"通行证"通知（删不掉），已压到最低优先级：不出声、不弹横幅、锁屏不显示 -->
+    <string name="notif_channel_desc">前台服务运行所必需，只显示一行"运行中"，可一键停止</string>
+    <string name="notif_title">黎明界自动化</string>
+    <string name="notif_action_stop">停止</string>
+</resources>

@@ -1,0 +1,189 @@
+package com.lmj.labyrinthauto.frida
+
+import com.lmj.labyrinthauto.core.AppState
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.util.concurrent.TimeUnit
+
+/**
+ * 申请 root 并跑命令。
+ *
+ * 为什么要有这一层：MuMu 上 su 是**厂商实现**，参数写法跟 AOSP 不完全一样
+ * （实测 `/system/xbin/su` 只放行 uid 0/1000/2000，普通 app 被文件权限挡死；
+ *  而 `/system/bin/su` 会弹「SuperUser 授权框」，授权后才是 root）。
+ * 所以这里**逐个试**几种常见写法，用 `id` 有没有输出 uid=0 来判定哪种可用，然后缓存。
+ *
+ * 第一次调用会弹出 MuMu 的授权框（选「永久记住选择」后就不弹了）。
+ */
+object RootShell {
+
+    /** 可用的调用形态：prefix + [单条命令字符串] */
+    data class Form(val label: String, val prefix: List<String>)
+
+    data class Exec(val exit: Int, val out: String, val err: String) {
+        val text: String get() = (out + err).trim()
+    }
+
+    /** MuMu 12 的 su 客户端（世界可执行，虽然不是 setuid，但会走授权框 → root 守护进程） */
+    private const val SU_BIN = "/system/bin/su"
+
+    /**
+     * ★su 的候选路径（2026-10-18 用户反馈："MuMu 15 有这个问题，MuMu 12 正常"）。
+     *
+     * 查证结果：**MuMu 15 = MuMu 模拟器 6.0 / Android 15，root 改成了 KernelSU 方案**
+     * （官方测评："首创模拟器级 KernelSU 原生 Root"）。KernelSU 的 su **不在磁盘上放文件**：
+     * 内核 sucompat 截获 `execve("/system/bin/su")` 后改道到 `/data/adb/ksud`，
+     * **且只对已授权的 uid 生效**；未授权时 execve 返回 `ENOENT`（= 用户截图里的 `error=2`）。
+     * ⇒ 这里的候选路径只是"磁盘上真的放了 su 的镜像"（MuMu 12 / Magisk / AOSP）才需要 stat；
+     * `/system/bin/su` 与 PATH 里的裸 `su` 必须**无条件试**（见 [detect]）。
+     */
+    private val SU_PATHS = listOf(
+        "/system/bin/su",
+        "/system/xbin/su",
+        "/sbin/su",
+        "/su/bin/su",
+        "/vendor/bin/su",
+        "/debug_ramdisk/su",
+        "/data/local/tmp/su",
+    )
+
+    /** 同一条 su 的几种调用形态（MuMu 的 su 参数跟 AOSP 不完全一样，逐个试）。 */
+    private fun formsFor(bin: String) = listOf(
+        Form("$bin -c", listOf(bin, "-c")),
+        Form("$bin 0 -c", listOf(bin, "0", "-c")),
+        Form("$bin 0 sh -c", listOf(bin, "0", "sh", "-c")),
+        Form("$bin root -c", listOf(bin, "root", "-c")),
+    )
+
+    /**
+     * ★诊断一行：`路径: 不存在` / `路径: 存在(368656B, 64位/x86-64, 可执行=true)`。
+     * 用来区分"真没有 su"与"有 su 但 exec 报 ENOENT（位数/解释器不对）"。
+     */
+    private fun diagOf(path: String): String {
+        return try {
+            val f = File(path)
+            if (!f.exists()) return "$path: 不存在"
+            val buf = ByteArray(20)
+            runCatching { java.io.FileInputStream(f).use { it.read(buf) } }
+            val isElf = buf[0] == 0x7F.toByte() && buf[1] == 'E'.code.toByte()
+            val cls = if (buf[4].toInt() == 2) "64位" else "32位"
+            // ELF 头 +0x12 起 2 字节 = e_machine（小端）
+            val mach = ((buf[19].toInt() and 0xFF) shl 8) or (buf[18].toInt() and 0xFF)
+            val m = when (mach) {
+                0x3E -> "x86-64"; 0x03 -> "x86"; 0xB7 -> "aarch64"; 0x28 -> "arm"
+                else -> String.format("0x%04x", mach)
+            }
+            val kind = if (isElf) "$cls/$m" else if (buf[0] == '#'.code.toByte()) "脚本" else "非 ELF"
+            "$path: 存在(${f.length()}B, $kind, 可执行=${f.canExecute()})"
+        } catch (t: Throwable) {
+            "$path: 读不了(${t.message})"
+        }
+    }
+
+    @Volatile
+    private var cached: Form? = null
+
+    val form: Form? get() = cached
+
+    /** 探测哪种写法真能拿到 root（第一次会弹授权框）。 */
+    suspend fun detect(): Form? {
+        cached?.let { return it }
+        // ① 先看哪些路径**磁盘上**有 su（只 stat，不执行）
+        val found = SU_PATHS.filter { runCatching { File(it).exists() }.getOrDefault(false) }
+        // ★★关键：不能因为 exists=false 就跳过 exec（2026-10-18 查证）——
+        //   MuMu 6.0（Android 15 镜像，"MuMu 15"）的 root 是 **KernelSU 式**：`/system/bin/su`
+        //   **磁盘上本来就没有这个文件**，内核 sucompat 会拦 execve("/system/bin/su") 并改道到 ksud；
+        //   而这条改道**只对已授权的 UID 生效**。未授权时 execve 返回 ENOENT（= 截图里的 error=2）。
+        //   ⇒ 所以 /system/bin/su 与 PATH 里的 `su` **必须无条件试一次**，不能靠 File.exists() 预判。
+        val bins = (listOf(SU_BIN) + found + "su").distinct()
+        if (found.isNotEmpty() && found != listOf(SU_BIN)) {
+            AppState.addLog("root 探测：su 位于 ${found.joinToString("、")}")
+        }
+        // ② 逐个路径 × 每种写法试
+        var lastErr = ""
+        var sawEnoent = false
+        for (bin in bins) {
+            for (f in formsFor(bin)) {
+                val r = runWith(f, "id", 20_000L)
+                if (r.text.contains("uid=0")) {
+                    cached = f
+                    AppState.addLog("root 已就绪（写法：${f.label}）")
+                    return f
+                }
+                lastErr = r.text.take(120)
+                if (lastErr.contains("error=2") || lastErr.contains("No such file")) sawEnoent = true
+                AppState.addLog("root 探测失败（${f.label}）：$lastErr")
+            }
+        }
+        AppState.addLog("root 探测：${bins.size} 个路径 × 4 种写法都没拿到 uid=0（最后一次：$lastErr）")
+        // ③ 诊断：把"磁盘上有没有 / 位数"打出来，配合 ENOENT 判断是哪一类
+        SU_PATHS.forEach { AppState.addLog("  · ${diagOf(it)}") }
+        if (sawEnoent && !File(SU_BIN).exists()) {
+            AppState.addLog(
+                "root 诊断：/system/bin/su 在磁盘上不存在且 exec 报 ENOENT —— " +
+                    "若这是 MuMu 6.0 / Android 15（KernelSU 式 root），su 只在**已授权**时由内核改道，" +
+                    "⇒ 请到模拟器的「Root 权限 / 超级用户」里允许本应用（或先打开 Root 开关并重启实例），再点「检查 / 申请 root」",
+            )
+        }
+        return null
+    }
+
+    /** 跑一条短命令（id / pidof / pkill 这类）。 */
+    suspend fun exec(cmd: String, timeoutMs: Long = 20_000L): Exec {
+        val f = cached ?: detect() ?: return Exec(-1, "", "没有可用的 su 写法（授权被拒或超时）")
+        return runWith(f, cmd, timeoutMs)
+    }
+
+    /**
+     * 起一个**长驻**的 root 进程（frida-inject 就是这种）：
+     * 不等待结束，stdout/stderr 逐行回调，调用方拿到的 Process 可以用来 kill。
+     */
+    suspend fun spawn(cmd: String, onLine: (String) -> Unit): Process? {
+        val f = cached ?: detect() ?: run {
+            AppState.addLog("起注入器失败：没有可用的 su 写法")
+            return null
+        }
+        return withContext(Dispatchers.IO) {
+            try {
+                val p = ProcessBuilder(*(f.prefix + cmd).toTypedArray()).start()
+                Thread {
+                    runCatching { p.inputStream.bufferedReader().forEachLine { onLine(it) } }
+                }.apply { isDaemon = true }.start()
+                Thread {
+                    runCatching { p.errorStream.bufferedReader().forEachLine { onLine("[err] $it") } }
+                }.apply { isDaemon = true }.start()
+                p
+            } catch (t: Throwable) {
+                AppState.addLog("起注入器失败：${t.message}")
+                null
+            }
+        }
+    }
+
+    private suspend fun runWith(f: Form, cmd: String, timeoutMs: Long): Exec = withContext(Dispatchers.IO) {
+        val p = try {
+            ProcessBuilder(*(f.prefix + cmd).toTypedArray()).start()
+        } catch (t: Throwable) {
+            return@withContext Exec(-1, "", "启动 su 失败：${t.message}")
+        }
+        val out = StringBuilder()
+        val err = StringBuilder()
+        val tOut = Thread { runCatching { p.inputStream.bufferedReader().forEachLine { out.appendLine(it) } } }
+        val tErr = Thread { runCatching { p.errorStream.bufferedReader().forEachLine { err.appendLine(it) } } }
+        tOut.isDaemon = true
+        tErr.isDaemon = true
+        tOut.start()
+        tErr.start()
+        val done = p.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
+        if (!done) {
+            runCatching { p.destroy() }
+            tOut.join(500)
+            tErr.join(500)
+            return@withContext Exec(-1, out.toString(), err.toString() + "\n(等待超时 ${timeoutMs}ms)")
+        }
+        tOut.join(1000)
+        tErr.join(1000)
+        Exec(p.exitValue(), out.toString(), err.toString())
+    }
+}

@@ -1,0 +1,104 @@
+
+> Configure project :app
+WARNING: The option setting 'android.overridePathCheck=true' is experimental.
+The current default is 'false'.
+WARNING: We recommend using a newer Android Gradle plugin to use compileSdk = 35
+
+This Android Gradle plugin (8.5.2) was tested up to compileSdk = 34.
+
+You are strongly encouraged to update your project to use a newer
+Android Gradle plugin that has been tested with compileSdk = 35.
+
+If you are already using the latest version of the Android Gradle plugin,
+you may need to wait until a newer version with support for compileSdk = 35 is available.
+
+For more information refer to the compatibility table:
+https://d.android.com/r/tools/api-level-support
+
+To suppress this warning, add/update
+    android.suppressUnsupportedCompileSdk=35
+to this project's gradle.properties.
+
+> Task :app:checkKotlinGradlePluginConfigurationErrors
+> Task :app:preBuild UP-TO-DATE
+> Task :app:preDebugBuild UP-TO-DATE
+> Task :app:checkDebugAarMetadata UP-TO-DATE
+> Task :app:generateDebugResValues UP-TO-DATE
+> Task :app:mapDebugSourceSetPaths UP-TO-DATE
+> Task :app:generateDebugResources UP-TO-DATE
+> Task :app:mergeDebugResources UP-TO-DATE
+> Task :app:packageDebugResources UP-TO-DATE
+> Task :app:parseDebugLocalResources UP-TO-DATE
+> Task :app:createDebugCompatibleScreenManifests UP-TO-DATE
+> Task :app:extractDeepLinksDebug UP-TO-DATE
+> Task :app:processDebugMainManifest UP-TO-DATE
+> Task :app:processDebugManifest UP-TO-DATE
+> Task :app:processDebugManifestForPackage UP-TO-DATE
+> Task :app:processDebugResources UP-TO-DATE
+> Task :app:javaPreCompileDebug UP-TO-DATE
+> Task :app:mergeDebugShaders UP-TO-DATE
+> Task :app:compileDebugShaders NO-SOURCE
+> Task :app:generateDebugAssets UP-TO-DATE
+> Task :app:mergeDebugAssets UP-TO-DATE
+> Task :app:compressDebugAssets UP-TO-DATE
+> Task :app:desugarDebugFileDependencies UP-TO-DATE
+> Task :app:checkDebugDuplicateClasses UP-TO-DATE
+> Task :app:mergeDebugStartupProfile UP-TO-DATE
+> Task :app:mergeExtDexDebug UP-TO-DATE
+> Task :app:mergeLibDexDebug UP-TO-DATE
+> Task :app:mergeDebugJniLibFolders UP-TO-DATE
+> Task :app:mergeDebugNativeLibs UP-TO-DATE
+> Task :app:stripDebugDebugSymbols UP-TO-DATE
+> Task :app:validateSigningDebug UP-TO-DATE
+> Task :app:writeDebugAppMetadata UP-TO-DATE
+> Task :app:writeDebugSigningConfigVersions UP-TO-DATE
+
+> Task :app:compileDebugKotlin
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/core/LogFile.kt:230:82 'versionCode: Int' is deprecated. Deprecated in Java
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/input/InputBackends.kt:15:22 Parameter 'ctx' is never used
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/MazeLoop.kt:496:17 Variable 'rounds' is never used
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/MazeLoop.kt:594:29 Name shadowed: top
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/MazeLoop.kt:1327:9 Parameter 'st' is never used
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/MazeLoop.kt:1330:9 Parameter 'screenW' is never used
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/MazeLoop.kt:1331:9 Parameter 'screenH' is never used
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/MazeLoop.kt:1630:27 Unsafe use of a nullable receiver of type JSONArray?
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/MazeLoop.kt:2161:45 Unsafe use of a nullable receiver of type Any?
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/MazeLoop.kt:2181:75 Unsafe use of a nullable receiver of type Any?
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/MazeLoop.kt:2509:21 Name shadowed: sig
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/MazeLoop.kt:2608:56 Parameter 'st' is never used
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/MazeLoop.kt:3343:52 Unnecessary non-null assertion (!!) on a non-null receiver of type JSONObject
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/MazeLoop.kt:3344:49 Unnecessary non-null assertion (!!) on a non-null receiver of type JSONObject
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/MazeLoop.kt:3388:31 Condition 'root == null' is always 'false'
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/MazeLoop.kt:3401:57 Parameter 'deep' is never used
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/MazeLoop.kt:3957:21 Name shadowed: names
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/Navigator.kt:92:21 Variable 'front' initializer is redundant
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/party/PartyPlan.kt:222:90 Unsafe use of a nullable receiver of type JSONArray?
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/shop/ShopPlan.kt:161:32 Unsafe use of a nullable receiver of type Any?
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/shop/ShopPlan.kt:169:44 Unsafe use of a nullable receiver of type Any?
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/shop/ShopPlan.kt:206:61 Unnecessary non-null assertion (!!) on a non-null receiver of type Double
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/shop/ShopPlan.kt:211:67 Unnecessary non-null assertion (!!) on a non-null receiver of type Double
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/team/TeamBuild.kt:451:49 Unnecessary non-null assertion (!!) on a non-null receiver of type Int
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/team/TeamBuild.kt:457:31 Unnecessary non-null assertion (!!) on a non-null receiver of type Pair<String, String>
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/team/TeamBuild.kt:458:31 Unnecessary non-null assertion (!!) on a non-null receiver of type Pair<String, String>
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/team/TeamBuild.kt:662:9 Parameter 'pf' is never used
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/team/TeamBuild.kt:1017:9 Parameter 'relicsSkill' is never used
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/logic/team/TeamBuild.kt:1281:9 Parameter 'relicsSkill' is never used
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/reroll/RerollController.kt:66:42 No cast needed
+w: file:///D:/Users/zhouyi/Documents/LMJ/labyrinth_auto_android/android/app/src/main/java/com/lmj/labyrinthauto/ui/HomeScreen.kt:942:45 Parameter 'msg' is never used
+
+> Task :app:compileDebugJavaWithJavac NO-SOURCE
+> Task :app:dexBuilderDebug
+> Task :app:mergeDebugGlobalSynthetics
+> Task :app:processDebugJavaRes
+> Task :app:mergeProjectDexDebug
+> Task :app:mergeDebugJavaResource
+> Task :app:packageDebug
+> Task :app:createDebugApkListingFileRedirect
+
+> Task :app:installDebug
+[EmulatorConsole]: Failed to start Emulator console for 5564
+Installing APK 'app-debug.apk' on 'emulator-5564 - 12' for :app:debug
+Installed on 1 device.
+
+BUILD SUCCESSFUL in 37s
+38 actionable tasks: 10 executed, 28 up-to-date

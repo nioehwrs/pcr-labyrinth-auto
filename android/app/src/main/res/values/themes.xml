@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Compose 自己画界面，这里只要一个"没有 ActionBar"的底板即可（不引 AppCompat）。
+         ★底色用**深色**（2026-10-17 用户选"深色为主"）：app 默认就是深色，
+         启动那一瞬如果还是白底会闪一下 ⇒ windowBackground 直接跟 Compose 的 background 对齐
+         （见 ui/theme/Theme.kt 的 DarkColors.background = #111316）。 -->
+    <style name="Theme.LabyrinthAuto" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#FF111316</item>
+        <item name="android:statusBarColor">#FF111316</item>
+        <item name="android:navigationBarColor">#FF111316</item>
+    </style>
+</resources>

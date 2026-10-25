@@ -1,0 +1,40 @@
+# 本机路径 / 本机环境（绝不入库）
+android/local.properties
+android/.gradle/
+**/build/
+captures/
+.cxx/
+
+# 生成物
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# 发布产物目录（历史版本安装包放这里分发，不入库）
+dist/
+
+# 运行日志 / 截图（一跑就几 MB，不入库）
+logs/
+screenshots/
+
+# ★大二进制：huabanxie-server（改名版 frida-server，106MB）
+#   2026-10-25 起不再随 APK 走，改由发布仓库的 Release 附件提供（gz 约 42MB）；
+#   本地留底在 dist/frida/*.gz（dist/ 已忽略）。留在 assets 里会让 Gitee 附件超 100MB。
+android/app/src/main/assets/frida-server-*
+android/app/src/main/assets/huabanxie-server-*
+
+# ★发布用 token（等同密码，绝不入库）
+tools/.gitee_token
+
+# IDE / 编辑器（本工程用命令行构建，不需要提交 IDE 配置）
+.idea/
+*.iml
+*.iws
+.vscode/
+*.swp
+
+# 日志、临时文件
+*.log
+*.hprof
+*.tmp

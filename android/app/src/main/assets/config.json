@@ -1,0 +1,30 @@
+{
+ "sdk": "official",
+ "captcha_service": "https://pcrd.tencentbot.top",
+ "debug": false,
+ "guild_id": 3,
+ "difficulty": 5,
+ "max_count": -1,
+ "boss_area3": [
+  301206,
+  306604,
+  312505,
+  319604
+ ],
+ "boss_area5": [
+  301701,
+  302501,
+  310103,
+  315004,
+  319401
+ ],
+ "check_boss": true,
+ "check_value": true,
+ "event_value": 350,
+ "max_value_gap": 0,
+ "max_gap_areas": -1,
+ "sleep_between": 0.15,
+ "sync_pkg": "",
+ "stuck_same": 40,
+ "shop_buy_2star": false
+}

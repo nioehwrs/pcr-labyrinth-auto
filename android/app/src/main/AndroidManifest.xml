@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- P1：agent 回连 app 的 socket 服务端（没有这条，socket() 会 EPERM） -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- MuMu 的 SuperUser 会读这条来判断"这个 app 是干嘛的"（弹窗里的开发人员警告点名要它） -->
+    <uses-permission android:name="android.permission.ACCESS_SUPERUSER" />
+
+    <!-- 通知栏（前台服务 + 暂停/继续/停止） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Android 14+：本服务属于"特殊用途"（自动化控制），需要单独声明 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- ★状态悬浮窗（2026-10-17 用户）：在游戏画面上叠一行"第几局/第几层/当前状态"，不可点不交互。
+         这是"特殊应用权限"——装完不会自动给，要在系统设置里手动允许（助手首页有「去授权」入口）。 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!-- ★包可见性（Android 11+，2026-10-23）：B 站登录协议要 `getPackageInfo("com.bilibili.priconne")`
+         读游戏包的签名/版本；不声明这条的话，在 Android 11+ 上会直接抛 **NameNotFoundException**
+         —— 看起来像"没装游戏"，其实是"查不到"。MuMu 15(Android 15) 上就是这么崩的。 -->
+    <queries>
+        <package android:name="com.bilibili.priconne" />
+    </queries>
+
+    <application
+        android:name=".LmjApp"
+        android:allowBackup="false"
+        android:icon="@drawable/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.LabyrinthAuto">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 常驻前台服务：跑状态机、挂通知栏控制
+             ★exported=true（2026-10-19）：调试入口 ACTION_TREE / ACTION_PROBE / ACTION_GOTO_LAB
+             要能用 `adb shell am startservice` 打进来（服务注释里就是这么写的，之前 exported=false 打不进来） -->
+        <service
+            android:name=".service.AutoForegroundService"
+            android:exported="true"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="labyrinth automation controller" />
+            <intent-filter>
+                <action android:name="com.lmj.labyrinthauto.action.START" />
+                <action android:name="com.lmj.labyrinthauto.action.STOP" />
+            </intent-filter>
+        </service>
+
+        <!-- ★一键分享日志（2026-10-19 用户：日志在 Android/data 私有目录里，普通文件管理器进不去，
+             得让用户能挑一份发给开发者）—— FileProvider 把 logs/ 暴露给系统分享面板 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+</manifest>
