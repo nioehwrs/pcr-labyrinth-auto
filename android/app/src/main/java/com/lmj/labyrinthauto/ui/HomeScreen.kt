@@ -150,6 +150,8 @@ fun HomeScreen(
     // ★运行组件状态（2026-10-26 用户方案）：首次要备 42MB 的 frida-server，不是错误、不该弹窗打断 ——
     //   在标题下面挂一条常驻细条，下载中给进度，移动网络/失败给可点入口，就绪后整条消失。
     val compDownloading = compStatus?.startsWith("运行组件下载中") == true
+    // ★上次进程是否突然消失（CrashGuard 判定，启动时写一次）→ 首页横幅，点「知道了」清掉
+    val abnormalExit by AppState.abnormalExit.collectAsStateWithLifecycle()
     val compPct = compStatus?.let { s ->
         Regex("(\\d+)%").find(s)?.groupValues?.get(1)?.toIntOrNull()
     }
@@ -208,6 +210,10 @@ fun HomeScreen(
                     scope.launch {
                         runCatching { FridaServerInstaller.prepare(context, wifiOnly = false) }
                     }
+                }
+                // ★上次异常中断的横幅（2026-10-26）：进程被杀后用户只看到"什么都没了"，给一句话
+                abnormalExit?.let {
+                    AbnormalExitBar(it) { AppState.setAbnormalExit(null) }
                 }
             }
         },
@@ -1684,6 +1690,37 @@ private fun ComponentBar(status: String?, onFetch: () -> Unit) {
                     .height(3.dp),
             )
         }
+    }
+}
+
+/**
+ * 「上次运行异常中断」横幅（2026-10-26）。
+ *
+ * 来自真实反馈日志的复盘：Android 15 那台死在**进入战斗后 1 秒**，日志断在 `页面 → ?(29)` 之后
+ * 什么都没有（连战斗中每 30s 的心跳都没来得及打）⇒ 进程是被**当场**带走的。用户看到的现象只有
+ * "游戏和工具都没了"，既不知道发生了什么，也不知道还能不能再跑。
+ *
+ * 所以这里只做一件事：把 CrashGuard 判出来的结论用一句人话摆出来（时间 + 当时在干什么），
+ * 点「知道了」就清掉；真正的原因（崩溃栈 / tombstone / 最后状态）仍然只在日志里。
+ */
+@Composable
+private fun AbnormalExitBar(text: String, onDismiss: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.errorContainer)
+            .padding(start = 16.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onErrorContainer,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        TextButton(onClick = onDismiss) { Text("知道了") }
     }
 }
 

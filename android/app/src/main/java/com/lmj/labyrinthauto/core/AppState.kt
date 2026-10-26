@@ -111,6 +111,20 @@ object AppState {
         _component.value = status
     }
 
+    /**
+     * ★上次进程是不是**突然没了**（2026-10-26：Android 15 反馈"跑着跑着游戏和工具都没了"）。
+     *
+     * null = 首次启动 / 上次正常；非 null = 一句人话（"上次运行在 11:02 突然中断（战斗中）"）。
+     * 由 `CrashGuard.report()` 在启动时写入，首页横幅显示；用户点「知道了」置 null（只清界面，
+     * 日志里那份详情仍在）。
+     */
+    private val _abnormalExit = MutableStateFlow<String?>(null)
+    val abnormalExit: StateFlow<String?> = _abnormalExit.asStateFlow()
+
+    fun setAbnormalExit(text: String?) {
+        _abnormalExit.value = text
+    }
+
     /** ★启动时检查到的新版本（null = 没查/已是最新）。首页据此点亮「版本•」 */
     private val _updateInfo = MutableStateFlow<UpdateChecker.Info?>(null)
     val updateInfo: StateFlow<UpdateChecker.Info?> = _updateInfo.asStateFlow()

@@ -50,9 +50,24 @@ object CrashGuard {
     private var marker: File? = null
     private var installed = false
 
-    /** 上次进程的死因结论（[install] 时算好，供 [report] 打进日志） */
+    /**
+     * 上次进程的非正常退出（null = 首次启动 / 上次走完了 / 记录太旧）。
+     *
+     * ★2026-10-26 用真实反馈日志复盘出来的形状：Android 15 那台死在"进入战斗后 1 秒"，
+     * 日志直接断在 `页面 → ?(29)`，连战斗中每 30s 的心跳都没有 ⇒ 进程是**当场消失**的。
+     * 所以这里除了"死了"，还要带上"死的时候在干什么"（[view] / [maze]），用户一眼能对上。
+     */
+    data class PrevExit(
+        val pid: String,
+        val at: String,       // "yyyy-MM-dd HH:mm:ss"
+        val agoSec: Long,
+        val why: String,
+        val view: String,
+        val maze: String,
+    )
+
     @Volatile
-    var previousDeath: String? = null
+    var previousExit: PrevExit? = null
         private set
 
     /** 进程入口尽早调一次（重复调无害） */
@@ -62,7 +77,7 @@ object CrashGuard {
         dirs = runCatching { buildDirs(ctx) }.getOrDefault(emptyList())
         val m = File(ctx.filesDir, MARKER_NAME)
         marker = m
-        previousDeath = runCatching { readPrevious(m) }.getOrNull()
+        previousExit = runCatching { readPrevious(m) }.getOrNull()
         runCatching { writeMarker(m, "启动") }
         runCatching { startHeartbeat(m) }
         runCatching { installHandler(ctx) }
@@ -74,14 +89,32 @@ object CrashGuard {
      * 避免平白弹授权框）。
      */
     fun report() {
-        val p = previousDeath ?: return
-        AppState.addLog(p)
+        val p = previousExit ?: return
+        val where = whereText(p)
+        val hhmm = p.at.takeIf { it.length >= 16 }?.substring(11, 16) ?: "?"
+        // 日志：完整信息（排查用）
+        AppState.addLog("⚠上次进程（pid=${p.pid}）在 $hhmm 之后突然没了，最后停在：$where（why=${p.why}）")
+        AppState.addLog("　没有正常收尾 ⇒ 被系统杀 / native 崩溃 / 整机重启，三者之一；崩溃栈看 logs/crash_*.txt")
+        // 界面：一句话（首页横幅，可关掉）
+        AppState.setAbnormalExit("上次运行在 $hhmm（$where）突然中断，可能是被系统关闭或崩溃")
         if (RootShell.form == null) return
         CoroutineScope(Dispatchers.IO).launch {
             runCatching { tombstoneHint() }.getOrNull()
                 ?.takeIf { it.isNotEmpty() }
                 ?.let { AppState.addLog(it) }
         }
+    }
+
+    /**
+     * 把"最后停在哪"翻成人话。
+     *
+     * ★`?(29)` 就是**战斗页**：真实日志里每次 `进入战斗` 之后紧跟的就是 `页面 → ?(29)`
+     *   （2026-10-26 复盘，那份日志里出现 59 次），而 agent 现场报文里同一时刻是 `view=ViewBattle`。
+     */
+    private fun whereText(p: PrevExit): String = when {
+        p.view.contains("Battle", ignoreCase = true) || p.view.contains("?(29)") -> "战斗中"
+        p.maze.isNotBlank() && p.maze != "-" && p.maze != "?" -> "迷宫里 ${p.maze}"
+        else -> "没在跑图"
     }
 
     /**
@@ -114,24 +147,24 @@ object CrashGuard {
         return out
     }
 
-    /** 读上次的心跳：存在 ⇒ 上次进程**没走正常收尾**（被 SIGKILL / native 崩溃 / 整机重启） */
-    private fun readPrevious(m: File): String? {
+    /** 读上次的心跳：文件还在 ⇒ 上次进程**没走正常收尾**（被 SIGKILL / native 崩溃 / 整机重启） */
+    private fun readPrevious(m: File): PrevExit? {
         if (!m.exists()) return null
         val txt = runCatching { m.readText() }.getOrNull()?.trim().orEmpty()
-        runCatching { m.delete() }
+        runCatching { m.delete() }                    // 读完立刻删 ⇒ 只报一次
         if (txt.isEmpty()) return null
-        val beat = Regex("beat=(\\d{13})").find(txt)?.groupValues?.get(1)?.toLongOrNull()
-        val pid = Regex("pid=(\\d+)").find(txt)?.groupValues?.get(1)
-        val why = Regex("why=([^|]*)").find(txt)?.groupValues?.get(1).orEmpty()
-        val agoSec = beat?.let { (System.currentTimeMillis() - it) / 1000 } ?: -1
-        if (agoSec < 0) return "上次进程记录无法解析（$txt）"
-        if (agoSec > FRESH_MS / 1000) {
-            return "上次进程（pid=${pid ?: "?"}）最后一次心跳是 ${agoSec / 60} 分钟前 —— 之后不是正常收尾" +
-                "（时间太久，多半是用户自己清了后台/没开自动化）"
-        }
-        return "⚠上次进程（pid=${pid ?: "?"}）在 ${agoSec}s 前还有心跳就没了（why=$why）" +
-            "—— **没走正常收尾**：被系统杀 / native 崩溃 / 整机重启，三者之一。" +
-            "请对照 session 日志最后一行定位死在哪一步"
+        val beat = Regex("beat=(\\d{13})").find(txt)?.groupValues?.get(1)?.toLongOrNull() ?: return null
+        val agoSec = (System.currentTimeMillis() - beat) / 1000
+        // 太久以前的不报：多半是用户自己清了后台、或隔天才打开，属于正常
+        if (agoSec > FRESH_MS / 1000) return null
+        return PrevExit(
+            pid = Regex("pid=(\\d+)").find(txt)?.groupValues?.get(1) ?: "?",
+            at = Regex("at=([^|]+)").find(txt)?.groupValues?.get(1)?.trim() ?: "?",
+            agoSec = agoSec,
+            why = Regex("why=([^|]*)").find(txt)?.groupValues?.get(1).orEmpty(),
+            view = Regex("view=(\\S+)").find(txt)?.groupValues?.get(1) ?: "-",
+            maze = Regex("maze=(\\S+)").find(txt)?.groupValues?.get(1) ?: "-",
+        )
     }
 
     /** 写/刷心跳（pid + 时刻 + 当前状态），供下次启动判断"是不是突然死的" */

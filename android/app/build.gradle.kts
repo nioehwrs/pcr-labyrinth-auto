@@ -14,8 +14,8 @@ android {
         applicationId = "com.lmj.labyrinthauto"
         minSdk = 26
         targetSdk = 35
-        versionCode = 13
-        versionName = "0.3.5"
+        versionCode = 14
+        versionName = "0.3.6"
 
         // 本阶段只保证 MuMu（x86_64）。P0 没有 native 库；
         // 等 PLAN.md §4 方案 B（内嵌 libfrida-core.so）时这条才会真正生效。
