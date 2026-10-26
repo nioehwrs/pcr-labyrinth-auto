@@ -343,6 +343,10 @@ def main():
     # ③ latest.json
     tag = "v%s" % cur_name
     notes = _changelog_head(cur_name)
+    if not notes:
+        # ★CHANGELOG 里没写这一版会让 Gitee 直接拒收：
+        #   HTTP 400「验证失败：发行版的描述不能为空」——2026-10-26 发 0.3.1 时踩到。
+        notes = "版本 %s" % cur_name
     frida_block = {}
     for f in frida_files:
         abi = os.path.basename(f).replace("huabanxie-server-%s-" % FRIDA_VERSION, "").replace(".gz", "")

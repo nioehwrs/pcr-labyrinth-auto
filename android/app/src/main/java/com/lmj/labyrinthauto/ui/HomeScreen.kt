@@ -91,6 +91,7 @@ import com.lmj.labyrinthauto.core.AppState
 import com.lmj.labyrinthauto.core.LogFile
 import com.lmj.labyrinthauto.core.UpdateChecker
 import com.lmj.labyrinthauto.logic.team.TeamRunLog
+import com.lmj.labyrinthauto.frida.FridaServerInstaller
 import com.lmj.labyrinthauto.frida.RootCheck
 import com.lmj.labyrinthauto.net.bilibili.CaptchaChallenge
 import com.lmj.labyrinthauto.net.bilibili.GeetestPageBuilder
@@ -138,25 +139,19 @@ fun HomeScreen(
     var logOpen by remember { mutableStateOf(false) }
     // ★应用内「更新记录」（2026-10-23 用户）：内容就是仓库根目录那份 CHANGELOG.md
     var changelogOpen by remember { mutableStateOf(false) }
-    // ★自动更新（2026-10-25 用户）：启动后静默查一次 —— 有新版本才弹窗，失败不打扰；
-    //   手动入口在「版本」弹窗里。debug 包不允许自更新（签名和发布包不同，装了会冲突）。
+    // ★自动更新（2026-10-25）：**检查动作在 `LmjApp` 启动时做**（和运行组件预热一起），
+    //   这里只读结果、点亮「版本•」。debug 包不参与自更新（签名与发布包不同，装了会冲突）。
+    val updInfo by AppState.updateInfo.collectAsStateWithLifecycle()
+    val compStatus by AppState.component.collectAsStateWithLifecycle()
     var updateOpen by remember { mutableStateOf(false) }
-    var updateInfo by remember { mutableStateOf<UpdateChecker.Info?>(null) }
-    var newVerCode by remember { mutableStateOf<Int?>(null) }
-    LaunchedEffect(Unit) {
-        delay(6_000)                      // 先让首屏/root 自检跑完，别抢
-        if (UpdateChecker.isDebuggable(context)) return@LaunchedEffect
-        when (val r = UpdateChecker.check(context)) {
-            is UpdateChecker.Check.New ->
-                if (UpdateChecker.skipVersionCode(context) != r.info.versionCode) {
-                    // ★只点亮「版本•」+ 记一行日志，**不自动弹窗** —— 别在跑图时抢走焦点
-                    newVerCode = r.info.versionCode
-                    updateInfo = r.info
-                    AppState.addLog("发现新版本 ${r.info.versionName}（${r.info.versionCode}）→ 右上角「版本•」可更新")
-                }
-            is UpdateChecker.Check.Failed -> AppState.addLog("检查更新失败：${r.message}")
-            else -> Unit
-        }
+    val newVerCode = remember(updInfo) {
+        updInfo?.versionCode?.takeIf { it != UpdateChecker.skipVersionCode(context) }
+    }
+    // ★运行组件状态（2026-10-26 用户方案）：首次要备 42MB 的 frida-server，不是错误、不该弹窗打断 ——
+    //   在标题下面挂一条常驻细条，下载中给进度，移动网络/失败给可点入口，就绪后整条消失。
+    val compDownloading = compStatus?.startsWith("运行组件下载中") == true
+    val compPct = compStatus?.let { s ->
+        Regex("(\\d+)%").find(s)?.groupValues?.get(1)?.toIntOrNull()
     }
     // ★刷开局方式（接口 / 局内）提到首页层：底部「刷开局」按钮要按它决定走哪条路
     var rerollMode by remember { mutableStateOf(RerollSettings.loadRerollMode(context)) }
@@ -166,6 +161,13 @@ fun HomeScreen(
     var guideOpen by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
         if (!RerollSettings.loadGuideShown(context)) guideOpen = true
+    }
+    // ★有新版就**自动弹窗**（2026-10-26 用户："能不能开启应用就检查，并且自动弹出更新窗口"）：
+    //   检查动作在 LmjApp 启动时做，结果落在 AppState.updateInfo，这里一看到"有新版且没被忽略"
+    //   就把对话框弹出来，不用用户再去点「版本•」。
+    //   ★首次使用说明优先：guideOpen 开着时先别叠第二个弹窗（用户看完说明关掉，这里会再触发一次）。
+    LaunchedEffect(newVerCode, guideOpen) {
+        if (newVerCode != null && !guideOpen) updateOpen = true
     }
     var tab by rememberSaveable { mutableIntStateOf(0) }
 
@@ -188,16 +190,26 @@ fun HomeScreen(
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
         topBar = {
-            TopAppBar(
-                title = { Text("黎明界自动化", style = MaterialTheme.typography.titleLarge) },
-                actions = {
-                    TextButton(onClick = { guideOpen = true }) { Text("说明") }
-                    // 有新版时按钮后面点个「•」，不弹横幅打断跑图
-                    TextButton(onClick = { changelogOpen = true }) { Text(if (newVerCode != null) "版本•" else "版本") }
-                    TextButton(onClick = { logOpen = !logOpen }) { Text(if (logOpen) "日志▾" else "日志▴") }
-                    TextButton(onClick = { onToggleDark(!darkOn) }) { Text(if (darkOn) "浅色" else "深色") }
-                },
-            )
+            Column {
+                TopAppBar(
+                    title = { Text("黎明界自动化", style = MaterialTheme.typography.titleLarge) },
+                    actions = {
+                        TextButton(onClick = { guideOpen = true }) { Text("说明") }
+                        // 有新版时按钮后面点个「•」，不弹横幅打断跑图
+                        TextButton(onClick = { changelogOpen = true }) {
+                            Text(if (newVerCode != null) "版本•" else "版本")
+                        }
+                        TextButton(onClick = { logOpen = !logOpen }) { Text(if (logOpen) "日志▾" else "日志▴") }
+                        TextButton(onClick = { onToggleDark(!darkOn) }) { Text(if (darkOn) "浅色" else "深色") }
+                    },
+                )
+                // ★运行组件状态条（替代原来标题下那行小字）：就绪后整条消失，未就绪时可点
+                ComponentBar(compStatus) {
+                    scope.launch {
+                        runCatching { FridaServerInstaller.prepare(context, wifiOnly = false) }
+                    }
+                }
+            }
         },
         // ★主操作放在底部「拇指区」：自动迷宫页 = 一键黎明界 + 停止；刷开局页 = 登录并刷开局
         bottomBar = {
@@ -242,11 +254,20 @@ fun HomeScreen(
                                 }
                             }
                         },
-                        enabled = mazeProgress == null,
+                        // ★组件还在下（首次约 42MB）时按钮自己说清在等什么，别让它看起来"点了没反应"
+                        enabled = mazeProgress == null && !compDownloading,
                         modifier = Modifier
                             .weight(1f)
                             .heightIn(min = 48.dp),
-                    ) { Text(if (mazeProgress != null) "运行中…" else "一键黎明界") }
+                    ) {
+                        Text(
+                            when {
+                                mazeProgress != null -> "运行中…"
+                                compDownloading -> "准备组件 ${compPct ?: 0}%…"
+                                else -> "一键黎明界"
+                            },
+                        )
+                    }
                     OutlinedButton(
                         onClick = { AutoForegroundService.send(context, AutoForegroundService.ACTION_STOP) },
                         enabled = running,
@@ -393,7 +414,6 @@ fun HomeScreen(
             onDismiss = { changelogOpen = false },
             onCheckUpdate = {                    // ★自动更新（2026-10-25）：从「版本」里进
                 changelogOpen = false
-                updateInfo = null
                 updateOpen = true
             },
         )
@@ -401,7 +421,7 @@ fun HomeScreen(
     if (updateOpen) {
         UpdateDialog(
             ctx = context,
-            initial = updateInfo,
+            initial = updInfo,
             onDismiss = { updateOpen = false },
         )
     }
@@ -980,6 +1000,20 @@ private fun RerollTab(
                             },
                             modifier = Modifier.fillMaxWidth(),
                         )
+                        // ★账号用途说明（2026-10-26 用户要求）：把"存哪、给谁、干什么"讲清楚。
+                        //   注意不能写"不会上传"——登录本来就要把凭证发给 B 站官方接口，那是必要环节；
+                        //   承诺的是"只发给 B 站、只存在本机、不作他用"。
+                        Text(
+                            "账号密码只保存在本机（应用私有目录），仅用于向 B 站官方接口登录、刷开局；" +
+                                "不会上传到任何第三方服务器，也不会用于其他用途。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            "需要先在游戏里登录同一个账号。当前仅支持 B 站官服（b 服），其他渠道服计划适配中。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                         if (summary != null) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text(
@@ -1327,7 +1361,7 @@ private fun ShareLogDialog(onDismiss: () -> Unit) {
                             TextButton(onClick = {
                                 runCatching { LogFile.share(ctx, e.f) }
                                     .onFailure { err ->
-                                        Toast.makeText(ctx, "分享失败：${err.message}", Toast.LENGTH_LONG).show()
+                                        Toast.makeText(ctx, "分享失败：${err.message ?: "原因未知"}", Toast.LENGTH_LONG).show()
                                     }
                             }) { Text("分享", style = MaterialTheme.typography.labelSmall) }
                             TextButton(onClick = {
@@ -1337,9 +1371,9 @@ private fun ShareLogDialog(onDismiss: () -> Unit) {
                             }) { Text("打开", style = MaterialTheme.typography.labelSmall) }
                             TextButton(onClick = {
                                 runCatching { LogFile.copyToDownloads(ctx, e.f) }
-                                    .onSuccess { Toast.makeText(ctx, "已复制到 $it", Toast.LENGTH_LONG).show() }
+                                    .onSuccess { Toast.makeText(ctx, "已复制到下载目录", Toast.LENGTH_SHORT).show() }
                                     .onFailure { err ->
-                                        Toast.makeText(ctx, "复制失败：${err.message}", Toast.LENGTH_LONG).show()
+                                        Toast.makeText(ctx, "复制失败：${err.message ?: "原因未知"}", Toast.LENGTH_LONG).show()
                                     }
                             }) { Text("复制", style = MaterialTheme.typography.labelSmall) }
                         }
@@ -1363,11 +1397,11 @@ private fun ShareLogDialog(onDismiss: () -> Unit) {
 @Composable
 private fun TeamRunExportBlock(ctx: Context, s: TeamRunLog.Stats) {
     val f = remember { TeamRunLog.currentFile() }
-    Text("组队记录（team_runs.jsonl）", style = MaterialTheme.typography.labelMedium)
+    Text("组队记录", style = MaterialTheme.typography.labelMedium)
     Spacer(Modifier.height(2.dp))
     if (f == null || !f.exists() || s.runs == 0) {
         Text(
-            "还没有组队记录 —— 跑一局、进一次编组页就会写一行（文件在 logs/ 下）",
+            "还没有组队记录 —— 跑一局、进一次编组页就会自动记一行",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -1375,16 +1409,15 @@ private fun TeamRunExportBlock(ctx: Context, s: TeamRunLog.Stats) {
     }
     Text(
         "${s.runs} 条 ｜ ${(s.bytes + 1023) / 1024} KB" +
-            (if (s.files > 1) " ｜ 另有 ${s.files - 1} 份历史（team_runs_*.jsonl 同目录）" else "") +
-            "\n每次编队一行 JSON（关卡/池/遗物/目标队+理由/分数/唯一 run_id）；" +
-            "导出后可直接粘进 PC 的 team_runs.jsonl 复盘",
+            (if (s.files > 1) " ｜ 另有 ${s.files - 1} 份历史" else "") +
+            "\n每次编队记一行（关卡 / 池 / 遗物 / 目标队 / 分数），导出后可在 PC 端复盘",
         style = MaterialTheme.typography.labelSmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
     Row(verticalAlignment = Alignment.CenterVertically) {
         TextButton(onClick = {
             runCatching { LogFile.share(ctx, f) }
-                .onFailure { Toast.makeText(ctx, "分享失败：${it.message}", Toast.LENGTH_LONG).show() }
+                .onFailure { Toast.makeText(ctx, "分享失败：${it.message ?: "原因未知"}", Toast.LENGTH_LONG).show() }
         }) { Text("分享", style = MaterialTheme.typography.labelSmall) }
         TextButton(onClick = {
             if (!LogFile.openWithViewer(ctx, f)) {
@@ -1393,8 +1426,8 @@ private fun TeamRunExportBlock(ctx: Context, s: TeamRunLog.Stats) {
         }) { Text("打开", style = MaterialTheme.typography.labelSmall) }
         TextButton(onClick = {
             runCatching { LogFile.copyToDownloads(ctx, f) }
-                .onSuccess { Toast.makeText(ctx, "已复制到 $it", Toast.LENGTH_LONG).show() }
-                .onFailure { Toast.makeText(ctx, "复制失败：${it.message}", Toast.LENGTH_LONG).show() }
+                .onSuccess { Toast.makeText(ctx, "已复制到下载目录", Toast.LENGTH_SHORT).show() }
+                .onFailure { Toast.makeText(ctx, "复制失败：${it.message ?: "原因未知"}", Toast.LENGTH_LONG).show() }
         }) { Text("复制到下载", style = MaterialTheme.typography.labelSmall) }
     }
 }
@@ -1454,27 +1487,59 @@ private fun GuideDialog(
 ) {
     val needsOverlay = overlayGranted != true
     val needsRoot = rootOk != true
-    val steps = listOf(
-        "1. 确认设备已获取 Root 权限（Magisk 等），并已安装本应用与游戏客户端。",
-        "2. 授权权限：首次运行会弹出 Root（超级用户）授权，请允许；并在系统设置中授予「悬浮窗」权限（状态悬浮窗用，建议开启）。",
-        "3. 配置：切到「刷开局」页填入 B 站账号密码；切到「策略」页按需调整 Boss 区选择、运行次数等设置。",
-        "4. 启动：回到「自动迷宫」页，点「一键黎明界」开始；运行中把游戏切到后台会自动停止。",
+    // 分段 + 小标题：原来四条长句糊在一起，用户扫一眼抓不到重点（2026-10-26 用户："改得更好一点"）
+    val sections = listOf(
+        "一、准备" to listOf(
+            "设备需要有 Root 权限（模拟器里打开 Root 开关，或 Magisk 授权）。",
+            "安装本应用，并在游戏里登录好账号。",
+            "游戏里登录的账号，必须和「刷开局」页填的账号是同一个。",
+            "当前仅支持 B 站官服（b 服），其他渠道服（华为、应用宝等）计划适配中。",
+        ),
+        "二、授权" to listOf(
+            "首次运行会弹 Root 授权框，请允许（建议勾选「永久记住」）。",
+            "授予「悬浮窗」权限，否则运行时看不到状态条。",
+        ),
+        "三、配置" to listOf(
+            "「刷开局」页：刷开局方式选「接口」时，需要填 B 站账号密码。",
+            "「策略」页：Boss 区、运行次数、开局角色等按需调整。",
+        ),
+        "四、开跑" to listOf(
+            "回到「自动迷宫」页，点「一键黎明界」开始。",
+            "运行中把游戏切到后台会自动停止；要停下来点「停止」。",
+        ),
     )
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = { TextButton(onClick = onDismiss) { Text("知道了") } },
-        title = { Text("使用说明（首次启动）") },
+        title = { Text("使用说明") },
         text = {
             Column(
                 Modifier.verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                steps.forEach { Text(it, style = MaterialTheme.typography.bodyMedium) }
+                sections.forEach { (head, items) ->
+                    Text(head, style = MaterialTheme.typography.titleSmall)
+                    items.forEach { Text("· $it", style = MaterialTheme.typography.bodyMedium) }
+                    Spacer(Modifier.height(4.dp))
+                }
+                // ★游戏内三项只能在游戏里改，脚本碰不到 —— 但**不必提前设好**，跑起来再改也行
+                //   （2026-10-26 用户要求补这条）
+                Text("五、游戏里需要你自己设的三项", style = MaterialTheme.typography.titleSmall)
+                listOf(
+                    "战斗界面右下角的「SET」",
+                    "战斗倍速（1× / 2× / 4×）",
+                    "关闭「获得角色时的动画」",
+                ).forEach { Text("· $it", style = MaterialTheme.typography.bodyMedium) }
+                Text(
+                    "这三项脚本不会替你改。不用提前设好 —— 脚本运行中随时改都可以，不影响正在跑的任务。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
                 // ★把"授权"做成可直接点的动作，避免用户漏开悬浮窗（运行时看不到状态，容易错过）
                 if (needsOverlay || needsRoot) {
                     HorizontalDivider(Modifier.padding(vertical = 4.dp))
                     Text(
-                        "还没授权的话，直接点下面按钮去开启（悬浮窗不开启则看不到运行状态条）：",
+                        "还没授权的话，直接点下面按钮开启：",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -1505,13 +1570,14 @@ private fun GuideDialog(
  */
 private fun readChangelog(ctx: Context): String = runCatching {
     ctx.assets.open("CHANGELOG.md").bufferedReader().use { it.readText() }
-}.getOrElse { "读不到更新记录（assets/CHANGELOG.md 缺失）：${it.message}" }
+}.getOrElse { "读不到更新记录" }
 
 @Composable
 private fun ChangelogDialog(onDismiss: () -> Unit, onCheckUpdate: () -> Unit) {
     val ctx = LocalContext.current
     val text = remember { readChangelog(ctx) }
-    val ver = remember { "${UpdateChecker.versionName(ctx)}（${UpdateChecker.versionCode(ctx)}）" }
+    // 只显示版本名，versionCode 对用户没意义
+    val ver = remember { UpdateChecker.versionName(ctx) }
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
@@ -1570,6 +1636,75 @@ private fun MarkdownColumn(text: String) {
 }
 
 /**
+ * 运行组件状态条（2026-10-26 用户方案："初次运行下载必备组件应该是合理行为"）。
+ *
+ * 首次要备一个约 42MB 的 frida-server，这既不是错误、也不需要用户决策，所以**不弹窗**，
+ * 就在标题下面挂一条常驻细条：
+ *  * 下载中 → `运行组件下载中 45%（19/42MB）` + 细进度条（不可点）
+ *  * 移动网络没下 → `运行组件未下载…` + 点一下用流量下（不偷跑流量，但给出口）
+ *  * 失败 → 红条 + 点一下重试
+ *  * 已就绪 → **整条消失**（不留"已完成"这种噪音）
+ */
+@Composable
+private fun ComponentBar(status: String?, onFetch: () -> Unit) {
+    if (status == null || status.startsWith("运行组件已就绪")) return
+    val downloading = status.startsWith("运行组件下载中")
+    val missing = status.startsWith("运行组件不可用")       // 架构没发布件，点也没用
+    val failed = status.startsWith("运行组件下载失败") || missing
+    val pct = Regex("(\\d+)%").find(status)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+    val tint = when {
+        failed -> MaterialTheme.colorScheme.error
+        downloading -> MaterialTheme.colorScheme.primary
+        else -> MaterialTheme.colorScheme.tertiary
+    }
+    val base = Modifier
+        .fillMaxWidth()
+        .background(tint.copy(alpha = 0.10f))
+    Column(
+        (if (downloading || missing) base else base.clickable { onFetch() })
+            .padding(horizontal = 16.dp, vertical = 6.dp),
+    ) {
+        Text(
+            text = when {
+                downloading || missing -> status
+                failed -> "$status · 点此重试"
+                else -> "$status · 用流量下载 42MB"
+            },
+            style = MaterialTheme.typography.labelSmall,
+            color = tint,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        if (downloading) {
+            Spacer(Modifier.height(4.dp))
+            LinearProgressIndicator(
+                progress = { pct / 100f },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(3.dp),
+            )
+        }
+    }
+}
+
+/**
+ * 去掉更新说明开头的 `## 0.3.4（2026-10-26）` 标题行。
+ *
+ * 弹窗上方已经用大标题写了「发现新版本 0.3.4」，notes 里再来一遍版本号纯属重复
+ * （2026-10-26 用户："发现更新的页面可以写一下更新了哪些内容"——要的是内容，不是版本号）。
+ */
+private fun stripVersionHeading(md: String): String {
+    val lines = md.lines()
+    val first = lines.indexOfFirst { it.isNotBlank() }
+    if (first < 0) return ""
+    return if (lines[first].trimStart().startsWith("## ")) {
+        lines.drop(first + 1).joinToString("\n").trim()
+    } else {
+        md.trim()
+    }
+}
+
+/**
  * ★「检查更新」弹窗（2026-10-25 用户："0.3.0 要带自动更新"）。
  *
  * 一个对话框走完全部状态：检查中 → 有新版/已最新/失败 → 下载（进度条）→ 安装（交给系统安装器）。
@@ -1581,7 +1716,7 @@ private fun MarkdownColumn(text: String) {
 @Composable
 private fun UpdateDialog(ctx: Context, initial: UpdateChecker.Info?, onDismiss: () -> Unit) {
     val scope = rememberCoroutineScope()
-    val localVer = remember { "${UpdateChecker.versionName(ctx)}（${UpdateChecker.versionCode(ctx)}）" }
+    val localVer = remember { UpdateChecker.versionName(ctx) }
     var info by remember { mutableStateOf(initial) }
     var phase by remember { mutableStateOf(if (initial != null) "new" else "checking") }
     var msg by remember { mutableStateOf("") }
@@ -1595,7 +1730,12 @@ private fun UpdateDialog(ctx: Context, initial: UpdateChecker.Info?, onDismiss: 
             when (val r = UpdateChecker.check(ctx)) {
                 is UpdateChecker.Check.New -> { info = r.info; phase = "new" }
                 is UpdateChecker.Check.Latest -> { phase = "latest"; msg = "已经是最新版本了" }
-                is UpdateChecker.Check.Failed -> { phase = "failed"; msg = r.message }
+                is UpdateChecker.Check.Failed -> {
+                    // 失败要给原因（2026-10-26 用户）；日志里再留一份
+                    AppState.addLog("检查更新失败：${r.message}")
+                    phase = "failed"
+                    msg = "检查失败：${r.message}"
+                }
             }
         }
     }
@@ -1604,7 +1744,7 @@ private fun UpdateDialog(ctx: Context, initial: UpdateChecker.Info?, onDismiss: 
         val i = info ?: return
         if (UpdateChecker.isDebuggable(ctx)) {
             phase = "failed"
-            msg = "这是 debug 构建，签名和发布包不同，装不上（换用发布版 APK 才能自更新）"
+            msg = "当前是开发版，不能自动更新；请安装正式发布版"
             return
         }
         phase = "downloading"
@@ -1613,10 +1753,21 @@ private fun UpdateDialog(ctx: Context, initial: UpdateChecker.Info?, onDismiss: 
             try {
                 val f = UpdateChecker.download(ctx, i) { p, _, _ -> pct = p }
                 apkPath = f.absolutePath
-                phase = "ready"
+                // ★下载完**直接拉起系统安装器**（2026-10-26 用户："能不能下载完自动弹出安装页面"）：
+                //   原来还要停在"下载完成，可以安装了"再让用户点一下，纯属多余的一步。
+                val err = UpdateChecker.install(ctx, f)
+                if (err == null) {
+                    onDismiss()                 // 安装器已经接管，这个弹窗不用留
+                } else {
+                    // 只有"要授权 / 拉不起来"这种没法自动继续的情况，才退回来让用户点「安装」
+                    phase = "ready"
+                    msg = err
+                }
             } catch (t: Throwable) {
+                // 失败要给原因（2026-10-26 用户）：日志留完整异常，界面给简短原因
+                AppState.addLog("更新下载失败：${t.javaClass.simpleName}: ${t.message}")
                 phase = "failed"
-                msg = "下载失败：${t.message}"
+                msg = "下载失败：${t.message ?: "未知原因"}"
             }
         }
     }
@@ -1625,7 +1776,16 @@ private fun UpdateDialog(ctx: Context, initial: UpdateChecker.Info?, onDismiss: 
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("检查更新") },
+        // 自动弹出时标题直接说"发现新版本"，比统一的"检查更新"更像人话
+        title = {
+            Text(
+                when (phase) {
+                    "new" -> "发现新版本"
+                    "ready" -> "安装更新"
+                    else -> "检查更新"
+                },
+            )
+        },
         confirmButton = {
             when (phase) {
                 "new" -> TextButton(onClick = { download() }) { Text("下载更新") }
@@ -1678,13 +1838,13 @@ private fun UpdateDialog(ctx: Context, initial: UpdateChecker.Info?, onDismiss: 
                     } else {
                         val i = info!!
                         Text(
-                            "发现新版本 ${i.versionName}（${i.versionCode}）",
+                            "发现新版本 ${i.versionName}",
                             style = MaterialTheme.typography.titleSmall,
                             color = MaterialTheme.colorScheme.primary,
                         )
                         if (i.isBlocked(UpdateChecker.versionCode(ctx))) {
                             Text(
-                                "该版本要求最低 versionCode ${i.minVersionCode}，必须更新后才能继续使用",
+                                "这个版本必须更新后才能继续使用",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.error,
                                 modifier = Modifier.padding(top = 4.dp),
@@ -1693,41 +1853,36 @@ private fun UpdateDialog(ctx: Context, initial: UpdateChecker.Info?, onDismiss: 
                         Spacer(Modifier.height(8.dp))
                         HorizontalDivider()
                         Spacer(Modifier.height(6.dp))
-                        if (i.notes.isBlank()) {
+                        // ★只显示"更新了哪些内容"（2026-10-26 用户）：notes 开头那行是 CHANGELOG 的
+                        //   `## 0.3.4（日期）`，上面已经写了「发现新版本 0.3.4」⇒ 去掉，避免版本号重复两遍。
+                        val notesBody = stripVersionHeading(i.notes)
+                        if (notesBody.isBlank()) {
                             Text("（这个版本没写更新说明）", style = MaterialTheme.typography.bodySmall)
                         } else {
-                            MarkdownColumn(i.notes)
+                            MarkdownColumn(notesBody)
                         }
                         Spacer(Modifier.height(8.dp))
+                        // 下载完会自动拉起安装页，所以只说大小，不再教用户"点安装"
                         Text(
-                            "下载约 ${i.size / 1048576}MB ｜ 下载后校验 sha256 + 签名，再交给系统安装",
+                            "安装包约 ${i.size / 1048576}MB",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                     "downloading" -> {
+                        // ★只留进度条（2026-10-26 用户："下载期间可以继续使用…去掉这行，这怎么用啊"）
+                        //   弹窗是模态的，用户在下载期间根本点不到别的，写"可以继续使用"是自相矛盾。
                         Text("正在下载…$pct%", style = MaterialTheme.typography.bodySmall)
                         Spacer(Modifier.height(8.dp))
                         LinearProgressIndicator(progress = { pct / 100f }, modifier = Modifier.fillMaxWidth())
-                        Spacer(Modifier.height(8.dp))
-                        Text(
-                            "下载完成后会校验 sha256 与签名；期间可以继续用应用，别退出即可",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
                     }
                     "ready" -> {
+                        // ★正常情况下载完会自动拉起安装器，走不到这里；
+                        //   停在这儿基本只有一种原因：还没允许「安装未知应用」（2026-10-26 用户：提示别啰嗦）
                         Text(
-                            "下载完成，已通过 sha256 / 签名校验",
+                            "下载完成，点「安装」继续",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.primary,
-                        )
-                        Spacer(Modifier.height(6.dp))
-                        Text(
-                            "点「安装」会打开系统安装器 —— 覆盖安装需要你确认一次；" +
-                                "首次可能要先允许「安装未知应用」。",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                     else -> Text(msg, style = MaterialTheme.typography.bodySmall)
@@ -1736,10 +1891,12 @@ private fun UpdateDialog(ctx: Context, initial: UpdateChecker.Info?, onDismiss: 
                     Spacer(Modifier.height(8.dp))
                     Text(msg, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
                 }
+                // ★失败时不显示更新源 URL（2026-10-26 用户：sha256/签名/地址这类技术细节用户看不懂）；
+                //   真正排查靠日志里的「检查更新失败：<原因>」，界面上只给一句人话。
                 if (phase == "failed") {
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        "更新源：${UpdateChecker.urlOf(ctx)}",
+                        "可以检查一下网络，或稍后再试",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )

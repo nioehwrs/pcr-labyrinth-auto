@@ -2,6 +2,8 @@ package com.lmj.labyrinthauto.frida
 
 import com.lmj.labyrinthauto.core.AppState
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.TimeUnit
@@ -86,9 +88,21 @@ object RootShell {
 
     val form: Form? get() = cached
 
-    /** 探测哪种写法真能拿到 root（第一次会弹授权框）。 */
+    /**
+     * 防并发重复探测（2026-10-26）：运行组件预热改成"启动即做"后，它和**首页的 root 自检**
+     * 会几乎同时调 [detect] —— 没有锁的话会各弹一次授权框（MuMu 首次很烦），
+     * 还会把 4 种写法 × N 个路径的 `su -c id` 白跑两遍。
+     */
+    private val detectLock = Mutex()
+
+    /** 探测哪种写法真能拿到 root（第一次会弹授权框）。并发调用会合并成一次。 */
     suspend fun detect(): Form? {
         cached?.let { return it }
+        return detectLock.withLock { cached ?: detectInner() }
+    }
+
+    /** [detect] 的实际探测（调用前已持锁；成功时会把结果写进 [cached]） */
+    private suspend fun detectInner(): Form? {
         // ① 先看哪些路径**磁盘上**有 su（只 stat，不执行）
         val found = SU_PATHS.filter { runCatching { File(it).exists() }.getOrDefault(false) }
         // ★★关键：不能因为 exists=false 就跳过 exec（2026-10-18 查证）——

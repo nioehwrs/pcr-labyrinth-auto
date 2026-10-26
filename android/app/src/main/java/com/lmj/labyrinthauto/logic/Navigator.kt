@@ -270,29 +270,53 @@ object Navigator {
     }
 
     /**
+     * 「259 → 进迷宫」的结果。
+     *
+     * ★为什么不用 Boolean（2026-10-25 用户）：`false` 同时表示"没进去、该重试"和"到了 259 但压根
+     *   没有进行中的开局"，上层只能一律重试 3 次 ⇒ 游戏明明就停在 259，还要空转十来秒、再打一句
+     *   "连续 3 次都没成"，把"登错号"这种**确定性问题**伪装成偶发失败。
+     */
+    enum class EnterResult {
+        /** 已进入迷宫地图（264），可交给迷宫内状态机 */
+        ENTERED,
+
+        /**
+         * 已到 259，但服务器说**没有进行中的开局**（`labChallenging` = false）。
+         * 按约定不自动开局 ⇒ 立即结束、不重试。
+         * 正常流程是"先刷开局 → 再启动游戏"，所以这种情况**多半是当前登录的账号不对**
+         * （登错号 / 小号没开局）——日志会提示用户去核对账号。
+         */
+        NOT_CHALLENGING,
+
+        /** 真失败（agent 没连、导航没走到 259、点了出发没进图…）—— 值得重试 */
+        FAILED,
+    }
+
+    /**
      * 259 → 进迷宫（PC 版外层状态机在 259 上的动作，`pcr_auto.py` 6923~6939）：
      * **只有"挑战中"才点 `labyrinth_thumb_start`（出发）**，会直接进地图不弹框；
-     * 未挑战 → 不自动开局（PC 同款规矩），返回 false。
-     *
-     * @return true = 已进入迷宫（视图进了 260..265）
+     * 未挑战 → 不自动开局（PC 同款规矩），返回 [EnterResult.NOT_CHALLENGING]。
      */
-    suspend fun enterMaze(input: InputBackend, maxTries: Int = 20): Boolean {
+    suspend fun enterMaze(input: InputBackend, maxTries: Int = 20): EnterResult {
         var n = 0
         while (n++ < maxTries) {
             if (!AgentBridge.connected.value) {
                 AppState.addLog("停手：agent 没连上")
-                return false
+                return EnterResult.FAILED
             }
             val vid = currentViewId()
-            if (vid == 264) return true                     // 已经在迷宫地图里（子菜单不算，见 goToLabyrinthTop）
+            if (vid == 264) return EnterResult.ENTERED    // 已经在迷宫地图里（子菜单不算，见 goToLabyrinthTop）
             if (vid != TARGET_VIEW) {
                 AppState.addLog("不在 259（当前 ${viewLabel(vid)}）→ 先走到位再进")
-                return false
+                return EnterResult.FAILED
             }
             when (AgentApi.labChallenging()) {
                 false -> {
-                    AppState.addLog("259 未处于挑战中 → 按约定不自动开局，停止（PC 同款）")
-                    return false
+                    AppState.addLog("已到「黎明界 top」但 259 未处于「挑战中」→ 按约定不自动开局，本步结束（PC 同款）")
+                    // ★用户 2026-10-25：正常流程一定是"先刷开局 → 再启动游戏"，此时服务器必然有进行中的开局；
+                    //   查不到 ⇒ 基本是**当前登录账号不对**（登错号 / 小号）。这类问题重试一百次也没用。
+                    AppState.addLog("★请检查当前登录账号：该账号下没有进行中的黎明界开局（多半是登错号了）")
+                    return EnterResult.NOT_CHALLENGING
                 }
                 null -> {
                     if (n == 1 || n % 5 == 0) AppState.addLog("259 挑战中状态未知（第 $n/$maxTries 次）→ 本轮不点，稍后重读")
@@ -320,13 +344,13 @@ object Navigator {
                 val v = currentViewId()
                 if (v == 264) {
                     AppState.addLog("已进入地图 ${viewLabel(v)} → 交给迷宫内状态机")
-                    return true
+                    return EnterResult.ENTERED
                 }
             }
             AppState.addLog("点了出发但没进迷宫（第 $n/$maxTries 次）→ 重试")
         }
         AppState.addLog("停手：$maxTries 次都没进迷宫")
-        return false
+        return EnterResult.FAILED
     }
 
     private const val REF_W = 1920

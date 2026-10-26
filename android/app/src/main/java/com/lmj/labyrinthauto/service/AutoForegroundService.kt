@@ -424,14 +424,27 @@ class AutoForegroundService : Service() {
             refreshNotification()
             return
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(
-                NOTIFICATION_ID,
-                buildNotification(),
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, buildNotification())
+        // ★Android 14/15 的 startForeground 是**会抛异常**的（2026-10-26）：
+        //   `ForegroundServiceStartNotAllowedException`（后台启动被拒）、`SecurityException`（缺类型权限）、
+        //   `InvalidForegroundServiceTypeException` … 以前裸调 ⇒ 抛在 onStartCommand 主线程上就是
+        //   **FATAL，整个进程瞬间消失**（"工具突然没了"最典型的一种死法，且不会有任何我们自己的日志）。
+        val started = runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    buildNotification(),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, buildNotification())
+            }
+        }
+        if (started.isFailure) {
+            val e = started.exceptionOrNull()
+            AppState.addLog("前台服务起不来（Android 14/15 限制）：${e?.javaClass?.simpleName}: ${e?.message}")
+            AppState.addLog("→ 请把助手切到前台再点开始（后台不允许拉起前台服务）；本次不自启，已退出")
+            stopSelf()
+            return
         }
         AppState.setRunning(true)
         AppState.addLog("服务已启动")
@@ -555,10 +568,20 @@ class AutoForegroundService : Service() {
      *   只剩 `su dumpsys` 读前台，而重启后那一两秒它常返回空 ⇒ 老的 `goToLabyrinthTop` 一次读空
      *   就 `return false`、调用方直接 `return@launch` ⇒ **整条自动链路无声收摊**（游戏停在 TITLE，
      *   日志只剩"停手/自动黎明界结束"）。这里给 3 次机会，中间等 5s。
+     *
+     * ★但"到了 259 却没有进行中的开局"（[Navigator.EnterResult.NOT_CHALLENGING]）**不重试**（用户 2026-10-25）：
+     *   那是确定性状态——正常流程先刷开局再启动游戏，查不到开局基本是登错号；重试只会空转十来秒、
+     *   还把"登错号"写成"连续 3 次都没成"。此时 Navigator 已打出「请检查当前登录账号」，这里直接收手。
      */
     private suspend fun enterMazeWithRetry(input: InputBackend): Boolean {
         repeat(ENTER_RETRY) { i ->
-            if (Navigator.goToLabyrinthTop(input) && Navigator.enterMaze(input)) return true
+            if (Navigator.goToLabyrinthTop(input)) {
+                when (Navigator.enterMaze(input)) {
+                    Navigator.EnterResult.ENTERED -> return true
+                    Navigator.EnterResult.NOT_CHALLENGING -> return false   // 登错号/没开局：重试无意义
+                    Navigator.EnterResult.FAILED -> Unit
+                }
+            }
             if (i < ENTER_RETRY - 1) {
                 AppState.addLog("进迷宫第 ${i + 1} 次没成 → 等 ${ENTER_RETRY_GAP_MS / 1000}s 重来（冷启动那几秒前台常读不到）")
                 delay(ENTER_RETRY_GAP_MS)

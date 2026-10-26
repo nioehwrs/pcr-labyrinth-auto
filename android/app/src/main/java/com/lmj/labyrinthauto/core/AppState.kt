@@ -99,6 +99,26 @@ object AppState {
         _rerollResultSummary.value = summary
     }
 
+    /**
+     * ★运行组件（huabanxie-server）的准备状态（2026-10-25 用户："下载解压放在启动的时候"）。
+     * null = 还没开始；"已就绪" = 可以直接开跑；"下载中 37%…" = 后台在准备。
+     * 由 [com.lmj.labyrinthauto.frida.FridaServerInstaller.prepare] 更新，首页显示一行。
+     */
+    private val _component = MutableStateFlow<String?>(null)
+    val component: StateFlow<String?> = _component.asStateFlow()
+
+    fun setComponent(status: String?) {
+        _component.value = status
+    }
+
+    /** ★启动时检查到的新版本（null = 没查/已是最新）。首页据此点亮「版本•」 */
+    private val _updateInfo = MutableStateFlow<UpdateChecker.Info?>(null)
+    val updateInfo: StateFlow<UpdateChecker.Info?> = _updateInfo.asStateFlow()
+
+    fun setUpdateInfo(info: UpdateChecker.Info?) {
+        _updateInfo.value = info
+    }
+
     private val _log = MutableStateFlow<List<String>>(emptyList())
     val log: StateFlow<List<String>> = _log.asStateFlow()
 

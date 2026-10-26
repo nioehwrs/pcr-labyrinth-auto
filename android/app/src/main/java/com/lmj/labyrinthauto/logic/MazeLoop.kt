@@ -4454,7 +4454,8 @@ object MazeLoop {
         if (!inMaze) {
             AppState.addLog("自愈：重启后在 ${Navigator.viewLabel(vid)}（不在迷宫内）→ 重新走「黎明界 top → 出发」")
             if (!Navigator.goToLabyrinthTop(input)) return false
-            if (!Navigator.enterMaze(input)) return false
+            // NOT_CHALLENGING（到了 259 却没有进行中的开局）也在这里收手：Navigator 已提示「请检查当前登录账号」
+            if (Navigator.enterMaze(input) != Navigator.EnterResult.ENTERED) return false
         } else {
             AppState.addLog("自愈：已在迷宫内（${Navigator.viewLabel(vid)}）→ 不重新导航，直接继续")
         }

@@ -204,7 +204,9 @@ object UpdateChecker {
                 val got = sha256Of(part)
                 if (!got.equals(info.sha256, ignoreCase = true)) {
                     part.delete()
-                    throw IllegalStateException("sha256 校验失败（收到 ${got.take(12)}…，应为 ${info.sha256.take(12)}…）")
+                    // ★技术细节进日志，界面上只给用户能懂的一句话（2026-10-26 用户）
+                    AppState.addLog("sha256 校验失败（收到 ${got.take(12)}…，应为 ${info.sha256.take(12)}…）")
+                    throw IllegalStateException("下载的文件不完整，请重新下载")
                 }
             }
             out.delete()
@@ -264,12 +266,23 @@ object UpdateChecker {
         val flags = if (Build.VERSION.SDK_INT >= 28) PackageManager.GET_SIGNING_CERTIFICATES
         else @Suppress("DEPRECATION") PackageManager.GET_SIGNATURES
         val theirs = runCatching { pm.getPackageArchiveInfo(apk.absolutePath, flags) }.getOrNull()
-            ?: return "读不出安装包信息（文件损坏？）"
-        if (theirs.packageName != ctx.packageName) return "包名不符（${theirs.packageName}）"
+            ?: return "安装包已损坏，请重新下载"
+        // ★以下失败原因都**写进日志**（排查用），界面上只给用户能看懂的一句话（2026-10-26 用户）
+        if (theirs.packageName != ctx.packageName) {
+            AppState.addLog("安装包校验：包名不符（${theirs.packageName}）→ 拒绝安装")
+            return "安装包不正确，已取消安装"
+        }
         val mine = runCatching { signaturesOf(pm.getPackageInfo(ctx.packageName, flags)) }.getOrDefault(emptySet())
         val other = runCatching { signaturesOf(theirs) }.getOrDefault(emptySet())
-        if (mine.isEmpty() || other.isEmpty()) return "读不到签名，不敢装"
-        return if (mine.intersect(other).isEmpty()) "签名与本机不一致（可能被改过），已拒绝安装" else null
+        if (mine.isEmpty() || other.isEmpty()) {
+            AppState.addLog("安装包校验：读不到签名（本机 ${mine.size} 个 / 包里 ${other.size} 个）→ 拒绝安装")
+            return "安装包校验没通过，已取消安装"
+        }
+        if (mine.intersect(other).isEmpty()) {
+            AppState.addLog("安装包校验：签名与本机不一致（可能被改过）→ 拒绝安装")
+            return "安装包校验没通过，已取消安装（请从官方渠道重新下载）"
+        }
+        return null
     }
 
     private fun signaturesOf(pi: PackageInfo): Set<String> {

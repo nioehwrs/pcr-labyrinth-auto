@@ -203,7 +203,7 @@ object FridaInjector {
         job = null
         scope.launch {
             if (pf != null && pf.exists()) {
-                RootShell.exec("kill -9 \$(cat ${pf.absolutePath}); rm -f ${pf.absolutePath}", 8_000L)
+                RootShell.exec(killInjectorCmd(pf), 8_000L)
             }
         }
         firstSeen.clear()
@@ -546,6 +546,25 @@ object FridaInjector {
     }.getOrDefault(false)
 
     /**
+     * ★安全杀注入器（2026-10-26）：原来是裸的 `kill -9 $(cat inject.pid)`。
+     *
+     * 那个 pid 属于**上一次会话**的注入器，进程早退了 ⇒ 这个 pid 可能已经被系统**复用给任何进程**，
+     * 而我们手里是 **root** —— 杀错一次就是"跑着跑着工具/游戏直接消失"，而且一点日志都不会留
+     * （SIGKILL 不给人收尾的机会）。这与用户反馈的 Android 15 症状高度吻合，所以先堵住。
+     *
+     * 现在先读 `/proc/<pid>/cmdline` 校验身份，只有确实是注入器才杀。
+     */
+    private fun killInjectorCmd(pf: File): String {
+        val me = android.os.Process.myPid()
+        return "p=\$(cat ${pf.absolutePath} 2>/dev/null); " +
+            "if [ -n \"\$p\" ] && [ \"\$p\" != \"$me\" ] && " +
+            "grep -qa 'huabanxie-inject' /proc/\$p/cmdline 2>/dev/null; then " +
+            "kill -9 \$p; echo \"已杀掉旧注入器 pid=\$p\"; " +
+            "else echo \"跳过 kill（pid=\${p:-空} 已不是注入器，可能被系统复用）\"; fi; " +
+            "rm -f ${pf.absolutePath}"
+    }
+
+    /**
      * 游戏 pid（尽量免 root，顺序）：
      *   ① 本地 `pidof`（app 能不能看到别的 uid 的进程看设备配置）
      *   ② **借 frida-core 的进程枚举**（frida-server 在跑就已经是全量的，最稳）
@@ -605,7 +624,7 @@ object FridaInjector {
 
             val pf = File(ctx.filesDir, "inject.pid")
             pidFile = pf
-            RootShell.exec("test -f ${pf.absolutePath} && kill -9 \$(cat ${pf.absolutePath}); rm -f ${pf.absolutePath}", 8_000L)
+            RootShell.exec(killInjectorCmd(pf), 8_000L)
 
             val gamePid = RootShell.exec("pidof $GAME_PKG", 8_000L).out.trim()
             if (gamePid.isEmpty()) {
