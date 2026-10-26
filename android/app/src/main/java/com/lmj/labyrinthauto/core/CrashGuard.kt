@@ -97,11 +97,26 @@ object CrashGuard {
         AppState.addLog("　没有正常收尾 ⇒ 被系统杀 / native 崩溃 / 整机重启，三者之一；崩溃栈看 logs/crash_*.txt")
         // 界面：一句话（首页横幅，可关掉）
         AppState.setAbnormalExit("上次运行在 $hhmm（$where）突然中断，可能是被系统关闭或崩溃")
-        if (RootShell.form == null) return
+        // ★2026-10-27：这里原来有一句 `if (RootShell.form == null) return`，**必须删掉** ——
+        //   启动顺序是 report() 先跑、root 自检后跑（真实日志的顺序就是"⚠上次进程…" →
+        //   "日志落盘…" → "root 已就绪"），于是它每次都在"root 还没探测完"时 return，
+        //   **tombstone 一行永远出不来**。2026-10-26 那次闪退能定性（system_server 崩），
+        //   全靠用户手动敲 dumpsys，代码自己一个字都没记 —— 这就是那句话的代价。
+        //   现在直接进协程：`RootShell.exec` 内部本来就会 `cached ?: detect()`，自己能探测，
+        //   不需要外面先判；探测和首页自检并发有 Mutex 兜着，不会双弹授权框。
         CoroutineScope(Dispatchers.IO).launch {
-            runCatching { tombstoneHint() }.getOrNull()
-                ?.takeIf { it.isNotEmpty() }
-                ?.let { AppState.addLog(it) }
+            val hint = runCatching { tombstoneHint() }.getOrNull()
+            if (!hint.isNullOrEmpty()) {
+                AppState.addLog(hint)
+                // ★"崩的是系统"和"崩的是我们/游戏"结论完全不同，这里直接翻译成人话：
+                //   system_server 崩 ⇒ 整机（所有 App）一起消失，跟脚本无关。
+                if (hint.contains("system_server")) {
+                    AppState.addLog(
+                        "　⚠最近一次 native 崩溃是 **system_server**（Android 系统进程）⇒ " +
+                            "系统服务重启/整机连带重启，脚本和游戏都是被连带的，不是我们的 bug",
+                    )
+                }
+            }
         }
     }
 
@@ -159,11 +174,17 @@ object CrashGuard {
         if (agoSec > FRESH_MS / 1000) return null
         return PrevExit(
             pid = Regex("pid=(\\d+)").find(txt)?.groupValues?.get(1) ?: "?",
-            at = Regex("at=([^|]+)").find(txt)?.groupValues?.get(1)?.trim() ?: "?",
+            // ★2026-10-27：时间戳一律用 `beat`（毫秒数）反推，**不再读 `at=` 字符串**。
+            //   实测两次闪退都显示 "在 ? 之后"（`at` 解析失败），而 `stampFmt` 这个
+            //   SimpleDateFormat 被心跳线程和主线程共用（不是线程安全的），很可能产出残缺值。
+            //   beat 是纯数字、同一个字段又是判定"多久以前"的依据，用它最可靠。
+            at = stampFmt.format(Date(beat)),
             agoSec = agoSec,
             why = Regex("why=([^|]*)").find(txt)?.groupValues?.get(1).orEmpty(),
             view = Regex("view=(\\S+)").find(txt)?.groupValues?.get(1) ?: "-",
-            maze = Regex("maze=(\\S+)").find(txt)?.groupValues?.get(1) ?: "-",
+            // ★maze 的值里带空格（如 "第 2 层 节点 50701"），原来用 `\S+` 会被截成 "第"
+            //   —— 真实日志里就是"最后停在：迷宫里 第"，层数和节点全丢了。改 `[^|]+`。
+            maze = Regex("maze=([^|]+)").find(txt)?.groupValues?.get(1)?.trim() ?: "-",
         )
     }
 

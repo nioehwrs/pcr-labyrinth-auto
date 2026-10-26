@@ -31,6 +31,10 @@ object Navigator {
         // ★47=剧情首页（2026-10-15 实测确认，底部导航第 4 个「剧情」）——不是死路：
         //   点底部那个「冒险」ButtonQuest 就能继续（见 STEP_BUTTON），与 PC 版一致
         47 to "STORY_TOP", 76 to "STORY_ADVENTURE", 77 to "MENU",
+        // ★29 = BATTLE（`dump.cs` 的 `eViewId BATTLE = 29`，2026-10-26 核实）。
+        //   PC 版那张表只抄了流程用到的 id，所以这里一直没有 29 —— 日志里就显示成 `?(29)`，
+        //   排查时很容易被误当成"未知页面"（实际每场战斗都会经过它，结算页也是盖在 BATTLE 上的 dialog）。
+        29 to "BATTLE",
         // ★104 = 新角色介绍（点屏幕推进的演出页；2026-10-23 实机踩到，见 [TAP_CENTER_VIEWS]）
         78 to "LOGING_BONUS", 104 to "NEW_CHARACTER_INTRODUCTION",
         259 to "LABYRINTH_TOP", 260 to "LABYRINTH_REWARD_LIST",
