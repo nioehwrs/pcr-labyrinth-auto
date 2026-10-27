@@ -7,6 +7,7 @@ import com.lmj.labyrinthauto.core.CenterTapGate
 import com.lmj.labyrinthauto.core.LabBtnStore
 import com.lmj.labyrinthauto.core.LogFile
 import com.lmj.labyrinthauto.core.OverlayStatus
+import com.lmj.labyrinthauto.core.TapDelayStore
 import com.lmj.labyrinthauto.data.GameData
 import com.lmj.labyrinthauto.reroll.RerollState
 import com.lmj.labyrinthauto.reroll.RerollSettings
@@ -349,6 +350,8 @@ object MazeLoop {
                     return
                 }
                 lastTag = null
+                tapProbeKey = null               // 重连回来是"新现场"，旧的点击探针作废
+                tapProbeTag = null
                 tagAt = SystemClock.elapsedRealtime()
                 hbAt = tagAt
                 idle = 0
@@ -459,8 +462,13 @@ object MazeLoop {
             //   所有 `continue` 之前）⇒ 连迷宫结算页那种提前 continue 的分支也不会停在旧文字上 ✓
             overlayTick(st, stt)
             // tag（PC 6004）：带 view —— statusType 在换页时可能不变，只看状态会漏判"页面已换"
+            // ★2026-10-27：`viewClass` 为空时原来退化成**裸数字**（日志里出现 `view=29`，
+            //   排查时完全看不出是战斗页）。现在走 Navigator 的名字表 ⇒ `view=BATTLE(29)`。
+            val viewPart = jStr(st, "viewClass").ifEmpty {
+                jStr(st, "viewId").toIntOrNull()?.let { Navigator.viewLabel(it) } ?: jStr(st, "viewId")
+            }
             val tag = "节点${jStr(st, "blockId")} [${jStr(st, "panelTypeName")}] " +
-                "状态=${statusName(stt)} view=${jStr(st, "viewClass").ifEmpty { jStr(st, "viewId") }} " +
+                "状态=${statusName(stt)} view=$viewPart " +
                 "顶框=${jStr(st, "pageTop").ifEmpty { "无" }}"
 
             val now = SystemClock.elapsedRealtime()
@@ -471,6 +479,29 @@ object MazeLoop {
             if (vseen != lastViewSeen) {
                 lastViewSeen = vseen
                 sceneHoldUntil = now + SCENE_HOLD_MS
+            }
+            // ★2026-10-27「点早了就下次多等」的探针结算：上一轮点过带 learnKey 的按钮，这一轮回来看现场变没变。
+            //   变了 ⇒ 点成功了（不回调，避免越学越慢）；没变 ⇒ 那会儿按钮还不可点 ⇒ 该 key 下次多等一点。
+            //   判据是现成的 tag，不增加任何读取。
+            curTag = tag
+            tapProbeKey?.let { pk ->
+                tapProbeKey = null
+                if (tag == tapProbeTag) {
+                    val c = appCtx
+                    if (c != null) {
+                        // 结算页是"明确很久"的例外：一次 +600、上限 3000；其余：一次 +300、上限 1200
+                        val isSettle = pk.startsWith("settle|")
+                        val nv = TapDelayStore.miss(
+                            c, pk,
+                            if (isSettle) 600L else 300L,
+                            if (isSettle) 3_000L else 1_200L,
+                        )
+                        AppState.addLog(
+                            "… 「$pk」点了现场没变（点早了）→ 该按钮下次多等 ${nv}ms" +
+                                if (nv == 0L) "（已到上限，清空重学）" else "",
+                        )
+                    }
+                }
             }
             if (tag != lastTag) {
                 lastTag = tag
@@ -1276,6 +1307,20 @@ object MazeLoop {
 
     /** ★app 上下文（[LabBtnStore] 按钮路径落盘/回喂用；[run] 开头赋值） */
     private var appCtx: android.content.Context? = null
+
+    /**
+     * ★2026-10-27「点击学延迟」的探针（用户方案：一次点早了，下次同样的按钮就稍微晚点）。
+     *
+     * 机制：`tap(..., learnKey = ...)` 点下去时记下当时"现场指纹"，**下一轮**主循环重新算出 tag 后比对：
+     *   · 变了 ⇒ 点成功了，什么都不做（成功不回调，免得把自己越学越慢）；
+     *   · 没变 ⇒ 认定"那一会儿按钮还不可点" ⇒ [TapDelayStore.miss] 让这个 key 下次多等一点。
+     * 判据只用现成的 `tag`（每轮本来就要算），**不增加任何读取**。
+     */
+    private var tapProbeKey: String? = null
+    private var tapProbeTag: String? = null
+
+    /** 本轮"现场指纹"（主循环每轮写；`lastTag` 是 `run()` 的局部变量，[tap] 里够不着，所以另存一份） */
+    private var curTag: String? = null
 
     // ── 跨轮的"点击节流"记录（PC `_NODE_TAP_AT/_NODE_TAP_N/_NODE_SAID_AT`，按节点记、**不清**）──
     private val nodeTapAt = HashMap<Int, Long>()
@@ -3850,7 +3895,7 @@ object MazeLoop {
         if (label == "关闭") maybeFillScoreFromLtd("关闭前")
         tries["$tag|rtaps"] = taps0 + 1
         AppState.addLog("迷宫结算：点了「$label」(${p.first},${p.second})")
-        tap(input, p.first, p.second, "结算·$label")
+        tap(input, p.first, p.second, "结算·$label", learnKey = "settle|result")
         delay(1_200)
     }
 
@@ -4152,7 +4197,10 @@ object MazeLoop {
         // ══ 层 2：认出来 + 静置够了，才去找按钮 ══════════════════════════════════════════════
         var win: JSONObject? = null
         var fail: JSONObject? = null
-        val settled = battleRes0 > 0L && now - battleRes0 >= RESULT_SETTLE_MS
+        // ★2026-10-27 结算页是「明确很久」的例外：基础 3.5s + 学到的附加（一次 +600、上限 3000、超了清空）。
+        //   实测 3.5s 静置后仍会点空 2~3 次（12:13:41/43/46「下一步」同坐标连点），所以让它自己往后挪。
+        val settleExtra = appCtx?.let { TapDelayStore.extra(it, "settle|result") } ?: 0L
+        val settled = battleRes0 > 0L && now - battleRes0 >= RESULT_SETTLE_MS + settleExtra
         val bot = (scrH * 0.85).toInt()
         // ⚠必须尊重 `battleProbeAt`：胜利页点完会把它 +2.5s（防"同一页连点"；
         //   20:22 那场 2 秒点了 4 下就是这个没生效）。
@@ -4528,7 +4576,14 @@ object MazeLoop {
      * 起因：卡片/按钮"还没落位"（入场滑动动画）时坐标会跑到屏外，空点会伪装成"点了没反应/按钮无效"。
      * 这里兜一道（越界只报一次、不下发），返回 true = 真点下去了（调用方据此决定"算不算一次尝试"）。
      */
-    private suspend fun tap(input: InputBackend, x: Int, y: Int, what: String): Boolean {
+    private suspend fun tap(
+        input: InputBackend,
+        x: Int,
+        y: Int,
+        what: String,
+        /** ★2026-10-27：非 null 表示这颗按钮参与"点早了就下次多等"的自学习（见 [tapProbeKey]）。 */
+        learnKey: String? = null,
+    ): Boolean {
         if (x !in 0..scrW || y !in 0..scrH) {
             if (lastOOR != (x to y)) {
                 lastOOR = x to y
@@ -4538,7 +4593,13 @@ object MazeLoop {
         }
         return when (val r = input.tap(x, y)) {
             is com.lmj.labyrinthauto.input.InputResult.Ok -> {
-                AppState.addLog("点了 $what ($x,$y)［${input.name}］"); true
+                AppState.addLog("点了 $what ($x,$y)［${input.name}］")
+                // ★2026-10-27：参与自学习的按钮，挂个探针 —— 下一轮用"现场 tag 变没变"判它点早了没有
+                if (learnKey != null) {
+                    tapProbeKey = learnKey
+                    tapProbeTag = curTag
+                }
+                true
             }
             is com.lmj.labyrinthauto.input.InputResult.Failed -> {
                 AppState.addLog("点 $what 失败：${r.reason}"); false
@@ -4702,11 +4763,19 @@ object MazeLoop {
                     px = fxy.first; py = fxy.second
                 }
             }
+            // ★2026-10-27 弹窗按钮也参与"点早了就下次多等"（普通档：一次 +300、上限 1200、超了清空）。
+            //   实测病例（12:08:26）商店「关闭」连点 3 次同坐标才关掉 —— 弹窗刚出现时按钮还不吃点击。
+            val dlgKey = "dlg|${top.removeSuffix("(Clone)")}|$bn"
+            val dlgExtra = appCtx?.let { TapDelayStore.extra(it, dlgKey) } ?: 0L
+            if (dlgExtra > 0) {
+                AppState.addLog("… 弹窗「$bn」按学到的延迟先等 ${dlgExtra}ms 再点")
+                delay(dlgExtra)
+            }
             if (px > 0 && py > 0) {
-                tap(input, px, py, "对话框「$bn」")
+                tap(input, px, py, "对话框「$bn」", learnKey = dlgKey)
                 return true
             }
-            tap(input, wl.optInt("x"), wl.optInt("y"), "对话框「$bn」")   // 没学到 → 用宽名单坐标
+            tap(input, wl.optInt("x"), wl.optInt("y"), "对话框「$bn」", learnKey = dlgKey)   // 没学到 → 用宽名单坐标
             return true
         }
         if (named.isEmpty()) {

@@ -64,6 +64,8 @@ object CrashGuard {
         val why: String,
         val view: String,
         val maze: String,
+        /** 上次心跳那一刻**是否正在跑图**（`stateSnapshot` 的 `running=`） */
+        val running: Boolean,
     )
 
     @Volatile
@@ -92,6 +94,22 @@ object CrashGuard {
         val p = previousExit ?: return
         val where = whereText(p)
         val hhmm = p.at.takeIf { it.length >= 16 }?.substring(11, 16) ?: "?"
+        // ★★2026-10-27 用户反馈的**误报**：正常跑完 5 局 → 关掉 App → 再打开，仍然弹"上次突然中断"。
+        //   根因：判定条件原来只有"心跳文件还在 + 30 分钟内"，**根本不看当时在不在跑图**。
+        //   而心跳一直在写 ⇒ 用户主动关掉的、已经跑完的进程（running=false）也被当成"突然死亡"。
+        //   现在分成两档，只有下面三种才叫异常：
+        //     ① running=true（跑图途中消失，这才是我们真正要抓的）
+        //     ② why=启动（进程连第一次心跳都没活到 ⇒ 打开就闪退）
+        //     ③ why=CRASH:xxx（Java 崩溃兜底写的）
+        //   其余（没在跑图时被关/被系统回收）属于正常收尾，日志留一行即可，不打扰用户。
+        val abnormal = p.running || p.why == "启动" || p.why.startsWith("CRASH")
+        if (!abnormal) {
+            AppState.addLog(
+                "上次进程（pid=${p.pid}）在 $hhmm 之后退出（最后停在：$where，why=${p.why}）" +
+                    "—— 当时没在跑图，按正常关闭处理，不提示",
+            )
+            return
+        }
         // 日志：完整信息（排查用）
         AppState.addLog("⚠上次进程（pid=${p.pid}）在 $hhmm 之后突然没了，最后停在：$where（why=${p.why}）")
         AppState.addLog("　没有正常收尾 ⇒ 被系统杀 / native 崩溃 / 整机重启，三者之一；崩溃栈看 logs/crash_*.txt")
@@ -185,6 +203,7 @@ object CrashGuard {
             // ★maze 的值里带空格（如 "第 2 层 节点 50701"），原来用 `\S+` 会被截成 "第"
             //   —— 真实日志里就是"最后停在：迷宫里 第"，层数和节点全丢了。改 `[^|]+`。
             maze = Regex("maze=([^|]+)").find(txt)?.groupValues?.get(1)?.trim() ?: "-",
+            running = Regex("running=(true|false)").find(txt)?.groupValues?.get(1) == "true",
         )
     }
 

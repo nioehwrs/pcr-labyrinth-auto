@@ -46,22 +46,22 @@ object FridaInjector {
      */
     private const val KEY_SO = "libil2cpp.so"
 
-    /** maps 里出现 libil2cpp.so 之后再静置这么久才注入（PC 版 ATTACH_DELAY = 2.0） */
-    private const val SETTLE_MS = 2_000L
-
-    /** ★慢启动设备的判据（2026-10-21 uuz 实测：低端模拟器启动慢，libil2cpp 出现得晚 = 整机都慢） */
-    private const val SLOW_BOOT_MS = 3_000L
-
-    /** 慢启动设备的额外静置（映射出现得越晚，初始化越没底，多等一会儿再 attach） */
- 
-    private const val SLOW_BOOT_EXTRA_MS = 4_000L
-
-    /** 每次注入失败后，下一次注入前多等这么久（避免"杀→起→又太早注入"的循环） */
-    private const val FAIL_EXTRA_STEP_MS = 2_000L
-
-    /** 学习型静置的默认秒数 / 上限（慢启动设备最多等到 15s） */
-    private const val DEFAULT_SETTLE_SEC = 2
-    private const val MAX_SETTLE_SEC = 15
+    /**
+     * maps 里出现 libil2cpp.so 之后再静置这么久才注入。
+     *
+     * ★★2026-10-27 用户拍板：**固定 6 秒，不学、不随设备变**（原话："就设置成 6s 吧，这里不要动了，
+     *   也不学什么"）。注入成功后**不再回写**、失败后也不再 +=1s。
+     *
+     * 为什么要废掉原来的"学习型等待"（2026-10-21）：它成功后把**本次实际静置**固化回默认值，
+     * 而那个值里含着"慢启动额外 +4s"，于是变成**只涨不降的棘轮**：
+     *   2s →（一次慢启动）6s →（再一次）10s →（再一次）14s … 一直顶到 15s 上限，
+     * 且全无下调路径。实测 2026-10-27 20:59 那局已经卡在 14s
+     * （日志：`libil2cpp.so 已映射（游戏起了 1s）→ 静置 14s 再注入（该设备学过：注入前等 14s）`），
+     * 每局白白多等十几秒。现在写死 6s，换设备/清数据都一样。
+     *
+     * （PC 版 ATTACH_DELAY = 2.0；但模拟器上 2s 偏早，6s 是实测能稳定注入、又不浪费的值。）
+     */
+    private const val SETTLE_MS = 6_000L
 
     /** 等就绪的总超时（PC 版 step_wait_ready 的 timeout = 120） */
     private const val READY_TIMEOUT_MS = 120_000L
@@ -164,34 +164,12 @@ object FridaInjector {
     var autoRecover = false
 
 
-    /** ★注入前静置秒数（2026-10-21 用户设计"学习型等待"）：**持久化**——这次几秒注入成功，
-    之后都按这个等；注入失败一次 +1s（上限 [MAX_SETTLE_SEC]）。换设备/清数据会回到默认值。 */
-    @Volatile
-    private var settleSec = DEFAULT_SETTLE_SEC
-
-    /** 本次实际使用的注入前静置（waitGameReady 记、注入成功后固化） */
-    private var lastSettleMs = SETTLE_MS
-
-    private fun prefs(ctx: Context) =
-        ctx.getSharedPreferences("frida", Context.MODE_PRIVATE)
-
-    private fun loadSettleSec(ctx: Context): Int {
-        settleSec = prefs(ctx).getInt("injectSettleSec", DEFAULT_SETTLE_SEC)
-            .coerceIn(DEFAULT_SETTLE_SEC, MAX_SETTLE_SEC)
-        return settleSec
-    }
-
-    private fun saveSettleSec(ctx: Context, sec: Int) {
-        settleSec = sec.coerceIn(DEFAULT_SETTLE_SEC, MAX_SETTLE_SEC)
-        prefs(ctx).edit().putInt("injectSettleSec", settleSec).apply()
-    }
-
     fun start(ctx: Context) {
         if (running) {
             AppState.addLog("注入已经在跑了（忽略重复请求）")
             return
         }
-        job = scope.launch { loop(ctx.applicationContext.also { loadSettleSec(it) }) }
+        job = scope.launch { loop(ctx.applicationContext) }
     }
 
     fun stop() {
@@ -338,12 +316,6 @@ object FridaInjector {
                     lastPid = pid
                     launchTries = 0                  // 游戏活了（被注入成功）→ 调起计数清零
                     injectFails = 0
-                    // ★学习型等待（2026-10-21 用户）：这次几秒注入成功，之后都按这个等
-                    val ok = (lastSettleMs / 1000).toInt().coerceIn(DEFAULT_SETTLE_SEC, MAX_SETTLE_SEC)
-                    if (ok != settleSec) {
-                        AppState.addLog("注入成功 ⇒ 该设备的注入前等待固化为 ${ok}s（以后默认）")
-                        saveSettleSec(ctx, ok)
-                    }
                     AppState.addLog("已让 frida-server 把 agent 注入进 pid=$pid（脚本 ${agent.length()} 字节）")
                     AppState.setFridaStatus("注入完成，等 agent 回连…")
                 } else {
@@ -357,12 +329,6 @@ object FridaInjector {
                         err.contains("No such process")
                     if (fatal || injectFails >= MAX_INJECT_FAILS) {
                         injectFails = 0
-                        // 注入失败 ⇒ 该设备的等待 +1s 并持久化（下次注入前多等一会儿）
-                        val up = (settleSec + 1).coerceAtMost(MAX_SETTLE_SEC)
-                        if (up != settleSec) {
-                            AppState.addLog("注入失败 ⇒ 该设备的注入前等待 ${settleSec}s → ${up}s（已记住）")
-                        }
-                        saveSettleSec(ctx, up)
                         AppState.addLog(
                             if (fatal) "注入失败且进程多半已僵死 → 自愈：杀掉游戏重开"
                             else "连续 $MAX_INJECT_FAILS 次注入失败 → 自愈：杀掉游戏重开",
@@ -455,17 +421,9 @@ object FridaInjector {
                 return why
             }
             val ms = SystemClock.elapsedRealtime() - startedAt
-            // ★自适应静置（2026-10-21 uuz 实测：低端模拟器启动慢，映射出现得晚 = 初始化更没底，
-            //   这时候 attach 会把进程搞成僵死态）；注入失败过的（settleExtraMs）也再加码。
-            val settle = settleSec * 1000L +
-                if (ms > SLOW_BOOT_MS) SLOW_BOOT_EXTRA_MS else 0
-            lastSettleMs = settle                 // 记下本次实际静置（注入成功后固化为默认值）
-            AppState.addLog(
-                "$KEY_SO 已映射（游戏起了 ${ms / 1000}s）→ 静置 ${settle / 1000}s 再注入" +
-                    (if (ms > SLOW_BOOT_MS) "（慢启动设备 +${SLOW_BOOT_EXTRA_MS / 1000}s）" else "") +
-                    (if (settleSec != DEFAULT_SETTLE_SEC) "（该设备学过：注入前等 ${settleSec}s）" else ""),
-            )
-            delay(settle)
+            // ★2026-10-27：固定 [SETTLE_MS]，不再"慢启动额外 +4s"、不再学习、不再持久化。
+            AppState.addLog("$KEY_SO 已映射（游戏起了 ${ms / 1000}s）→ 静置 ${SETTLE_MS / 1000}s 再注入")
+            delay(SETTLE_MS)
             return null
         }
         val age = SystemClock.elapsedRealtime() - startedAt
@@ -660,6 +618,18 @@ object FridaInjector {
         var misses = 0
         while (true) {                            // 取消靠 delay() 抛 CancellationException（同 AutoForegroundService）
             delay(POLL_MS)
+            // ★★2026-10-27：**总闸关了就一次都别问 agent**。
+            //   实测 13:56:46 已经打印"自动黎明界结束 → 停止注入/自愈，之后不再碰游戏进程（待命）"，
+            //   可这里仍在每 1.5s 调 `viewId`（13:57:57 起连续超时），三次之后自己把状态刷成
+            //   "agent 掉线，等它重连…" —— 待命期自问自答，日志里看着像故障，还会误导后续判断。
+            //   （另一条腿 `loop()` 早就在 `!autoRecover` 时待命了，只有这条漏了。）
+            if (!autoRecover) {
+                toldConnected = false             // 下次开闸重新握手，别复用旧状态
+                lastPage = null
+                lastPageTop = null
+                AppState.setFridaStatus("待命（未跑迷宫，不注入游戏）")
+                continue
+            }
             if (!AgentBridge.connected.value) {
                 if (toldConnected) {
                     toldConnected = false

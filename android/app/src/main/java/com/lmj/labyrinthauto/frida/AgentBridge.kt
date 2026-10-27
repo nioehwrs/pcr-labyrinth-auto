@@ -37,6 +37,24 @@ object AgentBridge {
     /** 连续超时计数（任何调用都算；成功一次清零）—— 到 3 就 [noteStale] 触发自愈，见 [call]。 */
     private val timeoutStreak = java.util.concurrent.atomic.AtomicInteger(0)
 
+    /** 最近一次**成功回包**的时刻（0 = 还没成功过）。用于区分"agent 在忙"和"agent 真死了"，见 [BUSY_GRACE_MS]。 */
+    @Volatile
+    private var lastOkAt = 0L
+
+    /**
+     * ★2026-10-27「拥堵不算掉线」：这段时间内**有过成功回包** ⇒ 超时只是单通道被重活占住。
+     *
+     * 真实病例（0.3.7 测试日志，12:11 / 12:38 / 13:19 各一次）：
+     * ```
+     * 12:11:12  labStatus（5000ms）超时 → 同时仍在飞：findTextIn（已等 5826ms）
+     * 12:11:22  agent 疑似掉线（连续 3 次调用超时）→ 等它重连
+     * ```
+     * agent 根本没掉线，只是 `findTextIn` 全树遍历跑了 5.8s，把通道堵住了 —— 后面排队的
+     * `viewId`（3s）、`dialog`（6s）排着队超时，攒满 3 次就判"掉线"，于是重注入 3 次、
+     * 再杀游戏重来（13:19 那局白跑）。20s 内有过成功回包就说明连接是活的，不该判死。
+     */
+    private const val BUSY_GRACE_MS = 20_000L
+
     /** 在飞调用（id → "fn@发出时刻"）：超时时用它报出**真正还卡着的那次调用**（见 [call]）。
      *  ⚠为什么需要：先超时的往往是**便宜调用**（`viewId` T_FAST=3s），而真正卡住 agent 的常是
      *  之前发出的**重活**（堆扫描 `labChoices` 实测 3.1s ✗、全树 find ✗）—— 只看"第一个超时"会误判。 */
@@ -177,17 +195,26 @@ object AgentBridge {
         //   ★并且把**此刻还没回来的调用**一起报出来 —— 先超时的往往是便宜调用（`viewId` 3s），
         //   真正卡住 agent 的多半是之前那次**重活**（`labChoices` 扫堆 3.1s / 全树 find ✗）。
         if (res == null) {
-            // ★★连续超时 ⇒ 直接判定"这条连接死了"并触发自愈（2026-10-17 第四次卡死复盘）：
+            val timeoutAt = System.currentTimeMillis()
+            // ★★连续超时 ⇒ 判定"这条连接死了"并触发自愈（2026-10-17 第四次卡死复盘）：
             //   原来只有**注入循环**的 `viewId` 计数会调 [noteStale]，而导航阶段卡住时那个循环没在看
             //   ⇒ 一卡到底（日志里 90s+ 全是超时、没人管 ✗）。现在放在最底层：**任何**调用连续 3 次
             //   超时 ⇒ noteStale（置未连接 ⇒ 注入循环按 autoRecover 重注入 / 杀进程重开 ✓）。成功一次清零。
-            if (timeoutStreak.incrementAndGet() >= 3) {
+            // ★2026-10-27 加一道"拥堵豁免"（见 [BUSY_GRACE_MS]）：**别的调用还在飞 + 20s 内有过成功回包**
+            //   ⇒ 这是单通道被重活占住，连接是活的，**既不算掉线、也不累积计数**（清零，等重活回来）。
+            //   否则一次 5.8s 的全树遍历就能把后面排队的轻调用全部超时攒成"掉线"，进而误触发
+            //   重注入 / 杀游戏重来。
+            val othersInflight = pendingInfo.keys.any { it != id }
+            val busy = othersInflight && (timeoutAt - lastOkAt) < BUSY_GRACE_MS
+            if (busy) {
+                timeoutStreak.set(0)
+            } else if (timeoutStreak.incrementAndGet() >= 3) {
                 timeoutStreak.set(0)
                 noteStale("连续 3 次调用超时（最近：$fn）")
             }
             if (lastTimeoutFn != fn) {
                 lastTimeoutFn = fn
-                val now = System.currentTimeMillis()
+                val now = timeoutAt
                 val inflight = pendingInfo.entries
                     .filter { it.key != id }
                     .joinToString("｜") { "${it.value.first}（已等 ${now - it.value.second}ms）" }
@@ -201,7 +228,9 @@ object AgentBridge {
                 AppState.addLog(
                     "agent 调用超时：$fn（${timeoutMs}ms 没回包，实际等了 ${selfMs}ms）→ " +
                         when {
-                            inflight.isNotEmpty() -> "同时仍在飞：$inflight（多半是那次重活占住了单通道）"
+                            inflight.isNotEmpty() ->
+                                "同时仍在飞：$inflight（多半是那次重活占住了单通道）" +
+                                    if (busy) " ⇒ 按拥堵处理，不判掉线" else ""
                             selfMs >= timeoutMs * 3 / 2 ->
                                 "当时只有它自己在飞，且它自己就跑了 ${selfMs}ms ⇒ **它就是那个重活**（不是掉线）"
                             else -> "当时没有别的调用在飞 ⇒ agent 没应答（真僵/断开，等自愈）"
@@ -211,6 +240,7 @@ object AgentBridge {
         } else {
             lastTimeoutFn = null
             timeoutStreak.set(0)
+            lastOkAt = System.currentTimeMillis()      // 拥堵豁免的判据：最近一次"活着"的证据
         }
         return res
     }
