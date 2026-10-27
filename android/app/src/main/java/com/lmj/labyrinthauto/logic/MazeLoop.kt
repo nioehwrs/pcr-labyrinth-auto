@@ -146,6 +146,8 @@ object MazeLoop {
         CenterTapGate.reset("新的一局开始")
         LogFile.init(ctx.applicationContext)
         LogFile.beginRun("maze")
+        // ★局号写进**本局文件**（见 [roundLabel] 的注释）：日志页靠这行认「第几局」
+        roundLabel?.let { AppState.addLog("── 本局：第 $it 局 ──") }
         runFinished = false
         lastScore = emptyMap()
         lastRewards = emptyList()
@@ -165,6 +167,7 @@ object MazeLoop {
         } finally {
             // ★本局结束（含取消/异常）一律关掉，绝不带到下一局/刷初始
             CenterTapGate.reset("本局结束")
+            roundLabel = null      // 局号只对本次 run 有效，别泄漏给"只跑迷宫"这类入口
             LogFile.endRun(
                 done = runFinished,
                 tag = when {
@@ -1137,6 +1140,15 @@ object MazeLoop {
     /** ★本局结算奖励（中文名+数量，已按 id 汇总；供整轮汇总） */
     var lastRewards: List<RewardEntry> = emptyList()
         private set
+
+    /**
+     * ★本局是整轮里的第几局（形如 `2/5`；由连跑循环在开跑前塞进来）。
+     *
+     * 2026-10-27：日志页要按「本次运行 → 第 N 局」两级展示，而连跑循环那句
+     * `第 N/M 局开始` 是在 [LogFile.beginRun] **之前**打的 —— 它只会落进 session 和**上一局**的文件，
+     * 本局文件里没有任何局号。所以在 beginRun 之后补一行只属于本局的标记。
+     */
+    var roundLabel: String? = null
 
     /** ★奖励页"点屏幕中央"的次数（按现场 tag 计，最多 [REWARD_CENTER_MAX] 次） */
     private val rewardCenterTaps = HashMap<String, Int>()

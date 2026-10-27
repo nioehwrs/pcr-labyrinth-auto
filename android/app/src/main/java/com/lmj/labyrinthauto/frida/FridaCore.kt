@@ -45,7 +45,7 @@ object FridaCore {
 
     fun logAvailability() {
         if (loadError == null) {
-            AppState.addLog("libfrida_bridge.so 已加载（方案 B：内嵌 frida-core，当 frida-server 客户端）")
+            AppState.addLog("libfrida_bridge.so 已加载（方案 B：内嵌注入桥，当运行组件的客户端）")
         } else {
             AppState.addLog("libfrida_bridge.so 加载失败：$loadError")
         }

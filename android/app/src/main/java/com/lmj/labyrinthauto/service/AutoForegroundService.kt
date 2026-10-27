@@ -258,6 +258,8 @@ class AutoForegroundService : Service() {
                                     delay(1000)
                                 }
                             }
+                            // ★本局局号（日志页按局展示用）：写进本局日志文件头
+                            MazeLoop.roundLabel = "$idx/$totalTxt"
                             if (!runOneMaze(input)) {
                                 ticker.cancel()
                                 // ★策略「撤退重跑」：本局作废（不算完成、不消耗计划次数）→ 撤销当前局后继续下一局

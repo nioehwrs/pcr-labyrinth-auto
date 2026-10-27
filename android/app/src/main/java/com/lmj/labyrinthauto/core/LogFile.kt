@@ -186,6 +186,319 @@ object LogFile {
             }
     }
 
+    // ─────────────── 日志页的两级列表（2026-10-27 用户方案） ───────────────
+
+    /** 徽章语义色；core 层不碰 Compose，UI 侧映射到 `StatusColors` */
+    enum class Tone { GOOD, WARN, BAD, IDLE }
+
+    /**
+     * **一级条目 = 一次运行**（一份 `session_*.txt`，跨多局）；二级 = 这次运行里的单局。
+     *
+     * 2026-10-27 用户口径（原话的形状）：
+     * ```
+     * ▸ 本次运行 10-27 21:47   成功 5/5 局 · 1小时50分        [生成诊断包]
+     *     ├ 第 1 局 21:49 成功 26分钟 51000分                [选这一局]
+     *     └ 第 5 局 23:40 成功 27分钟 51600分
+     * ```
+     * * 点顶层 ⇒ 诊断包 = **session + 该次运行的全部单局**；
+     * * 点某一局 ⇒ 诊断包 = **session + 这一局**；
+     * * 打包只按用户选择生成，**不包含全部历史**。
+     */
+    data class SessionEntry(
+        val key: String,
+        val title: String,          // 本次运行 · 10-27 21:47
+        val badge: String,          // 全部成功 / 有未完成 / 进行中
+        val tone: Tone,
+        val timeText: String,       // 成功 5/5 局 · 1 小时 50 分
+        val detail: String,         // 共 6 份日志 · 2.3 MB
+        val sortMs: Long,
+        /** 是不是**本次进程**正在写的那一条（只有它叫"本次运行"，且永远不折叠） */
+        val current: Boolean,
+        val sessionFile: LogEntry?, // 可能已被清理（每目录只留 60 份）
+        val files: List<LogEntry>,  // 诊断包要带的全部文件（session + 各单局 + 该时段的崩溃记录）
+        val runs: List<RunEntry>,
+    )
+
+    /** 二级条目 = **单局**（`run_*.txt`） */
+    data class RunEntry(
+        val key: String,
+        val title: String,          // 第 1 局 · 21:49
+        val badge: String,          // 成功 / 失败：手动停止 / 被中断
+        val tone: Tone,
+        val timeText: String,       // 26 分钟 · 总分 51000
+        val detail: String,         // 510 KB
+        val kind: String,           // MAZE / REROLL / SELFTEST
+        val index: Int?,            // 第几局（日志里「本局：第 N/M 局」；老日志按时间顺序补）
+        val planned: Int?,          // 这一轮计划几局
+        val score: Long?,           // 总分（只认「迷宫结算…总分=…」，不要刷开局路线那个总分）
+        val startMs: Long,
+        val endMs: Long?,           // 被杀的局没有结束时间
+        val sortMs: Long,
+        val files: List<LogEntry>,
+    )
+
+    /** `run_开始_KIND__结论_结束`（**不含扩展名**：分组时已经去掉，旧版遗留的 .log 也认） */
+    private val runNameRe = Regex(
+        "^run_(\\d{8}_\\d{6})_([A-Za-z0-9]+)(?:__([A-Za-z0-9_]+?)_(\\d{8}_\\d{6}))?$",
+    )
+
+    /** 解析文件名里的时间戳（**不复用 [nameFmt]**：那个在 io 线程写文件名，SimpleDateFormat 不是线程安全的） */
+    private val stampFmt = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
+    private val hmFmt = SimpleDateFormat("HH:mm", Locale.US)
+    private val mdHmFmt = SimpleDateFormat("MM-dd HH:mm", Locale.US)
+
+    /**
+     * 局号：`── 本局：第 2/5 局 ──`（2026-10-27 起由 `MazeLoop` 在 beginRun 之后写进本局文件）。
+     * 老日志没有这一行 ⇒ 用"本次运行里的第几份单局日志"兜底。
+     */
+    private val runIndexRe = Regex("第 (\\d+)/(\\d+) 局")
+
+    /**
+     * 总分：**只认**「迷宫结算…总分=…」。⚠ 不能用宽松的 `总分=(\d+)` ——
+     * 刷开局路线日志里也有 `（刷开局记住的路线，总分=1700）`，那是**路线分**不是本局结算分。
+     */
+    private val scoreRe = Regex("迷宫结算[^\\n]*?总分=(\\d+)")
+
+    /**
+     * 一级列表（按最近活动倒序）：**先按 session 归堆，再把单局挂到"开始时间不晚于它"的最近一次 session**。
+     *
+     * 为什么不看目录（done/abort/根目录）：那是**结论**，不是层级；用户要的是"我发哪一次"。
+     */
+    fun listSessions(max: Int = 20): List<SessionEntry> {
+        val entries = listRecent(300)
+
+        val runs = entries.asSequence()
+            .filter { it.name.startsWith("run_") }
+            .groupBy { groupKey(it.name) }
+            .mapNotNull { (key, files) -> buildRun(key, files) }
+            .sortedBy { it.startMs }
+            .toList()
+
+        // session 按开始时间升序（后面用"最近一个开始时间 ≤ X"来归属）
+        val sessions = entries.asSequence()
+            .filter { it.name.startsWith("session_") }
+            .mapNotNull { e ->
+                val stamp = e.name.substringBeforeLast('.').removePrefix("session_")
+                parseStamp(stamp)?.let { Triple(it, e, ArrayList<RunEntry>()) }
+            }
+            .sortedBy { it.first }
+            .toList()
+
+        // 崩溃记录 / 认不出的杂项：按时间挂到所属 session（这样诊断包会**自动带上崩溃记录**）
+        val loose = HashMap<Long, MutableList<LogEntry>>()
+        val unowned = ArrayList<LogEntry>()
+        for (e in entries) {
+            if (e.name.startsWith("run_") || e.name.startsWith("session_")) continue
+            val t = e.f.lastModified()
+            val owner = sessions.lastOrNull { it.first <= t }
+            if (owner == null) unowned.add(e) else loose.getOrPut(owner.first) { ArrayList() }.add(e)
+        }
+
+        val orphanRuns = ArrayList<RunEntry>()
+        for (r in runs) {
+            val owner = sessions.lastOrNull { it.first <= r.startMs }
+            if (owner == null) orphanRuns.add(r) else owner.third.add(r)
+        }
+
+        val out = ArrayList<SessionEntry>()
+        for (i in sessions.indices) {
+            val (start, sessFile, rs) = sessions[i]
+            val nextStart = sessions.getOrNull(i + 1)?.first
+            val own = rs.filter { nextStart == null || it.startMs < nextStart }
+            val extra = loose[start].orEmpty()
+            // 归属下一条 session 开始之前的崩溃记录也算这一轮（两端都按时间切）
+            val extra2 = extra.filter { nextStart == null || it.f.lastModified() < nextStart }
+            out.add(
+                sessionEntry(
+                    start, sessFile, own, extra2,
+                    running = i == sessions.lastIndex,
+                    // 只有**最新那条**才是"本次运行"（本次进程还在写它），其余一律按时间叫"运行"
+                    current = i == sessions.lastIndex,
+                ),
+            )
+        }
+
+        if (orphanRuns.isNotEmpty() || unowned.isNotEmpty()) {
+            val files = ArrayList<LogEntry>()
+            for (r in orphanRuns) files.addAll(r.files)
+            files.addAll(unowned)
+            out.add(
+                SessionEntry(
+                    key = "loose",
+                    title = "历史日志（没有会话日志）",
+                    badge = "未归属",
+                    tone = Tone.IDLE,
+                    timeText = "共 ${orphanRuns.size} 局 + ${unowned.size} 份其它日志",
+                    detail = sizeText(files.sumOf { it.sizeKb }),
+                    sortMs = (files.maxOfOrNull { it.f.lastModified() } ?: 0L),
+                    current = false,
+                    sessionFile = null,
+                    files = files.sortedByDescending { it.f.lastModified() },
+                    runs = orphanRuns.sortedByDescending { it.startMs },
+                ),
+            )
+        }
+
+        return out.sortedByDescending { it.sortMs }.take(max)
+    }
+
+    /** 分组键：`run_x_KIND__TAG_end.txt` → `run_x_KIND` */
+    private fun groupKey(name: String): String {
+        val base = name.substringBeforeLast('.')
+        val i = base.indexOf("__")
+        return if (i > 0) base.substring(0, i) else base
+    }
+
+    private fun sessionEntry(
+        start: Long,
+        sessFile: LogEntry,
+        runs: List<RunEntry>,
+        extra: List<LogEntry>,
+        running: Boolean,
+        current: Boolean,
+    ): SessionEntry {
+        // ★局号：日志里有就用日志里的（撤退重跑会重复同一个号，那是真的）；老日志没有 → 按时间顺序补
+        val plannedHint = runs.maxOfOrNull { it.planned ?: 0 }?.takeIf { it > 0 }
+        var seq = 0
+        val sortedRuns = runs.sortedBy { it.startMs }.map { r ->
+            if (r.kind == "MAZE") seq++
+            val idx = r.index ?: seq
+            r.copy(
+                index = idx,
+                planned = r.planned ?: plannedHint,
+                title = runTitle(r.kind, idx, r.startMs),
+            )
+        }
+        val planned = plannedHint ?: sortedRuns.count { it.kind == "MAZE" }
+        val ok = sortedRuns.count { it.tone == Tone.GOOD }
+        val end = sortedRuns.maxOfOrNull { it.endMs ?: it.sortMs } ?: start
+        val files = ArrayList<LogEntry>()
+        files.add(sessFile)
+        for (r in sortedRuns) files.addAll(r.files)
+        files.addAll(extra)
+        val crashN = extra.count { it.name.startsWith("crash_") }
+        val (badge, tone) = when {
+            running && runPath.isNotEmpty() -> "进行中" to Tone.WARN
+            // 只有会话日志（打完开局就被关掉 / 只刷了开局）⇒ 中性，不算失败
+            sortedRuns.isEmpty() -> "仅会话" to Tone.IDLE
+            ok == planned && sortedRuns.none { it.tone == Tone.BAD } -> "全部成功" to Tone.GOOD
+            sortedRuns.any { it.tone == Tone.BAD } -> "有中断" to Tone.BAD
+            else -> "有未完成" to Tone.WARN
+        }
+        return SessionEntry(
+            key = "session_${start}",
+            title = (if (current) "本次运行" else "运行") + " · ${mdHmFmt.format(Date(start))}",
+            badge = badge,
+            tone = tone,
+            timeText = if (sortedRuns.isEmpty()) "没有单局日志" + (if (crashN > 0) "（含崩溃记录）" else "")
+            else "成功 $ok/$planned 局 · 用时 ${duration(end - start)}",
+
+            detail = "共 ${files.size} 份日志 · ${sizeText(files.sumOf { it.sizeKb })}" +
+                (if (crashN > 0) " · 含 $crashN 份崩溃记录" else ""),
+            sortMs = files.maxOfOrNull { it.f.lastModified() } ?: start,
+            current = current,
+            sessionFile = sessFile,
+            files = files.sortedByDescending { it.f.lastModified() },
+            runs = sortedRuns,
+        )
+    }
+
+    private fun buildRun(key: String, files: List<LogEntry>): RunEntry? {
+        val newest = files.maxByOrNull { it.f.lastModified() } ?: return null
+        val m = runNameRe.find(key) ?: return null
+        val startMs = parseStamp(m.groupValues[1]) ?: newest.f.lastModified()
+        val kind = m.groupValues[2].uppercase(Locale.US)
+        // ★结论与结束时间要回到**归档后的原文件名**上找：分组键已经把 `__结论_结束时间` 剥掉了
+        val archived = files
+            .mapNotNull { runNameRe.find(it.f.name.substringBeforeLast('.')) }
+            .firstOrNull { it.groupValues[3].isNotEmpty() }
+        val tag = archived?.groupValues?.get(3)?.takeIf { it.isNotEmpty() }
+        val endMs = archived?.groupValues?.get(4)?.takeIf { it.isNotEmpty() }?.let { parseStamp(it) }
+        val running = runPath.isNotEmpty() && files.any { it.f.absolutePath == runPath }
+        val (badge, tone) = when {
+            running -> "进行中" to Tone.WARN
+            tag == "DONE" || newest.dir == "done" -> "成功" to Tone.GOOD
+            newest.dir == "abort" -> "失败 · ${abortLabel(tag)}" to Tone.WARN
+            // 根目录、没有结论后缀 = 进程被当场干掉（没来得及收尾）
+            else -> "被中断" to Tone.BAD
+        }
+        // 「第 N/M 局」写在**文件头**（开局就写），「总分=」在**文件尾**（结算时写）⇒ 头尾各读一段
+        val head = readSlice(newest.f, 8 * 1024, fromEnd = false)
+        val tail = readSlice(newest.f, 64 * 1024, fromEnd = true)
+        val mi = runIndexRe.find(head)
+        val index = mi?.groupValues?.get(1)?.toIntOrNull()
+        val planned = mi?.groupValues?.get(2)?.toIntOrNull()
+        val score = scoreRe.findAll(tail).lastOrNull()?.groupValues?.get(1)?.toLongOrNull()
+
+        val durText = endMs?.let { duration(it - startMs) }
+        val scoreText = score?.let { "总分 $it" }
+        return RunEntry(
+            key = key,
+            title = runTitle(kind, index, startMs),
+            badge = badge,
+            tone = tone,
+            timeText = listOfNotNull(durText, scoreText).joinToString(" · ").ifEmpty { "—" },
+            detail = sizeText(files.sumOf { it.sizeKb }),
+            kind = kind,
+            index = index,
+            planned = planned,
+            score = score,
+            startMs = startMs,
+            endMs = endMs,
+            sortMs = newest.f.lastModified(),
+            files = files.sortedBy { it.f.name },
+        )
+    }
+
+    /** 读文件头/尾一小段（日志可能有几 MB，不能整个读进内存） */
+    private fun readSlice(f: File, maxBytes: Int, fromEnd: Boolean): String = runCatching {
+        java.io.RandomAccessFile(f, "r").use { raf ->
+            val len = raf.length()
+            val n = minOf(len, maxBytes.toLong()).toInt()
+            if (n <= 0) return@use ""
+            if (fromEnd) raf.seek(len - n)
+            val buf = ByteArray(n)
+            raf.readFully(buf)
+            String(buf, Charsets.UTF_8)
+        }
+    }.getOrDefault("")
+
+    private fun sizeText(kb: Long): String = if (kb >= 1024) "%.1f MB".format(kb / 1024.0) else "$kb KB"
+
+    /** 单局标题：`第 1 局 · 21:49`（刷开局/自检没有局号，用类型 + 日期） */
+    private fun runTitle(kind: String, index: Int?, startMs: Long): String =
+        if (kind == "MAZE" && index != null) "第 $index 局 · ${hmFmt.format(Date(startMs))}"
+        else "${kindLabel(kind)} · ${mdHmFmt.format(Date(startMs))}"
+
+    private fun parseStamp(s: String): Long? = runCatching { stampFmt.parse(s)?.time }.getOrNull()
+
+    private fun kindLabel(kind: String): String = when (kind) {
+        "MAZE" -> "跑迷宫"
+        "REROLL" -> "刷开局"
+        "SELFTEST" -> "自检"
+        else -> kind
+    }
+
+    /** `abort/` 里的结论标签 → 人话；未知标签原样附在括号里（对日志时还能认） */
+    private fun abortLabel(tag: String?): String = when (tag) {
+        null -> "中途退出"
+        "ABORT_STOP" -> "手动停止"
+        "ABORT_EXIT" -> "中途退出"
+        "ABORT_RETREAT" -> "按策略撤退"
+        "ABORT_REPLACED" -> "被新一局替换"
+        "ABORT_CRASH" -> "异常中断"
+        else -> "中途退出（$tag）"
+    }
+
+    private fun duration(ms: Long): String {
+        val min = (ms / 60000).toInt()
+        return when {
+            min >= 60 -> "${min / 60} 小时 ${min % 60} 分"
+            min >= 1 -> "$min 分钟"
+            else -> "${ms / 1000} 秒"
+        }
+    }
+
     /** 把某份日志用系统分享面板发出去（微信 / QQ / 邮件都能收文件）。 */
     fun share(ctx: Context, f: File) {
         val uri = androidx.core.content.FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", f)

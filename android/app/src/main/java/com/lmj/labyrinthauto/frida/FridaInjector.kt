@@ -36,6 +36,15 @@ object FridaInjector {
     private const val POLL_MS = 1_500L
 
     /**
+     * 日志脱敏（2026-10-28 用户："日志不要显示下载的组件名，和所有的 huabanxie-server 字样"）。
+     *
+     * 注入器的 stdout/stderr 里会带真实二进制名和路径（`/data/local/tmp/huabanxie-inject` 之类），
+     * 这些日志是用户会直接发出去的，所以统一换成「运行组件」。
+     */
+    private fun redact(text: String): String =
+        text.replace(Regex("huabanxie[\\w.\\-]*"), "运行组件")
+
+    /**
      * 游戏"启动期"不许注入：实测冷启动后 15s / 45s 注入都会让它**原生崩溃**
      * （exit-info = reason 5 APP CRASH(NATIVE)）。
      *
@@ -256,7 +265,7 @@ object FridaInjector {
                     continue
                 }
                 if (!ensureFridaServer(ctx)) {
-                    AppState.setFridaStatus("frida-server 没起来，注入没法做")
+                    AppState.setFridaStatus("运行组件没起来，注入没法做")
                     delay(POLL_MS)
                     continue
                 }
@@ -310,13 +319,13 @@ object FridaInjector {
                 if (lastPid <= 0) {
                     AppState.addLog("找到游戏 pid=$pid（起了 ${(SystemClock.elapsedRealtime() - startedAt) / 1000}s），开始注入")
                 }
-                AppState.setFridaStatus("注入中（frida-core → frida-server）…")
+                AppState.setFridaStatus("注入中（注入桥 → 运行组件）…")
                 val err = FridaCore.attachAndLoad(FRIDA_SERVER, pid, agent.absolutePath, eternalize = true)
                 if (err.isEmpty()) {
                     lastPid = pid
                     launchTries = 0                  // 游戏活了（被注入成功）→ 调起计数清零
                     injectFails = 0
-                    AppState.addLog("已让 frida-server 把 agent 注入进 pid=$pid（脚本 ${agent.length()} 字节）")
+                    AppState.addLog("已让运行组件把 agent 注入进 pid=$pid（脚本 ${agent.length()} 字节）")
                     AppState.setFridaStatus("注入完成，等 agent 回连…")
                 } else {
                     injectFails++
@@ -482,7 +491,10 @@ object FridaInjector {
             if (!said && dt > 8_000) {
                 // PC 版同款：8 秒还没读到就把"实际读到什么"打一次（读不到往往是 root 没生效）
                 said = true
-                AppState.addLog("…已等 ${dt / 1000}s 仍未映射：rc=${r.exit} out=${r.out.trim().take(40)} err=${r.err.trim().take(80)}")
+                AppState.addLog(
+                    "…已等 ${dt / 1000}s 仍未映射：rc=${r.exit} " +
+                        "out=${redact(r.out.trim().take(40))} err=${redact(r.err.trim().take(80))}",
+                )
             }
             delay(MAPS_POLL_MS)
         }
@@ -494,7 +506,7 @@ object FridaInjector {
      */
     private suspend fun ensureFridaServer(ctx: Context): Boolean {
         if (portOpen()) return true
-        AppState.addLog("frida-server 没在听 $FRIDA_SERVER，走自带的那一份…")
+        AppState.addLog("运行组件端口没通，改用自带的那一份…")
         return FridaServerInstaller.ensure(ctx, FRIDA_SERVER_PORT)
     }
 
@@ -592,7 +604,7 @@ object FridaInjector {
             AppState.addLog("游戏 pid=$gamePid，开始注入…")
 
             val cmd = "echo \$\$ > ${pf.absolutePath}; exec $INJECT_BIN -p $gamePid -s ${agent.absolutePath}"
-            proc = RootShell.spawn(cmd) { line -> AppState.addLog("[inject] $line") }
+            proc = RootShell.spawn(cmd) { line -> AppState.addLog("[inject] ${redact(line)}") }
             if (proc == null) {
                 AppState.setFridaStatus("注入器没起来（看日志）")
                 return

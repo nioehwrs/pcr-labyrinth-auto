@@ -88,6 +88,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.lmj.labyrinthauto.core.AppState
+import com.lmj.labyrinthauto.core.DiagPack
 import com.lmj.labyrinthauto.core.LogFile
 import com.lmj.labyrinthauto.core.UpdateChecker
 import com.lmj.labyrinthauto.logic.team.TeamRunLog
@@ -100,8 +101,10 @@ import com.lmj.labyrinthauto.reroll.RerollSettings
 import com.lmj.labyrinthauto.reroll.RerollUseCase
 import com.lmj.labyrinthauto.service.AutoForegroundService
 import com.lmj.labyrinthauto.ui.theme.StatusColors
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 助手的唯一界面（2026-10-17 重排 → 当天按用户意见分三页）。
@@ -1247,7 +1250,8 @@ private fun SectionTitle(text: String, modifier: Modifier = Modifier) {
 @Composable
 private fun BoxScope.LogDock(log: List<String>, open: Boolean, onToggle: () -> Unit, onClear: () -> Unit) {
     val ctx = LocalContext.current
-    var shareOpen by remember { mutableStateOf(false) }
+    // 2026-10-27：这个入口改成中性的「日志文件」，真正的分享动作挪到二级（点开某一次运行之后）
+    var exportOpen by remember { mutableStateOf(false) }
     Column(Modifier.align(Alignment.BottomCenter)) {
         if (open) {
             Surface(
@@ -1259,7 +1263,7 @@ private fun BoxScope.LogDock(log: List<String>, open: Boolean, onToggle: () -> U
                 Column(Modifier.padding(14.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text("日志 · ${log.size} 行", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
-                        TextButton(onClick = { shareOpen = true }) { Text("分享日志") }
+                        TextButton(onClick = { exportOpen = true }) { Text("日志文件") }
                         TextButton(onClick = onClear) { Text("清空") }
                         TextButton(onClick = onToggle) { Text("收起") }
                     }
@@ -1304,137 +1308,434 @@ private fun BoxScope.LogDock(log: List<String>, open: Boolean, onToggle: () -> U
             }
         }
     }
-    if (shareOpen) {
-        ShareLogDialog(onDismiss = { shareOpen = false })
+    if (exportOpen) {
+        LogExportDialog(onDismiss = { exportOpen = false })
     }
 }
 
 /**
- * 挑一份日志分享出去（2026-10-19 用户："让其他用户提供某一次的日志，能不能一键"）。
- * 列最近 40 份（根目录 = 被杀的 / done/ 完整跑完 / abort/ 中途退出），点一下进系统分享面板，
- * 微信 / QQ / 邮件都能直接把 .log 文件发出去。
+ * 日志与诊断包（2026-10-27 用户口径，两级 = **本次运行 → 单局**）。
+ *
+ * ```
+ * ▸ 本次运行 10-27 21:47   成功 5/5 局 · 1小时50分        [生成诊断包]
+ *     ├ 第 1 局 21:49 成功 26分钟 51000分                [选这一局]
+ *     └ 第 5 局 23:40 成功 27分钟 51600分
+ * ```
+ *
+ * * 顶层「生成诊断包」= session + **该次运行的全部单局**（+ 同时段的崩溃记录）；
+ * * 某一局「选这一局」= session + **这一局**；
+ * * 只打用户选中的，**不扫全部历史**；
+ * * 生成只落在 cache，界面上「保存到本地」才写进公共「下载」（= 以前的"复制到下载"）；
+ * * 老的三件套（分享 / 打开 / 复制到下载）仍保留，但降级到"点某一行才展开"的原始文件层；
+ * * **只有会话日志的运行折叠成一行**（每次启动都会新增一条，摊开会把有用的运行挤出屏幕）。
  */
 @Composable
-private fun ShareLogDialog(onDismiss: () -> Unit) {
+private fun LogExportDialog(onDismiss: () -> Unit) {
     val ctx = LocalContext.current
-    val files = remember { LogFile.listRecent(40) }
-    val teamRec = remember { TeamRunLog.stats() }
+    val scope = rememberCoroutineScope()
+    val sessions = remember { LogFile.listSessions(20) }
+    // ★只有会话日志的运行（开一下应用就被关掉）单独折叠成一行（2026-10-27 用户："折叠一下这些仅会话的"）：
+    //   每次启动都会新增一条，摊开摆会把真正有单局的运行挤出屏幕。
+    //   例外：**本次运行**哪怕还没跑出单局，也留在上面（它才是用户最可能要的那条）
+    val withRuns = remember(sessions) { sessions.filter { it.runs.isNotEmpty() || it.current } }
+    val emptyOnly = remember(sessions) { sessions.filter { it.runs.isEmpty() && !it.current } }
+    // 默认展开最近一次**有单局**的运行：用户八成就是来发"刚才那次"的
+    var openSession by remember {
+        mutableStateOf<String?>((withRuns.firstOrNull { it.runs.isNotEmpty() } ?: withRuns.firstOrNull())?.key)
+    }
+    var emptyOpen by remember { mutableStateOf(false) }
+    var openFiles by remember { mutableStateOf<String?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    var pack by remember { mutableStateOf<DiagPack.Result?>(null) }
+
+    fun makePack(title: String, entries: List<LogFile.LogEntry>) {
+        if (busy) return
+        busy = true
+        scope.launch {
+            val r = runCatching {
+                withContext(Dispatchers.IO) { DiagPack.build(ctx, title, entries.map { it.f }) }
+            }
+            busy = false
+            r.onSuccess { pack = it }
+                .onFailure { Toast.makeText(ctx, "生成失败：${it.message ?: "原因未知"}", Toast.LENGTH_LONG).show() }
+        }
+    }
+
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
-        title = { Text("分享日志") },
+        title = { Text("日志与诊断包") },
         text = {
             Column {
-                // ★组队记录导出（2026-10-24 用户："导出按钮设置在日志导出页面里面"）
-                TeamRunExportBlock(ctx, teamRec)
-                HorizontalDivider(Modifier.padding(vertical = 8.dp))
                 Text(
-                    "按时间倒序，点一份即弹出分享（微信/QQ/邮件）。命名：run_开始时间_类型__结果_结束时间，" +
-                        "类型 MAZE=跑迷宫一局、REROLL=只刷开局一次；条目前的 done/ = 完整跑完、" +
-                        "abort/ = 中途退出，没有目录前缀 = 进程被杀（没来得及收尾）。" +
-                        "发「刚才那一次」按结束时间找就行。",
+                    "选一整次运行 = 会话 + 该次全部单局；选某一局 = 只打这一局。",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                if (busy) {
+                    Spacer(Modifier.height(6.dp))
+                    LinearProgressIndicator(Modifier.fillMaxWidth())
+                }
                 Spacer(Modifier.height(8.dp))
-                if (files.isEmpty()) {
-                    Text("还没有日志文件（跑一局就有了）")
-                } else {
-                    LazyColumn(Modifier.height(380.dp)) {
-                    items(files.size) { i ->
-                        val e = files[i]
-                        // ★三个动作（2026-10-19 用户：模拟器上没微信/QQ，分享面板没用）：
-                        //   分享 = 系统分享面板；打开 = 文件管理器/文本查看器；复制 = 拷进公共 Download
-                        Row(
-                            Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Column(Modifier.weight(1f)) {
-                                Text(
-                                    (if (e.dir.isNotEmpty()) "${e.dir}/ " else "") + e.name,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    fontFamily = FontFamily.Monospace,
-                                    maxLines = 2,
-                                )
-                                Text(
-                                    "${e.time} ｜ ${e.sizeKb} KB",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                LazyColumn(Modifier.height(400.dp)) {
+                    if (sessions.isEmpty()) {
+                        item { Text("还没有日志（跑一局就有了）", style = MaterialTheme.typography.bodyMedium) }
+                    }
+                    items(withRuns) { s ->
+                        SessionRow(
+                            s = s,
+                            expanded = openSession == s.key,
+                            onToggle = { openSession = if (openSession == s.key) null else s.key },
+                            onPack = { makePack(s.title, s.files) },
+                        )
+                        if (openSession == s.key) {
+                            for (r in s.runs) {
+                                RunRow(
+                                    r = r,
+                                    filesOpen = openFiles == r.key,
+                                    onToggleFiles = { openFiles = if (openFiles == r.key) null else r.key },
+                                    onPack = {
+                                        // 单局诊断包 = 会话 + 这一局（会话日志有就带上，没有就只带这一局）
+                                        makePack(
+                                            "${s.title} / ${r.title}",
+                                            listOfNotNull(s.sessionFile) + r.files,
+                                        )
+                                    },
                                 )
                             }
-                            TextButton(onClick = {
-                                runCatching { LogFile.share(ctx, e.f) }
-                                    .onFailure { err ->
-                                        Toast.makeText(ctx, "分享失败：${err.message ?: "原因未知"}", Toast.LENGTH_LONG).show()
-                                    }
-                            }) { Text("分享", style = MaterialTheme.typography.labelSmall) }
-                            TextButton(onClick = {
-                                if (!LogFile.openWithViewer(ctx, e.f)) {
-                                    Toast.makeText(ctx, "没有能打开它的应用", Toast.LENGTH_SHORT).show()
-                                }
-                            }) { Text("打开", style = MaterialTheme.typography.labelSmall) }
-                            TextButton(onClick = {
-                                runCatching { LogFile.copyToDownloads(ctx, e.f) }
-                                    .onSuccess { Toast.makeText(ctx, "已复制到下载目录", Toast.LENGTH_SHORT).show() }
-                                    .onFailure { err ->
-                                        Toast.makeText(ctx, "复制失败：${err.message ?: "原因未知"}", Toast.LENGTH_LONG).show()
-                                    }
-                            }) { Text("复制", style = MaterialTheme.typography.labelSmall) }
+                            if (s.runs.isEmpty()) {
+                                Text(
+                                    "这次还没有单局日志（会话日志就在这一条里）",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(start = 10.dp, bottom = 6.dp),
+                                )
+                            }
                         }
-                        HorizontalDivider()
+                    }
+                    if (emptyOnly.isNotEmpty()) {
+                        item {
+                            // 折叠行：一次点开，里面是原样的 session 行（每条仍可单独生成诊断包）
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clickable { emptyOpen = !emptyOpen }
+                                    .padding(vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    if (emptyOpen) "▾" else "▸",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary,
+                                )
+                                Spacer(Modifier.width(6.dp))
+                                Text(
+                                    "其余 ${emptyOnly.size} 次运行（只有会话日志）",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.weight(1f),
+                                )
+                            }
+                            if (emptyOpen) {
+                                for (s in emptyOnly) {
+                                    SessionRow(
+                                        s = s,
+                                        expanded = false,
+                                        onToggle = {},
+                                        onPack = { makePack(s.title, s.files) },
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    item {
+                        HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                        TeamRunEntry(remember { TeamRunLog.stats() })
                     }
                 }
             }
-            }
         },
+    )
+
+    pack?.let { p ->
+        AlertDialog(
+            // 用户口径（2026-10-27）：只有「取消 / 保存到本地」，不要"发送/分享"——
+            // 模拟器里一般不装微信/QQ，分享面板点了也是空的；保存到本地 = 以前的「复制到下载」。
+            onDismissRequest = {
+                DiagPack.discard(p)
+                pack = null
+            },
+            title = { Text("诊断包") },
+            text = {
+                Column {
+                    Text(p.name, style = MaterialTheme.typography.bodyLarge, fontFamily = FontFamily.Monospace)
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "${p.fileCount} 份日志 · ${(p.bytes + 1023) / 1024} KB",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    pack = null
+                    scope.launch {
+                        runCatching { withContext(Dispatchers.IO) { DiagPack.save(ctx, p) } }
+                            .onSuccess {
+                                Toast.makeText(ctx, "已保存到 $it", Toast.LENGTH_LONG).show()
+                                DiagPack.discard(p)
+                            }
+                            .onFailure {
+                                Toast.makeText(ctx, "保存失败：${it.message ?: "原因未知"}", Toast.LENGTH_LONG).show()
+                            }
+                    }
+                }) { Text("保存到本地") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    DiagPack.discard(p)
+                    pack = null
+                }) { Text("取消") }
+            },
+        )
+    }
+}
+
+/**
+ * 一级行 = **本次运行**：中文标题 + 状态徽章 + 「生成诊断包」。
+ * 点标题区展开/收起二级（单局列表）。
+ */
+@Composable
+private fun SessionRow(
+    s: LogFile.SessionEntry,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+    onPack: () -> Unit,
+) {
+    Column(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(top = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Row(
+                Modifier
+                    .weight(1f)
+                    .clickable(onClick = onToggle)
+                    .padding(vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    if (expanded) "▾" else "▸",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+                Spacer(Modifier.width(6.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        s.title,
+                        style = MaterialTheme.typography.bodyLarge,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        "${s.timeText} ｜ ${s.detail}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            Spacer(Modifier.width(6.dp))
+            LogBadge(s.badge, s.tone)
+            TextButton(onClick = onPack) { Text("诊断包", style = MaterialTheme.typography.labelSmall) }
+        }
+        // 单局行（二级）由对话框按 s.runs 逐个渲染 —— 这里只管这一行本身
+        HorizontalDivider()
+    }
+}
+
+/**
+ * 二级行 = **单局**：`第 1 局 · 21:49` + 成功/失败徽章 + 时长/总分 + 「选这一局」。
+ * 点行本身展开原始文件（分享 / 打开 / 复制到下载）——分享面板就降在这一层。
+ */
+@Composable
+private fun RunRow(
+    r: LogFile.RunEntry,
+    filesOpen: Boolean,
+    onToggleFiles: () -> Unit,
+    onPack: () -> Unit,
+) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(start = 14.dp),
+    ) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onToggleFiles)
+                .padding(top = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(
+                    r.title,
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    "${r.timeText} ｜ ${r.detail}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Spacer(Modifier.width(6.dp))
+            LogBadge(r.badge, r.tone)
+            TextButton(onClick = onPack) { Text("选这一局", style = MaterialTheme.typography.labelSmall) }
+        }
+        if (filesOpen) {
+            Column(Modifier.padding(start = 8.dp, bottom = 4.dp)) {
+                for (e in r.files) LogFileRow(e)
+            }
+        }
+    }
+}
+
+/** 原始文件行：文件名（等宽，对日志时能直接念出来）+ 三个老动作 */
+@Composable
+private fun LogFileRow(e: LogFile.LogEntry) {
+    val ctx = LocalContext.current
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(top = 4.dp),
+    ) {
+        Text(
+            e.name,
+            style = MaterialTheme.typography.labelSmall,
+            fontFamily = FontFamily.Monospace,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Text(
+            "${e.time} ｜ ${e.sizeKb} KB" + (if (e.dir.isNotEmpty()) " ｜ ${e.dir}/" else ""),
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        // ★三个动作（2026-10-19 用户：模拟器上没微信/QQ，分享面板没用）：
+        //   分享 = 系统分享面板；打开 = 文件管理器/文本查看器；复制 = 拷进公共 Download
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+            TextButton(onClick = {
+                runCatching { LogFile.share(ctx, e.f) }
+                    .onFailure { err ->
+                        Toast.makeText(ctx, "分享失败：${err.message ?: "原因未知"}", Toast.LENGTH_LONG).show()
+                    }
+            }) { Text("分享", style = MaterialTheme.typography.labelSmall) }
+            TextButton(onClick = {
+                if (!LogFile.openWithViewer(ctx, e.f)) {
+                    Toast.makeText(ctx, "没有能打开它的应用", Toast.LENGTH_SHORT).show()
+                }
+            }) { Text("打开", style = MaterialTheme.typography.labelSmall) }
+            TextButton(onClick = {
+                runCatching { LogFile.copyToDownloads(ctx, e.f) }
+                    .onSuccess { Toast.makeText(ctx, "已复制到下载目录", Toast.LENGTH_SHORT).show() }
+                    .onFailure { err ->
+                        Toast.makeText(ctx, "复制失败：${err.message ?: "原因未知"}", Toast.LENGTH_LONG).show()
+                    }
+            }) { Text("复制到下载", style = MaterialTheme.typography.labelSmall) }
+        }
+    }
+}
+
+/** 状态徽章（一级行右侧）：语义色 + 14% 底色，比一行 `done/`、`abort/` 前缀好认 */
+@Composable
+private fun LogBadge(text: String, tone: LogFile.Tone) {
+    val c = when (tone) {
+        LogFile.Tone.GOOD -> StatusColors.good
+        LogFile.Tone.WARN -> StatusColors.warn
+        LogFile.Tone.BAD -> StatusColors.bad
+        LogFile.Tone.IDLE -> StatusColors.idle
+    }
+    Text(
+        text,
+        style = MaterialTheme.typography.labelSmall,
+        color = c,
+        maxLines = 1,
+        modifier = Modifier
+            .clip(MaterialTheme.shapes.extraSmall)
+            .background(c.copy(alpha = 0.14f))
+            .padding(horizontal = 6.dp, vertical = 2.dp),
     )
 }
 
 /**
- * 「组队记录」导出块（2026-10-24 用户要求：导出按钮放进日志导出页）。
+ * 「组队记录」也收成一级条目（2026-10-24 用户：导出按钮放进日志导出页；
+ * 2026-10-27 按同一套层级放进二级）。
  *
  * 内容是 `logs/team_runs.jsonl` —— 每次**编队决策**一行 JSON，字段与 PC 版
  * `team_build.log_run()` 对齐（stage/池/遗物/目标队+理由/属性/权重快照/分数/questId…），
  * `run_id` 全球唯一（`stage|时间|随机`）⇒ 多台设备的记录合并时不会重复。
- * 三个动作与下面的 .txt 列表一致：分享（微信/QQ）/ 打开（文件管理器）/ 复制到公共 Download。
  */
 @Composable
-private fun TeamRunExportBlock(ctx: Context, s: TeamRunLog.Stats) {
+private fun TeamRunEntry(s: TeamRunLog.Stats) {
+    val ctx = LocalContext.current
     val f = remember { TeamRunLog.currentFile() }
-    Text("组队记录", style = MaterialTheme.typography.labelMedium)
-    Spacer(Modifier.height(2.dp))
-    if (f == null || !f.exists() || s.runs == 0) {
-        Text(
-            "还没有组队记录 —— 跑一局、进一次编组页就会自动记一行",
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        return
-    }
-    Text(
-        "${s.runs} 条 ｜ ${(s.bytes + 1023) / 1024} KB" +
-            (if (s.files > 1) " ｜ 另有 ${s.files - 1} 份历史" else "") +
-            "\n每次编队记一行（关卡 / 池 / 遗物 / 目标队 / 分数），导出后可在 PC 端复盘",
-        style = MaterialTheme.typography.labelSmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-    )
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        TextButton(onClick = {
-            runCatching { LogFile.share(ctx, f) }
-                .onFailure { Toast.makeText(ctx, "分享失败：${it.message ?: "原因未知"}", Toast.LENGTH_LONG).show() }
-        }) { Text("分享", style = MaterialTheme.typography.labelSmall) }
-        TextButton(onClick = {
-            if (!LogFile.openWithViewer(ctx, f)) {
-                Toast.makeText(ctx, "没有能打开它的应用", Toast.LENGTH_SHORT).show()
+    var open by remember { mutableStateOf(false) }
+    val ready = f != null && f.exists() && s.runs > 0
+    val file = if (open && ready) f else null
+    Column(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .clickable(enabled = ready, onClick = { open = !open })
+                .padding(vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("组队记录", style = MaterialTheme.typography.bodyLarge)
+                Text(
+                    if (ready) {
+                        "${s.runs} 条 ｜ ${(s.bytes + 1023) / 1024} KB" +
+                            (if (s.files > 1) " ｜ 另有 ${s.files - 1} 份历史" else "")
+                    } else {
+                        "还没有组队记录 —— 跑一局、进一次编组页就会自动记一行"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
-        }) { Text("打开", style = MaterialTheme.typography.labelSmall) }
-        TextButton(onClick = {
-            runCatching { LogFile.copyToDownloads(ctx, f) }
-                .onSuccess { Toast.makeText(ctx, "已复制到下载目录", Toast.LENGTH_SHORT).show() }
-                .onFailure { Toast.makeText(ctx, "复制失败：${it.message ?: "原因未知"}", Toast.LENGTH_LONG).show() }
-        }) { Text("复制到下载", style = MaterialTheme.typography.labelSmall) }
+            Spacer(Modifier.width(8.dp))
+            LogBadge(if (ready) "可导出" else "空", LogFile.Tone.IDLE)
+            Spacer(Modifier.width(6.dp))
+            Text(
+                if (open) "▾" else "▸",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+            )
+        }
+        if (file != null) {
+            // 每次编队一行（关卡 / 池 / 遗物 / 目标队 / 分数），导出后可在 PC 端复盘
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                TextButton(onClick = {
+                    runCatching { LogFile.share(ctx, file) }
+                        .onFailure { Toast.makeText(ctx, "分享失败：${it.message ?: "原因未知"}", Toast.LENGTH_LONG).show() }
+                }) { Text("分享", style = MaterialTheme.typography.labelSmall) }
+                TextButton(onClick = {
+                    if (!LogFile.openWithViewer(ctx, file)) {
+                        Toast.makeText(ctx, "没有能打开它的应用", Toast.LENGTH_SHORT).show()
+                    }
+                }) { Text("打开", style = MaterialTheme.typography.labelSmall) }
+                TextButton(onClick = {
+                    runCatching { LogFile.copyToDownloads(ctx, file) }
+                        .onSuccess { Toast.makeText(ctx, "已复制到下载目录", Toast.LENGTH_SHORT).show() }
+                        .onFailure { Toast.makeText(ctx, "复制失败：${it.message ?: "原因未知"}", Toast.LENGTH_LONG).show() }
+                }) { Text("复制到下载", style = MaterialTheme.typography.labelSmall) }
+            }
+        }
+        HorizontalDivider()
     }
 }
 

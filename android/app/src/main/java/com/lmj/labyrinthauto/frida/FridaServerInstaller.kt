@@ -125,14 +125,14 @@ object FridaServerInstaller {
         if (deviceHas(asset)) {
             deviceReady = true
             AppState.setComponent("运行组件已就绪（复用设备上的副本，未下载）")
-            AppState.addLog("设备上已有同版本 huabanxie-server（${asset.rawBytes} 字节）→ 跳过下载")
+            AppState.addLog("设备上已有同版本的运行组件（${asset.rawBytes} 字节）→ 跳过下载")
             return null
         }
 
-        // ③ 只在 WiFi 下自动下（省流量；用流量时等开跑那一刻再下）
-        if (wifiOnly && !isWifi(ctx)) {
+        // ③ 只在"不计流量"的网络下自动下（省流量；用流量时等开跑那一刻再下）
+        if (wifiOnly && !canAutoDownload(ctx)) {
             AppState.setComponent("运行组件未下载")
-            AppState.addLog("当前不是 WiFi，先不自动下载运行组件（开始跑时再下，约 42MB）")
+            AppState.addLog("当前走的是移动流量，先不自动下载运行组件（开始跑时再下，约 42MB）")
             return null
         }
 
@@ -147,7 +147,7 @@ object FridaServerInstaller {
         val out = File(ctx.filesDir, "${LOCAL_BASE}-${asset.abi}")
         val had = if (part.isFile) part.length() else 0L
         AppState.addLog(
-            "开始下载运行组件（huabanxie-server，解压后 ${asset.rawBytes / 1048576}MB，压缩包约 42MB）" +
+            "开始下载运行组件（解压后 ${asset.rawBytes / 1048576}MB，压缩包约 42MB）" +
                 if (had > 0) "，从 ${had / 1048576}MB 续传" else "",
         )
         AppState.setComponent("运行组件下载中…")
@@ -155,7 +155,7 @@ object FridaServerInstaller {
         try {
             download(url, part) { pct, done, total ->
                 AppState.setComponent("运行组件下载中 $pct%（${done / 1048576}/${total / 1048576}MB）")
-                if (pct % 12 < 2) AppState.addLog("下载 huabanxie-server：$pct%（${done / 1048576}MB / ${total / 1048576}MB）")
+                if (pct % 12 < 2) AppState.addLog("下载运行组件：$pct%（${done / 1048576}MB / ${total / 1048576}MB）")
             }
         } catch (t: Throwable) {
             AppState.setComponent("运行组件下载失败")
@@ -176,7 +176,7 @@ object FridaServerInstaller {
 
         if (out.length() != asset.rawBytes || !rawSha.equals(asset.rawSha256, ignoreCase = true)) {
             AppState.addLog(
-                "huabanxie-server 校验失败（${out.length()}/${asset.rawBytes}，sha256 ${rawSha.take(12)}…）→ 已删除",
+                "运行组件校验失败（${out.length()}/${asset.rawBytes}，sha256 ${rawSha.take(12)}…）→ 已删除",
             )
             out.delete()
             AppState.setComponent("运行组件校验失败")
@@ -185,7 +185,8 @@ object FridaServerInstaller {
         out.setExecutable(true, false)
         localReady = out
         AppState.setComponent("运行组件已就绪")
-        AppState.addLog("运行组件已就绪：${out.name}（${out.length()} 字节，sha256 校验通过）")
+        // 只报大小/校验结果，不写文件名（2026-10-28 用户："日志不要显示下载的组件名"）
+        AppState.addLog("运行组件已就绪（${out.length()} 字节，sha256 校验通过）")
         return out
     }
 
@@ -199,32 +200,32 @@ object FridaServerInstaller {
         // wifiOnly=false：真正开跑时**不再限制网络**，该下就下（用户点了开始就是在等这个）
         val local = prepare(ctx, wifiOnly = false)
         if (local == null && !deviceReady) {
-            AppState.setFridaStatus("拿不到 huabanxie-server（下载失败或该架构没有发布件，看日志）")
+            AppState.setFridaStatus("拿不到运行组件（下载失败或该架构没有发布件，看日志）")
             return false
         }
         if (local != null && !deviceCopyUpToDate(local)) {
-            AppState.addLog("把 huabanxie-server 拷到 $DEVICE_PATH（要 root，首次会弹授权框）…")
+            AppState.addLog("把运行组件拷到设备目录（要 root，首次会弹授权框）…")
             val r = RootShell.exec(
                 "cp -f ${local.absolutePath} $DEVICE_PATH && chmod 755 $DEVICE_PATH && ls -l $DEVICE_PATH",
                 180_000L,
             )
-            AppState.addLog("拷贝结果：${r.text.take(160)}")
+            AppState.addLog("拷贝结果：${redact(r.text.take(160))}")
         }
         return launch(port)
     }
 
     private suspend fun launch(port: Int): Boolean {
         RootShell.exec("chmod 755 $DEVICE_PATH", 8_000L)
-        AppState.addLog("启动 huabanxie-server（root）：$DEVICE_PATH -l 0.0.0.0:$port -D")
+        AppState.addLog("启动运行组件（root）：-l 0.0.0.0:$port -D")
         RootShell.exec("$DEVICE_PATH -l 0.0.0.0:$port -D", 20_000L)
         repeat(25) {
             delay(400)
             if (portOpen(port)) {
-                AppState.addLog("huabanxie-server 已起来（127.0.0.1:$port 通了）")
+                AppState.addLog("运行组件已起来（127.0.0.1:$port 通了）")
                 return true
             }
         }
-        AppState.addLog("等不到 huabanxie-server 端口（看是不是 root 被拒了）")
+        AppState.addLog("等不到运行组件端口（看是不是 root 被拒了）")
         return false
     }
 
@@ -249,7 +250,7 @@ object FridaServerInstaller {
         val sha = Regex("[0-9a-fA-F]{64}").find(text)?.value ?: return true
         if (sha.equals(asset.rawSha256, ignoreCase = true)) return true
         AppState.addLog(
-            "设备上的 huabanxie-server 大小对但 sha256 不符（${sha.take(12)}…，应为 ${asset.rawSha256.take(12)}…）" +
+            "设备上的运行组件大小对但 sha256 不符（${sha.take(12)}…，应为 ${asset.rawSha256.take(12)}…）" +
                 "→ 不复用它，改为下载",
         )
         return false
@@ -330,13 +331,41 @@ object FridaServerInstaller {
         true
     }.getOrDefault(false)
 
-    /** 自动下载只在 WiFi 下做（移动网络留给"真正开跑时"） */
-    private fun isWifi(ctx: Context): Boolean = runCatching {
+    /**
+     * 能不能"顺手"下载（WiFi / 有线 / 系统标注的不计费网络；移动流量留给"真正开跑时"）。
+     *
+     * ⚠ 2026-10-27 实测（0.3.10 前）：这里以前**恒为 false** —— manifest 少声明
+     * `ACCESS_NETWORK_STATE`，[ConnectivityManager.getNetworkCapabilities] 直接抛 SecurityException，
+     * 又被 runCatching 静默吞掉，于是"启动自动下载运行组件"在任何设备上都没真正执行过
+     * （老用户机器里早有副本，所以从来没暴露）。
+     *
+     * 现在：判不出来就**允许下载**并写日志 —— 宁可多花 42MB，也不要永远不下。
+     */
+    private fun canAutoDownload(ctx: Context): Boolean = runCatching {
         val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return false
+        val active = cm.activeNetwork
+        val caps = active?.let { cm.getNetworkCapabilities(it) }
+        if (caps == null) {
+            AppState.addLog("判不出当前网络（activeNetwork=$active）→ 按「可以下载」处理")
+            return@runCatching true
+        }
         caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
-    }.getOrDefault(false)
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) ||
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+    }.getOrElse {
+        AppState.addLog("网络判定出错（${it.javaClass.simpleName}: ${it.message}）→ 按「可以下载」处理")
+        true
+    }
+
+    /**
+     * 日志脱敏（2026-10-28 用户："日志不要显示下载的组件名，和所有的 huabanxie-server 字样"）。
+     *
+     * root 命令的输出（`ls -l` / `sha256sum`）会带真实文件名和路径，进日志前一律换成「运行组件」；
+     * 用正则挡住整个名字（含版本与架构后缀），以后别处再漏也能兜住。
+     */
+    private fun redact(text: String): String = text
+        .replace(Regex("huabanxie[\\w.\\-]*"), "运行组件")
+        .replace(DEVICE_PATH, "运行组件")
 
     /** 当前 ABI 的规范名（与发布件命名一致） */
     private fun abiOf(): String {
