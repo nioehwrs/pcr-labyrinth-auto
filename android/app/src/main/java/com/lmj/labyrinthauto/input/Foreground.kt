@@ -1,5 +1,6 @@
 package com.lmj.labyrinthauto.input
 
+import android.os.Build
 import android.os.SystemClock
 import com.lmj.labyrinthauto.core.AppState
 import com.lmj.labyrinthauto.frida.RootShell
@@ -74,33 +75,74 @@ object Foreground {
     // ────────────────────────── 内部 ──────────────────────────
 
     /**
-     * 从 `dumpsys input` 的 `FocusedWindows` 段取前台包名。
+     * 取前台包名。
      *
-     * ⚠读数失败**只返回 null，绝不回退到 `dumpsys activity` / `dumpsys window`** ——
-     *   那两条都会把 system_server 打崩（见类注释）。宁可不点。
+     * 两条来源，按系统版本分流（2026-10-27 实测补的坑）：
+     *
+     *  · **Android 13+（SDK ≥ 33）**：`dumpsys input` 的 `FocusedWindows` 段有内容，用它。
+     *    实测（Android 15 / MuMu）：
+     *      `FocusedWindows:` → `displayId=0, name='71d0adf com.bilibili.priconne/com.bilibili.priconne.MainActivity'`
+     *
+     *  · **Android 12 及以下（SDK ≤ 32）**：`dumpsys input` 里 `FocusedWindows:` 是**空段**
+     *    （实测 Samsung b0q / Android 12 / SDK 32：`focusedWindows:` 后面直接是 `FocusRequests:`，
+     *    里面只有一堆 `name='xxx ScreenDecorOverlay'` 这类系统窗口，没有带组件的窗口名）
+     *    ⇒ 解析必然失败，表现为日志里的
+     *      `前台读不到（dumpsys input：没有 FocusedWindows）→ 本轮不点`
+     *    于是"读不到前台"→ 一步都不点（用户 2026-10-27 报的"Android 12 上不动了"）。
+     *    这类系统改用 `dumpsys window displays` 里的 `mCurrentFocus`（实测有、且很快）。
+     *
+     *  ⚠为什么敢在 12 上用 `dumpsys window displays`：那条命令会遍历任务树，Android 15 上会踩
+     *    `TaskUtils.shouldIgnoreDesktopHomeOcclusion`（desktop windowing 的 15 新代码）把 system_server
+     *    打崩；**Android 12 没有这段代码**，实测安全。所以这里严格按 SDK 分流，绝不在 15 上回退。
+     *
+     *  ⚠两条都失败时**只返回 null**（不点），绝不回退到 `dumpsys activity`。
      */
     private suspend fun readFocusPkg(): String? {
-        val out = RootShell.exec(CMD_INPUT, 8_000L).out
-        val name = FOCUS_NAME.find(out)?.groupValues?.getOrNull(1)
-        if (name != null) {
-            COMPONENT.find(name)?.groupValues?.getOrNull(1)?.let { return it }
+        // 本机已经确定用哪条源之后，就只跑那一条（少起一次 su）
+        if (!useWindowSource) {
+            val out = RootShell.exec(CMD_INPUT, 8_000L).out
+            val name = FOCUS_NAME.find(out)?.groupValues?.getOrNull(1)
+            if (name != null) {
+                COMPONENT.find(name)?.groupValues?.getOrNull(1)?.let { return it }
+            }
+            if (Build.VERSION.SDK_INT <= 32) {
+                // Android 12 及以下：input 这条路结构不同，换 WMS 焦点（见方法注释）
+                useWindowSource = true
+                AppState.addLog(
+                    "前台判定：本机 dumpsys input 取不到焦点窗口（Android ${Build.VERSION.SDK_INT}）" +
+                        "→ 改用 dumpsys window displays 的 mCurrentFocus（仅 12 及以下可走，15 会崩系统）",
+                )
+            } else {
+                val now = System.currentTimeMillis()
+                if (now - lastMissLogAt > LOG_EVERY_MS) {
+                    lastMissLogAt = now
+                    AppState.addLog(
+                        "前台读不到（dumpsys input" +
+                            (if (name != null) "：焦点窗口名「$name」不含组件名" else "：没有 FocusedWindows") +
+                            "）→ 本轮不点",
+                    )
+                }
+                return null
+            }
         }
-        // 读不到：要么真没焦点窗口（锁屏/转场），要么焦点窗口名不含 "包名/Activity"。
-        // 后者如果是常态（比如某个界面永远读不到），这里能第一时间在日志里看出来。
+        val w = RootShell.exec(CMD_WINDOW, 8_000L).out
+        COMPONENT.find(w)?.groupValues?.getOrNull(1)?.let { return it }
         val now = System.currentTimeMillis()
         if (now - lastMissLogAt > LOG_EVERY_MS) {
             lastMissLogAt = now
-            AppState.addLog(
-                "前台读不到（dumpsys input" +
-                    (if (name != null) "：焦点窗口名「$name」不含组件名" else "：没有 FocusedWindows") +
-                    "）→ 本轮不点",
-            )
+            AppState.addLog("前台读不到（dumpsys window displays：没有 mCurrentFocus）→ 本轮不点")
         }
         return null
     }
 
+    /** 本机是否改用 WMS 焦点源（Android 12 及以下；试出来一次就记住） */
+    @Volatile private var useWindowSource = false
+
     /** 只取焦点窗口那几行：`FocusedWindows:` 之后 3 行内就有 name（全量 dump 没必要，也省时间）。 */
     private const val CMD_INPUT = "dumpsys input | grep -A3 -m1 FocusedWindows"
+
+    /** Android 12 及以下的备用源：`mCurrentFocus=Window{… u0 包名/Activity}`（只取第一行） */
+    private const val CMD_WINDOW = "dumpsys window displays | grep -m1 mCurrentFocus"
 
     /** `displayId=0, name='71d0adf com.bilibili.priconne/com.bilibili.priconne.MainActivity'` */
     private val FOCUS_NAME = Regex("name='([^']*)'")
