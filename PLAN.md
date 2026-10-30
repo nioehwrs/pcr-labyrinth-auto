@@ -239,6 +239,21 @@ APK 里没有 Python 了，于是"谁打电话"这件事有两条做法：
 5. Frida 路线：~~先做方案 A~~ → **方案 A（frida-inject 自注入）实测不可用，改用"frida-server 注入 + agent 自开 socket"**（§4 定案，2026-10-14）。
 6. 对拍：用例放 `labyrinth_auto_android/tests/fixtures/`，**由 PC 版脚本一键生成**，APK 版拿它自测（P4 才需要）。
 
+**已定（2026-10-30）**
+
+7. **ARM（arm64 真机）支持：暂不做**，方案与调研结论见 §11。当前行为是"明确告知不支持"（`AbiRepair.deviceSupportsX86_64()` 前置，不再白试重装/注入）。
+8. `huabanxie-server` **不指望 pcrtool 作者出 arm64 版**（用户只是普通使用者，问不到）；将来要支持 ARM 就**自己按同一套去特征改造重编一个 arm64 frida**（见 §11.4）。
+
+**渠道服验证状态（2026-10-30，0.4.0 发布前）**
+
+| 服务器 | 状态 |
+|---|---|
+| MuMu 渠道服（`com.bilibili.priconne.yofun.mumu`） | ✅ **实机跑通**：启动渠道客户端 → 抓凭证 → 登录 → 到黎明界 top → 进地图 → 选人编队 → 战斗 → 结算 → 战后选人 → 下一节点 |
+| 小米 / 华为 / vivo / OPPO / 九游 / 4399 / 应用宝 | ⚠ **理论可用、未实测**（同一套渠道服登录协议 + 同一套 `BilibiliGameGatewayFactory` 适配，只差实测） |
+| 国服 B 服（`com.bilibili.priconne`） | 0.3.x 系列一直在用（账密登录） |
+
+要补齐其余渠道，需要：对应渠道的账号 + 已装该渠道客户端（并预置 `x86_64` 架构）+ 开服时段；验收口径与 MuMu 那次相同（能进迷宫、能打、能结算）。
+
 **暂无需你定的** —— P0/P1 可以直接按本文件开跑。
 
 ---
@@ -257,3 +272,64 @@ APK 里没有 Python 了，于是"谁打电话"这件事有两条做法：
 - **用例 / fixture**：就是上面那份"输入 + 期望输出"存成的 JSON 文件，PC 版跑一遍自动生成，APK 版拿它自测。
 - **无障碍（Accessibility）**：安卓官方给"辅助功能"用的 API，可以模拟点按/滑动，不需要 root。
 - **悬浮窗**：叠在其它 App 上面显示的小窗口，需要 `SYSTEM_ALERT_WINDOW` 权限。
+
+---
+
+## 11. ARM（arm64 真机）支持 —— **暂不做**，能做的话这样做（2026-10-30 记录，供以后捡起来）
+
+### 11.1 先纠正一个误解
+
+"ARM 上读不到游戏信息"**不成立**。读不到只发生在 **MuMu/Houdini 这一种组合**：arm64 游戏跑在 x86_64 宿主进程里被翻译执行，`/proc/<pid>/maps` 里没有 `libil2cpp.so`。
+真机 arm64 上游戏是**原生**的，il2cpp 模块正常存在于进程里，arm64 版 frida 注入后能正常枚举模块、读内存、调 `il2cpp_*` 导出 —— 该有的信息都在。
+
+当前不支持，纯粹是"**我们只发了 x86_64 的工具链**"：
+
+| 层 | 现状 | 卡在哪 |
+|---|---|---|
+| 助手 APK | `abiFilters = x86_64`、`jniLibs/` 只有 x86_64 | ARM 机器**装不上**（`INSTALL_FAILED_NO_MATCHING_ABIS`） |
+| `libfrida_bridge.so` | 121MB，静态链 `libfrida-core.a` | 只有 x86_64 一份 |
+| 设备端 `huabanxie-server` | 只有 `-x86_64.gz` 发布件 | 只有 x86_64 一份 |
+
+### 11.2 需要的改动清单（按顺序）
+
+1. **`libfrida_bridge.so` 出 arm64**（可控）
+   - 源码 `tools/frida_bridge/bridge.c`（8.4KB JNI 壳）；构建 `tools/build_frida_bridge.ps1`
+   - 需要 `frida-core-devkit-17.16.4-android-arm64`（当前用的是 `D:\Environment\frida-devkit-17.16.4`）
+   - 脚本里 `--target=x86_64-linux-android` 和输出目录 `jniLibs\x86_64` 是写死的 → 加 `-Abi` 参数；产物放 `jniLibs/arm64-v8a/`
+   - 放开 `abiFilters`；**注意 APK 体积**（两个 121MB）→ 建议 ABI splits 或按需下载桥接库
+2. **arm64 的 `huabanxie-server`**（不可控，见 11.4）
+   - 发布件命名 `huabanxie-server-17.16.4-arm64.gz`，`FridaServerInstaller.ASSETS` 加一行（解压字节数 + sha256）
+   - `abiOf()` 已支持 arm64 映射，不用改
+   - 版本三方必须对齐：server / 桥接库内嵌的 frida-core / PC 端 frida 客户端
+3. **判定逻辑去掉写死 x86_64**
+   - `AbiRepair.TARGET_ABI` → "设备首选 ABI"（`Build.SUPPORTED_ABIS.first()`）
+   - `deviceSupportsX86_64()` → `supportsTarget()`
+   - `ensure()` 在真机上应退化成 **no-op**（真机上游戏本来就该是 arm64，与设备一致就不需要"修"）；`report()` 里"走 ARM 翻译层"的提示只在 x86 宿主上有意义，要按宿主架构分支
+4. **agent 脚本**：基本不用改
+   - 65 处 `il2cpp_*` 都是 `findExportByName` + `NativeFunction`，frida 自动按目标架构处理调用约定（x86_64: rdi/rsi…+xmm0；arm64: x0–x7 + v0）
+   - **已无写死 RVA**（2026-10-30 删掉了 `RVA_INIT`/`RVA_CTOR` 两个死常量，取地址一律走 `luMethodPtrByName`）
+   - 字段偏移：arm64 与 x86_64 都是 LP64，类布局**基本一致**，但要在真机抽查 `LabyrinthTempData` / `ViewLabyrinthMap` / `LabyrinthPanelData` 三个类再确认
+5. **真机环境**（最不确定的部分）
+   - root：Magisk / KernelSU 的 `su` 语义、`/data/local/tmp` 可否执行、SELinux enforcing
+   - 前台检测：走 `dumpsys input` 的 `FocusedWindows`，Android 13+ 正常，12 及以下为空段（模拟器上吃过这个亏）
+   - 反作弊：真机还有 Play Integrity 一类检测，`huabanxie` 的伪装在模拟器上验过，真机要重测
+
+### 11.3 验收标准（最小链路）
+
+真机上：能装 → 能起 server → `attach` 成功 → 能读一次 il2cpp（打印迷宫 panel 列表）→ 再谈跑局。
+
+### 11.4 关于 `huabanxie-server`：它不是"改名的 frida-server"
+
+2026-10-30 对 `D:\pcrtool\assets\frida\huabanxie-server`（x86_64 ELF，111,587,168 字节，与 APK 资产同尺寸）做过字符串取证：
+
+- 经典检测特征**全部为 0**：`frida:rpc`、`gum-js-loop`、`pool-frida`、`gmain`、`frida-agent`、`frida-helper`、`frida_memfd`、`frida-server`
+- 换成了整套 `huabanxie-*`：`/data/local/tmp/huabanxie-helper-`、`huabanxie-agent-{arm,arm64,32,64,<arch>}.so`、`huabanxie_agent_main`、SELinux 标签 `huabanxie_memfd` / `huabanxie_file`、`huabanxie-agent-container` / `huabanxie-agent-emulated`
+- `frida_agent_main`(15) → `huabanxie_agent_main`(20) **长度变了 ⇒ 不是等长 hex patch，是改源码重编**
+- 残留（一般不用于检测）：`/frida/runtime/*.js`、Vala 符号 `_frida_thread`、构建路径 `../subprojects/frida-core/...`
+- 附带发现：这份 server 内部**已包含 arm/arm64 agent 的加载逻辑**，它本身支持注入 64 位 ARM 目标
+
+⇒ **arm64 版不能拿官方 arm64 server 改名了事**，必须用同一套去特征改造重编。用户只是 pcrtool 的普通使用者、问不到作者，所以将来真要做 ARM，就走"**自己按上面的标识清单改 frida 源码 → 编 arm64 server**"这条路（可作为 §11.2 第 2 步的替代实现）。
+
+**路线选择（2026-10-30 用户拍板）**：只走 **A 路线（改源码 + 交叉编译重编）**。"等长二进制字符串替换"这条路评估过、**不采用**，以后不要再提。
+
+自建时的验收：`strings` 扫上面那批特征串必须全为 0，且真机能注入不被踢。

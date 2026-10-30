@@ -49,8 +49,10 @@ class BilibiliGameProtocolGateway(
                 fields = linkedMapOf(
                     "uid" to sdkSession.uid,
                     "access_key" to sdkSession.accessKey,
-                    "platform" to "2",
-                    "channel_id" to "1",
+                    // ★B 服 platform=2/channel_id=1；渠道服 platform=4 + 各自的 channel_id
+                    //   （MuMu=65），由 [GameProtocolProfile] 带下来，别写死。
+                    "platform" to profile.platform,
+                    "channel_id" to profile.channelId,
                     "challenge" to captcha?.challenge,
                     "validate" to captcha?.validate,
                     "seccode" to captcha?.let { "${it.validate}|jordan" },

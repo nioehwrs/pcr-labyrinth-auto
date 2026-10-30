@@ -87,6 +87,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.lmj.labyrinthauto.core.Accounts
 import com.lmj.labyrinthauto.core.AppState
 import com.lmj.labyrinthauto.core.DiagPack
 import com.lmj.labyrinthauto.core.LogFile
@@ -95,6 +96,7 @@ import com.lmj.labyrinthauto.logic.team.TeamRunLog
 import com.lmj.labyrinthauto.frida.FridaServerInstaller
 import com.lmj.labyrinthauto.frida.RootCheck
 import com.lmj.labyrinthauto.net.bilibili.CaptchaChallenge
+import com.lmj.labyrinthauto.net.bilibili.GameServer
 import com.lmj.labyrinthauto.net.bilibili.GeetestPageBuilder
 import com.lmj.labyrinthauto.reroll.RerollConfig
 import com.lmj.labyrinthauto.reroll.RerollSettings
@@ -135,10 +137,13 @@ fun HomeScreen(
     var mazeRuns by remember { mutableStateOf(RerollSettings.loadMazeRuns(context).toString()) }
     var overlayOn by remember { mutableStateOf(RerollSettings.loadOverlayOn(context)) }
     var failStrategy by remember { mutableStateOf(RerollSettings.loadFailStrategy(context)) }
-    // 账号/密码提到首页层：刷开局主按钮挪到「拇指区」底部栏，需要在这里拿到
-    val cred = remember { RerollSettings.loadCredentials(context) }
-    var account by remember { mutableStateOf(cred.first) }
-    var password by remember { mutableStateOf(cred.second) }
+    // 账号/密码提到首页层：刷开局主按钮挪到「拇指区」底部栏，需要在这里拿到。
+    // 2026-10-28：改成多账号可切换（Accounts 表），这里只保存"当前选中账号"的凭证；
+    //   切换/编辑账号由 [AccountsCard] 回填，Accounts 同时把凭证镜像给旧的刷开局链路。
+    val initAccount = remember { Accounts.selected(context) }
+    var account by remember { mutableStateOf(initAccount?.loginId.orEmpty()) }
+    var password by remember { mutableStateOf(initAccount?.secret.orEmpty()) }
+    var accountServer by remember { mutableStateOf(initAccount?.server ?: GameServer.CN_BILIBILI) }
     var logOpen by remember { mutableStateOf(false) }
     // ★应用内「更新记录」（2026-10-23 用户）：内容就是仓库根目录那份 CHANGELOG.md
     var changelogOpen by remember { mutableStateOf(false) }
@@ -248,10 +253,16 @@ fun HomeScreen(
                                             "（去「策略 → 开局角色选择」补上）",
                                         Toast.LENGTH_LONG,
                                     ).show()
+                                // ★渠道服走的是 uid / access_key 直通（2026-10-29 接通），
+                                //   所以这里不再按服务器拦截，只看"凭证齐不齐"。
                                 needAccount && (account.isBlank() || password.isBlank()) ->
                                     Toast.makeText(
                                         context,
-                                        "接口刷开局需要账号密码（去「刷开局」页填写，或把刷开局方式改成局内）",
+                                        if (accountServer.isChannelServer) {
+                                            "渠道服需要 uid / access_key（去「刷开局 → 账号 → 编辑 → 抓取」）"
+                                        } else {
+                                            "接口刷开局需要账号密码（去「刷开局」页填写，或把刷开局方式改成局内）"
+                                        },
                                         Toast.LENGTH_LONG,
                                     ).show()
                                 else -> {
@@ -305,9 +316,10 @@ fun HomeScreen(
                                     AutoForegroundService.ACTION_REROLL_ONLY,
                                 )
                             } else {
+                                // B 服（账密 → SDK）与渠道服（uid/access_key 直通）都走这一条：
+                                // 具体用哪套由 LabyrinthLoginClient 按【选中账号】的服务器决定。
                                 forceOverlayDragOff(context) { overlayDraggable = it }
-                                RerollSettings.saveCredentials(context, account, password)
-                                scope.launch { RerollUseCase.login(context, account, password) }
+                                scope.launch { RerollUseCase.login(context) }
                             }
                         },
                         enabled = !rerollBusy &&
@@ -372,10 +384,16 @@ fun HomeScreen(
                         },
                     )
                     1 -> RerollTab(
-                        account = account,
-                        onAccount = { v -> account = v; RerollSettings.saveCredentials(context, v, password) },
-                        password = password,
-                        onPassword = { v -> password = v; RerollSettings.saveCredentials(context, account, v) },
+                        // 账号卡（多账号切换 / 服务器 / 抓取入口）作为插槽传进去，避免 HomeScreen 再长
+                        accountSection = {
+                            AccountsCard(
+                                onSelected = { a ->
+                                    account = a?.loginId.orEmpty()
+                                    password = a?.secret.orEmpty()
+                                    accountServer = a?.server ?: GameServer.CN_BILIBILI
+                                },
+                            )
+                        },
                         rerollMode = rerollMode,
                         onRerollMode = { v ->
                             rerollMode = v
@@ -932,10 +950,8 @@ private fun guildPicksIncomplete(context: Context): List<String> {
 /** 标签页 ②：刷开局 —— 账号（折叠）＋ 刷开局按钮在底部 ＋ 高级设置（折叠，尽量做成选项） */
 @Composable
 private fun RerollTab(
-    account: String,
-    onAccount: (String) -> Unit,
-    password: String,
-    onPassword: (String) -> Unit,
+    // 账号卡整块由调用方提供（2026-10-28：多账号切换 / 选服务器 / 渠道服抓取入口都在 AccountsCard 里）
+    accountSection: @Composable () -> Unit,
     // ★刷开局方式提到首页（底部「刷开局」按钮也要用），这里只负责改
     rerollMode: Int,
     onRerollMode: (Int) -> Unit,
@@ -964,65 +980,27 @@ private fun RerollTab(
     var bossArea3Sel by remember { mutableStateOf(cfg.bossArea3) }
     var bossArea5Sel by remember { mutableStateOf(cfg.bossArea5) }
 
-    var accountOpen by remember { mutableStateOf(false) }
+    // 账号卡的展开/密码显示开关随账号卡一起搬进 AccountsCard 了
     var advanced by remember { mutableStateOf(true) }
-    // 密码明文开关：右侧眼睛图标切换
-    var showPwd by remember { mutableStateOf(false) }
 
     LazyColumn(
         Modifier.fillMaxSize(),
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 64.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        item {
-            Card(
-                Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-            ) {
-                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Row(
-                        Modifier.clickable { accountOpen = !accountOpen },
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        SectionTitle("账号", Modifier.weight(1f))
-                        Text(if (accountOpen) "收起" else "展开")
-                    }
-                    if (accountOpen) {
-                        OutlinedTextField(
-                            account, onAccount,
-                            label = { Text("B 站账号") },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth(),
-                        )
-                        OutlinedTextField(
-                            password, onPassword,
-                            label = { Text("B 站密码") },
-                            singleLine = true,
-                            visualTransformation = if (showPwd) VisualTransformation.None else PasswordVisualTransformation(),
-                            trailingIcon = {
-                                IconButton(onClick = { showPwd = !showPwd }) {
-                                    Icon(
-                                        imageVector = if (showPwd) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
-                                        contentDescription = if (showPwd) "隐藏密码" else "显示密码",
-                                    )
-                                }
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                        )
-                        // ★账号用途说明（2026-10-26 用户要求）：把"存哪、给谁、干什么"讲清楚。
-                        //   注意不能写"不会上传"——登录本来就要把凭证发给 B 站官方接口，那是必要环节；
-                        //   承诺的是"只发给 B 站、只存在本机、不作他用"。
-                        Text(
-                            "账号密码只保存在本机（应用私有目录），仅用于向 B 站官方接口登录、刷开局；" +
-                                "不会上传到任何第三方服务器，也不会用于其他用途。",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                        Text(
-                            "需要先在游戏里登录同一个账号。当前仅支持 B 站官服（b 服），其他渠道服计划适配中。",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+        // 账号（2026-10-28 换成 AccountsCard：多账号切换 / 选服务器 / 渠道服抓取入口）
+        item { accountSection() }
+        // 刷开局结果与状态：跟账号卡分开，收起账号时也看得见。
+        // ★2026-10-30 用户："还没有刷开局结果，这行提示应该去掉。刷开局只是个附带功能，
+        //   我们主要还是要用一键黎明界，不要引导到刷开局这里来" ⇒ 没有结果/状态时整块不渲染，
+        //   也不再写引导文案。真正的主线在「自动迷宫」页的「一键黎明界」。
+        if (summary != null || status != null) {
+            item {
+                Card(
+                    Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+                ) {
+                    Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         if (summary != null) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text(
@@ -1798,16 +1776,20 @@ private fun GuideDialog(
     val sections = listOf(
         "一、准备" to listOf(
             "设备需要有 Root 权限（模拟器里打开 Root 开关，或 Magisk 授权）。",
+            "设备必须是 x86_64 架构：只在 MuMu、雷电等「x86 版」模拟器上工作；" +
+                "手机等 ARM 设备（ARM 真机 / ARM 云机）暂不支持，开跑时会直接提示，不会白试。",
             "安装本应用，并在游戏里登录好账号。",
-            "游戏里登录的账号，必须和「刷开局」页填的账号是同一个。",
-            "当前仅支持 B 站官服（b 服），其他渠道服（华为、应用宝等）计划适配中。",
+            "游戏里登录的账号，必须和「刷开局 → 账号」里选中的那个账号是同一个。",
+            "支持 B 站官服与各联运渠道服（小米 / 华为 / vivo / OPPO / 九游 / 4399 / MuMu / 应用宝）；" +
+                "渠道服不用账密，点「抓取」自动取 uid + access_key。",
+            "凭证加密保存在本机（系统密钥库），只会发给对应渠道的官方接口。",
         ),
         "二、授权" to listOf(
             "首次运行会弹 Root 授权框，请允许（建议勾选「永久记住」）。",
             "授予「悬浮窗」权限，否则运行时看不到状态条。",
         ),
         "三、配置" to listOf(
-            "「刷开局」页：刷开局方式选「接口」时，需要填 B 站账号密码。",
+            "「刷开局」页 · 账号：选好服务器；B 服填账密，渠道服点「抓取」。刷开局方式选「接口」时需要账号，选「局内」则不需要。",
             "「策略」页：Boss 区、运行次数、开局角色等按需调整。",
         ),
         "四、开跑" to listOf(

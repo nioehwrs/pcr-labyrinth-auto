@@ -1,6 +1,7 @@
 package com.lmj.labyrinthauto.reroll
 
 import android.content.Context
+import com.lmj.labyrinthauto.core.Accounts
 import com.lmj.labyrinthauto.core.AppState
 import com.lmj.labyrinthauto.core.CenterTapGate
 import com.lmj.labyrinthauto.logic.party.PartyPlan
@@ -28,11 +29,11 @@ object RerollUseCase {
     var forceRerollNext = false
 
     /**
-     * 仅刷开局（不跑迷宫）：保存账密后调 [reroll]。
-     * 凭证只来自 UI 输入（[LabyrinthLoginClient] 不做任何令牌回退），账密留空会直接登录失败。
+     * 仅刷开局（不跑迷宫）。
+     * 凭证只来自账号表里的**选中账号**（B 服账密 / 渠道服 uid+access_key），
+     * [LabyrinthLoginClient] 不做任何令牌回退。
      */
-    suspend fun login(context: Context, account: String, password: String) {
-        RerollSettings.saveCredentials(context, account, password)
+    suspend fun login(context: Context) {
         reroll(context)
     }
 
@@ -44,12 +45,19 @@ object RerollUseCase {
     suspend fun reroll(context: Context): Boolean {
         // ★刷初始前先关"屏幕中心加速"（2026-10-22 用户）：新开局的选人页绝不能继承上一局的开关。
         CenterTapGate.reset("刷初始前")
-        val (account, password) = RerollSettings.loadCredentials(context)
-        RerollSettings.saveCredentials(context, account, password)
+        val acct = Accounts.selected(context)
+        if (acct == null) {
+            AppState.addLog("刷开局：没有账号 —— 先在账号卡里添加（B 服填账密 / 渠道服抓 uid+access_key）")
+            AppState.setRerollStatus("没有账号")
+            AppState.setRerollBusy(false)
+            return false
+        }
+        // 顺手让选中账号的凭证镜像进 RerollSettings（旧链路/一键黎明界仍按那两个值读）
+        Accounts.select(context, acct.id)
         AppState.setRerollBusy(true)
-        AppState.setRerollStatus("正在登录 B 站…")
-        client = LabyrinthLoginClient(context)
-        return when (val r = client!!.login(account, password)) {
+        AppState.setRerollStatus(if (acct.isChannel) "正在登录渠道服…" else "正在登录 B 站…")
+        client = LabyrinthLoginClient(context, acct)
+        return when (val r = client!!.login()) {
             is LoginOutcome.Session -> {
                 session = r.session
                 AppState.setRerollStatus("登录成功，开始刷开局")
@@ -83,14 +91,14 @@ object RerollUseCase {
      * 撤退前用保存的凭据重新登录一次（顺带把客户端挤掉——局已作废，无所谓）即可。
      */
     suspend fun ensureLogin(context: Context): Boolean {
-        val (account, password) = RerollSettings.loadCredentials(context)
-        if (account.isBlank() || password.isBlank()) {
-            AppState.addLog("撤退：没有保存的账号密码，无法重新登录 → 交给下一局刷开局兜底撤退")
+        val acct = Accounts.selected(context)
+        if (acct == null || !acct.ready) {
+            AppState.addLog("撤退：没有可用的账号凭证，无法重新登录 → 交给下一局刷开局兜底撤退")
             return false
         }
-        AppState.setRerollStatus("重新登录 B 站…")
-        client = LabyrinthLoginClient(context)
-        return when (val r = client!!.login(account, password)) {
+        AppState.setRerollStatus(if (acct.isChannel) "重新登录渠道服…" else "重新登录 B 站…")
+        client = LabyrinthLoginClient(context, acct)
+        return when (val r = client!!.login()) {
             is LoginOutcome.Session -> {
                 session = r.session
                 AppState.setRerollStatus("重新登录成功")

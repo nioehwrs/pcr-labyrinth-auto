@@ -365,7 +365,7 @@ object MazeLoop {
                 continue
             }
             // ★安全闸门（同 Navigator）：只在游戏前台时跑；读不到就停，不猜
-            if (!Foreground.isGameForeground(GameProcess.GAME_PKG)) {
+            if (!Foreground.isGameForeground(GameProcess.pkg())) {
                 AppState.addLog("停手：前台已切到 ${Foreground.packageName() ?: "读不到"}（不再碰游戏）")
                 return
             }
@@ -4492,10 +4492,10 @@ object MazeLoop {
         AppState.addLog("自愈：等游戏被重新拉起 + agent 回连…")
         val t0 = SystemClock.elapsedRealtime()
         while (SystemClock.elapsedRealtime() - t0 < STUCK_BACK_MS) {
-            if (Foreground.isGameForeground(GameProcess.GAME_PKG) && AgentBridge.connected.value) break
+            if (Foreground.isGameForeground(GameProcess.pkg()) && AgentBridge.connected.value) break
             delay(1_000)
         }
-        if (!Foreground.isGameForeground(GameProcess.GAME_PKG) || !AgentBridge.connected.value) {
+        if (!Foreground.isGameForeground(GameProcess.pkg()) || !AgentBridge.connected.value) {
             AppState.addLog("自愈：${STUCK_BACK_MS / 1000}s 内游戏/agent 没回来")
             return false
         }
@@ -4809,11 +4809,16 @@ object MazeLoop {
             return false
         }
         if (named.size > 1) {
-            if (tries.getOrPut("$tag|dlgu", { 0 }) == 0) {
+            // ★静音"选角色面板"（2026-10-30 用户：日志噪音）：它的顶框也是 `DialogCommonFullSize`，
+            //   里面只有 `reset_button` + 一堆 `ButtonObj`（12 颗），每局都会命中这条"都不在白名单"警告。
+            //   它不是待确认的弹窗，是我们要操作的那一页自己，所以照样"不猜"，但不再刷日志。
+            val names = named.map { it.optString("name") }
+            val charSelectPanel = names.all { it == "reset_button" || it == "ButtonObj" }
+            if (!charSelectPanel && tries.getOrPut("$tag|dlgu", { 0 }) == 0) {
                 tries["$tag|dlgu"] = 1
                 AppState.addLog(
                     "[!] 弹窗（顶框=$top）有 ${named.size} 颗按钮、都不在白名单 → 不猜（怕误点取消）｜ " +
-                        "按钮=${named.joinToString(",") { it.optString("name") }.take(160)}",
+                        "按钮=${names.joinToString(",").take(160)}",
                 )
             }
             return false

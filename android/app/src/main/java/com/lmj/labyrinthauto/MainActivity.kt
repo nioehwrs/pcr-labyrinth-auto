@@ -8,9 +8,11 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.lifecycleScope
 import com.lmj.labyrinthauto.core.AppState
+import com.lmj.labyrinthauto.frida.AbiRepair
 import com.lmj.labyrinthauto.frida.AgentApi
 import com.lmj.labyrinthauto.frida.AgentBridge
 import com.lmj.labyrinthauto.frida.FridaInjector
+import com.lmj.labyrinthauto.frida.GameProcess
 import com.lmj.labyrinthauto.frida.RootCheck
 import com.lmj.labyrinthauto.reroll.RerollSettings
 import com.lmj.labyrinthauto.ui.HomeScreen
@@ -41,6 +43,16 @@ class MainActivity : ComponentActivity() {
         //   以前只有前台服务起来 3s 后才探 ⇒ 光打开助手时那一行永远是"（还没自检）"✗。
         //   第一次探会弹模拟器的超管授权框（这正是"申请 root 授权"的那一下）。
         lifecycleScope.launch { RootCheck.run("助手启动") }
+
+        // ★架构自检（2026-10-30 实测定案）：**只检测不动手**（这一刻用户可能正自己玩着游戏）。
+        //   原来只挂在 AutoForegroundService.onCreate 里 —— 那服务要等点「开始 / 一键黎明界」才起，
+        //   光打开助手它从来不跑（日志里连"服务已启动"都没有）。这里和 root 自检并列。
+        //   包名跟着**当前选中的账号**走（渠道服就是渠道包），别写死国服。
+        //   顺手把目标包名写进 GameProcess —— 打开助手这一刻就定好，后面服务/注入直接用。
+        lifecycleScope.launch {
+            GameProcess.syncTargetFromAccount(applicationContext)
+            AbiRepair.report("助手启动", GameProcess.pkg())
+        }
 
         // ★UI 结构采集（2026-10-18，做「局内刷初始」时用来抓节点名）：
         //   `am start -n com.lmj.labyrinthauto/.MainActivity --es uiTag diff`

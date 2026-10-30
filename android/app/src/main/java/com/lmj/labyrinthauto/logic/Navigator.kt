@@ -108,7 +108,7 @@ object Navigator {
         var front = ""
         while (true) {
             val p = Foreground.packageName()
-            if (p == GameProcess.GAME_PKG) break
+            if (p == GameProcess.pkg()) break
             front = p ?: "读不到"
             if (SystemClock.elapsedRealtime() - t0 >= FRONT_WAIT_MS) {
                 AppState.addLog(
@@ -134,7 +134,7 @@ object Navigator {
             // 闸门每轮复查：**读到、且不是游戏** ⇒ 立刻停手（真切走了）；只是"读不到" ⇒ 本轮先不点、
             //   继续等（刚换页/刚重启时偶发读空，不该把整局判成失败）
             val fp = Foreground.packageName()
-            if (fp != null && fp != GameProcess.GAME_PKG) {
+            if (fp != null && fp != GameProcess.pkg()) {
                 AppState.addLog("停手：前台已切到 $fp（不再往游戏上点）")
                 return false
             }
@@ -169,7 +169,9 @@ object Navigator {
             }
 
             if (vid == TARGET_VIEW) {
-                AppState.addLog("已到「黎明界 top」${viewLabel(vid)} —— 按约定**不点出发**，这一步到此结束")
+                // ★文案（2026-10-30）：原来写"不点出发，这一步到此结束"，下一行迷宫状态机就点了出发，
+                //   日志看起来自相矛盾。真实语义 = 本阶段只负责"点到 top"，出发交给迷宫状态机。
+                AppState.addLog("已到「黎明界 top」${viewLabel(vid)} → 本阶段到此结束，交给迷宫状态机（接下来会点出发）")
                 return true
             }
 

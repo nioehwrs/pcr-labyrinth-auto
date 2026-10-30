@@ -14,9 +14,11 @@ import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import com.lmj.labyrinthauto.MainActivity
 import com.lmj.labyrinthauto.R
+import com.lmj.labyrinthauto.core.Accounts
 import com.lmj.labyrinthauto.core.AppState
 import com.lmj.labyrinthauto.core.LogFile
 import com.lmj.labyrinthauto.core.OverlayStatus
+import com.lmj.labyrinthauto.frida.AbiRepair
 import com.lmj.labyrinthauto.frida.AgentApi
 import com.lmj.labyrinthauto.frida.AgentBridge
 import com.lmj.labyrinthauto.frida.FridaInjector
@@ -39,6 +41,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
@@ -71,6 +74,10 @@ class AutoForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // ★目标客户端（2026-10-30 用户："按当前账号的渠道启动对应的客户端"）：
+        //   每个意图进来都先同步一次 —— 之后 kill / launch / pid / 前台判定 / 架构自检
+        //   全部走 GameProcess.pkg()，选中的是渠道服账号就走渠道包，不再写死国服。
+        GameProcess.syncTargetFromAccount(applicationContext)
         when (intent?.action) {
             ACTION_INJECT -> {
                 FridaInjector.start(applicationContext)
@@ -210,18 +217,21 @@ class AutoForegroundService : Service() {
                         return@launch
                     }
                     // ★前置（2026-10-23 MuMu 15 闪退）：游戏必须装在**同一用户空间**里。
-                    //   B 站登录协议要读游戏包的签名/版本（`getPackageInfo`），查不到时会在刷开局
+                    //   登录协议要读游戏包的签名/版本（`getPackageInfo`），查不到时会在刷开局
                     //   第一步抛 NameNotFoundException —— 与其崩在几百行深处，不如这里一句话说清楚。
-                    val gamePkg = GameProcess.GAME_PKG
+                    //   ★2026-10-30：包名跟着**当前选中账号的渠道**（GameProcess.pkg()），
+                    //   不再写死国服 —— 否则渠道服用户会被这里误判成"没装游戏"。
+                    val gamePkg = GameProcess.pkg()
+                    val serverName = Accounts.selected(applicationContext)?.server?.displayName
                     val gameInstalled = runCatching {
                         applicationContext.packageManager.getPackageInfo(gamePkg, 0)
                     }.isSuccess
                     if (!gameInstalled) {
                         AppState.addLog(
-                            "停手：这台设备/这个用户空间里查不到国服游戏（$gamePkg）。" +
-                                "常见三种原因：① 装上的是**渠道服**（MuMu/小米/vivo…包名是 " +
-                                "com.bilibili.priconne.yofun.mumu 之类，本工具只支持国服）；" +
-                                "② 游戏装在多开/分身或工作资料里（本 app 看不到）；③ 压根没装。" +
+                            "停手：这台设备/这个用户空间里查不到「${serverName ?: "当前账号"}」的客户端（$gamePkg）。" +
+                                "常见三种原因：① 账号页选的服务器和实际装的客户端不一致" +
+                                "（换账号或改账号的服务器再试）；② 游戏装在多开/分身或工作资料里" +
+                                "（本 app 看不到）；③ 压根没装。" +
                                 "可先在终端跑 `pm list packages | grep priconne` 确认",
                         )
                         return@launch
@@ -360,7 +370,18 @@ class AutoForegroundService : Service() {
                     LogFile.beginRun("reroll")
                     var ok = false
                     try {
-                        ok = InGameReroll.run(input, applicationContext)
+                        // ★架构闸门（2026-10-30）：只刷开局（局内）同样要修 —— 架构不对时
+                        //   InGameReroll 第 0 步就连不上 agent。重装杀进程无害（它自己会 launch）。
+                        val abiFix = AbiRepair.ensure(GameProcess.pkg())
+                        if (!abiFix.ok) {
+                            AppState.addLog("⚠ 游戏架构修复没成（局内刷开局会读不到页面）：${abiFix.detail}")
+                        }
+                        ok = if (abiFix.fatal) {
+                            AppState.addLog("⇒ 确定性原因（换包/装游戏/给 root 才能解决），本次不刷，避免反复杀游戏白折腾")
+                            false
+                        } else {
+                            InGameReroll.run(input, applicationContext)
+                        }
                         AppState.addLog(
                             if (ok) {
                                 "刷开局完成 ✓：已停在合格开局（角色选择页），可以手动接手；" +
@@ -464,8 +485,15 @@ class AutoForegroundService : Service() {
         //   root（frida-server/注入/点击全都要它）+ 悬浮窗权限（状态悬浮窗要它）。
         scope.launch {
             delay(3_000)
-            reportRoot("启动自检")
-            reportOverlay("启动自检")
+            // ★三项**各自独立**（2026-10-30 实测教训）：原来是顺序直调，只要 reportOverlay 抛一次异常
+            //   （它要 OverlayWindow.init/hasPermission），后面的架构自检就整条被吞掉 ——
+            //   日志里连一行都没有，只有 logcat 看得到。现在各自 try/catch，并且把"某项自己炸了"
+            //   也写进日志，避免再出现"静默没跑"。
+            // ★三项**各自 launch**（2026-10-30 二次修正）：哪怕某一项内部卡住或被取消，
+            //   也不会挡住另外两项 —— 顺序执行时一条协程出事就是全灭，且不留下任何日志。
+            launch { selfCheck("root") { reportRoot("启动自检") } }
+            launch { selfCheck("悬浮窗") { reportOverlay("启动自检") } }
+            launch { selfCheck("游戏架构") { reportAbi("启动自检") } }
         }
         // P1：服务一起来就把感知链路拉起来（申请 root → 注入 agent → 读页面名）
         FridaInjector.start(applicationContext)
@@ -487,6 +515,18 @@ class AutoForegroundService : Service() {
             OverlayStatus.setFloor("刷开局中（局内）")
             FridaInjector.autoRecover = true
             return try {
+                // ★架构闸门（2026-10-30 用户："局内模式也要修，杀进程不是硬限制"）：
+                //   局内一般不需要杀进程，但**架构不对时注入根本连不上**，不修这一步也没法跑。
+                //   重装会杀进程 —— 无害：InGameReroll.run() 第 0 步 ensureGameReady() 本来就
+                //   会"没进程 → GameProcess.launch → 等 agent 60s"，会自己把游戏重新拉起来。
+                val abiFix = AbiRepair.ensure(GameProcess.pkg())
+                if (!abiFix.ok) {
+                    AppState.addLog("⚠ 游戏架构修复没成（局内刷开局会读不到页面）：${abiFix.detail}")
+                    if (abiFix.fatal) {
+                        AppState.addLog("⇒ 确定性原因（换包/装游戏/给 root 才能解决），本局不跑，避免反复杀游戏白折腾")
+                        return false
+                    }
+                }
                 if (!InGameReroll.run(input, applicationContext)) {
                     AppState.addLog("局内刷开局未成功 → 本局不进入迷宫")
                     return false
@@ -514,6 +554,17 @@ class AutoForegroundService : Service() {
         //    期间游戏崩了/卡死由本进程杀进程/重启；窗口一结束（含异常/提前返回）就关掉。
         FridaInjector.autoRecover = true
         return try {
+            // ★架构闸门（2026-10-30）：下面马上就要 kill 游戏，这是**确定性**的修复窗口 ——
+            //   不再依赖注入循环里"恰好拍到 pid<=0"的时序（POLL_MS=1.5s，可能刚好错过）。
+            //   已是 x86_64 时这里只花一次 dumpsys；不是则本地重装（零下载、保存档、约 8s）。
+            val abiFix = AbiRepair.ensure(GameProcess.pkg())
+            if (!abiFix.ok) {
+                AppState.addLog("⚠ 游戏架构修复没成：${abiFix.detail}")
+                if (abiFix.fatal) {
+                    AppState.addLog("⇒ 确定性原因（换包/装游戏/给 root 才能解决），本局不跑，避免白等/反复重启游戏")
+                    return false
+                }
+            }
             // ②-a 刷完开局 → **显式杀进程 + 重启游戏一次**（= PC pcr_auto step_kill→step_launch）：
             //   reroll 只改了**服务器**状态，客户端必须冷启动才会同步到这个合格开局
             //   （PC keep_opening(sync=False) 注释：调用方自己的"杀进程→启动→attach"就是同步）。
@@ -551,6 +602,15 @@ class AutoForegroundService : Service() {
      * 有权限 + 用户在助手里开着开关 ⇒ 直接把状态悬浮窗显示出来（连跑期间它一直跟着 OverlayStatus 刷新）。
      * 没权限 ⇒ 只喊一声，让用户回助手首页「悬浮窗 → 去授权」（不打断正在跑的东西）。
      */
+    /**
+     * ★游戏架构自检（只检测、只提示，不动手）—— 实现已下沉到 [AbiRepair.report]，
+     * 因为同一个结论在「打开助手」（MainActivity）和「服务启动」两处都要报，
+     * 而服务只有点「开始 / 一键黎明界」才会起。
+     */
+    private suspend fun reportAbi(where: String) {
+        AbiRepair.report(where, GameProcess.pkg())
+    }
+
     private fun reportOverlay(where: String) {
         OverlayWindow.init(applicationContext)
         val ok = OverlayWindow.hasPermission()
@@ -666,6 +726,27 @@ class AutoForegroundService : Service() {
      * 自检一次 **root**（唯一的先决条件：frida-server、注入、点击全都要它），
      * 结论写进 **日志 + 界面横幅 + 通知栏**（三者同一句话）。启动 / 需要复查时调用。
      */
+    /**
+     * 跑一项启动自检，**任何异常都不许影响其它项**（2026-10-30）。
+     *
+     * 背景：三项原来顺序直调，`reportOverlay` 一抛异常就把后面的架构自检跳过，
+     * 而且异常只进 logcat、不进会话日志 ⇒ 表现成"这项压根没实现"。现在异常本身也落日志。
+     * `CancellationException` 必须原样抛出，否则服务停止时协程会当成普通异常吞掉。
+     */
+    private suspend fun selfCheck(name: String, block: suspend () -> Unit) {
+        try {
+            block()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // ⚠ `TimeoutCancellationException` 也是 CancellationException 的子类：
+            //   一律重抛的话，"某项内部超时"会被当成"整个协程被取消"而**静默结束、不留一行日志**
+            //   （2026-10-30 实测：架构自检就是这么消失的）。只有服务真的停了才往外抛。
+            if (!currentCoroutineContext().isActive) throw e
+            AppState.addLog("⚠ $name 自检被取消：${e.message ?: e.javaClass.simpleName}")
+        } catch (t: Throwable) {
+            AppState.addLog("⚠ $name 自检异常：${t.message ?: t.javaClass.simpleName}")
+        }
+    }
+
     private fun reportRoot(where: String) {
         scope.launch {
             RootCheck.run(where)

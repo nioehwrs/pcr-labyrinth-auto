@@ -213,6 +213,134 @@
     }
   }
 
+  // ══════════════════════════════════════════════════════════════════════════
+  // ★渠道服凭证抓取（2026-10-28）：hook `Cute.SdkLoginTask.SetParameter(uid, access_key,
+  //   platform, channel_id)` 把入参截下来 —— 这四个值就是游戏服 `tool/sdk_login` 的入参，
+  //   渠道服账号有了 uid + access_key 就能直通游戏服（B 服那条走 SDK 账密换，不关这里的事）。
+  //
+  // 为什么挂在 SetParameter：它是**渠道 SDK 登录成功之后**游戏自己的第一跳，参数全是明文
+  // Il2CppString，不用解 Obscured*，也不用碰任何网络/加密逻辑（dump.cs 里签名确认过：
+  // `public void SetParameter(string _uid, string _access_key, string _platform, string _channel_id)`)。
+  //
+  // 用法（app 侧 AccessCapture 编排）：
+  //   ① captureArm   —— 挂钩子（可重复调用；il2cpp 没就绪会返回 err，重试即可）
+  //   ② capturePoll  —— 轮询是否抓到
+  //   ③ captureStop  —— 摘钩子 + 清状态（抓完/放弃时调）
+  // ★必须在游戏**发起 sdk_login 之前**挂上；错过就只能重启游戏再抓（app 侧有重试）。
+  // ══════════════════════════════════════════════════════════════════════════
+  var CAP = {
+    armed: false, hooked: false, err: null,
+    got: false, uid: '', accessKey: '', platform: '', channelId: '', at: 0, calls: 0
+  };
+  var capHook = null;
+
+  function capSnapshot() {
+    return {
+      armed: CAP.armed, hooked: CAP.hooked, err: CAP.err,
+      got: CAP.got, uid: CAP.uid, accessKey: CAP.accessKey,
+      platform: CAP.platform, channelId: CAP.channelId, at: CAP.at, calls: CAP.calls
+    };
+  }
+
+  // il2cpp 是否就绪 —— ★不只等 base 那个 250ms 的 setInterval：它要是撞上异常就**永远**停在
+  // `g_il2cpp = null`（2026-10-28 实测：注入后 25s 一直"未就绪"，日志里连 init 的打印都没有）。
+  // 这里主动调一次 initIl2Cpp()，并把 **typeof / 返回值 / 抛的异常** 一起带回 app，
+  // 让"为什么没就绪"有据可查（否则只能看到一句没信息量的"未就绪"）。
+  var capDiagN = 0;
+
+  // 环境快照：注入到底落在哪个进程/哪个 ABI、看不看得见 libil2cpp ——
+  //   MuMu 这类"arm64 游戏跑在 x86 设备上"的转译环境里，最容易出的问题就是
+  //   **注入到的进程看不见 arm 模块**（maps 里有、frida 模块表里没有），
+  //   这时 initIl2Cpp 会一直 false，光看"未就绪"三个字完全没法定位。
+  function capEnvText() {
+    var parts = [];
+    try { parts.push('arch=' + Process.arch); } catch (e) { }
+    try { parts.push('pid=' + Process.id); } catch (e) { }
+    try { parts.push('mods=' + Process.enumerateModules().length); } catch (e) { }
+    try {
+      var hits = Process.enumerateModules().map(function (m) { return m.name; })
+        .filter(function (n) { return /il2cpp|unity/i.test(n); });
+      parts.push('il2cppMods=[' + hits.join(',') + ']');
+    } catch (e) { parts.push('modsErr=' + e); }
+    try {
+      var mm = Process.findModuleByName('libil2cpp.so');
+      parts.push('findByName=' + (mm ? mm.base.toString() : 'null'));
+    } catch (e) { parts.push('findErr=' + e); }
+    return parts.join(' ');
+  }
+
+  function capIl2cppState() {
+    var t = (typeof g_il2cpp);
+    if (t !== 'undefined' && g_il2cpp) return { ok: true, why: 'ok' };
+    var why = 'g_il2cpp=' + t + '｜' + capEnvText();
+    if (typeof initIl2Cpp === 'function') {
+      try {
+        var r = initIl2Cpp();
+        why += '｜主动 initIl2Cpp() 返回 ' + r + '，之后 g_il2cpp=' + (typeof g_il2cpp);
+      } catch (e) {
+        why += '｜主动 initIl2Cpp() 抛异常：' + e;
+      }
+    } else {
+      why += '｜脚本里没有 initIl2Cpp（base 版本不对？）';
+    }
+    if (capDiagN++ % 20 === 0) log('il2cpp 诊断：' + why);   // 别每 500ms 刷一行
+    return { ok: !!(typeof g_il2cpp !== 'undefined' && g_il2cpp), why: why };
+  }
+
+  function capArm() {
+    CAP.armed = true;
+    if (CAP.hooked) return capSnapshot();
+    CAP.err = null;
+    try {
+      var st = capIl2cppState();
+      if (!st.ok) { CAP.err = 'il2cpp 未就绪（' + st.why + '）'; return capSnapshot(); }
+      var klass = null;
+      try { klass = findClassNS('SdkLoginTask', 'Cute'); } catch (e) { }
+      if (!klass || klass.isNull()) klass = findClass('SdkLoginTask');
+      if (!klass || klass.isNull()) { CAP.err = '未找到类 SdkLoginTask'; return capSnapshot(); }
+      var m = findMethodAny(klass, 'SetParameter');
+      if (!m) { CAP.err = '未找到 SdkLoginTask.SetParameter'; return capSnapshot(); }
+      var fp = _resolveThunk(methodPtr(m));
+      if (!fp || fp.isNull()) { CAP.err = 'SetParameter 函数指针为空'; return capSnapshot(); }
+      capHook = Interceptor.attach(fp, {
+        onEnter: function (args) {
+          try {
+            var u = _str(args[1]);
+            var a = _str(args[2]);
+            var p = _str(args[3]);
+            var c = _str(args[4]);
+            CAP.calls++;
+            if (u && u !== 'null' && u !== '?' && u.length > 0) {
+              CAP.got = true; CAP.uid = u; CAP.accessKey = a; CAP.platform = p; CAP.channelId = c;
+              CAP.at = Date.now();
+              log('抓到 sdk_login 凭证：uid=' + u + ' platform=' + p + ' channel=' + c +
+                  ' access_key=' + (a ? (a.length + ' 字符') : '空'));
+            } else {
+              log('SetParameter 被调用但 uid 读不出（raw=' + u + '）');
+            }
+          } catch (e) { }
+        }
+      });
+      CAP.hooked = true;
+      log('已挂钩 Cute.SdkLoginTask.SetParameter @ ' + fp + '（等渠道 SDK 登录）');
+    } catch (e) {
+      CAP.err = String(e);
+      log('挂钩失败：' + e);
+    }
+    return capSnapshot();
+  }
+
+  function capStop() {
+    try { if (capHook) capHook.detach(); } catch (e) { }
+    capHook = null;
+    CAP.armed = false; CAP.hooked = false;
+    return capSnapshot();
+  }
+
+  rpc.exports.captureArm = function () { return capArm(); };
+  rpc.exports.capturePoll = function () { return capSnapshot(); };
+  rpc.exports.captureStop = function () { return capStop(); };
+
   log('bridge 已加载，准备回连 ' + HOST + ':' + PORT);
   main();
 })();

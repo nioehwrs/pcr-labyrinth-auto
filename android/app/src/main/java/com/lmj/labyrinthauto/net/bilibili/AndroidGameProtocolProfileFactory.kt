@@ -6,6 +6,13 @@ import android.os.Build
 data class GameProtocolProfile(
     val appVersion: String,
     val headers: Map<String, String>,
+    /** `tool/sdk_login` 的 `platform`：B 服 `"2"`，渠道服 `"4"`。 */
+    val platform: String = "2",
+    /**
+     * `tool/sdk_login` 的 `channel_id`：B 服 `"1"`；
+     * 渠道服按渠道区分（MuMu=65），只能从客户端抓取时带回来，不能猜。
+     */
+    val channelId: String = "1",
 )
 
 /**
@@ -19,6 +26,8 @@ class AndroidGameProtocolProfileFactory(
     private val resKey: String = RES_KEY,
     /** PLATFORM-ID：B 服 2，渠道服 4。 */
     private val platformId: String = "2",
+    /** CHANNEL-ID：B 服 1，渠道服见 [GameProtocolProfile.channelId]。 */
+    private val channelId: String = "1",
 ) {
     fun create(): GameProtocolProfile {
         // ★人话报错（2026-10-23）：`targetSdk=35` 且 manifest 没声明 `<queries>` 时，Android 11+
@@ -57,10 +66,12 @@ class AndroidGameProtocolProfileFactory(
                 "RES-KEY" to resKey,
                 "RES-VER" to DEFAULT_RES_VERSION,
                 "SHORT-UDID" to "0",
-                "PLATFORM" to "2",
+                "PLATFORM" to platformId,
                 "PLATFORM-ID" to platformId,
-                "CHANNEL-ID" to "1",
+                "CHANNEL-ID" to channelId,
             ),
+            platform = platformId,
+            channelId = channelId,
         )
     }
 

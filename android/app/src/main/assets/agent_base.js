@@ -85,9 +85,11 @@ const FIELDS = [
   { k: "CurrentPattern", off: 0x120, t: "i" },
 ];
 
-// Init() / .ctor 的 dump RVA（相对 libil2cpp.so 基址）
-const RVA_INIT  = 0x4F2DDDF;
-const RVA_CTOR  = 0x4F2D91F;
+// ★禁止在这里写死 dump RVA（2026-10-30）：RVA 只对"某一次 dump 出来的某个 so"成立 ——
+//   换游戏版本、换架构（x86_64 ↔ arm64）立刻失效，而且失效时是**静默挂空**，极难查。
+//   取方法地址一律用 luMethodPtrByName(klass, 名字)：它从运行时 MethodInfo 拿 methodPointer，
+//   与架构和游戏版本都无关（相对偏移 / jmp 跳板两种坑见下文 848、2835 处的注释）。
+//   （原来这里有两行 RVA_INIT / RVA_CTOR 常量，全仓已无引用，属于历史残留，已删除。）
 
 let g_inst = null;
 let g_il2cpp = null;

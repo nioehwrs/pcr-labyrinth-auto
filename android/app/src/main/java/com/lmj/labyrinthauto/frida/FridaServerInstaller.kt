@@ -108,8 +108,18 @@ object FridaServerInstaller {
         val abi = abiOf()
         val asset = ASSETS[abi] ?: run {
             // 界面只说人话；abi 这种细节进日志
-            AppState.setComponent("运行组件不可用")
-            AppState.addLog("运行组件缺失：$abi 架构没有发布件")
+            if (!AbiRepair.deviceSupportsX86_64()) {
+                // ★ARM 真机（2026-10-30）：不是"发布件漏了"，是这套工具链只有 x86_64 一份 ——
+                //   说清楚，别让用户以为是下载失败。
+                AppState.setComponent("需要 x86 模拟器")
+                AppState.addLog(
+                    "运行组件不可用：这台设备的 CPU 是 ${AbiRepair.deviceAbiText()}，本工具只在 " +
+                        "x86_64 模拟器（MuMu / 雷电等 x86 版）上工作，ARM 真机暂不支持",
+                )
+            } else {
+                AppState.setComponent("运行组件不可用")
+                AppState.addLog("运行组件缺失：$abi 架构没有发布件")
+            }
             return null
         }
 

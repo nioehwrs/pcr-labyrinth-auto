@@ -32,10 +32,18 @@ object BilibiliGameGatewayFactory {
         }
     }
 
+    /** 账号所属服务器 → 网关（B 服 l3 / 渠道服 l1）。 */
+    fun endpointFor(server: GameServer): ChannelEndpoint =
+        if (server.isChannelServer) ChannelEndpoint.CHANNEL_UO else ChannelEndpoint.BILIBILI
+
+    /**
+     * @param channelId `tool/sdk_login` 的 `channel_id`（B 服 "1"；渠道服从抓取带回，如 MuMu=65）
+     */
     fun create(
         context: Context,
         gamePackageName: String,
         endpoint: ChannelEndpoint,
+        channelId: String = "1",
     ): BilibiliGameGateway {
         val client = OkHttpClient.Builder()
             .connectTimeout(20, TimeUnit.SECONDS)
@@ -52,6 +60,7 @@ object BilibiliGameGatewayFactory {
                 gamePackageName,
                 endpoint.resKey,
                 endpoint.platformId,
+                channelId,
             ).create(),
             json = Json { ignoreUnknownKeys = true },
         )

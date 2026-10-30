@@ -253,18 +253,18 @@ object InGameReroll {
 
     /** 游戏进程 pid（读不到/非数字 ⇒ 空串） */
     private suspend fun gamePid(): String {
-        val t = RootShell.exec("pidof ${GameProcess.GAME_PKG}", 8_000L).text.trim()
+        val t = RootShell.exec("pidof ${GameProcess.pkg()}", 8_000L).text.trim()
         return if (t.isNotEmpty() && t.all { it.isDigit() }) t else ""
     }
 
     /** 把游戏顶到前台（已在就秒过）；切不过去返回 false。 */
     private suspend fun bringGameFront(ctx: Context): Boolean {
-        if (Foreground.isGameForeground(GameProcess.GAME_PKG)) return true
+        if (Foreground.isGameForeground(GameProcess.pkg())) return true
         AppState.addLog("局内刷开局：游戏不在前台 → 切过去")
         GameProcess.launch(ctx)
         val t0 = SystemClock.elapsedRealtime()
         while (SystemClock.elapsedRealtime() - t0 < 20_000L) {
-            if (Foreground.isGameForeground(GameProcess.GAME_PKG)) return true
+            if (Foreground.isGameForeground(GameProcess.pkg())) return true
             delay(700)
         }
         AppState.addLog("局内刷开局：20s 内没切到游戏前台 → 停手")

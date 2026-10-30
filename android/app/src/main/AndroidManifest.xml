@@ -23,11 +23,26 @@
          这是"特殊应用权限"——装完不会自动给，要在系统设置里手动允许（助手首页有「去授权」入口）。 -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
-    <!-- ★包可见性（Android 11+，2026-10-23）：B 站登录协议要 `getPackageInfo("com.bilibili.priconne")`
-         读游戏包的签名/版本；不声明这条的话，在 Android 11+ 上会直接抛 **NameNotFoundException**
-         —— 看起来像"没装游戏"，其实是"查不到"。MuMu 15(Android 15) 上就是这么崩的。 -->
+    <!-- ★包可见性（Android 11+，2026-10-23）：登录协议要 `getPackageInfo(<游戏包>)` 读签名/版本；
+         不声明的话在 Android 11+ 上会直接抛 **NameNotFoundException**
+         —— 看起来像"没装游戏"，其实是"查不到"。MuMu 15(Android 15) 上就是这么崩的。
+         ★2026-10-30：目标客户端改为按**当前账号的渠道**取（见 GameServer.packageName），
+         所以这里要把每个渠道包都列出来，否则渠道服账号会被误判成"没装游戏"。
+         新增渠道时**两边一起改**（GameServer.kt 的枚举 + 这里）。 -->
     <queries>
+        <!-- 国服 Bilibili -->
         <package android:name="com.bilibili.priconne" />
+        <!-- 小米 / 华为 / vivo / OPPO(近应用商店) / 九游 / 4399 -->
+        <package android:name="com.bilibili.priconne.mi" />
+        <package android:name="com.bilibili.priconne.huawei" />
+        <package android:name="com.bilibili.priconne.vivo" />
+        <package android:name="com.bilibili.priconne.nearme.gamecenter" />
+        <package android:name="com.bilibili.priconne.aligames" />
+        <package android:name="com.bilibili.priconne.m4399" />
+        <!-- MuMu 渠道服 -->
+        <package android:name="com.bilibili.priconne.yofun.mumu" />
+        <!-- 应用宝 -->
+        <package android:name="com.tencent.tmgp.bilibili.priconne" />
     </queries>
 
     <application

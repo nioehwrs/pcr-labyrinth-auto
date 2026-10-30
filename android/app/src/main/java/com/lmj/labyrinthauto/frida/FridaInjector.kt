@@ -29,8 +29,13 @@ import java.net.Socket
  */
 object FridaInjector {
 
-    /** P0/P1 阶段只对着这一个游戏做（渠道包名表见 PLAN.md §2） */
-    const val GAME_PKG = GameProcess.GAME_PKG
+    /**
+     * ★目标客户端包名不再写死（2026-10-30 用户："一键黎明界写死了 B 服"）。
+     * 一律取 [GameProcess.pkg]：服务收到意图时已按**当前选中账号**的渠道同步过，
+     * 渠道服（`com.bilibili.priconne.yofun.mumu` 等）不会再有"没装国服"的误判。
+     */
+    @Deprecated("改用 GameProcess.pkg()", ReplaceWith("GameProcess.pkg()"))
+    val GAME_PKG: String get() = GameProcess.pkg()
 
     private const val INJECT_BIN = "/data/local/tmp/huabanxie-inject"
     private const val POLL_MS = 1_500L
@@ -99,6 +104,25 @@ object FridaInjector {
 
     /** 连续注入失败多少次就杀游戏重开（PC 版的自愈路径） */
     private const val MAX_INJECT_FAILS = 3
+
+    /**
+     * ★连续"注入失败 → 杀游戏重开"多少圈就**暂停自愈**（2026-10-29 用户报障加）。
+     *
+     * 现象（`logs/魔法真步/session_20261029_100409.txt`）：设备陷入死循环 ——
+     * ```
+     * 已调起游戏 → 游戏已起来 pid=5500 → libil2cpp.so 已映射（起了 0s）→ 静置 15s
+     * → 注入失败：attach 5500 失败：Unable to write to process memory: No such process
+     * → 注入失败且进程多半已僵死 → 自愈：杀掉游戏重开  →（回到第一行，无限）
+     * ```
+     * 单轮必然杀游戏 ⇒ 只要失败原因是**持续性**的（游戏装的是 arm64 包只走 Houdini 转译、
+     * 反作弊拦注入、运行组件与游戏 ABI 不匹配…），就会永远转圈：日志刷屏、反复 force-stop、
+     * 烧电，用户只能看到游戏被连着杀。
+     *
+     * ⇒ 连撞 [MAX_INJECT_CYCLES] 次就停手 [CYCLE_PAUSE_MS]，把现场诊断和"该查什么"写进日志，
+     *   决定权交回用户（他可以点停止，或换包/换设备）。**不解决根因也不至于无限重启。**
+     */
+    private const val MAX_INJECT_CYCLES = 3
+    private const val CYCLE_PAUSE_MS = 120_000L
 
     /** agent 掉线多久（游戏还活着）⇒ 开始**原地重注入**（★不再直接杀游戏，见下） */
     private const val AGENT_LOST_MS = 20_000L
@@ -199,6 +223,20 @@ object FridaInjector {
         AppState.setPageName(null)
     }
 
+    // ────────────────────── 抓取（[AccessCapture]）用的门面 ──────────────────────
+    //   抓 uid/access_key 走的是**另一条独立启动路径**（启动渠道客户端 → 注入 → 截 SDK 登录参数 → 退出），
+    //   跟这里的常驻自愈循环不共用状态，所以只把几步"设备侧动作"单独暴露出去，别复制一份实现。
+
+    /** 让 frida-server 就绪（没在听就用自带那份拉起来）。true = 端口已通 */
+    suspend fun ensureServer(ctx: Context): Boolean = ensureFridaServer(ctx)
+
+    /** 等 `libil2cpp.so` 映射（null = 好了；否则是人话原因）。抓取时注入前必须过这一关。 */
+    suspend fun waitMapped(pid: Int): String? = waitIl2CppMapped(pid)
+
+    /** 请 frida-server 把 agent 注入 pid（空串 = 成功）。 */
+    suspend fun inject(pid: Int, agent: File): String =
+        FridaCore.attachAndLoad(FRIDA_SERVER, pid, agent.absolutePath, eternalize = true)
+
     /** 把两个 assets 拼成实际注入的脚本文件（每次重建，保证跟 APK 里的版本一致）。 */
     fun agentFile(ctx: Context): File {
         val out = File(ctx.filesDir, "agent.js")
@@ -224,12 +262,17 @@ object FridaInjector {
         var lastPid = -1
         var launchTries = 0
         var injectFails = 0
+        var injectCycles = 0              // ★"注入失败 → 杀游戏重开"的连续圈数（见 [MAX_INJECT_CYCLES]）
         var agentLostSince = 0L          // 非 0 = 正处在"agent 掉线"状态（自愈计时）
         var lastReinjectAt = 0L          // 上次"原地重注入"的时刻（间隔节流）
         var reinjectN = 0                // 本次掉线已原地重注入几次
         var reinjectDead = false         // ★重注入"超时"失败 ⇒ 进程已僵，别再试，直接杀游戏（见 [REINJECT_TIMEOUT_MS]）
         var serverReady = false          // 本次跑迷宫期间 frida-server / libfrida 是否已就绪
         var wasRecover = false           // 上一轮 autoRecover 是否开着（用于检测"刚进/刚出"跑迷宫）
+        // ★架构闸门（2026-10-29）：每次进城只查一次（dumpsys 也有开销）。见 [AbiRepair.ensure]。
+        var abiChecked = false
+        // ★确定性修不了（包内无 x86_64 / 没装 / 没 root）⇒ 本次进城彻底静默，别再折腾游戏。
+        var abiBlocked = false
         while (true) {
             // ★注入只服务于「自动黎明界」：总闸关着就**待命** —— 不调起游戏、不注入、不自愈、不读页。
             //   这样"助手开着"也绝不碰游戏进程（用户 2026-10-16 要求：关着时没必要注入）。
@@ -244,6 +287,7 @@ object FridaInjector {
                     lastReinjectAt = 0L
                     reinjectN = 0
                     reinjectDead = false
+                    abiBlocked = false               // 下次进城重新给一次机会（用户可能换了包 / 给了 root）
                     AppState.addLog("自动黎明界结束 → 停止注入/自愈，之后不再碰游戏进程（待命）")
                 }
                 AppState.setFridaStatus("待命（未跑迷宫，不注入游戏）")
@@ -252,6 +296,8 @@ object FridaInjector {
             }
             if (!wasRecover) {
                 wasRecover = true
+                abiChecked = false               // 新一轮进城 → 重新确认一次游戏架构
+                abiBlocked = false
                 AppState.addLog("进入自动黎明界 → 接管游戏进程（调起 → 等就绪 → 注入；崩溃/卡死自愈）")
             }
 
@@ -260,7 +306,15 @@ object FridaInjector {
             if (!serverReady) {
                 FridaCore.logAvailability()
                 if (!FridaCore.available) {
-                    AppState.setFridaStatus("libfrida_bridge.so 没加载上（看日志）")
+                    // ★ARM 真机：桥接库本来就只打了 x86_64，这里别报成"加载失败，去看日志"，
+                    //   直接说清"这套工具链不支持这台设备"（2026-10-30）。
+                    AppState.setFridaStatus(
+                        if (AbiRepair.deviceSupportsX86_64()) {
+                            "libfrida_bridge.so 没加载上（看日志）"
+                        } else {
+                            "这台设备的 CPU 是 ${AbiRepair.deviceAbiText()}：只支持 x86_64 模拟器，ARM 真机暂不支持"
+                        },
+                    )
                     delay(POLL_MS)
                     continue
                 }
@@ -270,6 +324,39 @@ object FridaInjector {
                     continue
                 }
                 serverReady = true
+            }
+
+            // ★架构闸门（2026-10-30 修订）：进城（autoRecover 打开 = 用户点了某个"接管游戏"的入口）
+            //   之后的**第一拍无条件**确认 ABI，不再挂在 `pid <= 0` 上。
+            //
+            //   为什么可以无条件：ARM 模式下 agent 根本连不上（`Navigator.currentViewId()` 恒 -1、
+            //   MazeLoop 也跑不起来），所以"游戏已经在迷宫里跑着，别打断它"这个顾虑不成立 ——
+            //   那个状态我们压根感知不到。而 x86_64 下 `ensure()` 只读一次 dumpsys、零副作用。
+            //   ⇒ 唯一会被杀进程的组合是"arm64 + 游戏在跑"，而那本来就等于什么都做不了。
+            //
+            //   放这里而不是各入口各写一遍：一键黎明界 / 只刷开局 / 进迷宫 / 走到黎明界 top
+            //   全部覆盖，且不依赖 1.5s 轮询的相位。
+            if (!abiChecked) {
+                abiChecked = true
+                val fix = AbiRepair.ensure(GameProcess.pkg())
+                if (!fix.ok) {
+                    AppState.addLog("游戏架构检查未通过：${fix.detail}")
+                    AppState.setFridaStatus("架构不可用：${fix.detail.take(48)}")
+                    if (fix.fatal) {
+                        // ★确定性修不了 ⇒ 停手。再走下去必然是「等映射 120s → 注入失败 3 次
+                        //   → 杀游戏 3 轮 → 暂停 2 分钟」，只会反复杀游戏刷屏，用户还拿不到结果。
+                        AppState.addLog(
+                            "⇒ 确定性原因（换全 ABI 的安装包 / 装游戏 / 给 root 才能解决）→ " +
+                                "本次进城不注入、不自愈；处理完后重开「一键黎明界」会自动重试",
+                        )
+                        abiBlocked = true
+                    }
+                }
+            }
+            if (abiBlocked) {
+                AppState.setFridaStatus("架构不可用，已停止注入（处理完重开一键黎明界）")
+                delay(POLL_MS)
+                continue
             }
 
             var pid = gamePid()
@@ -290,7 +377,7 @@ object FridaInjector {
                 }
                 AppState.setFridaStatus("游戏没在跑，调起它（第 $launchTries 次）…")
                 GameProcess.launch(ctx)
-                pid = waitForGamePid(PID_WAIT_MS)
+                pid = waitForGamePid(GameProcess.pkg(), PID_WAIT_MS)
                 if (pid <= 0) {
                     AppState.addLog("调起后 ${PID_WAIT_MS / 1000}s 没看到游戏进程（第 $launchTries 次）")
                     delay(3_000)
@@ -310,7 +397,7 @@ object FridaInjector {
                         launchTries = 0
                         GameProcess.kill()
                         lastPid = -1
-                        delay(1_500)
+                        waitGameGone()
                         continue
                     }
                     delay(2_000)
@@ -320,11 +407,18 @@ object FridaInjector {
                     AppState.addLog("找到游戏 pid=$pid（起了 ${(SystemClock.elapsedRealtime() - startedAt) / 1000}s），开始注入")
                 }
                 AppState.setFridaStatus("注入中（注入桥 → 运行组件）…")
-                val err = FridaCore.attachAndLoad(FRIDA_SERVER, pid, agent.absolutePath, eternalize = true)
+                // ★V7（2026-10-30）：首次注入原来**没有超时** —— 进程僵住时会一直等到 frida 内部超时
+                //   （实测 25s），把"决定重试/杀游戏"整整拖后。这里补上限：取重注入上限的 2 倍
+                //   （首次 attach 要建 session + load script，比同 pid 重注入慢一点，别误杀）。
+                val injectTimeout = REINJECT_TIMEOUT_MS * 2
+                val err = withTimeoutOrNull(injectTimeout) {
+                    FridaCore.attachAndLoad(FRIDA_SERVER, pid, agent.absolutePath, eternalize = true)
+                } ?: "超时（${injectTimeout / 1000}s 没回来）"
                 if (err.isEmpty()) {
                     lastPid = pid
                     launchTries = 0                  // 游戏活了（被注入成功）→ 调起计数清零
                     injectFails = 0
+                    injectCycles = 0
                     AppState.addLog("已让运行组件把 agent 注入进 pid=$pid（脚本 ${agent.length()} 字节）")
                     AppState.setFridaStatus("注入完成，等 agent 回连…")
                 } else {
@@ -337,14 +431,40 @@ object FridaInjector {
                     val fatal = err.contains("Unable to write to process memory") ||
                         err.contains("No such process")
                     if (fatal || injectFails >= MAX_INJECT_FAILS) {
+                        // ★先分清"进程真没了"和"还活着、只是 frida 写内存失败"（2026-10-29）：
+                        //   以前一律当僵死杀游戏，于是持续性原因（arm64 包走 Houdini / 反作弊拦注入…）
+                        //   会变成「注入失败 → 杀 → 重开 → 再失败」的死循环，永远刷屏。
+                        val diag = diagnoseInject(pid)
+                        AppState.addLog("注入失败诊断：$diag")
+                        val alive = gamePid(GameProcess.pkg())
+                        if (alive == pid && injectFails == 1) {
+                            AppState.addLog("进程（pid=$pid）还在 ⇒ 先原地重试注入一次，不杀游戏")
+                            delay(2_000)
+                            continue
+                        }
                         injectFails = 0
+                        injectCycles++
+                        if (injectCycles >= MAX_INJECT_CYCLES) {
+                            injectCycles = 0
+                            GameProcess.kill()
+                            lastPid = -1
+                            AppState.addLog(
+                                "连续 $MAX_INJECT_CYCLES 次「注入失败 → 杀游戏重开」→ **暂停自愈 " +
+                                    "${CYCLE_PAUSE_MS / 1000}s**（不再无限重启）。常见原因：游戏装的是 " +
+                                    "arm64 包而设备是 x86 模拟器（Houdini 转译下注入后摸不到 il2cpp）、" +
+                                    "反作弊拦注入、运行组件与游戏 ABI 不匹配。诊断：$diag",
+                            )
+                            AppState.setFridaStatus("注入反复失败，已暂停自愈 2 分钟（看日志里的诊断）")
+                            delay(CYCLE_PAUSE_MS)
+                            continue
+                        }
                         AppState.addLog(
                             if (fatal) "注入失败且进程多半已僵死 → 自愈：杀掉游戏重开"
                             else "连续 $MAX_INJECT_FAILS 次注入失败 → 自愈：杀掉游戏重开",
                         )
                         GameProcess.kill()
                         lastPid = -1                 // 下一轮走"游戏没在跑，调起它"
-                        delay(1_500)
+                        waitGameGone()
                         continue
                     }
                     delay(5_000)
@@ -397,7 +517,7 @@ object FridaInjector {
                         reinjectDead = false
                         GameProcess.kill()
                         lastPid = -1
-                        delay(1_500)
+                        waitGameGone()
                         continue
                     }
                 }
@@ -444,6 +564,51 @@ object FridaInjector {
             return "游戏刚起来（时间兜底闸门），下轮再看"
         }
         return null
+    }
+
+    /**
+     * 等游戏进程**真的消失**（2026-10-29）：`am force-stop` 是异步的，杀完立刻 `am start`
+     * 很容易撞上"还没退干净的旧进程" —— 于是 `pidof` 拿到它、maps 里当然早有 libil2cpp
+     * （日志里那句 `已映射（游戏起了 0s）` 往往就是这么来的），静置完再 attach，进程正好退掉，
+     * 报 `No such process`，看起来像"注入失败"。
+     *
+     * 最多等 4s；没杀干净也往下走（`am start` 会把已有进程带回前台，不至于更坏）。
+     */
+    private suspend fun waitGameGone(timeoutMs: Long = 4_000L) {
+        val t0 = SystemClock.elapsedRealtime()
+        while (SystemClock.elapsedRealtime() - t0 < timeoutMs) {
+            if (fastPid(GameProcess.pkg()) <= 0) return
+            delay(300)
+        }
+        AppState.addLog("force-stop 后 ${timeoutMs / 1000}s 进程还在（继续往下走，可能撞到旧进程）")
+    }
+
+    /**
+     * 注入失败的现场快照（2026-10-29 用户报障后加）。
+     *
+     * 用户只能把日志发过来，所以日志必须**自己说清**失败原因 —— 下面几个值能把三种情况分开：
+     *  * 进程到底还在不在：`pidof` + `/proc/<pid>/status` 的 State（T/D/t = 僵死）；
+     *  * 游戏是不是 arm64 包在 x86 模拟器上跑：`primaryCpuAbi=arm64-v8a` ⇒ Houdini 转译，
+     *    这种情况下注入"看起来成功"也读不到 il2cpp（见 2026-10-29 那台 MuMu 的实测）；
+     *  * 是崩了还是被反作弊干掉：logcat 里的 FATAL / has died / Force finishing。
+     */
+    private suspend fun diagnoseInject(pid: Int): String {
+        val parts = ArrayList<String>()
+        runCatching {
+            val alive = gamePid()
+            parts.add("pidof=$alive" + if (alive == pid) "（同 pid）" else "（≠$pid）")
+            val state = RootShell.exec("awk '/^State:/{print \$2}' /proc/$pid/status", 3_000L).out.trim()
+            parts.add("state=${state.ifBlank { "已退出" }}")
+            val abi = RootShell.exec("dumpsys package ${GameProcess.pkg()} | grep -m1 primaryCpuAbi", 8_000L)
+                .out.substringAfter("primaryCpuAbi=", "").trim()
+            parts.add("游戏ABI=${abi.ifBlank { "?" }}")
+            val crash = RootShell.exec(
+                "logcat -d -t 400 | grep -iE \"Fatal signal|FATAL EXCEPTION|has died|Force finishing\" | tail -3",
+                8_000L,
+            ).out.trim()
+            if (crash.isNotBlank()) parts.add("崩溃线索=${crash.replace('\n', ' ').take(220)}")
+        }
+        return parts.joinToString(" ｜ ").ifBlank { "（诊断没取到）" }
     }
 
     /** root 能不能用（探测一次就记住，失败不每轮重试）。 */
@@ -540,25 +705,34 @@ object FridaInjector {
      *   ② **借 frida-core 的进程枚举**（frida-server 在跑就已经是全量的，最稳）
      *   ③ 兜底才用 root 的 pidof
      */
-    private suspend fun gamePid(): Int {
-        val plain = runCatching {
-            ProcessBuilder("pidof", GAME_PKG).start().inputStream.bufferedReader().readText().trim()
-        }.getOrDefault("")
-        plain.toIntOrNull()?.let { if (it > 0) return it }
+    suspend fun gamePid(pkg: String = GameProcess.pkg()): Int {
+        fastPid(pkg).let { if (it > 0) return it }
 
         // 注意：这个函数每 2 秒被调一次，**别在里面打日志**（会刷屏 —— 实测踩过）
-        val viaFrida = FridaCore.findPid(FRIDA_SERVER, GAME_PKG)
+        val viaFrida = FridaCore.findPid(FRIDA_SERVER, pkg)
         if (viaFrida > 0) return viaFrida
 
-        return RootShell.exec("pidof $GAME_PKG", 8_000L).out.trim().toIntOrNull() ?: -1
+        return parseFirstPid(RootShell.exec("pidof $pkg", 8_000L).out)
     }
 
+    /** 轻量版：只跑一次 `pidof`（不碰 frida-server）。给"等进程消失"这种高频判定用。 */
+    private fun fastPid(pkg: String): Int = runCatching {
+        ProcessBuilder("pidof", pkg).start().inputStream.bufferedReader().readText()
+    }.getOrDefault("").let { parseFirstPid(it) }
+
+    /**
+     * `pidof` 可能一次给**多个** pid（游戏带子进程时），旧写法 `toIntOrNull()` 会整串解析失败、
+     * 直接掉到 frida 兜底甚至返回 -1 ⇒ 明明有进程却判"没起"。取第一个有效 pid。
+     */
+    private fun parseFirstPid(out: String): Int =
+        out.split(' ', '\n', '\t').mapNotNull { it.trim().toIntOrNull() }.firstOrNull { it > 0 } ?: -1
+
     /** 等游戏进程出现（调起之后用）。@return pid；-1 = 超时没等到 */
-    private suspend fun waitForGamePid(timeoutMs: Long): Int {
+    suspend fun waitForGamePid(pkg: String = GameProcess.pkg(), timeoutMs: Long): Int {
         val t0 = SystemClock.elapsedRealtime()
         while (SystemClock.elapsedRealtime() - t0 < timeoutMs) {
             delay(1_000)
-            val p = gamePid()
+            val p = gamePid(pkg)
             if (p > 0) return p
         }
         return -1
@@ -596,9 +770,9 @@ object FridaInjector {
             pidFile = pf
             RootShell.exec(killInjectorCmd(pf), 8_000L)
 
-            val gamePid = RootShell.exec("pidof $GAME_PKG", 8_000L).out.trim()
+            val gamePid = RootShell.exec("pidof ${GameProcess.pkg()}", 8_000L).out.trim()
             if (gamePid.isEmpty()) {
-                AppState.setFridaStatus("游戏没在跑（$GAME_PKG），先启动游戏")
+                AppState.setFridaStatus("游戏没在跑（${GameProcess.pkg()}），先启动游戏")
                 return
             }
             AppState.addLog("游戏 pid=$gamePid，开始注入…")

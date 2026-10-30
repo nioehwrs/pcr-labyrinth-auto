@@ -2,12 +2,24 @@ package com.lmj.labyrinthauto.reroll
 
 import android.content.Context
 import android.content.SharedPreferences
+import com.lmj.labyrinthauto.core.SecureStore
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** 刷开局配置 + B 站账号/密码的本地持久化（SharedPreferences，明文存储，仅本机自动化自用）。 */
+/**
+ * 刷开局配置 + B 站账号/密码的本地持久化。
+ *
+ * 配置项是明文 SharedPreferences（不是秘密）；**账密走 [SecureStore] 加密**（2026-10-30）。
+ */
 object RerollSettings {
     private const val PREF = "reroll"
+
+    private const val KEY_ACCOUNT = "account"
+    private const val KEY_PASSWORD = "password"
+
+    /** 加密 AAD：密文绑死"这个文件这个字段"，不能挪到别处复用 */
+    private const val AAD_ACCOUNT = "$PREF:$KEY_ACCOUNT"
+    private const val AAD_PASSWORD = "$PREF:$KEY_PASSWORD"
 
     fun loadConfig(context: Context): RerollConfig {
         val d = RerollConfig()
@@ -185,15 +197,15 @@ object RerollSettings {
 
     fun loadCredentials(context: Context): Pair<String, String> {
         val sp = context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
-        return (sp.getString("account", "") ?: "") to (sp.getString("password", "") ?: "")
+        // 老版本的明文在这里会被 SecureStore 原地升级成密文
+        return (SecureStore.get(sp, KEY_ACCOUNT, AAD_ACCOUNT) ?: "") to
+            (SecureStore.get(sp, KEY_PASSWORD, AAD_PASSWORD) ?: "")
     }
 
     fun saveCredentials(context: Context, account: String, password: String) {
-        context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
-            .edit()
-            .putString("account", account)
-            .putString("password", password)
-            .apply()
+        val sp = context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+        SecureStore.put(sp, KEY_ACCOUNT, account, AAD_ACCOUNT)
+        SecureStore.put(sp, KEY_PASSWORD, password, AAD_PASSWORD)
     }
 
     /**
