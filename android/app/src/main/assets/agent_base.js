@@ -5671,10 +5671,17 @@ function labCharaPageQuick() {
   try {
     let ta = g_csCharaPage;
     // 缓存有效性：+0xF0 必须是 1..30（页面上限），否则视为失效重找
+    // ★2026-10-31 补：**还要核对节点名**。上一局的面板被销毁后，旧指针偶尔仍能读出一个
+    //   1..30 的数字 ⇒ 缓存被判"有效"⇒ 后面读 list 抛异常 ⇒ `out.ok` 永远停在 false，
+    //   而且缓存不会自愈 ⇒ 上层白等 30s（13:52:37 那次就是这么卡死的）。
     if (ta && !ta.isNull()) {
-      let sn = -1;
+      let sn = -1, nm = null;
       try { sn = ta.add(0xF0).readS32(); } catch (e) {}
-      if (!(sn >= 1 && sn <= 30)) ta = null;
+      try { nm = _str(_inv(_inv(ta, "get_transform"), "get_name")); } catch (e) {}
+      if (!(sn >= 1 && sn <= 30) || !nm || nm.indexOf(CS_CHARA_CLS) !== 0) {
+        ta = null;
+        g_csCharaPage = null;
+      }
     }
     if (!ta || ta.isNull()) {
       if (Date.now() - g_csCharaPageAt < 500) { out.err = "页面零件未就绪"; return out; }   // 别每轮都重找
@@ -5733,7 +5740,11 @@ function labCharaPageQuick() {
       try { out.friendCount = _str1(_inv(ta.add(0xB0).readPointer(), "get_text")); } catch (e) {}
     } catch (e) {}
     out.ok = true;
-  } catch (e) { out.err = String(e); }
+  } catch (e) {
+    out.err = String(e);
+    // ★出错就丢掉缓存，下一轮重新找（否则坏指针会一直被当成"有效"，永久 ok=false）
+    g_csCharaPage = null;
+  }
   return out;
 }
 

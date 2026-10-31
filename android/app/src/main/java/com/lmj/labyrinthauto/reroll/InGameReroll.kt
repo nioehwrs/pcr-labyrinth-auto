@@ -46,6 +46,17 @@ object InGameReroll {
     /** 单次找按钮的总时限（超时才算失败） */
     private const val FIND_MS = 8_000L
 
+    /**
+     * ★**学习档**单次 `labBtn` 的调用时限（2026-10-31 修「撤退失败 → 局内刷开局停手」）。
+     *
+     * `labBtn` 分两态：命中已学路径 = 几十 ms；**第一次学路径**要遍历"当前 View + DialogArea 子树"。
+     * 慢机器/大页面上实测学到 **3~7s**（日志：`[slow] labBtn 7064ms`），而原来一律按 3s 卡超时 ⇒
+     * 结果被丢掉、路径**也存不下来**（落盘只在拿到回包时做）⇒ 下一轮又从头学 ⇒
+     * 每轮都是"重学 + 超时"，最后「撤退」连点 3 次都没读到确认框、8s 找不到按钮就停手。
+     * 0.4.0 重装后缓存为空（缓存在 `filesDir/lab_btn.json`，卸载即清），必然踩这个坑。
+     */
+    private const val LEARN_MS = 12_000L
+
     /** 重找间隔（labBtn 命中路径只有几十 ms，所以可以很短；学习时会自然慢一点） */
     private const val GAP_MS = 200L
 
@@ -291,60 +302,154 @@ object InGameReroll {
      *  - 未挑战 → 出发 → 公会选择 → 确认（必要时改难度）→ 出发 → 关掉出发奖励。
      */
     private suspend fun enterOnce(input: InputBackend, guildId: Int, difficulty: Int): Boolean {
-        // ★刚到 259 时页面还在过渡，立刻点会被吞（2026-10-19 实测 01:24:19：
-        //   页面切换与点击同一秒 ⇒ 点了没反应、白等 7s 判失败）。
-        //   这里先等一拍，且**点了没换页就再点**（最多 3 次），和 `Navigator.enterMaze` 的节奏一致。
-        delay(250)                                  // 只给"刚建好"留一点余量；点不中会重试
-        var vid = -1
+        // ★刚到 259 时页面还在过渡，立刻点会被吞（2026-10-19 实测 01:24:19）。
+        delay(250)
+        val fromTop = Navigator.currentViewId() == Navigator.TARGET_VIEW
+        var vid = 264
+        // 链A：259 点「出发」→ 出口只可能是 263（公会选择）或 264（挑战中直接进图）
+        if (fromTop) vid = chainStart(input) ?: return false
+        // 链B：263 公会选择 → 出口一定是 264
+        if (vid == 263) {
+            if (!chainGuild(input, guildId, difficulty)) return false
+            vid = 264
+        }
+        if (vid != 264) {
+            AppState.addLog("[✗] 进局：本该在 264，实际 viewId=$vid → 失败")
+            return false
+        }
+        // 链C：入场弹窗 → 出口一定是「选人面板就绪」
+        return chainEntryPanels(input, resumed = !fromTop)
+    }
+
+    /**
+     * 【链 A】259 点「出发」——**入口唯一的链**。
+     *
+     * 出口只有两个可能：**263（公会选择）** 或 **264（挑战中 / 直接进图）**。
+     * 点空了（没换页）就再点，最多 3 次。
+     */
+    private suspend fun chainStart(input: InputBackend): Int? {
         var tries = 0
         while (tries < 3) {
             tries++
-            if (!tapNode(input, "labyrinth_thumb_start", "出发")) return false
-            vid = waitView(setOf(263, 264), 4_000L)  // 轮询：一变页立刻返回
-            if (vid == 263 || vid == 264) break
-            AppState.addLog("局内刷开局：点了出发没换页（viewId=$vid）→ 再点一次（第 $tries/3 次）")
-        }
-
-        // ★点完出发等页面：263=公会选择（未挑战）/ 264=地图（挑战中直接进）
-        //   ⚠不能用 `isLabyrinthView` 判"已在迷宫里"——它含 263（公会设置），
-        //     2026-10-19 实测就是这里把公会页当成已进图，拿着旧地图判"合格"，然后 MazeLoop 卡死在公会页。
-        if (vid == 264) {
-            AppState.addLog("局内刷开局：挑战中 → 直接进图")
-            return waitMapView()
-        }
-        if (vid != 263) {
-            // 个别情况下会先过一帧别的页：用节点兜底确认到底是不是公会选择页
-            if (AgentApi.find("GuildNameLabel") == null) {
-                AppState.addLog("局内刷开局：点出发后页面不认识（viewId=$vid）→ 失败")
-                return false
+            if (!tapNode(input, "labyrinth_thumb_start", "出发")) return null
+            val vid = waitView(setOf(263, 264), 4_000L)
+            if (vid == 263 || vid == 264) {
+                AppState.addLog("局内刷开局：链A（出发）完成 → 出口 viewId=$vid")
+                return vid
             }
+            AppState.addLog("局内刷开局：链A：点了出发没换页（viewId=$vid）→ 再点一次（第 $tries/3 次）")
         }
+        AppState.addLog("[✗] 链A：连点 3 次「出发」都没离开 259")
+        return null
+    }
 
+    /**
+     * 【链 B】263 公会选择 → 选公会 → 确保难度 → 确认出发。
+     *
+     * **出口一定在 264**（用户 2026-10-31："选公会链结束一定在入场链"）。
+     * 出口不符就报错，不再"猜着往下走"。
+     */
+    private suspend fun chainGuild(input: InputBackend, guildId: Int, difficulty: Int): Boolean {
+        AppState.addLog("局内刷开局：链B（选公会）开始")
         if (!selectGuild(input, guildId)) return false
         // 不睡固定时间：ensureDifficulty 内部读难度本身就是"等它建好"的轮询
         if (!ensureDifficulty(input, difficulty)) return false
         if (!tapStartConfirm(input)) return false
-
-        // 出发奖励（单按钮）——读不到无所谓（它自己会消失），但**点偏了不行**：
-        //   2026-10-19 实测第 2 次按缓存路径点到 (959,893)，比第一次学到的 (958,960) 差 67px
-        //   ⇒ 弹窗根本没关掉 ⇒ 后面连「地图」按钮都找不到（"8s 内没找到「地图」"）。
-        //   所以：①等它站稳再点；②点完确认真的关了；没关就丢掉缓存**重新学一次**位置再点。
-        waitStable("OneButtonWhite", 3_000L)
-        val sigBefore = pageSig()
-        tapNode(input, "OneButtonWhite", "关闭出发奖励", timeoutMs = 12_000L)
-        // ★验证前多等一拍：弹窗是**淡出**的，刚点完 200ms 按钮还在树里。
-        //   ⚠验证**不能用 findBtn**：按钮没了 ⇒ labBtn 走"学习"遍历整棵子树（~2s）再判空，
-        //     每局白等 2s（2026-10-19 用户："在选初始角色页面等一会，不知道在等什么"）。
-        //     改用便宜的页面签名（几十 ms）：关掉了 ⇒ 顶层对话框变了。
-        delay(DLG_CLOSE_MS)
-        if (pageSig() == sigBefore) {
-            AppState.addLog("局内刷开局：出发奖励没关掉（页面没变）→ 重新学一次按钮位置再点")
-            tapNode(input, "OneButtonWhite", "关闭出发奖励", timeoutMs = 6_000L, fresh = true)
-            delay(SETTLE_MS)
+        val vid = waitView(setOf(264), 6_000L)
+        if (vid != 264) {
+            AppState.addLog("[✗] 链B 出口不对：确认出发后应在 264，实际 viewId=$vid")
+            return false
         }
-        // ★关掉弹窗后给地图一拍再读（2026-10-19 实测：同一秒就读 ⇒ 拿到的是弹窗还在时的旧数据）
-        delay(SETTLE_MS)
-        return waitMapView()
+        AppState.addLog("局内刷开局：链B（选公会）完成 → 出口 264")
+        return true
+    }
+
+    /**
+     * 【链 C】入场链：逐层关掉白名单弹窗（出发奖励 / 公会专属遗物 / 印记…）。
+     *
+     * **出口一定是「选人面板就绪」**（用户 2026-10-31："入场链结束一定在选人面板"）——
+     * 判据是 `labCharaPageQuick.ok && buttons.map 坐标 > 0`，不是"top 为空"。
+     *
+     * ★面板与面板之间有 `top == null` 的过渡帧：这里只**等**，不点、不当作到站。
+     * ★唯一例外：`resumed=true`（挑战中直接进图、上一局可能停在半路）时，
+     *   "稳定无面板"也算到站，否则会白等 30s。
+     */
+    private suspend fun chainEntryPanels(
+        input: InputBackend,
+        resumed: Boolean,
+        timeoutMs: Long = 30_000L,
+    ): Boolean {
+        val whitelist = setOf("OneButtonWhite", "TwoButtonRight", "ThreeButtonCenter", "OneButtonBlue")
+        val t0 = SystemClock.elapsedRealtime()
+        var taps = 0
+        var unknownSaid = false
+        var looseHits = 0
+        while (SystemClock.elapsedRealtime() - t0 < timeoutMs) {
+            val q = AgentApi.labCharaPageQuick()
+            val mx = q?.optJSONObject("buttons")?.optJSONObject("map")?.optInt("x", -1) ?: -1
+            if (q?.optBoolean("ok") == true && mx > 0) {
+                AppState.addLog("局内刷开局：链C（入场）完成 → 选人面板已就绪（本链关了 $taps 层弹窗）")
+                return true
+            }
+            // ★兜底只用于"**面板确实在**、但坐标读不出来"这一种情况（2026-10-31 13:52 白等 30s）：
+            //   与 MazeLoop 完全相同的判据 —— `statusType==1` 且有顶框 —— 并且**要连续 3 拍成立**
+            //   （≈1.5s），不吃瞬时帧。坐标读不出不影响后续：撤退阶段 `dismissCharaPanel` 自己轮询等。
+            val st = AgentApi.labStatus()
+            val top = st?.optString("pageTop").let { t -> if (t == null || t == "null") "" else t }
+            if (st != null && st.optInt("statusType", -1) == 1 && top.isNotEmpty()) {
+                looseHits++
+                if (looseHits >= 3) {
+                    AppState.addLog(
+                        "局内刷开局：链C（入场）完成 → 选人页已在（statusType=1 顶框=$top 连续 $looseHits 拍；" +
+                            "坐标严格判据未通过：ok=${q?.optBoolean("ok")} err=${q?.optString("err")}）",
+                    )
+                    return true
+                }
+            } else {
+                looseHits = 0
+            }
+            val d = AgentApi.dialog()
+            if (d?.optBoolean("open") == true) {
+                val a = d.optJSONArray("buttons")
+                var hit: JSONObject? = null
+                if (a != null) {
+                    for (i in 0 until a.length()) {
+                        val b = a.optJSONObject(i) ?: continue
+                        if (whitelist.contains(b.optString("name"))) { hit = b; break }
+                    }
+                }
+                if (hit != null && taps < 10) {
+                    taps++
+                    AppState.addLog(
+                        "局内刷开局：链C·关掉一层「${hit.optString("name")}」" +
+                            "(${hit.optInt("x")},${hit.optInt("y")})",
+                    )
+                    input.tap(hit.optInt("x"), hit.optInt("y"))
+                    delay(400)
+                    continue
+                }
+                if (hit == null && !unknownSaid) {
+                    unknownSaid = true
+                    AppState.addLog("[!] 链C：弹窗里没有白名单按钮（${pageSig()}）→ 只等不点")
+                }
+            } else if (resumed && stableTopGone(2_500L)) {
+                AppState.addLog("局内刷开局：链C（入场）→ 挑战中且没有选人面板，按到站处理")
+                return true
+            } else if (!unknownSaid && top.isNotEmpty()) {
+                // ★2026-10-31 13:52:37 的坑：顶框已经是 DialogCommonFullSize（选人面板就在屏幕上），
+                //   但 labCharaPageQuick 一直不 ok、dialog() 又返回 open=false ⇒ 整段 30s 全在空等。
+                //   这里把"到底读到什么"打一次出来，便于下次直接定位。
+                unknownSaid = true
+                AppState.addLog(
+                    "[!] 链C：顶框=$top 但读不出面板（labCharaPageQuick.ok=${q?.optBoolean("ok")}" +
+                        " err=${q?.optString("err")} node=${q?.optString("node")}" +
+                        " dialog.open=${d?.optBoolean("open")}）→ 只等不点",
+                )
+            }
+            delay(POLL_MS)
+        }
+        AppState.addLog("[✗] 链C 超时：${timeoutMs / 1000}s 内没等到选人面板（${pageSig()}）")
+        return false
     }
 
     /**
@@ -377,14 +482,6 @@ object InGameReroll {
             delay(POLL_MS)
         }
         return Navigator.currentViewId()
-    }
-
-    /** 等真正进到地图（264）；读图前必须先到这里，否则会拿到上一局的旧地图。 */
-    private suspend fun waitMapView(): Boolean {
-        val v = waitView(setOf(264), 15_000L)
-        if (v == 264) return true
-        AppState.addLog("局内刷开局：没进到地图（viewId=$v）→ 失败")
-        return false
     }
 
     /**
@@ -860,54 +957,270 @@ object InGameReroll {
      *  · 两个交替找 8 轮（≈10s）都没有 → **按故障处理，停手**（多半在战斗中/异常页）。
      */
     private suspend fun retreat(input: InputBackend): Boolean {
-        var entry: JSONObject? = null
-        var viaMap = false
-        for (t in 1..8) {
-            findBtn("MapButton", 1_200L)?.let { entry = it; viaMap = true }
-            if (entry != null) break
-            findBtn("LabyrinthRetireButton", 1_200L)?.let { entry = it }
-            if (entry != null) break
-            delay(300)
-        }
-        val e = entry ?: run {
-            AppState.addLog("[✗] 局内刷开局：「地图」「撤退」按钮都找不到 → 按故障处理，停手（可能在战斗中/异常页）")
-            return false
-        }
-        AppState.addLog("局内刷开局：点「${if (viaMap) "地图" else "撤退"}」(${e.optInt("x")},${e.optInt("y")})")
-        input.tap(e.optInt("x"), e.optInt("y"))
-        if (viaMap) {
-            // 点了「地图」才刚到地图页：等它铺好再点撤退（同实测：切页那一下就点会点空）
-            delay(SETTLE_MS)
-            waitStable("LabyrinthRetireButton")
-        } else {
-            delay(400)
-        }
-        // ★点了要**看有没有弹确认框**（2026-10-19 实测 01:36:08：撤退那一下点空 ⇒ 确认框没出来，
-        //   而原来只点一次、之后干等 8s ⇒ "没找到确认撤退" 收摊）。没弹就再点，最多 3 次。
-        var confirmShown = false
-        for (t in 1..3) {
-            if (!tapNode(input, "LabyrinthRetireButton", "撤退（无报酬）")) return false
-            if (findBtn("TwoButtonRight", 5_000L) != null) { confirmShown = true; break }
-            AppState.addLog("局内刷开局：点了撤退没弹确认框 → 再点一次（第 $t/3 次）")
-        }
-        if (!confirmShown) return false
-        // 点确认：同样验证一下真的走了（撤退有演出），没回去就再点一次
-        for (t in 1..3) {
-            // ★确认框刚弹出时按钮还在动（实测 y：719 → 稳定 744），先等它站稳再点
-            waitStable("TwoButtonRight")
-            if (!tapNode(input, "TwoButtonRight", "确认撤退")) return false
-            val t0 = SystemClock.elapsedRealtime()
-            while (SystemClock.elapsedRealtime() - t0 < 6_000L) {
-                if (Navigator.currentViewId() == Navigator.TARGET_VIEW) {
-                    AppState.addLog("局内刷开局：已撤退回到黎明界 top")
+        // ★2026-10-31（用户："不能正确检测到初始角色选择的页面，一直在尝试点撤退按钮，
+        //   但应该先点地图按钮退到地图才对"）：选人页是盖在地图上的模态面板，HUD 只有
+        //   「地图 / 角色 / 迷宫遗物」，那颗「撤退」还在树里但**点不动**。
+        //   ⇒ 先离开面板回地图，再走原来的撤退流程。
+        //   ★★第二版（同一天，用户："各处都很慢、还可能点错"）：上一版用 labBtn 找「地图」这个名字，
+        //     实测代价 6.9~7.3s/次 —— **地图页上压根没这颗按钮**，agent 必须走完整棵子树才敢说没有。
+        //     现在全部换成便宜调用：
+        //       ① `labStatus`（实测 7ms）拿 statusType/pageTop；
+        //       ② 是选人页（statusType=1 且有顶框，与 MazeLoop 同一判据）→ `labCharaPageQuick`
+        //          （12ms）**直接拿面板自己报的「地图」坐标**去点（不搜名字，也就不会点到被盖住的按钮）；
+        //       ③ 其余情况直接撤退（撤退按钮命中缓存 4ms）。
+        // ★★2026-10-31 第三版：改成**固定链条**（用户："刷开局可以明确设定状态转换链条"）。
+        //   ① 选人面板让开（点面板自报的「地图」；坐标没算好就**等**，绝不退回点撤退）
+        //   ② 顶框**稳定**消失（连续两次读到 null）—— 专门吸收面板之间的过渡帧
+        //   ③ 点「撤退」→ 断言 dialog() 里出现 TwoButtonRight
+        //   ④ 点确认 → 断言回到 259
+        //   每步失败都报"卡在哪一步"，不再出现"点三次撤退都没反应"这种含糊失败。
+        // ★★2026-10-31 第四版（用户："进入时状态不是固定的，甚至可能包含 5 个链以外的节点"）：
+        //   进局现场取决于**上一局停在哪** —— 可能直接停在选人面板，也可能停在战斗面板
+        //   （战斗面板要点「取消」→「查看地图」才回得到地图）。所以撤退前先**判断处在哪条链的哪个位置**，
+        //   处理完回到地图，再走【地图页主链】撤退。
+        //   分类用便宜调用：viewId(1ms) + labStatus(7ms) + labCharaPageQuick(12ms)，不碰 labBtn。
+        for (round in 1..4) {
+            val sc = classifyScene()
+            AppState.addLog("局内刷开局：撤退前现场 = ${sceneName(sc)}（${pageSig()}）")
+            when (sc) {
+                Scene.TOP -> {
+                    AppState.addLog("局内刷开局：已经在 259 top，不用撤退")
                     return true
                 }
-                delay(POLL_MS)
+                Scene.MAP -> {
+                    if (!stableTopGone(5_000L)) {
+                        AppState.addLog("[!] 撤退②：顶框没稳定消失（${pageSig()}）→ 重新判定现场")
+                        continue
+                    }
+                    if (retreatFromMap(input)) return true
+                    AppState.addLog("[!] 撤退主链失败（第 $round/4 轮）→ 重新判定现场")
+                }
+                Scene.CHARA_PANEL -> if (!dismissCharaPanel(input)) return false
+                Scene.BATTLE -> if (!leaveBattlePanel(input)) return false
+                Scene.OTHER -> if (!clearOtherDialog(input)) return false
             }
-            AppState.addLog("局内刷开局：点了确认撤退还在 ${Navigator.currentViewId()} → 再点一次（第 $t/3 次）")
         }
-        AppState.addLog("局内刷开局：撤退后没能回到 top")
+        AppState.addLog("[✗] 撤退：4 轮都没能把现场恢复成「地图页并撤出去」（${pageSig()}）")
         return false
+    }
+
+    /** 【地图页主链】点「撤退」→ 断言确认框 → 点确认 → 断言回到 259。 */
+    private suspend fun retreatFromMap(input: InputBackend): Boolean {
+        val e = findBtn("LabyrinthRetireButton", FIND_MS)
+        if (e == null) {
+            AppState.addLog("[✗] 撤退③：找不到「撤退」按钮（view=${Navigator.currentViewId()}）")
+            return false
+        }
+        AppState.addLog("局内刷开局：点「撤退」(${e.optInt("x")},${e.optInt("y")})")
+        input.tap(e.optInt("x"), e.optInt("y"))
+        // ★先查确认框、没有再补点（补点会落在刚弹出的框上把它关掉）
+        var confirm = findConfirmButton(4_000L)
+        if (confirm == null) {
+            AppState.addLog("局内刷开局：点撤退后没弹确认框 → 补点一次「撤退」")
+            if (!tapNode(input, "LabyrinthRetireButton", "撤退（补点）")) return false
+            confirm = findConfirmButton(5_000L)
+        }
+        if (confirm == null) {
+            AppState.addLog("[✗] 撤退④：确认框没出来（顶框=${pageSig()}）")
+            return false
+        }
+        for (t in 1..2) {
+            val b = confirm ?: findConfirmButton(4_000L) ?: break
+            val bx = b.optInt("x", -1)
+            val by = b.optInt("y", -1)
+            if (bx <= 0 || by <= 0) break
+            AppState.addLog("局内刷开局：点「确认撤退」($bx,$by)（dialog 报的坐标）")
+            input.tap(bx, by)
+            if (waitView(setOf(Navigator.TARGET_VIEW), 6_000L) == Navigator.TARGET_VIEW) {
+                AppState.addLog("局内刷开局：已撤退回到黎明界 top")
+                return true
+            }
+            AppState.addLog("局内刷开局：点了确认还在 ${Navigator.currentViewId()} → 重来（第 $t/2 次）")
+            confirm = null            // 下一轮重新读坐标（不怕它挪位置）
+        }
+        AppState.addLog("[✗] 撤退⑤：点确认后没回到 259（view=${Navigator.currentViewId()}）")
+        return false
+    }
+
+    /** 进局/撤退时的**现场分类**（对应"现在是哪条链的哪个位置"）。 */
+    private enum class Scene { TOP, CHARA_PANEL, MAP, BATTLE, OTHER }
+
+    private fun sceneName(s: Scene): String = when (s) {
+        Scene.TOP -> "259 黎明界 top"
+        Scene.CHARA_PANEL -> "264 地图 + 初始选人面板"
+        Scene.MAP -> "264 地图页（无面板）"
+        Scene.BATTLE -> "264 战斗/任务详情面板"
+        Scene.OTHER -> "其他（未知面板/非迷宫页）"
+    }
+
+    /**
+     * ★**判断进入时停在哪条链**（2026-10-31 用户需求）。
+     *
+     * 只用便宜调用，全部实测：`viewId` 1ms、`labStatus` 7ms；选人面板再补一次
+     * `labCharaPageQuick`（12ms）。
+     *
+     * statusType 取值来自 agent（与 MazeLoop 日志里的 `状态=SUMMON_UNIT(1)` / `QUEST(5)` /
+     * `BATTLE(29)` 同一套）：1=选人页、5=关卡详情、29=战斗。
+     */
+    private suspend fun classifyScene(): Scene {
+        val vid = Navigator.currentViewId()
+        if (vid == Navigator.TARGET_VIEW) return Scene.TOP
+        if (vid != 264) return Scene.OTHER
+        val st = AgentApi.labStatus() ?: return Scene.OTHER
+        val top = st.optString("pageTop").let { if (it == "null") "" else it }
+        val type = st.optInt("statusType", -1)
+        if (type == 1 && top.isNotEmpty()) return Scene.CHARA_PANEL
+        if (type == 29 || type == 5) return Scene.BATTLE
+        if (top.isEmpty()) return Scene.MAP
+        return Scene.OTHER
+    }
+
+    /**
+     * ★**第 6 条链（暂定）**：停在战斗/关卡详情面板时，先「取消」再「查看地图」回到地图。
+     *
+     * 2026-10-31 用户："如果之前某次停在战斗面板，可能就要从战斗选人点取消，
+     * 再点一个查看地图按钮，回到地图，然后点撤退和确认"。
+     * ⚠这条链的按钮名只在 PC 版里确认过（`MapViewModeButton = 查看地图`），Android 上没实测；
+     *   第一次跑会打日志，按日志再校正名字即可。
+     */
+    private suspend fun leaveBattlePanel(input: InputBackend): Boolean {
+        // ① 取消（战斗/关卡详情里的 TwoButtonLeft = 取消）
+        val d = AgentApi.dialog()
+        val a = d?.optJSONArray("buttons")
+        var cancel: JSONObject? = null
+        if (a != null) {
+            for (i in 0 until a.length()) {
+                val b = a.optJSONObject(i) ?: continue
+                if (b.optString("name") == "TwoButtonLeft") { cancel = b; break }
+            }
+        }
+        if (cancel != null) {
+            AppState.addLog("局内刷开局：战斗面板 → 点「取消」(${cancel.optInt("x")},${cancel.optInt("y")})")
+            input.tap(cancel.optInt("x"), cancel.optInt("y"))
+            delay(SETTLE_MS)
+        }
+        // ② 查看地图（回到 264 地图页）
+        if (tapNode(input, "MapViewModeButton", "查看地图", FIND_MS)) {
+            delay(SETTLE_MS)
+            if (waitView(setOf(264), 4_000L) == 264) return true
+        }
+        AppState.addLog("[!] 撤退⑥：战斗面板没能回到地图（${pageSig()}）→ 交回主循环重判")
+        return false
+    }
+
+    /** 其他未知弹窗：只点白名单里的通用确认按钮（点掉一层就交给主循环重判）。 */
+    private suspend fun clearOtherDialog(input: InputBackend): Boolean {
+        val whitelist = setOf("OneButtonWhite", "TwoButtonRight", "ThreeButtonCenter", "OneButtonBlue")
+        val d = AgentApi.dialog()
+        val a = d?.optJSONArray("buttons")
+        if (a != null) {
+            for (i in 0 until a.length()) {
+                val b = a.optJSONObject(i) ?: continue
+                if (whitelist.contains(b.optString("name"))) {
+                    AppState.addLog("局内刷开局：未知面板 → 点掉「${b.optString("name")}」(${b.optInt("x")},${b.optInt("y")})")
+                    input.tap(b.optInt("x"), b.optInt("y"))
+                    delay(SETTLE_MS)
+                    return true
+                }
+            }
+        }
+        AppState.addLog("[!] 撤退：未知面板且没有白名单按钮（${pageSig()}）→ 只等不点")
+        delay(SETTLE_MS)
+        return false
+    }
+
+    /**
+     * ★**撤退链第①步**：选人面板挡着就让开（点它自报的「地图」）。
+     *
+     * 2026-10-31 的两次翻车都在这：
+     * * 面板刚弹出时 `labCharaPageQuick` 的 `buttons.map` **坐标还没算好**（这次日志里
+     *   `[!] 选人页上读不到「地图」坐标 → 照旧尝试撤退` 就是它）——正确做法是**等**，不是退回点撤退；
+     * * 用 `labBtn("MapButton")` 找名字要 6.9~7.3s/次（地图页上根本没这颗按钮）。
+     *
+     * 返回 true = 现在没有面板挡着（或成功点掉）。
+     */
+    private suspend fun dismissCharaPanel(input: InputBackend, timeoutMs: Long = 8_000L): Boolean {
+        val t0 = SystemClock.elapsedRealtime()
+        while (SystemClock.elapsedRealtime() - t0 < timeoutMs) {
+            val st = AgentApi.labStatus() ?: break
+            val top = st.optString("pageTop").let { if (it == "null") "" else it }
+            if (top.isEmpty()) return true
+            if (st.optInt("statusType", -1) != 1) {
+                AppState.addLog("局内刷开局：顶框=$top（不是选人页）→ 不动它")
+                return true
+            }
+            val q = AgentApi.labCharaPageQuick()
+            val mp = q?.optJSONObject("buttons")?.optJSONObject("map")
+            val mx = mp?.optInt("x", -1) ?: -1
+            val my = mp?.optInt("y", -1) ?: -1
+            if (mx > 0 && my > 0) {
+                AppState.addLog("局内刷开局：选人页（顶框=$top）→ 点面板上的「地图」($mx,$my) 退回地图")
+                input.tap(mx, my)
+                if (stableTopGone(5_000L)) {
+                    AppState.addLog("局内刷开局：面板已收起")
+                    return true
+                }
+                AppState.addLog("局内刷开局：点了地图面板还在（${pageSig()}）→ 再试一次")
+                delay(500)
+            } else {
+                // ★面板刚弹出、按钮坐标还没算好 ⇒ 等它铺好，**不要**退回去点撤退
+                delay(300)
+            }
+        }
+        AppState.addLog("[!] 撤退①：等不到选人面板的「地图」坐标（${pageSig()}）")
+        return false
+    }
+
+    /**
+     * ★顶框**稳定**消失：连续两次（间隔 [POLL_MS]）读到 `top == null` 才算。
+     *
+     * 为什么要"稳定"：进局演出里面板与面板之间存在 `top == null` 的过渡帧（2026-10-31 用户指出），
+     * 单次读到 null 就当成"已经在地图、可以点撤退"正是之前点进面板的根因。
+     */
+    private suspend fun stableTopGone(timeoutMs: Long): Boolean {
+        val t0 = SystemClock.elapsedRealtime()
+        var okRun = 0
+        while (SystemClock.elapsedRealtime() - t0 < timeoutMs) {
+            val s = AgentApi.uiSig()
+            val t = s?.optString("top") ?: ""
+            if (s != null && (t.isBlank() || t == "null")) {
+                okRun++
+                if (okRun >= 2) return true
+            } else {
+                okRun = 0
+            }
+            delay(POLL_MS)
+        }
+        return false
+    }
+
+    /**
+     * ★**确认框按钮**用 `dialog()` 读，不走 `labBtn`（2026-10-31 用户："撤退确认框没有读到"）。
+     *
+     * 实测同一页：
+     * * `dialog()` → **747ms**，直接给出 `buttons: [{name:"TwoButtonLeft"(取消), TwoButtonRight(确认)}]`
+     *   以及**当下**的坐标（1179,744）；
+     * * `labBtn("TwoButtonRight")` → **3.7~7s**（它从 `canvas` 整棵树找，找不到名字还要走完整个子树），
+     *   3s 的窗口根本等不到 ⇒ 日志里"还没有确认框 → 补点一次"反复出现，最后 `8s 内没找到「确认撤退」`。
+     *
+     * 返回 `{name,x,y}`（右侧那颗 = 确认）；没有框就 null。
+     */
+    private suspend fun findConfirmButton(timeoutMs: Long = 3_000L): JSONObject? {
+        val t0 = SystemClock.elapsedRealtime()
+        while (SystemClock.elapsedRealtime() - t0 < timeoutMs) {
+            val d = AgentApi.dialog()
+            if (d?.optBoolean("open") == true) {
+                val a = d.optJSONArray("buttons")
+                if (a != null) {
+                    for (i in 0 until a.length()) {
+                        val b = a.optJSONObject(i) ?: continue
+                        if (b.optString("name") == "TwoButtonRight") return b
+                    }
+                }
+            }
+            delay(POLL_MS)
+        }
+        return null
     }
 
     // ────────────────────────── 找节点小工具 ──────────────────────────
@@ -972,9 +1285,18 @@ object InGameReroll {
         val key = "${pageSig()}|$name"
         val known = if (fresh) null else appCtx?.let { LabBtnStore.get(it, key) }
         val t0 = SystemClock.elapsedRealtime()
+        // ★学习档放宽时限（见 [LEARN_MS]）：
+        //   · 已学到路径（known != null 且非 fresh）→ 仍是 3s 的便宜调用；
+        //   · 需要学习、且调用方给了正常窗口（≥3s）→ 给 LEARN_MS，保证**一次学成并落盘**；
+        //   · 1.2s 级别的"快速探测"（`retreat()` 里交替探「地图」「撤退」）→ 仍按 3s，免得把
+        //     "这页没有这按钮"拖成好几秒一轮。
+        val learning = fresh || known == null
+        // ★"有缓存"不等于"一定快"：缓存路径校验失败时 agent 仍要**重学**（实测 3.7~3.8s），
+        //   原来这一档给 3s ⇒ 每次都被砍、永远学不成。给 6s（命中缓存的实际往返仍是 4ms）。
+        val callMs = if (learning && timeoutMs >= 3_000L) LEARN_MS else 6_000L
         while (SystemClock.elapsedRealtime() - t0 < timeoutMs) {
             // 第 5 个参数 fresh：让 agent 连它进程内的缓存也丢掉，真的重学一次
-            val r = AgentApi.obj("labBtn", listOf(key, name, known?.first, known?.second, fresh), 3_000L)
+            val r = AgentApi.obj("labBtn", listOf(key, name, known?.first, known?.second, fresh), callMs)
             val x = r?.optInt("x", -1) ?: -1
             val y = r?.optInt("y", -1) ?: -1
             if (x > 0 && y > 0) {

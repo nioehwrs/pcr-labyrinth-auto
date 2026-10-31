@@ -79,8 +79,12 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import android.widget.Toast
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
@@ -1893,7 +1897,20 @@ private fun ChangelogDialog(onDismiss: () -> Unit, onCheckUpdate: () -> Unit) {
 }
 
 /**
- * 很轻的 Markdown 渲染：`## 版本` / `### 小节` / `- 条目`，其余按正文 ——
+ * 行内 `**加粗**` → AnnotatedString（其余按普通文字）。
+ * ★2026-10-30 用户：CHANGELOG 里大量 `**…**`，之前当正文原样显示，"两个星号"很扎眼。
+ * 按 `**` 切分后**奇数段加粗**即可（成对出现；落单的 `**` 只会少加粗一段，不会吃掉文字）。
+ */
+private fun mdInline(s: String): AnnotatedString = buildAnnotatedString {
+    s.split("**").forEachIndexed { i, seg ->
+        if (seg.isEmpty()) return@forEachIndexed
+        if (i % 2 == 1) withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(seg) }
+        else append(seg)
+    }
+}
+
+/**
+ * 很轻的 Markdown 渲染：`## 版本` / `### 小节` / `- 条目` / 行内 `**加粗**`，其余按正文 ——
  * 「更新记录」和「检查更新」（新版本说明来自 latest.json 的 notes）共用同一套排版。
  */
 @Composable
@@ -1903,23 +1920,23 @@ private fun MarkdownColumn(text: String) {
         when {
             line.startsWith("# ") -> Unit              // 文件顶部「# 更新日志」不重复显示
             line.startsWith("## ") -> Text(
-                line.removePrefix("## "),
+                mdInline(line.removePrefix("## ")),
                 style = MaterialTheme.typography.titleSmall,
                 color = MaterialTheme.colorScheme.primary,
                 modifier = Modifier.padding(top = 12.dp, bottom = 2.dp),
             )
             line.startsWith("### ") -> Text(
-                line.removePrefix("### "),
+                mdInline(line.removePrefix("### ")),
                 style = MaterialTheme.typography.labelLarge,
                 modifier = Modifier.padding(top = 6.dp),
             )
             line.startsWith("- ") -> Text(
-                "· " + line.removePrefix("- "),
+                mdInline("· " + line.removePrefix("- ")),
                 style = MaterialTheme.typography.bodySmall,
                 modifier = Modifier.padding(start = 6.dp, bottom = 2.dp),
             )
             line.isBlank() -> Spacer(Modifier.height(2.dp))
-            else -> Text(line, style = MaterialTheme.typography.bodySmall)
+            else -> Text(mdInline(line), style = MaterialTheme.typography.bodySmall)
         }
     }
 }
