@@ -86,6 +86,36 @@ object InGameReroll {
         private set
 
     /**
+     * ★true = 上一局**按策略作废**（目前是「凹分模式」分数不足主动撤退，2026-11-01）⇒
+     * 下一局即使当前这局路线合格也**不许沿用**，直接撤退重刷。
+     *
+     * 不这么拦就会死循环：废局的路线本来就合格（刷开局那套判据只看路线/价值/Boss），
+     * 沿用 = 再跑一遍注定要撤的图。[MazeLoop] 撤退没撤干净时置位，[takeoverCurrentMaze] 消费后清零。
+     */
+    @Volatile
+    var forceRerollNext = false
+
+    /**
+     * 供撤退模块 [com.lmj.labyrinthauto.logic.MazeRetreat] 复用：**按现场**把当前局撤掉。
+     *
+     * 分流（每种现场都有对应的一条链，不用调用方关心）：
+     *  · 战斗失败页 → [retreatFromFailPage]（点「结束」→「撤退（无报酬）」）
+     *  · 战斗/任务详情面板 → **不点**（战斗进行中打断不安全，返回 false 让调用方清现场）
+     *  · 259 top / 地图页 / 选人面板 / 其他面板 → [retreat]（先收敛现场，再走「地图」→「撤退」→「确认」）
+     *
+     * @return true = 已回到 259（本局按"撤退无报酬"作废，不计完成）
+     */
+    suspend fun retreatNow(input: InputBackend): Boolean {
+        val top = AgentApi.uiSig()?.optString("top").orEmpty()
+        if (top.contains("QuestFailed")) return retreatFromFailPage(input)
+        if (classifyScene() == Scene.BATTLE) {
+            AppState.addLog("撤退：当前在战斗/任务面板 → 不在战斗中强行点，交给上层清现场")
+            return false
+        }
+        return retreat(input)
+    }
+
+    /**
      * ★**固定路径表**（落盘 `files/ui_btn_paths.json`）：`key → (root, path)`。
      * UI 层级在同一个游戏版本内是固定的 ⇒ 第一次学完就存下来，之后（含 app 重启）
      * 直接把路径传给 agent 直达，**完全不用再学/扫**；只有节点名校验失败（游戏更新）才重学覆盖。
@@ -588,7 +618,17 @@ object InGameReroll {
             AppState.addLog("局内刷开局：停在战斗失败页 → 本局已废，点「结束」→「撤退（无报酬）」")
             return if (retreatFromFailPage(input)) null else false
         }
-        if (!Navigator.isLabyrinthView(vid0)) return null
+        if (!Navigator.isLabyrinthView(vid0)) {
+            // 已经不在迷宫（撤干净了）：作废标记没用了，清掉免得影响以后
+            forceRerollNext = false
+            return null
+        }
+        // ★上一局按策略作废（凹分不足）⇒ 不判定合格，直接撤退重开（见 [forceRerollNext]）
+        if (forceRerollNext) {
+            forceRerollNext = false
+            AppState.addLog("局内刷开局：上一局已按策略作废（凹分不足）→ 不沿用，直接撤退重刷")
+            return if (retreat(input)) null else false
+        }
         AppState.addLog("局内刷开局：当前在迷宫里（${Navigator.viewLabel(vid0)}）→ 先看这局合不合格")
         // 先直接读图：子菜单（角色选择/奖励/强化/商店…）是叠在地图上的对话框，地图数据通常还能读
         delay(SETTLE_MS)

@@ -59,6 +59,12 @@ object MazeLoop {
 
     fun statusName(t: Int): String = STATUS_NAMES[t] ?: "?($t)"
 
+    // ───────────────── ★凹分模式（2026-11-01 用户需求）─────────────────
+    // 检测点：站在 5 层商店（50701）、下一步要前往 5 层 Boss（50801）时查一次。
+    // 分数公式见 [RerollSettings.scoreBaseOf]（15200 + 100×角色 + 200×遗物，5 层结算页截图校准过）。
+    private const val NODE_SHOP_5F = 50701
+    private const val NODE_BOSS_5F = 50801
+
     /** 遗物决策层（PC `RelicPick`）—— 每局 run 开始时按当前 assets 重建 */
     private lateinit var relicPick: RelicPick
 
@@ -200,6 +206,7 @@ object MazeLoop {
         //   在同一失败页从 4/3 起步、一失败就再触发撤退（实测 19:51/19:52 连续 4/3、5/3 死循环）
         nodeFailed.clear()
         manualTeamNodes.clear()
+        scoreChaseChecked = false            // ★凹分检测：每局重置（新局重新查一次）
         if (!input.isAvailable()) {
             AppState.addLog("停手：点击后端不可用")
             return
@@ -1203,6 +1210,9 @@ object MazeLoop {
     private var dlgOpenMiss: String? = null
     @Volatile
     var retreatRequested = false
+
+    /** ★凹分模式：本局是否已经查过一次（每局只查一次，避免重复读数量/重复撤退） */
+    private var scoreChaseChecked = false
 
     /** ★策略=等待接手：这些节点关闭自动组队/自动开战，等用户自己操作 */
     private val manualTeamNodes = HashSet<String>()
@@ -2266,6 +2276,56 @@ object MazeLoop {
     }
 
     /**
+     * ★凹分检测（2026-11-01 用户需求）：5 层商店购物完、准备前往 5 层 Boss 时查一次分数，不够就撤退。
+     *
+     * 为什么这时能算：5 层结算里固定的部分是 15200（踏破 5600 + 普通 600 + 极难 6000 + 首领 3000），
+     * 之后只随「角色加入分 100/个」「迷宫遗物分 200/个」变化；商店是最后能改变这两样的地方，
+     * 过了它分数就定了（用户核对过 51 角色 + 25 遗物 = 25300 基础分）。
+     *
+     * 撤退动作统一交给 [MazeRetreat]（接口刷交给服务层、局内刷就地撤、撤不干净就重启游戏清现场），
+     * 这里只负责"算分 + 决定要不要撤"，不关心怎么撤 —— 以后加新的凹分条件也照这个写法。
+     *
+     * 收尾语义：置 [retreatRequested] ⇒ 本局判失败/作废（不算完成、不消耗计划次数），
+     * 服务层接着开下一轮「刷开局 → 跑迷宫」。
+     *
+     * @return true = 已触发撤退，调用方别再往 Boss 节点点
+     */
+    private suspend fun scoreChaseCheck(input: InputBackend): Boolean {
+        if (scoreChaseChecked) return false
+        val ctx = appCtx ?: return false
+        // ★开关判断放在置位之前：凹分关着时**连"本局查过了"的痕迹都不留**，
+        //   整条链路一点状态都不改（用户 2026-11-02："可以确定关闭时所有规则都不生效吧"）
+        if (!RerollSettings.loadScoreChaseOn(ctx)) return false
+        if (!RerollSettings.loadScoreChaseRetreatOn(ctx)) return false
+        scoreChaseChecked = true
+
+        val units = AgentApi.labUnits()
+        val ownRelics = AgentApi.labOwnRelics()
+        val unitCount = units?.optJSONArray("unitIds")?.length() ?: -1
+        val relicCount = ownRelics?.optJSONArray("relics")?.length() ?: -1
+        if (unitCount < 0 || relicCount < 0) {
+            // 读不到就不拦（宁可打完，也别因为一次读失败白扔一局）
+            AppState.addLog("[!] 凹分检测：读不到数量（角色=$unitCount 遗物=$relicCount）→ 本次不拦，继续打 Boss")
+            return false
+        }
+        val base = RerollSettings.scoreBaseOf(unitCount, relicCount)
+        val line = RerollSettings.loadScoreChaseBase(ctx)
+        AppState.addLog(
+            "凹分检测：角色 $unitCount×${RerollSettings.SCORE_PER_UNIT}" +
+                " + 遗物 $relicCount×${RerollSettings.SCORE_PER_RELIC}" +
+                " + 固定 ${RerollSettings.LAB_FIXED_BASE_SCORE} = 基础分 $base（阈值 $line）",
+        )
+        if (base >= line) {
+            AppState.addLog("凹分检测：$base ≥ $line → 分数够，继续打 5 层 Boss")
+            return false
+        }
+
+        AppState.addLog("凹分检测：$base < $line → 分数不够")
+        MazeRetreat.request(input, ctx, MazeRetreat.Reason.SCORE_LOW, "基础分 $base < 阈值 $line")
+        return true
+    }
+
+    /**
      * PC 版 `maze_loop` 的**"移动"分支**（6373~6458）：`statusType==0` 时点地图上的目标节点前进。
      *
      *   ① 优先按**预计算路线**走：取路线里"当前节点的下一站"（这就是"局内按路线前进"）；
@@ -2302,6 +2362,9 @@ object MazeLoop {
             val i = rp.indexOf(cur)
             if (i + 1 < rp.size) {
                 val want = rp[i + 1]
+                // ★凹分检测（2026-11-01）：站在 5 层商店、下一步就要去 5 层 Boss ——
+                //   此时角色数/遗物数已定，分数能提前算；不够就撤退，别往 50801 点下去。
+                if (cur == NODE_SHOP_5F && want == NODE_BOSS_5F && scoreChaseCheck(input)) return true
                 t = nodes.firstOrNull {
                     (it.opt("blockId") as? Number)?.toInt() == want &&
                         (it.opt("panelState") as? Number)?.toInt() == Route.NODE_SELECTABLE &&
@@ -2661,7 +2724,7 @@ object MazeLoop {
                 when (failStrategy) {
                     RerollSettings.FAIL_RETREAT -> {
                         AppState.addLog("[✗] 编组页连续 $n 轮算不出目标 → 按策略「撤退重跑」：本局作废，自动开下一局")
-                        retreatRequested = true
+                        MazeRetreat.request(input, appCtx, MazeRetreat.Reason.NO_PLAN, "连续 $n 轮算不出目标")
                         return
                     }
                     RerollSettings.FAIL_WAIT -> {
@@ -3683,7 +3746,7 @@ object MazeLoop {
             when (failStrategy) {
                 RerollSettings.FAIL_RETREAT -> {
                     AppState.addLog("[✗] 同一节点连续失败 3 次 → 按策略「撤退重跑」：本局作废，自动开下一局")
-                    retreatRequested = true
+                    MazeRetreat.request(input, appCtx, MazeRetreat.Reason.FAIL_3_TIMES, "节点 ${jStr(st, "blockId")}")
                     return
                 }
                 RerollSettings.FAIL_WAIT -> {
@@ -4461,7 +4524,7 @@ object MazeLoop {
                 when (failStrategy) {
                     RerollSettings.FAIL_RETREAT -> {
                         AppState.addLog("[✗] 同一节点连续失败 3 次 → 按策略「撤退重跑」：本局作废，自动开下一局")
-                        retreatRequested = true
+                        MazeRetreat.request(input, appCtx, MazeRetreat.Reason.FAIL_3_TIMES, "节点 ${jStr(st, "blockId")}")
                         return true
                     }
                     RerollSettings.FAIL_WAIT -> {

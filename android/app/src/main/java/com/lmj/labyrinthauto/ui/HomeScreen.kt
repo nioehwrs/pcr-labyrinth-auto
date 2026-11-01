@@ -93,6 +93,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlin.math.roundToInt
 import com.lmj.labyrinthauto.core.Accounts
 import com.lmj.labyrinthauto.core.AppState
 import com.lmj.labyrinthauto.core.DiagPack
@@ -717,7 +718,8 @@ private fun StrategyTab() {
         }
         item { StrategyCard("编队", implemented = false) }
         item {
-            StrategyCard("事件", defaultOpen = true) {
+            // 事件默认折叠（2026-11-01 用户）：条目多，展开后整页被它占满
+            StrategyCard("事件") {
                 entries.forEach { entry ->
                     EventRow(
                         entry = entry,
@@ -732,8 +734,113 @@ private fun StrategyTab() {
                 }
             }
         }
+        // ★凹分模式放最后（2026-11-01 用户）：总开关关闭时，卡片下面的内容整块不显示
+        item { ScoreChaseCard(context) }
     }
 }
+
+/**
+ * ★「凹分模式」（2026-11-01 用户需求）：监测最终分数，主动放弃分数不够的局。
+ *
+ * 按用户定的几条约束：
+ *  · 总开关关掉 → 卡片下面**什么都不显示**（和「状态悬浮窗」一样的做法）；
+ *  · 子条件 1 可以独立开关，但总开关关着时就整块不出现（那时它没意义）；
+ *  · 难度是下拉框 1~5、初值 5；阈值是滑块，区间是**基础值** 23000~27000、100 一档、初值 25000，
+ *    界面上显示的是「基础值 × 难度倍率」（难度 1~5 → 1.0/1.2/1.4/1.7/2.0）。
+ *
+ * 检测点只有一个：5 层 Boss 前的商店（节点 50701）购物之后 —— 5 层 Boss 的分数是固定的，
+ * 过了那里分数基本不会再变，没必要等打完再判断。
+ */
+@Composable
+private fun ScoreChaseCard(context: Context) {
+    var on by remember { mutableStateOf(RerollSettings.loadScoreChaseOn(context)) }
+    var retreatOn by remember { mutableStateOf(RerollSettings.loadScoreChaseRetreatOn(context)) }
+    var base by remember { mutableIntStateOf(RerollSettings.loadScoreChaseBase(context)) }
+    // ★难度不在这里另设：直接用「刷开局」页选的那个难度（2026-11-01 用户）。
+    //   实际运行时也是「基础值 × 该难度倍率」，两处各存一份只会打架。
+    val diff = remember { RerollSettings.loadConfig(context).difficulty.coerceIn(1, 5) }
+    val threshold = RerollSettings.scoreThreshold(diff, base)
+
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+    ) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            // ★总条目只放标题 + 开关，不写任何说明：凹分模式是**一组规则的集合**，
+            //   不是"只看分数"，写一句"分数不够就放弃"反而把范围说窄了（2026-11-01 用户）。
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                SectionTitle("凹分模式", Modifier.weight(1f))
+                Switch(
+                    checked = on,
+                    onCheckedChange = {
+                        on = it
+                        RerollSettings.saveScoreChaseOn(context, it)
+                    },
+                )
+            }
+            if (on) {
+                HorizontalDivider(Modifier.padding(vertical = 2.dp))
+                // ── 子条件 1（可独立开关）──
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text("条件 1 · 分数不足自动撤退", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            if (retreatOn) {
+                                "难度 $diff 时，分数 < ${fmtScore(threshold)} 就撤退重开"
+                            } else {
+                                "已关闭：这一条件不做任何检测"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(
+                        checked = retreatOn,
+                        onCheckedChange = {
+                            retreatOn = it
+                            RerollSettings.saveScoreChaseRetreatOn(context, it)
+                        },
+                    )
+                }
+                if (retreatOn) {
+                    // 阈值滑块：滑块本身是**基础值**，上面显示乘完倍率的实际阈值
+                    Row(verticalAlignment = Alignment.Bottom) {
+                        Text(
+                            "撤退阈值",
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Text(
+                            fmtScore(threshold),
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
+                    Slider(
+                        value = base.toFloat(),
+                        onValueChange = { v ->
+                            val snapped = (v / RerollSettings.SCORE_BASE_STEP).roundToInt() *
+                                RerollSettings.SCORE_BASE_STEP
+                            base = snapped.coerceIn(
+                                RerollSettings.SCORE_BASE_MIN,
+                                RerollSettings.SCORE_BASE_MAX,
+                            )
+                        },
+                        // 拖动中只更新界面，松手再落盘（同悬浮窗透明度滑块）
+                        onValueChangeFinished = { RerollSettings.saveScoreChaseBase(context, base) },
+                        valueRange = RerollSettings.SCORE_BASE_MIN.toFloat()..
+                            RerollSettings.SCORE_BASE_MAX.toFloat(),
+                        steps = (RerollSettings.SCORE_BASE_MAX - RerollSettings.SCORE_BASE_MIN) /
+                            RerollSettings.SCORE_BASE_STEP - 1,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** 分数带千分位，例：50,000 */
+private fun fmtScore(n: Int): String = "%,d".format(n)
 
 /** 一条策略决策：可折叠卡片，标题即选项名（不带冒号说明）。
  *  - implemented = true：整行可点击切换展开/收起，右侧保留「展开/收起」文字提示，内容由 [content] 提供（事件）。

@@ -1,0 +1,87 @@
+package com.lmj.labyrinthauto.logic
+
+import android.content.Context
+import com.lmj.labyrinthauto.core.AppState
+import com.lmj.labyrinthauto.core.OverlayStatus
+import com.lmj.labyrinthauto.input.InputBackend
+import com.lmj.labyrinthauto.reroll.InGameReroll
+import com.lmj.labyrinthauto.reroll.RerollSettings
+
+/**
+ * **迷宫内"作废本局"的唯一出口**（2026-11-01 用户："以后可能还有其他的凹分条件，也就是需要新加撤退点，
+ * 如果到时候一个个修撤退问题，会很麻烦"）。
+ *
+ * 以前每个撤退点都是"自己置 [MazeLoop.retreatRequested] + 各自决定要不要点 UI"，结果同样的 flag
+ * 在不同刷开局方式下语义不一样（接口刷由服务层统一处理，局内刷有的靠下一局接管、有的就地撤）。
+ * 现在统一走这里，**新增一个撤退条件 = 一行调用**，撤退怎么撤、撤不掉怎么办都在这一个地方管：
+ *
+ * | 刷开局方式 | 撤退动作 | 谁负责 |
+ * |---|---|---|
+ * | 接口刷 | 不点任何 UI | 服务层：杀进程 → 重新登录 → `labyrinth/retire` |
+ * | 局内刷 | 就地按现场撤（失败页/地图/选人面板/其他面板） | [InGameReroll.retreatNow] |
+ * | 局内刷 · 撤不干净 | 标记下一局不沿用 → 下一局接管时再撤一次；仍失败则整轮停止（留人工） | 本模块 |
+ *
+ * ★**只有真的撤退才会作废本局**：黎明界的局是服务器状态，杀客户端/重启游戏只是 resume 同一局
+ *  （2026-11-01 用户指出），所以"重启游戏"不能当兜底手段。
+ *
+ * 三种情况最后都置 [MazeLoop.retreatRequested] ⇒ `MazeLoop.run` 返回 false ⇒ 服务层
+ * 「本局作废、不算完成、不消耗计划次数 → 继续下一局」。
+ */
+object MazeRetreat {
+
+    /** 撤退原因（日志/悬浮窗共用，新增条件时在这里加一项） */
+    enum class Reason(val cn: String) {
+        FAIL_3_TIMES("同一节点连续失败 3 次"),
+        NO_PLAN("编组页算不出可用队伍"),
+        SCORE_LOW("凹分不足"),
+    }
+
+    /**
+     * 请求作废本局（**所有撤退点都该调这个**）。
+     *
+     * @param ctx 为 null 时只置标记、不做任何 UI 动作（保守兜底，正常路径都有 ctx）
+     * @param detail 具体数值，写进日志便于复盘（如 "基础分 24800 < 阈值 25000"）
+     * @return 恒为 true（方便调用方直接 `return MazeRetreat.request(...)` 收尾本轮）
+     */
+    suspend fun request(
+        input: InputBackend,
+        ctx: Context?,
+        reason: Reason,
+        detail: String = "",
+    ): Boolean {
+        val why = if (detail.isEmpty()) reason.cn else "${reason.cn}：$detail"
+        AppState.addLog("撤退：$why → 本局作废，自动开下一局")
+        OverlayStatus.setState("撤退：${reason.cn}")
+
+        if (ctx == null) {
+            AppState.addLog("[!] 撤退：拿不到 context → 只置标记，交给服务层/下一局兜底")
+            MazeLoop.retreatRequested = true
+            return true
+        }
+
+        if (RerollSettings.loadRerollMode(ctx) == RerollSettings.REROLL_API) {
+            // 接口刷：客户端此刻的会话多半已被冷启动挤掉，**必须**由服务层"先杀进程再用凭据重新登录"
+            AppState.addLog("撤退（接口刷）：交给服务层 杀进程 → 重新登录 → 调撤退接口")
+        } else {
+            val ok = InGameReroll.retreatNow(input)
+            if (ok) {
+                AppState.addLog("撤退（局内刷）：已撤干净，下一局从黎明界 top 正常开局")
+            } else {
+                // ★这里**不能靠"重启游戏"兜底**（用户 2026-11-01 指出）：黎明界的局是**服务器状态**，
+                //   杀客户端只会 resume 同一局，没撤掉就还在原地 —— 白花十几秒，局面一点没变。
+                //   所以只做两件事：
+                //   ① 标记下一局不沿用（否则下一局读到"路线合格"会直接接着打这局，连撤都不撤）；
+                //   ② 由下一局接管时**再撤一次**（[InGameReroll.takeoverCurrentMaze] 的 forceRerollNext 分支）。
+                //   两次都撤不掉 ⇒ runOneMaze 返回 false ⇒ 服务层结束整轮并报错，留给人工处理，
+                //   而不是无限重试。
+                AppState.addLog(
+                    "[!] 撤退（局内刷）：就地没撤干净（多半是关不掉的面板）→ 标记下一局不沿用、接管时再撤一次；" +
+                        "若仍失败会停止整轮运行，需要人工处理",
+                )
+                InGameReroll.forceRerollNext = true
+            }
+        }
+        MazeLoop.retreatRequested = true
+        return true
+    }
+}

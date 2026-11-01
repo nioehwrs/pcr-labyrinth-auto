@@ -195,6 +195,80 @@ object RerollSettings {
     fun loadShopUseMdp(context: Context): Boolean =
         context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getBoolean("shopUseMdp", true)
 
+    // ───────────────── ★凹分模式（2026-11-01 用户需求）─────────────────
+    // 目的：监测最终分数，主动放弃那些分数不够的局。
+    // 检测点只有一处 —— **5 层 Boss 之前的商店（节点 50701）购物之后**：5 层 Boss 本身分数固定，
+    // 过了这一关分数基本就定了，没必要等打完再看。
+    // 阈值 = 基础值 × 难度倍率（难度 1~5 → 1.0 / 1.2 / 1.4 / 1.7 / 2.0）；存的是**基础值**，
+    // 界面显示时再乘倍率，这样换难度不用重调滑块。
+
+    /** 基础阈值区间与步进（界面上按这个给滑块） */
+    const val SCORE_BASE_MIN = 23000
+    const val SCORE_BASE_MAX = 27000
+    const val SCORE_BASE_STEP = 100
+
+    private val DIFF_MULT = floatArrayOf(1f, 1.2f, 1.4f, 1.7f, 2f)
+
+    /** 难度倍率：1..5 → 1.0 / 1.2 / 1.4 / 1.7 / 2.0 */
+    fun diffMultiplier(diff: Int): Float = DIFF_MULT[(diff - 1).coerceIn(0, DIFF_MULT.size - 1)]
+
+    /** 实际撤退阈值 = 基础值 × 难度倍率。
+     *  ★必须**四舍五入**：1.4f/1.7f 这类倍率是二进制近似值（1.4f*23000 = 32199.999…），
+     *  直接 `toInt()` 会少 1 分，界面和判定都会显示 32,199。 */
+    fun scoreThreshold(diff: Int, base: Int): Int = Math.round(base * diffMultiplier(diff))
+
+    /** 5 层结算里**与角色/遗物无关**的固定基础分：踏破 5600 + 普通 600 + 极难 6000 + 首领 3000 */
+    const val LAB_FIXED_BASE_SCORE = 15_200
+    const val SCORE_PER_UNIT = 100
+    const val SCORE_PER_RELIC = 200
+
+    /**
+     * 本局**基础分**（不含难度倍率）= 15200 + 100×角色数 + 200×遗物数 —— 凹分检测用。
+     *
+     * 校准：51 角色 + 25 遗物 → 15200 + 5100 + 5000 = 25300（难度 5 ×2.0 = 50,600，与结算页截图一致）。
+     * ★运行时**不乘倍率**：滑块存的就是基础分，两边同量纲直接比；乘完的数是给用户看的。
+     */
+    fun scoreBaseOf(unitCount: Int, relicCount: Int): Int =
+        LAB_FIXED_BASE_SCORE + SCORE_PER_UNIT * unitCount + SCORE_PER_RELIC * relicCount
+
+    /** 总开关。默认关：关掉时策略页里连下面的子项都不显示（同「状态悬浮窗」的做法）。 */
+    fun loadScoreChaseOn(context: Context): Boolean =
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getBoolean("scoreChaseOn", false)
+
+    fun saveScoreChaseOn(context: Context, on: Boolean) {
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean("scoreChaseOn", on)
+            .apply()
+    }
+
+    /** 子条件 1：分数不足自动撤退。默认开（总开关关着时它没意义）。 */
+    fun loadScoreChaseRetreatOn(context: Context): Boolean =
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getBoolean("scoreChaseRetreat", true)
+
+    fun saveScoreChaseRetreatOn(context: Context, on: Boolean) {
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean("scoreChaseRetreat", on)
+            .apply()
+    }
+
+    // 难度**不在这里存**：凹分用的就是「刷开局」页选的难度（[loadConfig] 的 difficulty），
+    // 两处各存一份只会互相打架（2026-11-01 用户）。
+
+    /** 子条件 1 的基础阈值（23000~27000，100 一档），默认 25000。存基础值，显示时乘倍率。 */
+    fun loadScoreChaseBase(context: Context): Int =
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+            .getInt("scoreChaseBase", 25000)
+            .coerceIn(SCORE_BASE_MIN, SCORE_BASE_MAX) / SCORE_BASE_STEP * SCORE_BASE_STEP
+
+    fun saveScoreChaseBase(context: Context, base: Int) {
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+            .edit()
+            .putInt("scoreChaseBase", base.coerceIn(SCORE_BASE_MIN, SCORE_BASE_MAX) / SCORE_BASE_STEP * SCORE_BASE_STEP)
+            .apply()
+    }
+
     fun loadCredentials(context: Context): Pair<String, String> {
         val sp = context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
         // 老版本的明文在这里会被 SecureStore 原地升级成密文
