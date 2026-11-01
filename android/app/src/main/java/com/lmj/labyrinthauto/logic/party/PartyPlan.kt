@@ -61,6 +61,12 @@ object PartyPlan {
     const val LAB_PARTY_RECHECK_S = 1500L
     const val LAB_PARTY_STABLE_MS = 200L
     const val LAB_PARTY_STABLE_TRIES = 3
+    /** ★"刚动过"窗口（2026-11-01）：进场/滚动一览/切队伍之后的这段时间内，批前要做「坐标停住」确认
+     *  （`MazeLoop.settleTapCoords`）。窗口外不再做 —— 那时一览是静态网格、坐标不会变，做确认只是白花
+     *  一次完整 `labParty` 读取（实测 700~1000ms），一局 27 批 ≈ 白花 30s。
+     *  ⚠窗口必须盖住"动作 → 下一次点击"的真实间隔，否则保护会在最需要的时候失效：
+     *  滚完 `LAB_PARTY_SCROLL_SETTLE`(1.5s) + 下一轮读计划(~1s) + 循环开销 ⇒ 取 5s。 */
+    const val LAB_PARTY_MOTION_WINDOW = 5_000L
     /** Boss 多分队：编组页可编 3 队（第 1 队倒了第 2 队接着打）。本常量 = **失败后**最多编满几队 */
     const val LAB_BOSS_FILL_PARTIES = 3
 

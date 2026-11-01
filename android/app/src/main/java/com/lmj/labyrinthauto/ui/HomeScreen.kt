@@ -78,7 +78,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import android.widget.Toast
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -149,8 +151,9 @@ fun HomeScreen(
     var password by remember { mutableStateOf(initAccount?.secret.orEmpty()) }
     var accountServer by remember { mutableStateOf(initAccount?.server ?: GameServer.CN_BILIBILI) }
     var logOpen by remember { mutableStateOf(false) }
-    // ★应用内「更新记录」（2026-10-23 用户）：内容就是仓库根目录那份 CHANGELOG.md
-    var changelogOpen by remember { mutableStateOf(false) }
+    // ★反馈（2026-11-01 用户）：右上角入口，填昵称 + 内容 + 可选诊断包 → 直接开 Gitee issue
+    var feedbackOpen by remember { mutableStateOf(false) }
+    // ★「更新记录」已并进说明弹窗的第二个标签页（2026-11-01 用户：不要塞在长文底部）
     // ★自动更新（2026-10-25）：**检查动作在 `LmjApp` 启动时做**（和运行组件预热一起），
     //   这里只读结果、点亮「版本•」。debug 包不参与自更新（签名与发布包不同，装了会冲突）。
     val updInfo by AppState.updateInfo.collectAsStateWithLifecycle()
@@ -208,11 +211,10 @@ fun HomeScreen(
                 TopAppBar(
                     title = { Text("黎明界自动化", style = MaterialTheme.typography.titleLarge) },
                     actions = {
+                        // ★反馈（2026-11-01）：填昵称/内容/可选诊断包，直接开 issue
+                        TextButton(onClick = { feedbackOpen = true }) { Text("反馈") }
+                        // ★「版本」并进「说明」（2026-11-01 用户）：顶栏只留这一个入口，版本/更新记录在弹窗里
                         TextButton(onClick = { guideOpen = true }) { Text("说明") }
-                        // 有新版时按钮后面点个「•」，不弹横幅打断跑图
-                        TextButton(onClick = { changelogOpen = true }) {
-                            Text(if (newVerCode != null) "版本•" else "版本")
-                        }
                         TextButton(onClick = { logOpen = !logOpen }) { Text(if (logOpen) "日志▾" else "日志▴") }
                         TextButton(onClick = { onToggleDark(!darkOn) }) { Text(if (darkOn) "浅色" else "深色") }
                     },
@@ -424,6 +426,14 @@ fun HomeScreen(
             rootOk = rootOk,
             onRequestRoot = onRequestRoot,
             onRequestOverlay = onRequestOverlay,
+            // ★「版本」并进「说明」（2026-11-01 用户）：说明弹窗分两个标签页，更新记录不再塞在底部
+            versionName = UpdateChecker.versionName(context),
+            hasNewVersion = newVerCode != null,
+            onCheckUpdate = {
+                guideOpen = false
+                RerollSettings.saveGuideShown(context)
+                updateOpen = true
+            },
             onDismiss = {
                 guideOpen = false
                 RerollSettings.saveGuideShown(context)
@@ -439,16 +449,11 @@ fun HomeScreen(
         )
     }
 
-    // ★应用内「更新记录」（2026-10-23 用户）：直接渲染 CHANGELOG.md 原文
-    if (changelogOpen) {
-        ChangelogDialog(
-            onDismiss = { changelogOpen = false },
-            onCheckUpdate = {                    // ★自动更新（2026-10-25）：从「版本」里进
-                changelogOpen = false
-                updateOpen = true
-            },
-        )
+    // ★反馈（2026-11-01 用户）：右上角入口，不带预选附件
+    if (feedbackOpen) {
+        FeedbackDialog(onDismiss = { feedbackOpen = false })
     }
+
     if (updateOpen) {
         UpdateDialog(
             ctx = context,
@@ -1329,6 +1334,8 @@ private fun LogExportDialog(onDismiss: () -> Unit) {
     var openFiles by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
     var pack by remember { mutableStateOf<DiagPack.Result?>(null) }
+    // ★「提交反馈」时暂存这个包（反馈页开着的时候把诊断包页收起来，避免两层弹窗叠着）
+    var feedbackPack by remember { mutableStateOf<DiagPack.Result?>(null) }
 
     fun makePack(title: String, entries: List<LogFile.LogEntry>) {
         if (busy) return
@@ -1439,10 +1446,11 @@ private fun LogExportDialog(onDismiss: () -> Unit) {
         },
     )
 
-    pack?.let { p ->
+    pack?.takeIf { feedbackPack == null }?.let { p ->
         AlertDialog(
             // 用户口径（2026-10-27）：只有「取消 / 保存到本地」，不要"发送/分享"——
             // 模拟器里一般不装微信/QQ，分享面板点了也是空的；保存到本地 = 以前的「复制到下载」。
+            // 2026-11-01 用户新增：「提交反馈」——带着这个包直接开 issue（反馈对话框会自动选中它）。
             onDismissRequest = {
                 DiagPack.discard(p)
                 pack = null
@@ -1460,19 +1468,23 @@ private fun LogExportDialog(onDismiss: () -> Unit) {
                 }
             },
             confirmButton = {
-                TextButton(onClick = {
-                    pack = null
-                    scope.launch {
-                        runCatching { withContext(Dispatchers.IO) { DiagPack.save(ctx, p) } }
-                            .onSuccess {
-                                Toast.makeText(ctx, "已保存到 $it", Toast.LENGTH_LONG).show()
-                                DiagPack.discard(p)
-                            }
-                            .onFailure {
-                                Toast.makeText(ctx, "保存失败：${it.message ?: "原因未知"}", Toast.LENGTH_LONG).show()
-                            }
-                    }
-                }) { Text("保存到本地") }
+                Row {
+                    // ★带着这个包直接提反馈（2026-11-01 用户）：反馈对话框里已自动选中它
+                    TextButton(onClick = { feedbackPack = p }) { Text("提交反馈") }
+                    TextButton(onClick = {
+                        pack = null
+                        scope.launch {
+                            runCatching { withContext(Dispatchers.IO) { DiagPack.save(ctx, p) } }
+                                .onSuccess {
+                                    Toast.makeText(ctx, "已保存到 $it", Toast.LENGTH_LONG).show()
+                                    DiagPack.discard(p)
+                                }
+                                .onFailure {
+                                    Toast.makeText(ctx, "保存失败：${it.message ?: "原因未知"}", Toast.LENGTH_LONG).show()
+                                }
+                        }
+                    }) { Text("保存到本地") }
+                }
             },
             dismissButton = {
                 TextButton(onClick = {
@@ -1481,6 +1493,11 @@ private fun LogExportDialog(onDismiss: () -> Unit) {
                 }) { Text("取消") }
             },
         )
+    }
+
+    // 反馈页（从这个包进来）：关掉后回到「诊断包」页，包还在，用户仍可保存或取消
+    feedbackPack?.let { fp ->
+        FeedbackDialog(initialPack = fp, onDismiss = { feedbackPack = null })
     }
 }
 
@@ -1772,10 +1789,17 @@ private fun GuideDialog(
     rootOk: Boolean?,
     onRequestRoot: () -> Unit,
     onRequestOverlay: () -> Unit,
+    versionName: String,
+    hasNewVersion: Boolean,
+    onCheckUpdate: () -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val ctx = LocalContext.current
     val needsOverlay = overlayGranted != true
     val needsRoot = rootOk != true
+    // ★两个标签页（2026-11-01 用户："更新记录不要塞在长文底部"）：
+    //   0 = 使用说明，1 = 更新记录（内容就是 assets/CHANGELOG.md）
+    var tab by rememberSaveable { mutableIntStateOf(0) }
     // 分段 + 小标题：原来四条长句糊在一起，用户扫一眼抓不到重点（2026-10-26 用户："改得更好一点"）
     val sections = listOf(
         "一、准备" to listOf(
@@ -1801,55 +1825,103 @@ private fun GuideDialog(
             "运行中把游戏切到后台会自动停止；要停下来点「停止」。",
         ),
     )
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = { TextButton(onClick = onDismiss) { Text("知道了") } },
-        title = { Text("使用说明") },
-        text = {
-            Column(
-                Modifier.verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                sections.forEach { (head, items) ->
-                    Text(head, style = MaterialTheme.typography.titleSmall)
-                    items.forEach { Text("· $it", style = MaterialTheme.typography.bodyMedium) }
-                    Spacer(Modifier.height(4.dp))
-                }
-                // ★游戏内三项只能在游戏里改，脚本碰不到 —— 但**不必提前设好**，跑起来再改也行
-                //   （2026-10-26 用户要求补这条）
-                Text("五、游戏里需要你自己设的三项", style = MaterialTheme.typography.titleSmall)
-                listOf(
-                    "战斗界面右下角的「SET」",
-                    "战斗倍速（1× / 2× / 4×）",
-                    "关闭「获得角色时的动画」",
-                ).forEach { Text("· $it", style = MaterialTheme.typography.bodyMedium) }
+    // ★用自定义 Dialog 而不是 AlertDialog：AlertDialog 的内容没有可靠的高度约束，
+    //   给内容区写死 maxHeight 后底部（版本 / 检查更新）会被裁掉。这里把弹窗高度限制在屏幕 86%，
+    //   内容区用 weight(1f) 自适应 + 内部滚动，头部标签、底部版本行都固定不动。
+    val screenH = LocalConfiguration.current.screenHeightDp.dp
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            shape = MaterialTheme.shapes.extraLarge,
+            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+            tonalElevation = 6.dp,
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = screenH * 0.86f),
+        ) {
+            Column(Modifier.padding(horizontal = 20.dp, vertical = 14.dp)) {
                 Text(
-                    "这三项脚本不会替你改。不用提前设好 —— 脚本运行中随时改都可以，不影响正在跑的任务。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    if (hasNewVersion) "使用说明 · 有新版" else "使用说明",
+                    style = MaterialTheme.typography.titleLarge,
+                    modifier = Modifier.padding(bottom = 6.dp),
                 )
-                // ★把"授权"做成可直接点的动作，避免用户漏开悬浮窗（运行时看不到状态，容易错过）
-                if (needsOverlay || needsRoot) {
-                    HorizontalDivider(Modifier.padding(vertical = 4.dp))
+                TabRow(selectedTabIndex = tab, containerColor = Color.Transparent) {
+                    listOf("使用说明", if (hasNewVersion) "更新记录 •" else "更新记录")
+                        .forEachIndexed { i, label ->
+                            Tab(
+                                selected = tab == i,
+                                onClick = { tab = i },
+                                text = { Text(label, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                            )
+                        }
+                }
+                Spacer(Modifier.height(8.dp))
+                // 内容区：占满剩余高度后内部滚动，切标签不改变弹窗高度
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .weight(1f, fill = false)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    if (tab == 0) {
+                        sections.forEach { (head, items) ->
+                            Text(head, style = MaterialTheme.typography.titleSmall)
+                            items.forEach { Text("· $it", style = MaterialTheme.typography.bodyMedium) }
+                            Spacer(Modifier.height(4.dp))
+                        }
+                        // ★游戏内三项只能在游戏里改，脚本碰不到 —— 但**不必提前设好**，跑起来再改也行
+                        //   （2026-10-26 用户要求补这条）
+                        Text("五、游戏里需要你自己设的三项", style = MaterialTheme.typography.titleSmall)
+                        listOf(
+                            "战斗界面右下角的「SET」",
+                            "战斗倍速（1× / 2× / 4×）",
+                            "关闭「获得角色时的动画」",
+                        ).forEach { Text("· $it", style = MaterialTheme.typography.bodyMedium) }
+                        Text(
+                            "这三项脚本不会替你改。不用提前设好 —— 脚本运行中随时改都可以，不影响正在跑的任务。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        // ★把"授权"做成可直接点的动作，避免用户漏开悬浮窗（运行时看不到状态，容易错过）
+                        if (needsOverlay || needsRoot) {
+                            HorizontalDivider(Modifier.padding(vertical = 4.dp))
+                            Text(
+                                "还没授权的话，直接点下面按钮开启：",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            if (needsRoot) {
+                                FilledTonalButton(onClick = onRequestRoot, Modifier.fillMaxWidth()) {
+                                    Text("申请 Root 权限")
+                                }
+                            }
+                            if (needsOverlay) {
+                                Button(onClick = onRequestOverlay, Modifier.fillMaxWidth()) {
+                                    Text("去开启「悬浮窗」权限")
+                                }
+                            }
+                        }
+                    } else {
+                        MarkdownColumn(remember(tab) { readChangelog(ctx) })
+                    }
+                }
+                // ★版本 + 检查更新固定在底部，两个标签页都看得到（2026-11-01 用户："把版本并进说明"）
+                HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        "还没授权的话，直接点下面按钮开启：",
-                        style = MaterialTheme.typography.bodySmall,
+                        "版本 $versionName",
+                        style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.weight(1f),
                     )
-                    if (needsRoot) {
-                        FilledTonalButton(onClick = onRequestRoot, Modifier.fillMaxWidth()) {
-                            Text("申请 Root 权限")
-                        }
+                    TextButton(onClick = onCheckUpdate) {
+                        Text(if (hasNewVersion) "检查更新 •" else "检查更新")
                     }
-                    if (needsOverlay) {
-                        Button(onClick = onRequestOverlay, Modifier.fillMaxWidth()) {
-                            Text("去开启「悬浮窗」权限")
-                        }
-                    }
+                    Button(onClick = onDismiss) { Text("知道了") }
                 }
             }
-        },
-    )
+        }
+    }
 }
 
 /**
@@ -1865,36 +1937,8 @@ private fun readChangelog(ctx: Context): String = runCatching {
     ctx.assets.open("CHANGELOG.md").bufferedReader().use { it.readText() }
 }.getOrElse { "读不到更新记录" }
 
-@Composable
-private fun ChangelogDialog(onDismiss: () -> Unit, onCheckUpdate: () -> Unit) {
-    val ctx = LocalContext.current
-    val text = remember { readChangelog(ctx) }
-    // 只显示版本名，versionCode 对用户没意义
-    val ver = remember { UpdateChecker.versionName(ctx) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
-        // ★自动更新（2026-10-25 用户）：入口就放在「版本」弹窗里，不占首页空间
-        dismissButton = { TextButton(onClick = onCheckUpdate) { Text("检查更新") } },
-        title = { Text("更新记录") },
-        text = {
-            Column(
-                Modifier
-                    .fillMaxWidth()
-                    .heightIn(max = 460.dp)
-                    .verticalScroll(rememberScrollState()),
-            ) {
-                Text(
-                    "当前版本 $ver",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(bottom = 4.dp),
-                )
-                MarkdownColumn(text)
-            }
-        },
-    )
-}
+// ★原独立的「更新记录」弹窗已删除（2026-11-01）：现在是说明弹窗的第二个标签页，
+//   「检查更新」按钮固定在说明弹窗底部。
 
 /**
  * 行内 `**加粗**` → AnnotatedString（其余按普通文字）。

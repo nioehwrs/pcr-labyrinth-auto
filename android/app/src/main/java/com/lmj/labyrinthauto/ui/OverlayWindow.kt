@@ -192,9 +192,15 @@ object OverlayWindow {
                 alpha = RerollSettings.loadOverlayAlpha(c) / 100f
                 // ★可拖动模式（2026-10-20）：开着时不设 FLAG_NOT_TOUCHABLE（窗口自己收触摸拖动调位置）；
                 //   关闭时恢复穿透。启动运行前会强制关掉（用户设计）。
+                // ⚠2026-11-01 用户实测 bug：初始 flags 里**只有** FLAG_NOT_FOCUSABLE，**没有** NOT_TOUCHABLE，
+                //   而这里原来只在 dragOn=true 时"把它摘掉" ⇒ 拖动态持久化成 false 时启动后窗口仍然吃触摸
+                //   （点悬浮窗那块区域穿不到游戏），必须先手动开一次再被强制锁回去（走 [applyDraggable] 才 OR 上 flag）。
+                //   ⇒ 两个方向都要**显式设**，不能依赖初始值。
                 dragOn = RerollSettings.loadOverlayDraggable(c)
-                if (dragOn) {
-                    flags = flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                flags = if (dragOn) {
+                    flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                } else {
+                    flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
                 }
             }
             // ★拖过的位置持久化（**中心点**语义，2026-10-20）：存的是窗口中心，渲染时换算成左缘

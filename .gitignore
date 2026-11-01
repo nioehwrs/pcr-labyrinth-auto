@@ -1,6 +1,8 @@
 # 本机路径 / 本机环境（绝不入库）
 android/local.properties
 android/.gradle/
+# ★构建用的反馈令牌（随包分发的小号令牌，但仍不入库：泄露面最小）
+android/gitee.properties
 **/build/
 captures/
 .cxx/
@@ -25,7 +27,13 @@ android/app/src/main/assets/frida-server-*
 android/app/src/main/assets/huabanxie-server-*
 
 # ★发布用 token（等同密码，绝不入库）
+#   用通配：还可能有 .gitee_token_issue（专门提 issue 的账号）等派生的份
 tools/.gitee_token
+tools/.gitee_token*
+
+# Python 工具产出的缓存（tools/*.py 会生成）
+__pycache__/
+*.pyc
 
 # IDE / 编辑器（本工程用命令行构建，不需要提交 IDE 配置）
 .idea/

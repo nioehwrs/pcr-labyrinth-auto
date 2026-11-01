@@ -146,6 +146,8 @@ object MazeLoop {
         CenterTapGate.reset("新的一局开始")
         LogFile.init(ctx.applicationContext)
         LogFile.beginRun("maze")
+        PlanProbe.startRun(ctx.applicationContext)      // ★观测：一局一个 maze_seq_*.jsonl
+        BossChain.reset()                              // ★Boss 链影子：每局从头算
         // ★局号写进**本局文件**（见 [roundLabel] 的注释）：日志页靠这行认「第几局」
         roundLabel?.let { AppState.addLog("── 本局：第 $it 局 ──") }
         runFinished = false
@@ -168,14 +170,16 @@ object MazeLoop {
             // ★本局结束（含取消/异常）一律关掉，绝不带到下一局/刷初始
             CenterTapGate.reset("本局结束")
             roundLabel = null      // 局号只对本次 run 有效，别泄漏给"只跑迷宫"这类入口
+            val endTag = when {
+                runFinished -> "DONE"
+                retreatRequested -> "ABORT_RETREAT"
+                stopRequested -> "ABORT_STOP"
+                else -> "ABORT_EXIT"
+            }
+            PlanProbe.endRun(endTag)        // ★观测：补 run_end 行并关文件（失败自禁用，不影响本局）
             LogFile.endRun(
                 done = runFinished,
-                tag = when {
-                    runFinished -> "DONE"
-                    retreatRequested -> "ABORT_RETREAT"
-                    stopRequested -> "ABORT_STOP"
-                    else -> "ABORT_EXIT"
-                },
+                tag = endTag,
                 reason = when {
                     runFinished -> "已过结算页、本局完整跑完"
                     retreatRequested -> "按策略「撤退重跑」：本局作废，继续下一局"
@@ -473,6 +477,12 @@ object MazeLoop {
             val tag = "节点${jStr(st, "blockId")} [${jStr(st, "panelTypeName")}] " +
                 "状态=${statusName(stt)} view=$viewPart " +
                 "顶框=${jStr(st, "pageTop").ifEmpty { "无" }}"
+            // ★流程观测（2026-10-31）：**只记录、不判定**，放在所有 continue 之前 ⇒ 战斗页也覆盖。
+            //   ⚠不要在这里加任何"期望页/下一步"判断 —— 那是链化阶段的事（见 PlanProbe 类注释）。
+            PlanProbe.tick(st, tag, stt, statusName(stt), viewPart, idle)
+            // ★Boss 链影子（2026-10-31）：只把"当前这页属于第几步"解释出来写日志，不接管动作。
+            //   跑几局看吻合率（seq_report 的【Boss 链】一节）再决定是否让它驱动。
+            BossChain.tick(jStr(st, "panelTypeName"), jStr(st, "blockId"), jStr(st, "pageTop"), stt)
 
             val now = SystemClock.elapsedRealtime()
             // ★场景切换避让（2026-10-17）：`viewClass` 一变（进/出战斗、换区）说明**场景正在加载**，
@@ -1229,6 +1239,15 @@ object MazeLoop {
     /** ★编组页"首次看到它的时刻"用的键与时间（页面静置闸门，见 handlePartyEdit 顶部） */
     private var partyPageKey: String? = null
     private var partyPageAt = 0L
+
+    /** ★编组页"刚动过"的时刻：进场 / 滚动一览 / 切队伍 都会刷新它。
+     *  只有它还在 [PartyPlan.LAB_PARTY_MOTION_WINDOW] 内，批前才做「坐标停住」确认
+     *  （见 [settleTapCoords]）—— 其余时候一览是静态网格，多读一次纯属浪费。 */
+    private var partyMotionAt = 0L
+
+    /** 编组页最近是否"动过"（刚进场/刚滚/刚切队）→ 需要确认坐标停住再点 */
+    private fun partyMotionRecently(): Boolean =
+        SystemClock.elapsedRealtime() - partyMotionAt <= PartyPlan.LAB_PARTY_MOTION_WINDOW
 
     /** 上次点「挑战」的时刻（[BATTLE_RETAP_GAP_MS] 冷却用） */
     private var qdTapAt = 0L
@@ -2390,6 +2409,10 @@ object MazeLoop {
             if (q.isNotBlank() && a != null) PartyPlan.bossOf(q)?.let { bossByArea[a] = it }
         }
         val top = jStr(st, "pageTop")
+        // ★Boss 链断言（2026-11-01 实装第一刀）：Boss 节点上"页面与链期望对不上"就先**本轮不派发**，
+        //   宁可不点也不点错（已知事故都是两页叠在一起时点错坐标）。连挂 3s 自动放行，不会卡死。
+        //   非 Boss 节点 / 链未激活时 [BossChain.guard] 恒返回 true ⇒ 行为与以前完全一致。
+        if (!BossChain.guard(top)) return
         when {
             PAGE_QUEST_DETAIL in top -> handleQuestDetail(input, st, tag, tries)
             PAGE_PARTY_EDIT in top -> handlePartyEdit(input, st, tag)   // PC 3228：读人 → 决策编队 → 战斗开始
@@ -2596,6 +2619,7 @@ object MazeLoop {
         if (partyPageKey != tag) {
             partyPageKey = tag
             partyPageAt = SystemClock.elapsedRealtime()
+            partyMotionAt = partyPageAt          // ★刚进场（页面还在铺/卡片在入场）⇒ 头一批点之前要确认坐标停住
             delay(PartyPlan.LAB_PARTY_SETTLE_MS)
             return
         }
@@ -2703,6 +2727,7 @@ object MazeLoop {
                 if (t1 != null && t1.opt("x") != null) {
                     tap(input, t1.optInt("x"), t1.optInt("y"), "切回队伍1")
                     delay(PartyPlan.LAB_PARTY_SWITCH_MS)
+                    partyMotionAt = SystemClock.elapsedRealtime()   // ★刚切完队 ⇒ 一览会重新铺
                 }
                 AppState.addLog("编队：腾空完成 → 回队伍1 按算法重算")
                 return
@@ -2758,7 +2783,7 @@ object MazeLoop {
             //   （用户："移除角色时是一个个的"）。撤完只做**一次**核对。
             val removes = ops.filter { it.action == "remove" }
             if (removes.isNotEmpty()) {
-                val snap = AgentApi.labParty()
+                val snap = partySnap()
                 if (snap == null) {
                     AppState.addLog("[!] 撤人：读不到编队页快照 → 本轮不撤，下轮再试")
                     delay(PartyPlan.LAB_PARTY_BATCH_SETTLE)
@@ -2768,8 +2793,10 @@ object MazeLoop {
                 // ★顺序**照计划来**（PartyPlan 已按「攻击范围从大到小」排好 = 站位最左 → 最右）。
                 //   原来这里又按 x 升序重排了一遍：一旦坐标取自"角色一览"（x 是网格位置、与站位无关），
                 //   就会把顺序打乱 ⇒ 先撤了右边、左边的人被补位右移，后面的坐标全偏（2026-10-18 回归）。
-                val todo = removes.filter { it.unit in nowIds }
-                    .mapNotNull { op -> findUnitCoord(snap, op.unit, op.via)?.let { op to it } }
+                val todo = settleTapCoords(
+                    removes.filter { it.unit in nowIds }
+                        .mapNotNull { op -> findUnitCoord(snap, op.unit, op.via)?.let { op to it } },
+                )
                 if (todo.isEmpty()) {
                     AppState.addLog("[!] 撤人：快照里找不到槽位坐标（${removes.size} 个目标）→ 下轮再试")
                 } else {
@@ -2791,7 +2818,7 @@ object MazeLoop {
                 delay(PartyPlan.LAB_PARTY_BATCH_SETTLE)
                 return
             }
-            val snap2 = AgentApi.labParty()
+            val snap2 = partySnap()
             if (snap2 == null) {
                 AppState.addLog("[!] 加入：读不到编队页快照 → 本轮不加，下轮再试")
                 delay(PartyPlan.LAB_PARTY_BATCH_SETTLE)
@@ -2807,8 +2834,10 @@ object MazeLoop {
                 delay(PartyPlan.LAB_PARTY_BATCH_SETTLE)
                 return
             }
-            val addTodo = adds.filter { it.unit !in nowIds2 }                 // 已在队里的不必再点
-                .mapNotNull { op -> findUnitCoord(snap2, op.unit, op.via)?.let { op to it } }
+            val addTodo = settleTapCoords(
+                adds.filter { it.unit !in nowIds2 }                            // 已在队里的不必再点
+                    .mapNotNull { op -> findUnitCoord(snap2, op.unit, op.via)?.let { op to it } },
+            )
             val addSkipped = adds.filter { it.unit in nowIds2 }.map { it.unit }
             if (addSkipped.isNotEmpty()) {
                 AppState.addLog("〔跳过〕加入 ${addSkipped.joinToString(",")}：快照里已在队里")
@@ -2831,14 +2860,40 @@ object MazeLoop {
             delay(PartyPlan.LAB_PARTY_BATCH_SETTLE)                  // 等游戏把队伍真正更新
             // ★**整批只做一次核对**（撤的人是否真出队、加的人是否真入队）—— 取代原来"每个 op 一次读"的
             //   批内自检；哪一下没生效会明确列出来，下一轮按实际队伍重算。
-            val after = AgentApi.labParty()?.let { partyNowIds(it) }
+            // ★读之前先 flush（PC 3731 同款）：不 flush 会读到**点之前**的 1s 缓存 ⇒ 误判"加了没成"。
+            var afterSnap = partySnap()
+            var after = afterSnap?.let { partyNowIds(it) }
+            // ★核对不过 → **再等一会儿复读一次**（PC 3744~3757 同款，2026-11-01 补）：
+            //   编组页刚铺开/增删动画没停时，那一下点会被游戏吞掉，1s 静置不够 ⇒ 误判"点了没反应"；
+            //   而下一轮会对着同一张卡再点一下 —— 一览里那张卡是**切换**语义（再点=把人撤掉）⇒ 加/撤来回拉。
+            if (after != null && !partyBatchOk(ops, addTodo, after)) {
+                delay(PartyPlan.LAB_PARTY_RECHECK_S)
+                val second = partySnap()
+                val a2 = second?.let { partyNowIds(it) }
+                if (a2 != null) {
+                    if (a2 != after) {
+                        AppState.addLog(
+                            "编队：复读一次 → 实际队伍变了（${after.joinToString(",")} → ${a2.joinToString(",")}）",
+                        )
+                    }
+                    afterSnap = second
+                    after = a2
+                }
+            }
             if (after != null) {
                 val badRm = ops.filter { it.action == "remove" && it.unit in after }.map { it.unit }
                 val badAdd = addTodo.map { it.first.unit }.filter { it !in after }
                 if (badRm.isNotEmpty() || badAdd.isNotEmpty()) {
+                    // ★现场（PC `party_stuck` 同款，2026-11-01）：这一行就是"为什么加不进去"的证据 ——
+                    //   `√/×` = 该卡是否落在角色一览的裁剪带内（× = 屏上看不见/被裁，点了也白点）；
+                    //   `nowMemberN` = 队伍权威名单的原始长度（≠ 下面 `队=` 的个数 ⇒ 读到的人被过滤掉了）。
                     AppState.addLog(
                         "[!] 编队核对：撤了还在=[${badRm.joinToString(",")}]｜加了没成=[${badAdd.joinToString(",")}] " +
-                            "→ 下轮按实际队伍重算",
+                            "｜队=${after.joinToString(",")}（nowMemberN=${afterSnap?.optInt("nowMemberN")}）" +
+                            "｜槽位=${partyIconIds(afterSnap, "icons")}" +
+                            "｜一览=${partyIconIds(afterSnap, "scrollIcons")}" +
+                            "｜队伍=${((afterSnap?.opt("nowSelectParty") as? Number)?.toInt() ?: 0) + 1} " +
+                            "｜目标=${plan.target} → 下轮按实际队伍重算",
                     )
                 }
             }
@@ -2869,6 +2924,7 @@ object MazeLoop {
                 off.isNotEmpty() -> {
                     val dir = if (off.any { it.dir == "down" }) "down" else "up"
                     if (scrollPartyList(input, pt, dir)) {
+                        partyMotionAt = SystemClock.elapsedRealtime()   // ★刚滚过 ⇒ 下一批点之前要确认坐标停住
                         ps.count++
                         if (ps.count <= 2 || ps.count % 10 == 0) {
                             AppState.addLog(
@@ -3251,6 +3307,7 @@ object MazeLoop {
                 return
             }
             val n = left.coerceAtMost(5)
+            partyMotionAt = SystemClock.elapsedRealtime()   // ★整队连撤会挪动槽位 ⇒ 交给坐标停住确认
             if (round == 0) AppState.addLog("清队伍$teamNo：对着 1 号位（最右）连点 $n 次（撤下后后面的人往右补位）")
             for (i in 1..n) {
                 tap(input, c.first, c.second, "清队伍$teamNo·1 号位（$i/$n）")
@@ -3299,6 +3356,83 @@ object MazeLoop {
             }
         }
         return out
+    }
+
+    /**
+     * ★读**最新**编队快照（PC `handle_party_edit` 里那句 `script.exports_sync.lab_party_flush()` 同款）。
+     *
+     * agent 侧 `labPartySnapshot` 有 1s 的结果缓存（`PARTY_TTL_MS`）；点完一下若不 flush 就读，
+     * 很可能拿到**点之前**的队伍 ⇒ 自检误判"加了没成" → 下一轮对着同一张卡再点一下，
+     * 而一览里那张卡是**切换**语义（再点一下=把人撤掉）⇒ 加/撤来回拉、界面上看就是"同一个人点了上千次"。
+     * PC 侧批首/批末/复读三处都 flush，Android 之前一次都没调过（`labPartyFlush` 只声明没用）。
+     */
+    private suspend fun partySnap(): JSONObject? {
+        AgentApi.labPartyFlush()
+        return AgentApi.labParty()
+    }
+
+    /** 整批核对：撤的人是否真出队、加的人是否真入队（[handlePartyEdit] 批末用；PC 3739 `_okteam` 同款） */
+    private fun partyBatchOk(
+        ops: List<PartyPlan.Op>,
+        added: List<Pair<PartyPlan.Op, Pair<Int, Int>>>,
+        now: Set<Int>,
+    ): Boolean {
+        if (ops.any { it.action == "remove" && it.unit in now }) return false
+        return added.all { it.first.unit in now }
+    }
+
+    /** 快照里某个图标数组的 unitId 列表（`√`=在裁剪带内可点、`×`=被裁/屏外）—— 只用于卡住时的现场日志 */
+    private fun partyIconIds(pt: JSONObject?, arr: String): String {
+        val a = pt?.optJSONArray(arr) ?: return "-"
+        val out = ArrayList<String>(a.length())
+        for (i in 0 until a.length()) {
+            val c = a.optJSONObject(i) ?: continue
+            val u = (c.opt("unitId") as? Number)?.toInt() ?: continue
+            if (u == 0) continue
+            val vis = c.opt("vis")
+            out.add("$u" + if (vis === JSONObject.NULL || vis == false) "×" else "√")
+        }
+        return if (out.isEmpty()) "-" else out.joinToString(" ")
+    }
+
+    /**
+     * ★批前"坐标停住"确认（PC `handle_party_edit`(3656~3707) 同款，2026-11-01 补）。
+     *
+     * 为什么需要：一览刚滚完 / 页面还在入场动画时，**读到的坐标已经是新位置、屏幕还停在旧位置**
+     * ⇒ 点下去落在**另一张卡**上（PC 实机："编第 3 队点 130801，实际点到 y=731 的另一张"）。
+     * 表现就是点了一下没反应、下一轮重算后还点同一个"坐标"，永远加不上。
+     * 做法：flush 后连读两次（间隔 [PartyPlan.LAB_PARTY_STABLE_MS]），目标卡坐标两次一致才用；
+     * 变了就换成最新那次（最多 [PartyPlan.LAB_PARTY_STABLE_TRIES] 轮）。读不到该卡时沿用原坐标。
+     */
+    private suspend fun settleTapCoords(
+        todo: List<Pair<PartyPlan.Op, Pair<Int, Int>>>,
+    ): List<Pair<PartyPlan.Op, Pair<Int, Int>>> {
+        if (todo.isEmpty()) return todo
+        // ★只在"刚动过"时才花这次读取（2026-11-01 用户定，方案 B）：
+        //   进场 / 滚过一览 / 切过队伍之后 [PartyPlan.LAB_PARTY_MOTION_WINDOW] 内，坐标有可能"读到新的、屏幕还在旧的"；
+        //   其余时候一览是静态网格、坐标不会变 ⇒ 多读一次只是白花 700~1000ms（一局 27 批 ≈ 30s）。
+        if (!partyMotionRecently()) return todo
+        var cur = todo
+        var shifted = false
+        repeat(PartyPlan.LAB_PARTY_STABLE_TRIES) {
+            delay(PartyPlan.LAB_PARTY_STABLE_MS)
+            val fresh = partySnap() ?: return cur
+            var moved = false
+            val next = cur.map { (op, c) ->
+                val nc = findUnitCoord(fresh, op.unit, op.via) ?: return@map (op to c)
+                if (nc != c) { moved = true; shifted = true }
+                op to nc
+            }
+            cur = next
+            if (!moved) {
+                if (shifted) AppState.addLog("编队：一览刚动过 → 目标卡坐标变了，已改用最新坐标再点")
+                return cur
+            }
+        }
+        AppState.addLog(
+            "编队：一览一直在动（${PartyPlan.LAB_PARTY_STABLE_TRIES} 次复读坐标仍在变）→ 用最后一次读到的坐标点",
+        )
+        return cur
     }
 
     /**
@@ -3363,6 +3497,14 @@ object MazeLoop {
         //   一次落空就把唯一机会用掉、之后永远不再点 = 卡死在预览页（rel 的 [handleRelicChoice] 同款取舍）。
         val taps = tries["QD_TAPS"] ?: 0
         if (taps >= BATTLE_TAP_MAX) {
+            // ★Boss 链（2026-11-01）：已经过了「编队·开战」(step≥5) ⇒ 这个预览页只是**战斗过渡**，
+            //   不再重试点「挑战」（那一下的坐标在编组页里恰好是「战斗开始」⇒ 历史事故点）。
+            if (BossChain.isAfterBattleStart()) {
+                if (n == BATTLE_IDLE_WARN || n % 50 == 0) {
+                    AppState.addLog("… [链] 已开战（step≥5）：预览页只是过渡 → 不再点「$BATTLE_START_BTN」")
+                }
+                return
+            }
             // ★带证据地重试（2026-10-16）：只在"确认编组页没出现"时才再点一次 —— 那说明上一次是空点。
             val nowMs = SystemClock.elapsedRealtime()
             val tooMany = taps >= BATTLE_TAP_MAX_TOTAL
@@ -4606,6 +4748,7 @@ object MazeLoop {
         return when (val r = input.tap(x, y)) {
             is com.lmj.labyrinthauto.input.InputResult.Ok -> {
                 AppState.addLog("点了 $what ($x,$y)［${input.name}］")
+                PlanProbe.act(what)          // ★观测：挂到当前页的动作列表（不落盘、不判定）
                 // ★2026-10-27：参与自学习的按钮，挂个探针 —— 下一轮用"现场 tag 变没变"判它点早了没有
                 if (learnKey != null) {
                     tapProbeKey = learnKey

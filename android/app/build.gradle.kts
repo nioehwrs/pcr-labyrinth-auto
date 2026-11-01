@@ -10,19 +10,34 @@ android {
     namespace = "com.lmj.labyrinthauto"
     compileSdk = 35
 
+    // 反馈通道：**issue 专属小号**的令牌随包分发（2026-11-01 用户方案）。
+    // 安全边界：该小号对发布仓库只有"观察者"权限（实测改不了 Release），诊断包只能传到它自己的
+    // `labyrinth-auto-feedback`；令牌泄露最坏是公开仓库 spam + 附件仓库乱传，动不了 APK。
+    // 令牌不进版本库：读 android/gitee.properties（已 gitignore），缺文件时为空 ⇒ 反馈入口提示未配置。
+    val giteePropsFile = rootProject.file("gitee.properties")
+    val giteeToken: String = if (giteePropsFile.exists()) {
+        giteePropsFile.readLines()
+            .map { it.trim() }
+            .firstOrNull { it.startsWith("token") && it.contains("=") }
+            ?.substringAfter("=")?.trim().orEmpty()
+    } else ""
+
     defaultConfig {
         applicationId = "com.lmj.labyrinthauto"
         minSdk = 26
         targetSdk = 35
         // 0.4.0：渠道服支持 + 多账号 + 凭证加密 + 架构自检/修复
-        versionCode = 21
-        versionName = "0.4.1"
+        versionCode = 23
+        versionName = "0.4.3"
 
         // 本阶段只保证 MuMu（x86_64）。P0 没有 native 库；
         // 等 PLAN.md §4 方案 B（内嵌 libfrida-core.so）时这条才会真正生效。
         ndk { abiFilters += setOf("x86_64") }
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // 反馈用（见上面 giteeToken）：空的就表示这次构建不带反馈上传能力
+        buildConfigField("String", "GITEE_TOKEN", "\"$giteeToken\"")
     }
 
     // 发布签名：读取 android/keystore.properties（本地、已 gitignore，含密码）。
@@ -72,6 +87,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true      // 反馈令牌走 BuildConfig（见 defaultConfig 的 GITEE_TOKEN）
     }
     // Kotlin 1.9.24 对应的 Compose 编译器扩展版本（官方兼容表）
     composeOptions {
