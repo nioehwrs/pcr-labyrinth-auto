@@ -18,6 +18,11 @@ import org.json.JSONObject
  * 用上面的表去解释"当前这页属于第几步"，把偏差写进日志（跟 PlanProbe 同一个文件），
  * 跑几局看吻合率。吻合率够高再让它接管动作。
  *
+ * **实测（2026-11-02，21 局 / 36 条链）**：368 次步进里异常 6 次 = 98%，36 条链全部走完，
+ * `guard` 全程 **0 次拦截**（真机上没误伤过一次）。6 次异常全是"建模不够宽"而非模板错：
+ * 4 次收尾三页次序互换、1 次 `DialogPopUp` 插在战斗页、1 次 EX 结算比提示晚到。
+ * 前两类已建模掉（收尾合并为一 step + [TRANSIT_TOPS] 旁路），第二类随收尾合并一起消失。
+ *
  * ★三条铁律（和 [PlanProbe] 一样）：
  *   1. **不 tap、不改状态、不参与分派**，只在 step 变化时写一行日志；
  *   2. 认不出来就记 `unknown` 并**原地不动**，绝不猜；
@@ -56,14 +61,25 @@ object BossChain {
         Step("编队·开战", setOf("DialogCommonPartyEdit"), 60_000),
         Step("详情·开打", setOf("DialogQuestDetail"), STEP_TIMEOUT_MS),
         Step("战斗", setOf("", "ViewBattle"), BATTLE_TIMEOUT_MS),
-        Step("EX 结算", setOf("DialogLabyrinthExResult"), STEP_TIMEOUT_MS),
-        Step("过场", setOf("DialogBackKeyCapture"), 60_000),
-        Step("自动战斗提示", setOf("DialogFlatoutPlayer"), 30_000),
+        // ★收尾三页合并成一步（2026-11-02 依据 21 局 36 条链实测）：
+        //   EX 结算 / 过场(返回键捕获) / 自动战斗提示 这三页**顺序不固定** ——
+        //   4 局是「提示 → 过场」再来一遍（记成 back），1 局是 EX 结算晚于提示（记成 unknown）。
+        //   收尾阶段本就不需要驱动（等游戏自己走完），合一步后 6 处异常全部消失。
+        Step("收尾", setOf("DialogLabyrinthExResult", "DialogBackKeyCapture", "DialogFlatoutPlayer"), 180_000),
         Step("回地图", setOf(""), 30_000),
     )
 
     /** 出现这些页面说明 Boss 战已结束、进入层收尾 ⇒ 链结束（不算链内的步） */
     private val CHAIN_END_TOPS = listOf("DialogLabyrinthResult", "DialogAnimationViewer")
+
+    /**
+     * **通用壳页**：压在任意页上的小弹窗/过渡壳，**不代表步进** ⇒ 直接旁路（不改 step、不记 unknown）。
+     *
+     * 来历（2026-11-02 实测）：`DialogPopUp(Clone)` 在「战斗」步上冒出来被记成 unknown；
+     * `DialogCommonSmall` 是 PC 已认定的"进战斗/领奖过渡壳"（MazeLoop 里也是只等不点）。
+     * 这类页是**任意步都可能出现的插页**，写进链模板只会让每一步都要列一遍。
+     */
+    private val TRANSIT_TOPS = listOf("DialogPopUp", "DialogCommonSmall")
 
     private var active = false
     private var step = 0
@@ -93,6 +109,10 @@ object BossChain {
     fun guard(top: String): Boolean {
         if (!enabled || !active) return true
         return try {
+            // ★壳页**故意不在这里放行**（2026-11-02）：`DialogPopUp` 压在详情页上时，
+            //   放行就意味着"立刻按详情页的坐标点挑战"，而那坐标这时落在弹窗上 —— 正是历史事故形态。
+            //   让护栏照常拦满 [DRIFT_MAX]（≈3s，弹窗通常已消失）再放行，比放行安全。
+            //   （tick 里对壳页旁路只是为了不把 step 记乱，两回事。）
             if (match(step, top) != null) {
                 driftRounds = 0
                 true
@@ -143,6 +163,8 @@ object BossChain {
                 if (active) end("层收尾页 $top")
                 return
             }
+            // 通用壳页旁路：不改 step、不记 unknown（放在开链判断之前 ⇒ 壳页上不会误开链）
+            if (isTransit(top)) return
             if (!active) {
                 if (blockId.isNotEmpty() && blockId == doneBlock) return   // 这个节点已经跑完了
                 active = true
@@ -208,6 +230,8 @@ object BossChain {
         if (cur > 0 && fits(cur - 1, top)) return cur - 1
         return null
     }
+
+    private fun isTransit(top: String): Boolean = TRANSIT_TOPS.any { top.startsWith(it) }
 
     private fun fits(s: Int, top: String): Boolean {
         val st = STEPS[s]

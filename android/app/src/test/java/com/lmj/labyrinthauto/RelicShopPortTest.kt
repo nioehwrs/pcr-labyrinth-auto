@@ -109,11 +109,18 @@ class RelicShopPortTest {
         val cases = fx.getJSONArray("shop_cases")
         assertTrue("基准条数太少（${cases.length()}），八成没重新生成", cases.length() >= 150)
         var same = 0
+        var skipped5 = 0
         val bad = mutableListOf<String>()
         for (i in 0 until cases.length()) {
             val inp = cases.getJSONObject(i).getJSONObject("input")
             val exp = cases.getJSONObject(i).getJSONObject("expect")
             val area = if (inp.isNull("area")) null else inp.getInt("area")
+            // ★5 层不再与 PC 的 `shop_plan` 对拍（2026-11-02）：5 层的 2★/3★ 已由离线阈值表 + 精确 DP
+            //   （[com.lmj.labyrinthauto.logic.shop.ShopDp]）接管，PC 那份"按优先级全买"的 `picked`
+            //   已不是正确口径（基线是 2026-10-14 生成的，早于阈值表/DP 的接入）。
+            //   5 层的对拍改由 `ShopDpTest`（2400 例，对离线模型）承担；
+            //   3 层 / 4 层 / area=null 的兜底路径仍逐字对拍（PC 口径没变）。
+            if (area == 5) { skipped5++; continue }
             val sh = inp.getJSONObject("sh")
             val buy2 = inp.getBoolean("buy_2star")
             val diffs = mutableListOf<String>()
@@ -154,8 +161,9 @@ class RelicShopPortTest {
             }
         }
         assertTrue(
-            "商店购买对拍：一致 $same / ${cases.length()}\n\n" + bad.joinToString("\n"),
-            same == cases.length(),
+            "商店购买对拍：一致 $same / ${cases.length() - skipped5}" +
+                "（跳过 5 层 $skipped5 例 —— 已由 ShopDpTest 接管）\n\n" + bad.joinToString("\n"),
+            same == cases.length() - skipped5,
         )
     }
 

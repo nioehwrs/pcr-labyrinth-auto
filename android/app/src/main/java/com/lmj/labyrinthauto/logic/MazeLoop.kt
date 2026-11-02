@@ -108,6 +108,15 @@ object MazeLoop {
      */
     private const val POLL_MS = 100L
 
+    /**
+     * 前台闸门"读不到焦点窗口"的容忍轮数（2026-11-02 实机事故）：
+     * 点「挑战/开打」进战斗的**那一瞬**窗口在重建，`dumpsys window displays` 给不出
+     * `mCurrentFocus`（21:27:35 实测），旧代码把 null 当"切走了"⇒ 立刻停手、整局作废。
+     * 现在只当"这一刻读不到"：本轮不点、等下一轮；连挂 [FRONT_NULL_MAX] 轮（≈4s）才真停手。
+     * （真被切走时读得到包名=别的 app ⇒ 那条路仍然立刻停手，不受影响。）
+     */
+    private const val FRONT_NULL_MAX = 12
+
     /** PC `DLG_OWN_PAGE_EVERY`(340)："我们自己 handler 驱动的页"每隔这么多轮才查一次通用弹窗 */
     private const val DLG_OWN_PAGE_EVERY = 5
 
@@ -123,6 +132,41 @@ object MazeLoop {
     private const val SHOP_DRAG_MS = 700L
     /** PC `SHOP_AUTO`(4821)：true = 按计划真买/真刷新；false = 只读不点（安全排查用） */
     private const val SHOP_AUTO = true
+
+    /**
+     * 同一件点击**最多重试几次**（2026-11-02）：点完下一轮读回货架，若该槽位仍可买说明没点中，
+     * 就再点一次；超过这个次数仍没买到 → 放弃该件（清单扣件继续下一件），避免死循环。
+     */
+    private const val SHOP_PEND_MAX = 2
+
+    /**
+     * ★**商店购买子链**（2026-11-02 用户方案："点购买 → 点确认 → 点买到商品的消息（此时计数）→
+     * 回商店"）。实测 21 局 574 笔购买，序列**一笔不差**：
+     *
+     * ```
+     * 559 次  DialogCommonMiddle → DialogCommonSmall → DialogLabyrinthShop
+     *  15 次  Shop → Middle → Small → Shop        （多采到一次商店页，属抖动）
+     * 按钮    TwoButtonRight（确认购买） → OneButtonBlue（到账） → OneButtonWhite（获得提示，压在商店页上）
+     * ```
+     *
+     * `OneButtonWhite` 出现次数 = 购买笔数（574 = 574），即**每笔都有一层获得提示**，只是它 `top`
+     * 仍报商店页 ⇒ 只能靠"走完 确认→到账→回商店"来判定成交。
+     *
+     * 为什么必须有这条链：买完到"回商店"之间要 ~4s，这期间 `handleShop` **根本没被调用**
+     * （通用弹窗段点到按钮就 `continue`）⇒ 旧代码一回到商店就按"金币/货架"反推，既可能读到未刷新的
+     * 快照，又会在交易未结束时重复点买（点在弹窗上 ✗）。所以这里用子链做**交易锁 + 到账计数**：
+     *   · 交易进行中 ⇒ [handleShop] 本轮直接返回，不买下一件、不重算；
+     *   · 走完 确认→到账→回商店 ⇒ **此时才计数**（扣清单、记"✔ 买到"）；
+     *   · [SHOP_BUY_TIMEOUT_MS] 没走完 ⇒ 交回"金币/货架"判据兜底（那条已修成看钱和同款件数）。
+     */
+    private const val SHOP_BUY_TIMEOUT_MS = 15_000L
+
+    /**
+     * 点买之后"**等确认框**"单独给的时限（2026-11-02 实测补）：正常 ~1.7s 就弹出来，
+     * 超过 4s 说明这一下点击没生效（进店第一帧的槽位坐标是残值 ⇒ 点在空处），
+     * 应当立刻交回「金币/货架」判据重试，而不是占着交易锁干等满 [SHOP_BUY_TIMEOUT_MS]。
+     */
+    private const val SHOP_BUY_CONFIRM_WAIT_MS = 4_000L
 
     /**
      * ★商店金币读取重试（2026-10-18 用户："不会是进了商店、没读取到金币数，误以为没有操作直接退出吧"）。
@@ -178,7 +222,9 @@ object MazeLoop {
             roundLabel = null      // 局号只对本次 run 有效，别泄漏给"只跑迷宫"这类入口
             val endTag = when {
                 runFinished -> "DONE"
-                retreatRequested -> "ABORT_RETREAT"
+                // ★带上具体策略（2026-11-02 用户："日志里面的失败，按策略撤退能不能简单写一下是什么策略"）：
+                //   归档名变成 ABORT_RETREAT_SCORE / _NOPLAN / _FAIL3，日志页直接显示原因
+                retreatRequested -> "ABORT_RETREAT_" + (MazeRetreat.lastReason?.tag ?: "OTHER")
                 stopRequested -> "ABORT_STOP"
                 else -> "ABORT_EXIT"
             }
@@ -188,7 +234,8 @@ object MazeLoop {
                 tag = endTag,
                 reason = when {
                     runFinished -> "已过结算页、本局完整跑完"
-                    retreatRequested -> "按策略「撤退重跑」：本局作废，继续下一局"
+                    retreatRequested -> "按策略「撤退重跑」：" +
+                        (MazeRetreat.lastReason?.cn ?: "未知原因") + " → 本局作废，继续下一局"
                     stopRequested -> "handler 判定异常/卡死 → 收工"
                     else -> "未到结算页就退出（取消/掉线/异常）"
                 },
@@ -207,6 +254,7 @@ object MazeLoop {
         nodeFailed.clear()
         manualTeamNodes.clear()
         scoreChaseChecked = false            // ★凹分检测：每局重置（新局重新查一次）
+        MazeRetreat.resetReason()            // ★上局的撤退原因不能串到本局（归档 tag 要用）
         if (!input.isAvailable()) {
             AppState.addLog("停手：点击后端不可用")
             return
@@ -226,11 +274,12 @@ object MazeLoop {
             rewardItemNames = rn.items
             rewardExNames = rn.exEquip
         }
-        // 商店决策层（PC shop_plan / refreshDecision）；5 层刷新/3★ 决策接 MDP 最优停止算法
+        // 商店决策层（PC shop_plan / refreshDecision）；
+        // ★精确 DP（3 层 b=3 / 5 层 b=2）优先接管「买几件 + 买完刷不刷」，4 层与关闭时走 PC 旧逻辑
         val shopPlan = ShopPlan(
             GameData.relicTables(ctx),
-            RerollSettings.loadShopBuy2Star(ctx),
             useMdp = RerollSettings.loadShopUseMdp(ctx),
+            dp = if (RerollSettings.loadShopUseDp(ctx)) GameData.shopDp(ctx) else null,
         )
         // 遗物三选一决策层（PC RelicPick）
         relicPick = RelicPick(GameData.relicTables(ctx))
@@ -239,6 +288,8 @@ object MazeLoop {
         // 本局遗物决策用的"已遇 Boss / 已点次数"状态
         bossByArea.clear()
         shopRelicCtx = null; shopRelicCtxKey = null   // ★商店遗物序的上下文（按店缓存，跨局必须清）
+        shopBuyStep = 0; shopBuyAt = 0L              // ★购买子链也不能跨局（上一局杀进程前的半截交易）
+        frontNullRounds = 0                          // 前台读空计数（见 [FRONT_NULL_MAX]）
         relicChoiceTries.clear()
         partyScroll.clear()                     // 编队页"滚动找缺员"的每页状态（本局重来）
         partyTeams.clear()                      // 多分队：本进程已确认过的各队
@@ -375,11 +426,27 @@ object MazeLoop {
                 AppState.addLog("[✓] 已重连并回到迷宫 → 继续跑本局")
                 continue
             }
-            // ★安全闸门（同 Navigator）：只在游戏前台时跑；读不到就停，不猜
-            if (!Foreground.isGameForeground(GameProcess.pkg())) {
-                AppState.addLog("停手：前台已切到 ${Foreground.packageName() ?: "读不到"}（不再碰游戏）")
+            // ★安全闸门（同 Navigator，2026-11-02 对齐）：**读到别的包** ⇒ 立刻停手；
+            //   **读不到**只说明"这一刻没有焦点窗口"（进战斗/场景切换时窗口重建，实测 21:27:35）
+            //   ⇒ 本轮不点、等下一轮，连挂 [FRONT_NULL_MAX] 轮才停手。
+            val frontPkg = Foreground.packageName()
+            if (frontPkg != null && frontPkg != GameProcess.pkg()) {
+                AppState.addLog("停手：前台已切到 $frontPkg（不再碰游戏）")
                 return
             }
+            if (frontPkg == null) {
+                frontNullRounds++
+                if (frontNullRounds == 1 || frontNullRounds % 10 == 0) {
+                    AppState.addLog("… 前台读不到（dumpsys 没给）→ 本轮不点，继续等（第 $frontNullRounds 轮）")
+                }
+                if (frontNullRounds > FRONT_NULL_MAX) {
+                    AppState.addLog("停手：前台连续 $frontNullRounds 轮读不到 → 不再碰游戏")
+                    return
+                }
+                delay(300)
+                continue
+            }
+            frontNullRounds = 0
 
             // ── ★0.35) 游戏被重启过 ⇒ 清掉"建立在游戏侧状态还在"之上的缓存 ──
             //   2026-10-16 用户："为什么卡死重启之后组队没有选特别装备，是因为本场阵容和上一场一样吗？"
@@ -490,6 +557,8 @@ object MazeLoop {
             // ★Boss 链影子（2026-10-31）：只把"当前这页属于第几步"解释出来写日志，不接管动作。
             //   跑几局看吻合率（seq_report 的【Boss 链】一节）再决定是否让它驱动。
             BossChain.tick(jStr(st, "panelTypeName"), jStr(st, "blockId"), jStr(st, "pageTop"), stt)
+            // ★商店购买子链（2026-11-02）：只观测"确认框/到账提示"有没有走到，不点击（见 shopBuyStep）
+            shopBuyWatch(jStr(st, "pageTop"))
 
             val now = SystemClock.elapsedRealtime()
             // ★场景切换避让（2026-10-17）：`viewClass` 一变（进/出战斗、换区）说明**场景正在加载**，
@@ -1191,6 +1260,9 @@ object MazeLoop {
     /** 上次见到的"游戏被杀次数"（[GameProcess.kills]）；一变 ⇒ 说明游戏被重建过，清编队/装备缓存 */
     private var seenKills = 0
 
+    /** 前台连续"读不到焦点窗口"的轮数（见 [FRONT_NULL_MAX]）；每局开头清零 */
+    private var frontNullRounds = 0
+
     /** 上次已经取证过的顶框名（同一页面不重复 dump —— 见 [dumpBattleResult]） */
     private var lastDumpTop: String? = null
 
@@ -1670,12 +1742,84 @@ object MazeLoop {
     private var shopBought = false
 
     /**
+     * ★**购买清单**（2026-11-02 用户："每轮决策一次，拉一个清单就行了 —— 1星:x件；2星:x件；
+     * 3星:x件；印记:x件"）：进店或**刷新后**算一次，之后每次购买只按清单挑件，不再重跑 DP。
+     * [shopQuotaKey] = `blockId|area|已刷次数`：换店/刷新/换层 ⇒ 清单作废、重新决策。
+     *
+     * 与「每件重算」的区别只在**计划稳定性**，省不了 `labShop` 那 ~500ms（取坐标必须读货架）。
+     */
+    private var shopQuota: ShopPlan.Quota? = null
+    private var shopQuotaKey: String? = null
+
+    /**
+     * ★**待确认的一次购买**（2026-11-02 用户："判断'买了'的依据是什么，持有数量增加了？"）。
+     *
+     * 点完**不立刻扣清单**，而是下一轮读回货架核对，确认"真买到"才扣清单。
+     *
+     * ★判据（2026-11-02 真机日志修正）：**不能按"槽位是否仍可买"判** —— 实测买走后货架会
+     *   **重排**，下一件顶到同一个 `page*3+idx` 上，于是那个位置永远"可买"，每笔都被记成
+     *   "没买到→重试"（20:29:14 点 #0 付掉 1820、金币 12575→10755，却报"货架没变"）。
+     *   现在用两个**硬证据**（任一成立即算到账）：
+     *     ① 金币比点击前少了 ≥ 该件价格（买入必扣钱，最直接）；
+     *     ② 该 `rewardId` 的**可买件数**变少（同款可能有多件，如随机印记 ×2 ⇒ 按 id 计数，不按位置）。
+     *   两个都没有 ⇒ 这次点击确实没生效，不扣清单，下一轮再点（最多 [SHOP_PEND_MAX] 次）。
+     *   这些量都来自**本来就要读的那份 `labShop`**，不额外增加 RPC。
+     */
+    private var shopPendKind: String? = null
+    private var shopPendGi = -1
+    private var shopPendRetry = 0
+
+    /** 点击时的商品标识 / 价格 / 点击前金币 / 点击前该 id 的可买件数（到账确认用，见 [shopPendKind]） */
+    private var shopPendRid: String? = null
+    private var shopPendPrice = 0
+    private var shopPendCoinBefore = -1
+    private var shopPendCntBefore = 0
+
+    /**
+     * 购买子链步数：0=空闲 / 1=已点买（等确认框）/ 2=见过确认框 / 3=见得到账提示。
+     * 见 [SHOP_BUY_TIMEOUT_MS] 上方的设计说明。**弹窗期只有主循环的 [shopBuyWatch] 能推进它**
+     * （那时 `handleShop` 被通用弹窗段的 `continue` 跳过），所以它是纯观测、不点击。
+     */
+    private var shopBuyStep = 0
+    private var shopBuyAt = 0L
+
+    /**
+     * ★**成交对账**（2026-11-02 用户："链观测买到了正确的东西就行"）：链只能证明"交易完成了"，
+     * 证明不了"买的是清单上那一件"——若槽位坐标错，点到隔壁商品也照样弹确认框、照样扣钱。
+     * 所以成交后拿**金币差额**再核一次：差额 == 该件价格 ⇒ 就是它；差额 >0 却不相等 ⇒ 点到别的了。
+     */
+    private var shopChkKind: String? = null
+    private var shopChkPrice = 0
+    private var shopChkCoin = -1
+
+    /**
      * ★商店"同级遗物序"的上下文缓存（2026-10-22）：敌人情况 + 当前遗物，交给
      * [RelicPick.sortSameStar]。按店缓存（每轮读 `labOwnRelics` 太浪费）；**买走一件后置空** ⇒
      * 下一轮按新的持有状态重算（dot/吸血/守备的动态序会变）。每局开头也要清（同 blockId 会跨局重复）。
      */
     private var shopRelicCtx: RelicPick.Ctx? = null
     private var shopRelicCtxKey: String? = null
+
+    /**
+     * 购买子链**纯观测**：每轮调一次，只按 `pageTop` 推进 [shopBuyStep]，**不点击、不改流程**。
+     *
+     * 必须放在通用弹窗段**之前**：弹窗期（确认框/到账提示）`handleShop` 会被那段 `continue` 跳过，
+     * 只有这里能看到"已经走到确认框 / 到账提示"。
+     */
+    private fun shopBuyWatch(top: String) {
+        if (shopBuyStep <= 0 || shopBuyStep >= 3) return
+        when {
+            top.startsWith("DialogCommonMiddle") -> shopBuyStep = maxOf(shopBuyStep, 2)
+            top.startsWith("DialogCommonSmall") -> shopBuyStep = 3
+        }
+    }
+
+    /**
+     * 某件商品当前**还能买**（未售 + `availability==1`）—— 商店"到账确认/同款计数"统一用这个口径，
+     * 与 [ShopPlan.shopPlan] 里 `shelf` 的定义保持一致（PC `shop_plan` 同款）。
+     */
+    private fun shopBuyable(it: JSONObject): Boolean =
+        !Py.truthy(it.opt("isSold")) && (Py.num(it, "availability")?.toInt() ?: -1) == 1
 
     /** PC `_shop_slot_index`(4566)：商品全局序号 gi → 屏上槽位数组下标（滚动后按底部对齐换算） */
     private fun shopSlotIndex(gi: Int, total: Int, n: Int): Int? {
@@ -1701,6 +1845,35 @@ object MazeLoop {
         shopPlan: ShopPlan,
     ) {
         val n = bump(tries, tag)
+        // ★购买子链的交易锁（2026-11-02 用户方案，见 [SHOP_BUY_TIMEOUT_MS]）：
+        //   能走到这里说明"已经回到商店页"（弹窗期本函数不会被调用）。
+        if (shopBuyStep > 0) {
+            val cost = SystemClock.elapsedRealtime() - shopBuyAt
+            if (shopBuyStep >= 3) {
+                // 走完 确认框 → 到账提示 → 回商店 ⇒ 这就是"买到"的铁证，**此时才计数**
+                val kind = shopPendKind ?: "?"
+                shopQuota?.consume(kind)
+                AppState.addLog(
+                    "商店：✔ 买到 $kind（#${shopPendGi} ${shopPendRid}）确认框→到账→回商店，${cost}ms" +
+                        (shopQuota?.let { "；清单剩 $it" } ?: ""),
+                )
+                // 挂起对账：等本轮读到金币后核对"扣的钱是不是正好等于这件的价"
+                shopChkKind = kind; shopChkPrice = shopPendPrice; shopChkCoin = shopPendCoinBefore
+                shopBuyStep = 0; shopPendKind = null; shopPendGi = -1; shopPendRetry = 0
+            } else {
+                // ① 还在等确认框（step 1）：正常 ~1.7s 就弹；超过 [SHOP_BUY_CONFIRM_WAIT_MS] 说明
+                //    **这一下点击根本没生效**（实测进店第一帧读到残值坐标，点在空处）⇒ 早点交回判据重试，
+                //    别死等 15s。
+                // ② 已经见到确认框/到账提示：整笔给 [SHOP_BUY_TIMEOUT_MS]（演出/网络慢时确实要几秒）。
+                val limit = if (shopBuyStep <= 1) SHOP_BUY_CONFIRM_WAIT_MS else SHOP_BUY_TIMEOUT_MS
+                if (cost <= limit) return      // 交易还在路上 ⇒ 本轮不买下一件、不重算、也不读货架
+                AppState.addLog(
+                    "[!] 商店：购买子链 ${limit / 1000}s 没走完（只到第 $shopBuyStep 步：$shopPendKind #${shopPendGi}）" +
+                        " → 交回「金币/货架」判据",
+                )
+                shopBuyStep = 0; shopBuyAt = 0L      // pend 保留，交给下面的旧判据判
+            }
+        }
         if (!SHOP_AUTO && n == 1) AppState.addLog("⏸ 商店：只读不点（SHOP_AUTO=false）")
         val sh = AgentApi.labShop()
         if (sh == null) {
@@ -1755,7 +1928,10 @@ object MazeLoop {
         val blockId = st.opt("blockId")?.toString() ?: ""
         val rkey = "$blockId|$area"
         if (rkey != shopRefreshKey) {
-            shopRefreshCount = 0; shopRefreshKey = rkey; shopBought = false   // 换店 ⇒ 买过标记也清
+            // 换店 ⇒ 买过标记也清；★购买清单/待确认件同样作废（不同店的货架/金币无关）
+            shopRefreshCount = 0; shopRefreshKey = rkey; shopBought = false; shopQuota = null
+            shopPendKind = null; shopPendGi = -1; shopPendRetry = 0
+            shopBuyStep = 0; shopBuyAt = 0L          // 换店 ⇒ 购买子链作废（新店的交易与上家无关）
         }
         // ★金币读不到/读到 0 → **先别决策**（2026-10-18 用户："不会是没读取到金币数，误以为没操作直接退出吧"）：
         //   coin=0 时商品全被判"买不起"、刷新也"刷不起" ⇒ 立刻点「关闭」退出 —— 正好是"5 层 2w 什么都没买"。
@@ -1763,6 +1939,18 @@ object MazeLoop {
         //   ★但**本店买过之后 0 是正常值**（刚花光；用户 2026-10-18："一旦购买了商品，这条规则就该失效"）：
         //     此时只有"空（根本没读到）"才继续重读，读到 0 就照常决策（没钱了就刷/关）。
         val coinRead = (sh.opt("coin") as? Number)?.toInt()
+        // ★成交对账（见 [shopChkKind]）：上笔链判"买到"后，这里用金币差额确认买的**就是目标那件**。
+        //   差额 == 该件价 ⇒ 正确（静默，✔ 行已说明）；>0 但不相等 ⇒ 点到了别的格子（价格不同）；
+        //   差额 0 ⇒ 金币还是旧值（本轮读得早），不作为错误。
+        shopChkKind?.let { k ->
+            val paidNow = if (coinRead != null && shopChkCoin >= 0) shopChkCoin - coinRead else 0
+            if (paidNow > 0 && paidNow != shopChkPrice) {
+                AppState.addLog(
+                    "[!] 商店对账：$k 清单价 $shopChkPrice、实际扣 $paidNow → **可能点到了别的商品**（请核对）",
+                )
+            }
+            if (coinRead != null) shopChkKind = null
+        }
         val coinBad = coinRead == null || (coinRead <= 0 && !shopBought)
         if (coinBad) {
             val nowMs = SystemClock.elapsedRealtime()
@@ -1796,13 +1984,70 @@ object MazeLoop {
             if (own == null) null
             else relicPick.relicCtx(own, area, bossByArea[3]).also { shopRelicCtx = it }
         }
-        val (picked, desc) = shopPlan.shopPlan(area, sh, done = shopRefreshCount, relicCtx = relicCtx)
+        // ★上一件的**到账确认**（2026-11-02 用户："判断'买了'的依据是什么"）：
+        //   点完不立刻扣清单，这里读回货架核对，**确认真买到才扣**；没到账就不扣、下一轮再点。
+        //   ★判据见 [shopPendKind] 上方的修正说明：**不按槽位**（买完货架会重排，同位置永远是下一件），
+        //     而是 ①金币少了该件价 或 ②同 rewardId 的可买件数少了 —— 任一成立即算买到。
+        shopPendKind?.let { kind ->
+            val gi = shopPendGi
+            val rid = shopPendRid ?: ""
+            val price = shopPendPrice
+            val coinNow = coinRead
+            val paid = coinNow != null && shopPendCoinBefore > 0 && shopPendCoinBefore - coinNow >= price
+            val cntNow = items.count { shopBuyable(it) && it.opt("rewardId")?.toString() == rid }
+            val gone = cntNow < shopPendCntBefore
+            if (paid || gone) {
+                shopQuota?.consume(kind)                    // ✔ 确认买到，清单才扣
+                AppState.addLog(
+                    "商店：✔ 买到 $kind（#${gi} $rid）" +
+                        (if (paid) " 金币 $shopPendCoinBefore→$coinNow" else " 同款 $shopPendCntBefore→$cntNow 件") +
+                        (if (shopPendRetry > 0) "（第 ${shopPendRetry + 1} 次点击生效）" else ""),
+                )
+                shopPendKind = null; shopPendGi = -1; shopPendRetry = 0
+            } else if (shopPendRetry >= SHOP_PEND_MAX) {
+                AppState.addLog(
+                    "[!] 商店：$kind（#${gi} $rid）点了 $SHOP_PEND_MAX 次、金币和货架都没变 → 放弃该件" +
+                        "（清单扣掉继续；若是「钱不够/被限购」，属正常）",
+                )
+                shopQuota?.consume(kind)
+                shopPendKind = null; shopPendGi = -1; shopPendRetry = 0
+            } else {
+                shopPendRetry++
+                AppState.addLog(
+                    "[!] 商店：$kind（#${gi} $rid）上一轮点了但没到账（金币 $coinNow、同款 $cntNow 件）→ 重试第 $shopPendRetry 次",
+                )
+            }
+        }
+        // ★清单生命周期（2026-11-02 用户："每轮决策一次，拉一个清单"）：
+        //   key 里带 `shopRefreshCount` ⇒ **刷新后自动作废**重新决策；换店上面已清。
+        //   清单存在时 [ShopPlan.shopPlan] 不跑 DP，只按清单从当前货架挑件（具体哪个遗物照旧现排序现取）。
+        val qkey = "$rkey|$shopRefreshCount"
+        if (shopQuotaKey != qkey) { shopQuotaKey = qkey; shopQuota = null }
+        val (picked, desc) = shopPlan.shopPlan(
+            area, sh, done = shopRefreshCount, relicCtx = relicCtx, quota = shopQuota,
+        )
+        var freshQuota = false
+        if (shopQuota == null && shopPlan.dpEnabled(area)) {
+            // 刚跑完 DP → 取走新清单，后续每轮按它买
+            shopQuota = shopPlan.takeQuota()
+            freshQuota = shopQuota != null
+            // ★全货架诊断：每件标 已售/不在货架/✓买/✗不买 —— "某件为什么没买" 一眼可判
+            shopQuota?.let { AppState.addLog("商店：本次清单 $it${shopPlan.shelfBrief(sh, picked)}") }
+        }
         if (n == 1 || n % 20 == 0) {
-            // ★`desc` 与 PC 逐字一致（对拍测试守着），末尾这段"能买几件"是给**人**看的可读口径
+            // ★`desc` 与 PC 逐字一致（对拍测试守着），末尾这两段是给**人**看的可读口径
             //   （2026-10-17 用户："买完余=-2620 —— 日志修一下"：原来那个数会算上买不起的件）
-            AppState.addLog("商店：$desc${shopPlan.buyPlanBrief(picked, (sh.opt("coin") as? Number)?.toInt() ?: 0)}")
+            val coin0 = (sh.opt("coin") as? Number)?.toInt() ?: 0
+            AppState.addLog(
+                "商店：$desc${shopPlan.buyPlanBrief(picked, coin0)}" +
+                    (if (shopPlan.dpEnabled(area)) shopPlan.dpBrief(shopQuota) else ""),
+            )
         }
         if (!SHOP_AUTO) return
+        // ★刚算出清单的这一轮**只记账、不点**（2026-11-02 实机）：进店/刷新的第一帧 UI 还没铺好，
+        //   读到的是**上一页残留的槽位坐标** —— 实测点了 (1507,528)（空处）⇒ 确认框不弹 ⇒
+        //   购买子链白等 15s；下一轮重读才是正确的 (492,525)。多等一轮（~0.5s）换掉这段空转。
+        if (freshQuota) return
         val coin = (sh.opt("coin") as? Number)?.toInt() ?: 0
         // ① 先买：计划里第一个「未买 && 可买(availability==1) && 钱够」
         val tgt = picked.firstOrNull {
@@ -1851,6 +2096,19 @@ object MazeLoop {
             // ★本店买过 ⇒ 之后"金币=0"是正常值（刚花光），[SHOP_COIN_WAIT_MS] 的重读规则对它失效
             shopBought = true
             shopRelicCtx = null      // ★持有遗物变了 ⇒ 下一轮重算"同级遗物序"（dot/吸血/守备的动态项）
+            // ★**不在这里扣清单**（2026-11-02）：只记下"刚点了这一件"，下一轮读回货架核对到账才扣。
+            //   否则一旦点击没生效（坐标被挡/动画期间/商品被抢），清单已少一件 ⇒ 那件永远不买了。
+            shopPendKind = buyKind
+            shopPendGi = gi
+            shopPendRetry = 0
+            // 记下"点击前"的快照：到账确认要用它比（金币 / 同款件数），见 [shopPendKind] 上方说明
+            shopPendRid = tgt.opt("rewardId")?.toString() ?: ""
+            shopPendPrice = (tgt.opt("price") as? Number)?.toInt() ?: 0
+            shopPendCoinBefore = coin
+            shopPendCntBefore = items.count { shopBuyable(it) && it.opt("rewardId")?.toString() == shopPendRid }
+            // 开启购买子链：从现在起进入"交易锁"，回到商店页且走完确认+到账才计数（见 [SHOP_BUY_TIMEOUT_MS]）
+            shopBuyStep = 1
+            shopBuyAt = SystemClock.elapsedRealtime()
             tap(input, s.optInt("x"), s.optInt("y"), "商店·买#$vi($tgtTag)")
             return
         }
@@ -1863,6 +2121,9 @@ object MazeLoop {
             if (rb != null && hasXY(rb)) {
                 tap(input, rb.optInt("x"), rb.optInt("y"), "商店·更新")
                 shopRefreshCount++
+                // 刷新后货架全新 ⇒ 待确认件/清单都作废（清单 key 里带 shopRefreshCount，下轮会重算）
+                shopPendKind = null; shopPendGi = -1; shopPendRetry = 0
+                shopBuyStep = 0; shopBuyAt = 0L      // 刷新即换货架 ⇒ 购买子链作废
                 return
             }
             if (n == 1) AppState.addLog("[!] 想刷新但没读到「更新」按钮坐标 → 不点（留人工）")

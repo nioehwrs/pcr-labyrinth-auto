@@ -244,6 +244,9 @@ class AutoForegroundService : Service() {
                         return@launch
                     }
                     val totalTxt = "$total"
+                    // ★每轮运行单独一份 session（2026-11-02 用户）：否则同一次 app 启动里
+                    //   连着跑「1 局」和「3 局」，日志页会并成"成功 4/3 局 · 有未完成"
+                    LogFile.rotateSession()
                     AppState.addLog("── 一键黎明界：运行 $totalTxt 次 ──")
 
                     // 冷启动兜底：确保前台服务 + watcher + frida 注入都起来了（已在前台则空转返回）

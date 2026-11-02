@@ -692,23 +692,31 @@ private fun StrategyTab() {
             }
         }
         item { StrategyCard("遗物选择", implemented = false) }
+        // ★「商店购买」卡（2026-11-03 用户）：买什么、买几件、刷不刷全部由内置换算法算，
+        //   **没有任何可调项** —— 所以这里既不摆开关也不摆下拉框，展开只有一段说明 + 算法文档链接。
+        //   卡片保持可展开/收起（而不是像以前那样标"未开放"）：它不是没做，是做了但不需要人来调。
         item {
-            var shopBuy2Star by remember { mutableStateOf(RerollSettings.loadShopBuy2Star(context)) }
-            StrategyCard("商店购买顺序（未完成）", implemented = true) {
-                Row(
-                    Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                ) {
-                    Text("允许购买2星遗物", style = MaterialTheme.typography.bodyMedium)
-                    Switch(
-                        checked = shopBuy2Star,
-                        onCheckedChange = {
-                            shopBuy2Star = it
-                            RerollSettings.saveShopBuy2Star(context, it)
-                        },
-                    )
-                }
+            StrategyCard("商店购买（内置算法）") {
+                Text(
+                    "买什么、买几件、买完要不要刷新，都由内置算法自动决定：每次进店或刷新之后，" +
+                        "按当时的货架、金币与剩余刷新次数算出一张购买清单，再照单购买。" +
+                        "3 层与 5 层使用该算法，4 层仍按基础规则 —— 此处没有可调项。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    "查看算法说明（模型与推导）",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.clickable {
+                        runCatching {
+                            context.startActivity(
+                                Intent(Intent.ACTION_VIEW, Uri.parse(SHOP_ALGO_URL))
+                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                            )
+                        }
+                    },
+                )
             }
         }
         item {
@@ -924,6 +932,13 @@ private fun GuildPickCard(
         HorizontalDivider()
     }
 }
+
+/**
+ * 商店购买算法的公开文档（release 仓库）。App 内不解释算法，只给入口
+ * —— 2026-11-03 用户："附上关于本算法的链接，表明当前购买策略已有算法控制"。
+ */
+private const val SHOP_ALGO_URL =
+    "https://gitee.com/nioehwrs/labyrinth-auto-release/blob/master/shop-purchase-algorithm.md"
 
 @Composable
 private fun StrategyCard(

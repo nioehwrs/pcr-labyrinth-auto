@@ -102,6 +102,16 @@ object FridaInjector {
      */
     private const val MAX_LAUNCH_TRIES = 3
 
+    /**
+     * ★连续取不到几次 pid 才认定"游戏没了"（2026-11-02 实测）。
+     *
+     * 踩过的坑：10:04:52 游戏刚进战斗的那一瞬间，`gamePid()` 的三条路（app 内 `pidof`、
+     * frida-server 枚举、root `pidof`）一起失败了一拍，于是**活着的**游戏被判成"崩了"：
+     * am start（无效）→ 自愈重注入 → 停在战斗恢复页 `BATTLE(29)+DialogBackKeyCapture`
+     * 不认识，35 秒后停手。单拍失败不能当死亡，等到 [POLL_MS]×3 ≈ 4.5 秒都取不到再说。
+     */
+    private const val PID_MISS_LIMIT = 3
+
     /** 连续注入失败多少次就杀游戏重开（PC 版的自愈路径） */
     private const val MAX_INJECT_FAILS = 3
 
@@ -260,6 +270,7 @@ object FridaInjector {
      */
     private suspend fun injectViaFridaCore(ctx: Context, agent: File) {
         var lastPid = -1
+        var pidMisses = 0                 // ★连续几次取不到 pid（单拍失败不算死，见 [PID_MISS_LIMIT]）
         var launchTries = 0
         var injectFails = 0
         var injectCycles = 0              // ★"注入失败 → 杀游戏重开"的连续圈数（见 [MAX_INJECT_CYCLES]）
@@ -360,12 +371,24 @@ object FridaInjector {
             }
 
             var pid = gamePid()
+            // ★单拍取不到不算死（见 [PID_MISS_LIMIT]）：进战斗 / 大加载的瞬间三路检测可能一起失败
+            if (pid <= 0 && lastPid > 0) {
+                pidMisses++
+                if (pidMisses < PID_MISS_LIMIT) {
+                    delay(POLL_MS)
+                    continue
+                }
+            }
+            if (pid > 0) pidMisses = 0
             if (pid <= 0) {
                 // 开闸期间游戏没在跑 → 调起它（= "刷完开局 / 重启后调起游戏"的入口）
                 if (lastPid > 0) {
-                    AppState.addLog("游戏（pid=$lastPid）没了 —— 崩了或被系统回收，重新调起它")
+                    AppState.addLog(
+                        "游戏（pid=$lastPid）没了 —— 连续 $pidMisses 次取不到进程（崩了或被系统回收），重新调起它",
+                    )
                     launchTries = 0                      // 它活过一轮 → 计数清零，允许重来
                 }
+                pidMisses = 0
                 lastPid = -1
                 launchTries++
                 if (launchTries > MAX_LAUNCH_TRIES) {

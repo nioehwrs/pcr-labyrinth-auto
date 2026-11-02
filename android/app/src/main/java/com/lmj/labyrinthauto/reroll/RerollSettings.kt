@@ -174,26 +174,24 @@ object RerollSettings {
             .apply()
     }
 
-    /**
-     * ★商店是否购买 2★遗物（2026-10-17 用户："允许购买2星遗物"开关）。
-     * 默认开启，与 PC `SHOP_BUY_2STAR` 代码默认值一致。
-     */
-    fun loadShopBuy2Star(context: Context): Boolean =
-        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getBoolean("shopBuy2Star", true)
-
-    fun saveShopBuy2Star(context: Context, on: Boolean) {
-        context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
-            .edit()
-            .putBoolean("shopBuy2Star", on)
-            .apply()
-    }
+    // ★「允许购买2星遗物」开关已删（2026-11-02 用户）：3/5 层由精确 DP 全权决定，开关不再起作用。
+    //   旧的 pref 键 `shopBuy2Star` 留在设备上也不影响（不再有人读）。
 
     /**
      * ★商店是否启用 MDP 最优停止算法接管 5 层刷新/3★ 决策（2026-10-18 接入）。
+     * ⚠仅在精确 DP 不可用（`shopUseDp=false` 或曲线读不到）时才生效；DP 优先。
      * 默认开启；出问题改 false 即可回退到 PC 旧逻辑（q1 + refresh_above）。
      */
     fun loadShopUseMdp(context: Context): Boolean =
         context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getBoolean("shopUseMdp", true)
+
+    /**
+     * ★商店是否启用「精确 DP」（[com.lmj.labyrinthauto.logic.shop.ShopDp]，2026-11-02 接入）：
+     * 3 层(b=3) / 5 层(b=2) 的「买几件 + 买完刷不刷」改由离线 G/H 曲线 + 运行时子集枚举决定；
+     * 4 层不动。默认开启；置 false 即回退 PC 旧逻辑（q1 + refresh_above + 阈值表 + 5 层 MDP）。
+     */
+    fun loadShopUseDp(context: Context): Boolean =
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getBoolean("shopUseDp", true)
 
     // ───────────────── ★凹分模式（2026-11-01 用户需求）─────────────────
     // 目的：监测最终分数，主动放弃那些分数不够的局。

@@ -36,8 +36,18 @@ def load_rows(paths):
         else:
             for g in glob.glob(p):
                 files.append(g)
-    rows = []
+    # ★同一文件只读一次（2026-11-02）：`adb pull <设备目录> ./logs/probe` 在目标已存在时会多套一层
+    # `logs/probe/probe/`，递归 glob 于是把每个文件读两遍 ⇒ 链数/事件数全部翻倍（实测 66 vs 实际 33）。
+    seen = set()
+    uniq = []
     for f in files:
+        b = os.path.basename(f)
+        if b in seen:
+            continue
+        seen.add(b)
+        uniq.append(f)
+    rows = []
+    for f in uniq:
         try:
             with open(f, encoding="utf-8", errors="ignore") as fh:
                 for line in fh:
@@ -213,6 +223,25 @@ def main():
     if not chains:
         print("  （没有 chain 事件：要么没跑到 Boss 节点，要么影子链被禁用）")
     else:
+        # 先给一条"够不够格让链接管动作"的结论，再逐局看轨迹（2026-11-02）
+        starts = [r for r in chains if r.get("verdict") == "start"]
+        ends = [r for r in chains if r.get("verdict") == "end"]
+        done = [r for r in ends if "链完成" in (r.get("note") or "")]
+        ua = Counter(r.get("verdict") for r in chains)
+        adv = ua["advance"] + ua["back"]          # 计入"步进"的总次数
+        drift = ua["unknown"] + ua["back"]        # 认不出 + 回退 = 链解释不了的次数
+        rate = (1.0 - drift / adv) if adv else 0.0
+        pgs = [r.get("pages") for r in ends if isinstance(r.get("pages"), int)]
+        print("  ── 汇总：%d 条链（走完 %d / 提前结束 %d），步进 %d 次"
+              % (len(starts), len(done), len(ends) - len(done), adv))
+        print("     异常：unknown %d / back %d / timeout %d / guard %d；平均每链 %s 次页切换（含战斗视图抖动）"
+              % (ua["unknown"], ua["back"], ua["timeout"], ua["guard"],
+                 round(sum(pgs) / len(pgs), 1) if pgs else "—"))
+        print("     吻合度 %.0f%%（异常 %d / 步进 %d）→ %s"
+              % (rate * 100, drift, adv,
+                 "够格驱动动作" if (rate >= 0.95 and len(starts) >= 5)
+                 else ("吻合但样本不足（<5 条链），再多跑几局" if rate >= 0.95
+                       else "先补链（有认不出/回退的页）再谈驱动")))
         byrc = defaultdict(list)
         for r in chains:
             byrc[r.get("run") or "?"].append(r)

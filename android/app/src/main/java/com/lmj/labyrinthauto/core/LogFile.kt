@@ -92,15 +92,57 @@ object LogFile {
                 for (d in ds) {
                     runCatching { File(d, "done").mkdirs(); File(d, "abort").mkdirs() }
                 }
-                val nm = "session_" + nameFmt.format(Date())
-                session = openAll(nm)
-                sessionPath = pickReportPath(session)
+                openSessionLocked()
                 ready = true
                 pruneAll()
             }
             AppState.addLog(
                 "日志落盘：${sessionPath.ifEmpty { "（没有可用目录，只能看 logcat）" }}" +
                     "（完整跑完→ done/ *__DONE_*.txt；中途退出→ abort/ *__ABORT_*；根目录无后缀=被杀）",
+            )
+        }
+    }
+
+    /** 新建一份 `session_*.txt`（调用方必须已持有 [lock]；同秒内连切两次会追加到同名文件，可忽略） */
+    private fun openSessionLocked() {
+        session = openAll("session_" + nameFmt.format(Date()))
+        sessionPath = pickReportPath(session)
+    }
+
+    /**
+     * ★截断会话（2026-11-02 用户："按每次结束一轮运行，就应该截断一个 session"）。
+     *
+     * 以前一个 session = **一次 app 启动**，同一次启动里连着跑「1 局」和「3 局」两个任务会被并成一条，
+     * 日志页就出现「成功 4/3 局 · 有未完成」这种自相矛盾的统计（真实案例：00:18 单局 + 00:43 三局）。
+     * 现在每轮运行开始时另起一份，一条 session 只对应一次运行，成功数/计划数天然对齐。
+     */
+    fun rotateSession() {
+        if (!ready) return
+        io.execute {
+            var old = ""
+            var fresh = ""
+            synchronized(lock) {
+                if (session.isNotEmpty()) {
+                    old = sessionPath
+                    for (s in session) {
+                        runCatching {
+                            s.w.write(
+                                "\n===== 会话结束 ${nameFmt.format(Date())}：" +
+                                    "本轮运行到此为止，下一轮另起一份 =====\n",
+                            )
+                            s.w.flush()
+                            s.w.close()
+                        }
+                    }
+                    session = emptyList()
+                    sessionPath = ""
+                }
+                openSessionLocked()
+                fresh = sessionPath
+            }
+            AppState.addLog(
+                "会话日志切分：新一轮开始 → ${fresh.ifEmpty { "（没有可用目录）" }}" +
+                    if (old.isEmpty()) "" else "（上一份：$old）",
             )
         }
     }
@@ -150,6 +192,8 @@ object LogFile {
         if (!ready) return
         io.execute {
             synchronized(lock) {
+                // 防御：会话被截断后（rotateSession 与 append 之间有竞态）也要有地方写
+                if (session.isEmpty()) openSessionLocked()
                 val line = stamped + "\n"
                 writeAll(session, line)
                 writeAll(runSinks, line)
@@ -381,7 +425,9 @@ object LogFile {
             running && runPath.isNotEmpty() -> "进行中" to Tone.WARN
             // 只有会话日志（打完开局就被关掉 / 只刷了开局）⇒ 中性，不算失败
             sortedRuns.isEmpty() -> "仅会话" to Tone.IDLE
-            ok == planned && sortedRuns.none { it.tone == Tone.BAD } -> "全部成功" to Tone.GOOD
+            // ★`>=` 而不是 `==`：按运行截断会话后两者本就相等；旧数据里若有"两个任务并进一条"
+            //   （成功 4 / 计划 3）也不该判成"有未完成"（2026-11-02）
+            ok >= planned && sortedRuns.none { it.tone == Tone.BAD } -> "全部成功" to Tone.GOOD
             sortedRuns.any { it.tone == Tone.BAD } -> "有中断" to Tone.BAD
             else -> "有未完成" to Tone.WARN
         }
@@ -391,7 +437,8 @@ object LogFile {
             badge = badge,
             tone = tone,
             timeText = if (sortedRuns.isEmpty()) "没有单局日志" + (if (crashN > 0) "（含崩溃记录）" else "")
-            else "成功 $ok/$planned 局 · 用时 ${duration(end - start)}",
+            // 分母不比分子小：旧数据出现过"成功 4/3 局"（两个任务并进一条 session），显示上也别露馅
+            else "成功 $ok/${maxOf(planned, ok)} 局 · 用时 ${duration(end - start)}",
 
             detail = "共 ${files.size} 份日志 · ${sizeText(files.sumOf { it.sizeKb })}" +
                 (if (crashN > 0) " · 含 $crashN 份崩溃记录" else ""),
@@ -485,6 +532,11 @@ object LogFile {
         "ABORT_STOP" -> "手动停止"
         "ABORT_EXIT" -> "中途退出"
         "ABORT_RETREAT" -> "按策略撤退"
+        // ★细分到"哪一条策略"（2026-11-02 用户）：老文件仍是上面那条笼统的说法
+        "ABORT_RETREAT_SCORE" -> "凹分不足撤退"
+        "ABORT_RETREAT_NOPLAN" -> "编组算不出队伍，撤退"
+        "ABORT_RETREAT_FAIL3" -> "连败 3 次撤退"
+        "ABORT_RETREAT_OTHER" -> "按策略撤退（原因未知）"
         "ABORT_REPLACED" -> "被新一局替换"
         "ABORT_CRASH" -> "异常中断"
         else -> "中途退出（$tag）"

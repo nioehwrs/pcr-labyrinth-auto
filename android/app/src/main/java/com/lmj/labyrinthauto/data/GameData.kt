@@ -2,6 +2,7 @@ package com.lmj.labyrinthauto.data
 
 import android.content.Context
 import com.lmj.labyrinthauto.core.AppState
+import com.lmj.labyrinthauto.logic.shop.ShopDp
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -33,6 +34,25 @@ object GameData {
         relicTables ?: RelicTables.load { name ->
             ctx.assets.open(name).bufferedReader(Charsets.UTF_8).use { it.readText() }
         }.also { relicTables = it }
+    }
+
+    @Volatile
+    private var shopDp: Map<Int, ShopDp.Set>? = null
+
+    /**
+     * ★商店精确 DP 的 G/H 曲线（`shop_curves.json`，bCount → 曲线；约 54KB）。
+     * 读不到就返回空 Map（[ShopPlan] 会判定为「未加载」→ 自动回退 PC 旧逻辑，不影响开局）。
+     */
+    fun shopDp(ctx: Context): Map<Int, ShopDp.Set> = shopDp ?: synchronized(this) {
+        shopDp ?: run {
+            val m = try {
+                ShopDp.load { name -> ctx.assets.open(name).bufferedReader(Charsets.UTF_8).use { it.readText() } }
+            } catch (t: Throwable) {
+                AppState.addLog("读不到 shop_curves.json：${t.message} → 商店回退 PC 旧逻辑")
+                emptyMap()
+            }
+            m.also { shopDp = it }
+        }
     }
 
     @Volatile

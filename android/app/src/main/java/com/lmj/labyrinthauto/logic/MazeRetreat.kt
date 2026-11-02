@@ -29,11 +29,29 @@ import com.lmj.labyrinthauto.reroll.RerollSettings
  */
 object MazeRetreat {
 
-    /** 撤退原因（日志/悬浮窗共用，新增条件时在这里加一项） */
-    enum class Reason(val cn: String) {
-        FAIL_3_TIMES("同一节点连续失败 3 次"),
-        NO_PLAN("编组页算不出可用队伍"),
-        SCORE_LOW("凹分不足"),
+    /**
+     * 撤退原因（日志/悬浮窗共用，新增条件时在这里加一项）。
+     *
+     * [tag] 会拼进归档文件名：`run_..._MAZE__ABORT_RETREAT_SCORE_时间.txt`，
+     * 日志页据此显示「失败 · 凹分不足撤退」，不用打开文件猜是哪条策略。
+     */
+    enum class Reason(val cn: String, val tag: String) {
+        FAIL_3_TIMES("同一节点连续失败 3 次", "FAIL3"),
+        NO_PLAN("编组页算不出可用队伍", "NOPLAN"),
+        SCORE_LOW("凹分不足", "SCORE"),
+    }
+
+    /**
+     * 最近一次撤退的原因（[MazeLoop] 归档本局时拿来拼 tag 和结束语）。
+     * 每局开始由 `MazeLoop.runBody` 清空，所以不会串到下一局。
+     */
+    @Volatile
+    var lastReason: Reason? = null
+        private set
+
+    /** 每局开始时清掉上一局的原因（由 `MazeLoop` 调用） */
+    fun resetReason() {
+        lastReason = null
     }
 
     /**
@@ -49,6 +67,7 @@ object MazeRetreat {
         reason: Reason,
         detail: String = "",
     ): Boolean {
+        lastReason = reason
         val why = if (detail.isEmpty()) reason.cn else "${reason.cn}：$detail"
         AppState.addLog("撤退：$why → 本局作废，自动开下一局")
         OverlayStatus.setState("撤退：${reason.cn}")

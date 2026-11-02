@@ -25,6 +25,11 @@ import org.json.JSONObject
  *   不论 [useMdp] 开关、对所有层生效；2★在 5 层下全权由阈值决定，不再受 `buy2Star` 开关影响（开关只管非 5 层的无脑买）。
  *   抛弃了原 PC 的 `done>=max_refresh` 兜底与 MDP 的 T(R) 实时阈值。
  *   ⚠[RelicShopPortTest]（默认 [useMdp]=false）若覆盖 5 层 R≥1 的 3★ 场景，结果会变化，需同步更新对拍基线。
+ *
+ * ★[dp] 精确 DP（2026-11-02 与用户确认）：非 null 时 **3 层(b=3) 与 5 层(b=2)** 的「买几件 + 买完刷不刷」
+ *   全权由 [ShopDp.decide] 决定（PC 的"按优先级全买"、2★/3★ 阈值表、`refresh_above`、q1、上面的 MDP 全部让位）；
+ *   4 层不动。`dp=null`（默认）= 完全走 PC 旧逻辑（[RelicShopPortTest] 的基线就靠这个）。
+ *   为什么能 `dp` 与 `useMdp` 共存：dp 分支在 refreshDecision 里**先 return**，MDP 只在 dp=null 时才跑。
  */
 class ShopPlan(
     private val tables: RelicTables,
@@ -38,7 +43,110 @@ class ShopPlan(
      * `false` = PC 原行为（货架顺序），供 [com.lmj.labyrinthauto.RelicShopPortTest] 对拍。
      */
     private val sameStarRelicOrder: Boolean = true,
+    /**
+     * ★精确 DP 曲线（[ShopDp]）——**3 层与 5 层一起接**（3 层用 b=3、5 层用 b=2，四层不动）。
+     * `null` = 完全走 PC 旧逻辑（[RelicShopPortTest] 对拍基线）；非 null 时该层的「买几件 + 是否刷新」
+     * 由 [ShopDp.decide] 全权决定，PC 的 `SHOP_BUY_ORDER`/阈值表/`refresh_above`/q1 判据全部让位。
+     *
+     * 之所以能这么做：DP 的输入是「**当前货架上还剩什么** + 当前金币 + 剩余刷新次数」，
+     * 所以「进店时已经买过几件」（闪退重进、买一半失败）天然是普通输入。
+     */
+    private val dp: Map<Int, ShopDp.Set>? = null,
 ) {
+
+    /** 最近一次 [shopPlan] 里 DP 给出的「买完是否刷新」（供 [refreshDecision] 用；同轮顺序固定） */
+    private var dpSuggestRefresh: Boolean = false
+    private var dpLast: ShopDp.Decision? = null
+    private var dpLastDisc: Int = 100
+    private var dpLastRemaining: Int = 0
+
+    /** 最近一次**真正跑 DP** 得到的清单（[shopPlan] 里配额为 null 时产出；调用方 [takeQuota] 取走） */
+    private var lastQuota: Quota? = null
+
+    /**
+     * ★**购买清单**（2026-11-02 用户："每轮决策一次，拉一个清单就行了，清单写的内容比如说
+     * 1星:x件；2星:x件；3星:x件；印记:x件"）。
+     *
+     * 语义：**进店（或刷新后）算一次**，之后每次购买只按清单挑件、不再重跑 DP；
+     * 「哪一件具体是哪个遗物 / 购买按钮在哪」仍由调用方每轮现读现取（不动原流程）。
+     *
+     * 计数是**可变的**：调用方每买掉一件就对应减一（[shopPlan] 只按剩余配额挑件，不会改它）。
+     */
+    class Quota(
+        var n1: Int,
+        var n2: Int,
+        var n3: Int,
+        var nb: Int,
+        /** 清单买完后是否刷新（DP 的结论；刷新后清单作废，需重新决策） */
+        val refresh: Boolean,
+        /** 决策时的折扣整数百分比（日志用） */
+        val discPct: Int,
+    ) {
+        fun isEmpty(): Boolean = n1 <= 0 && n2 <= 0 && n3 <= 0 && nb <= 0
+
+        fun total(): Int = n1 + n2 + n3 + nb
+
+        /** 按品类名减一（买掉一件后调用）；不是遗物/印记品类则忽略 */
+        fun consume(kind: String) {
+            when (kind) {
+                "1★遗物" -> if (n1 > 0) n1--
+                "2★遗物" -> if (n2 > 0) n2--
+                "3★遗物" -> if (n3 > 0) n3--
+                "随机印记" -> if (nb > 0) nb--
+            }
+        }
+
+        override fun toString(): String =
+            "1★${n1} 2★${n2} 3★${n3} 印记${nb}" + (if (refresh) " → 买完刷新" else " → 不刷")
+    }
+
+    /** 取走最近一次 DP 算出的清单（取一次就清空，避免过期清单被复用） */
+    fun takeQuota(): Quota? = lastQuota.also { lastQuota = null }
+
+    private fun kindOf(it: JSONObject): String = shopItemKind(it.opt("rewardId")).first
+
+    /**
+     * 按清单从候选里挑件（同品类取前 N 件，且**累计不超预算**）。
+     *
+     * ★同品类内的先后**就是三选一那套**：`cand` 由 [dpCandidates] 用 [sortShopBucket] 排好，而
+     *   `sortShopBucket` 直接调 [RelicPick.sortSameStar]（暴击>削弱>加速>守备>强化，系列内见
+     *   [RelicPick.relicSubOrder]，再按敌人/持有物的动态项）—— 与三选一遗物**同一个函数**，不另立规则。
+     *   价格只在 `sortSameStar` 内部做同序兜底，这里**不再按价格重排**。
+     *
+     * 预算约束是必要的：清单是进店时按当时金币算的，执行期金币只会变少，
+     * 货架上可能还挂着买不起的件 ⇒ 不能把它们排进 `picked`（日志会误导、调度也会空转）。
+     *
+     * 返回顺序仍是 `cand` 原序（1★ → 印记 → 2★ → 3★），即点击顺序。
+     */
+    private fun pickByQuota(cand: List<JSONObject>, q: Quota, budget: Int): List<JSONObject> {
+        var n1 = q.n1
+        var n2 = q.n2
+        var n3 = q.n3
+        var nb = q.nb
+        var left = budget
+        val out = mutableListOf<JSONObject>()
+        for (it in cand) {
+            val price = Py.num(it, "price")?.toInt() ?: 0
+            if (price > left) continue                  // 买不起的跳过（不 break：品类顺序不是价格顺序）
+            val take = when (kindOf(it)) {
+                "1★遗物" -> n1 > 0
+                "2★遗物" -> n2 > 0
+                "3★遗物" -> n3 > 0
+                "随机印记" -> nb > 0
+                else -> false
+            }
+            if (!take) continue
+            when (kindOf(it)) {
+                "1★遗物" -> n1--
+                "2★遗物" -> n2--
+                "3★遗物" -> n3--
+                else -> nb--
+            }
+            left -= price
+            out.add(it)
+        }
+        return out
+    }
 
     /** PC 版 `shop_step` 抽出来的"不刷新"结论 */
     class RefreshDecision(
@@ -166,9 +274,133 @@ class ShopPlan(
         }
     }
 
+    // ────────────────────────── 精确 DP（3/5 层接管） ──────────────────────────
+
+    /** 该层是否交给精确 DP（3 层 b=3、5 层 b=2；四层不动；未加载曲线则不接管） */
+    fun dpEnabled(area: Int?): Boolean = dpModel(area) != null
+
+    /** 该层对应的曲线（b=2 / b=3）；不支持返回 null */
+    private fun dpModel(area: Int?): ShopDp.Set? {
+        val all = dp ?: return null
+        val b = when (area) {
+            3 -> 3
+            5 -> 2
+            else -> return null
+        }
+        return all[b]
+    }
+
+    /**
+     * 折扣 → **整数**百分比（只在换算时用浮点，比较一律整数）。
+     * 游戏实际只有 100/90/75/65；这里按 5 就近取整并夹在 65..100（曲线有 8 档，取不到时 [ShopDp.Set] 会兜到最近档）。
+     */
+    fun discPercent(sh: JSONObject): Int {
+        val raw = Py.roundInt(discOf(sh) * 100)
+        return ((raw / 5) * 5).coerceIn(65L, 100L).toInt()
+    }
+
+    /**
+     * 本店**剩余可刷新次数**（2=刚进店、1=已刷 1 次、0=不能再刷）。
+     *
+     * 权威来源是**游戏自己**：agent 读 `get_resettableNum` → `labShop.resettable`（还剩几次可刷），
+     * 不依赖任何进程记忆。[done] 只用来套 PC 的策略上限（本店最多刷 `max_refresh` 次）：
+     *   · 游戏说还能刷 3 次、策略只许 2 次 ⇒ 按 2（策略上限）
+     *   · 闪退重进后 `done` 归零、游戏还剩 1 次 ⇒ 按 1（游戏为准）
+     * 只有 `resettable` 读不到时才退回 `max_refresh - done`（此时才真的依赖记忆，日志里会体现）。
+     */
+    fun remainingRefresh(area: Int?, sh: JSONObject, done: Int): Int {
+        val cfg = SHOP_CFG[area] ?: SHOP_DEFAULT_CFG
+        val byDone = (cfgInt(cfg, "max_refresh", 0) - done).coerceAtLeast(0)
+        val left = Py.num(sh, "resettable")?.toInt()
+        return if (left != null) minOf(byDone, left.coerceAtLeast(0)) else byDone
+    }
+
+    /**
+     * 当前货架上「参与 DP 决策」的件（顺序 = 1★遗物 → 随机印记 → 2★遗物 → 3★遗物，同星级内按 [sortShopBucket]）。
+     *
+     * 过滤规则与 PC 的 `SHOP_BUY_ORDER` / `no_star` / `no_area4_only` 一致；**定向印记永不买**（PC 同款）。
+     * 不看钱够不够（DP 自己按预算枚举），但**必须**排除已售/不在货架的（那正是「剩余货架」的定义）。
+     */
+    private fun dpCandidates(
+        area: Int?, sh: JSONObject, relicCtx: RelicPick.Ctx?, buy2StarNow: Boolean,
+    ): List<JSONObject> {
+        val cfg = SHOP_CFG[area] ?: SHOP_DEFAULT_CFG
+        val a4 = area4OnlyIds().map { it.toString() }.toSet()
+        val noStar = cfgInts(cfg, "no_star")
+        val noArea4 = cfgBool(cfg, "no_area4_only")
+        // 3 层这是**本次一起接上**：原 cfg 没有 allow_3star（走阈值表），DP 接管后由算法自己决定买不买 3★
+        val allowThree = cfgBool(cfg, "allow_3star") || dpEnabled(area)
+        val order = buildList {
+            add("1★遗物"); add("随机印记")
+            if (buy2StarNow || dpEnabled(area)) add("2★遗物")   // 5 层本就恒允许；3 层看 buy2Star
+            if (allowThree) add("3★遗物")
+        }
+        val itemsArr = sh.optJSONArray("items")
+        val all = if (itemsArr == null) emptyList<JSONObject>()
+        else (0 until itemsArr.length()).mapNotNull { itemsArr.optJSONObject(it) }
+        val shelf = all.filter {
+            !Py.truthy(it.opt("isSold")) && (Py.num(it, "availability")?.toInt() ?: -1) == 1
+        }
+        val out = mutableListOf<JSONObject>()
+        for (want in order) {
+            val bucket = mutableListOf<JSONObject>()
+            for (it in shelf) {
+                val (kind, info) = shopItemKind(it.opt("rewardId"))
+                if (kind != want) continue
+                if (info != null && ((Py.num(info, "rarity")?.toInt() ?: 0) in noStar)) continue
+                if (noArea4 && it.opt("rewardId").toString() in a4) continue
+                if ((Py.num(it, "price")?.toInt() ?: 0) <= 0) continue    // 99999999 = 不可售
+                bucket.add(it)
+            }
+            out.addAll(if (sameStarRelicOrder) sortShopBucket(bucket, relicCtx) else bucket)
+        }
+        return out
+    }
+
+    /**
+     * **全货架诊断**（DP 模式算清单时打一次）：每件 = 品类(实付价) + 状态。
+     * 状态：`已售` / `不在货架`（availability≠1）/ `✓买`（进了清单）/ `✗不买`（清单不要它）。
+     * 有了它，"某件 1★ 为什么没买" 一眼可判 —— 是读取没看到（`不在货架`）、还是 DP 只要 N 件（`✗不买`）。
+     */
+    fun shelfBrief(sh: JSONObject, picked: List<JSONObject>): String {
+        val arr = sh.optJSONArray("items") ?: return ""
+        val chosen = picked.map { it.toString() }.toHashSet()
+        val parts = ArrayList<String>()
+        for (i in 0 until arr.length()) {
+            val it = arr.optJSONObject(i) ?: continue
+            val kind = shopItemKind(it.opt("rewardId")).first
+            val price = Py.num(it, "price")?.toInt() ?: 0
+            val mark = when {
+                Py.truthy(it.opt("isSold")) -> "已售"
+                (Py.num(it, "availability")?.toInt() ?: -1) != 1 -> "不在货架"
+                it.toString() in chosen -> "✓买"
+                else -> "✗不买"
+            }
+            parts.add("$kind($price)$mark")
+        }
+        return if (parts.isEmpty()) "" else "｜货架：${parts.joinToString(" ")}"
+    }
+
+    /**
+     * DP 那一行的日志（给人看；`desc` 必须与 PC 逐字一致，不能塞进去）。
+     * @param quota 当前生效的清单（按清单买时传它；刚算完时传 null 走 [lastQuota]/[dpLast]）
+     */
+    fun dpBrief(quota: Quota? = null): String {
+        val q = quota ?: lastQuota
+        if (q != null) return "｜DP清单：disc=${q.discPct}% 剩余刷新=$dpLastRemaining $q"
+        val d = dpLast ?: return "｜DP：—"
+        return "｜DP：disc=$dpLastDisc% 剩余刷新=$dpLastRemaining 买${Integer.bitCount(d.mask)}件" +
+            "(花${d.cost}分${d.score})" + (if (d.refresh) " → 买完刷新" else " → 不刷") +
+            " 期望=${Py.fmt2(d.value)}"
+    }
+
     // ────────────────────────── 商品识别 / 效率 ──────────────────────────
 
-    /** PC 版 `buy_2star_relic`(4397)：config.json 的 `shop_buy_2star` ＞ 代码默认 [SHOP_BUY_2STAR] */
+    /**
+     * PC 版 `buy_2star_relic`(4397)：config.json 的 `shop_buy_2star` ＞ 代码默认 [SHOP_BUY_2STAR]。
+     * ⚠设置页那个「允许购买2星遗物」开关**已删**（2026-11-02）：3/5 层由精确 DP 决定，2★ 买不买不再可配；
+     *   本函数只留作 PC 口径参考（旧逻辑 / 对拍）。
+     */
     fun buy2starRelic(configValue: Boolean?): Boolean = configValue ?: SHOP_BUY_2STAR
 
     /**
@@ -240,6 +472,11 @@ class ShopPlan(
         area: Int?, sh: JSONObject, buy2Star: Boolean = this.buy2Star, done: Int = 0,
         /** ★同级遗物序的上下文（敌人情况 + 当前遗物）；null = 只用静态系列序（PC 对拍/未接入时） */
         relicCtx: RelicPick.Ctx? = null,
+        /**
+         * ★已有的**购买清单**（[Quota]）。传了就**不跑 DP**，只按清单从当前货架挑件；
+         * 传 null 时（进店/刷新后）才跑 DP，并通过 [takeQuota] 把新清单交给调用方。
+         */
+        quota: Quota? = null,
     ): Pair<List<JSONObject>, String> {
         val cfg = SHOP_CFG[area] ?: SHOP_DEFAULT_CFG
         val a4 = area4OnlyIds().map { it.toString() }.toSet()
@@ -316,6 +553,51 @@ class ShopPlan(
                 if (p <= restCoin && (remaining <= 0 || restCoin >= threeThr)) {
                     picked.add(it); restCoin -= p
                 } else break
+            }
+        }
+        // ★③ 精确 DP 接管（3/5 层，[dp] 非 null 时）：**覆盖**上面 ①② 的结果。
+        //   上面那段是 PC 旧逻辑（对拍基线/关闭 DP 时用），这里按「当前剩余货架 + 当前金币 + 剩余刷新次数」
+        //   枚举子集重算 —— 所以「进店时已经买过几件」也能正常算（旧逻辑只会在满货架上想问题）。
+        val model = dpModel(area)
+        if (model != null) {
+            val cand = dpCandidates(area, sh, relicCtx, buy2Star)
+            val discPct = discPercent(sh)
+            val remaining = remainingRefresh(area, sh, done)
+            if (quota != null) {
+                // ★**按清单买**（2026-11-02 用户）：清单是进店/刷新后算好的，执行期只照着挑件 ——
+                //   不重跑 DP，所以中途买掉一件不会把后面的计划改掉（日志也稳定）。
+                //   「具体哪个遗物 / 按钮坐标」仍旧每轮现读现取（候选里已按同星级序排好）。
+                picked.clear()
+                picked.addAll(pickByQuota(cand, quota, coin))
+                dpSuggestRefresh = quota.refresh
+                dpLastDisc = quota.discPct
+                dpLastRemaining = remaining
+                dpLast = null
+            } else {
+                val items = cand.map {
+                    ShopDp.Item(Py.num(it, "price")?.toInt() ?: 0, shopValueOf(kindOf(it)))
+                }
+                val dec = ShopDp.decide(items, coin, discPct, remaining, model)
+                dpLast = dec
+                dpLastDisc = discPct
+                dpLastRemaining = remaining
+                dpSuggestRefresh = dec.refresh
+                picked.clear()
+                var q1 = 0
+                var q2 = 0
+                var q3 = 0
+                var qb = 0
+                for (i in cand.indices) if (dec.buys(i)) {
+                    when (kindOf(cand[i])) {
+                        "1★遗物" -> q1++
+                        "2★遗物" -> q2++
+                        "3★遗物" -> q3++
+                        else -> qb++
+                    }
+                    picked.add(cand[i])
+                }
+                // 产出清单给调用方（下轮起按清单买，直到刷新/换店）
+                lastQuota = Quota(q1, q2, q3, qb, dec.refresh, discPct)
             }
         }
         // ⚠`desc` 与 PC `shop_plan` **逐字一致**（有对拍测试 [RelicShopPortTest] 守着）⇒ 别在这里改文案。
@@ -435,6 +717,28 @@ class ShopPlan(
         val left = Py.num(sh, "resettable")?.toInt()          // 游戏自带的"还剩几次可刷"
         val mx = cfgInt(cfg, "max_refresh", 0)
         val thr = cfgInts(cfg, "refresh_above")
+
+        // ★精确 DP 接管（3/5 层）：用 [ShopDp] 的「买完是否刷新」结论替代 q1 / refresh_above / 阈值表；
+        //   刷得起、还剩次数、游戏还允许刷这些**硬约束照旧**。结论来自同一轮 [shopPlan]（DP 已按
+        //   「当前剩余货架 + 剩余刷新次数」算过），所以「买了一半」「闪退重进」都不会误判。
+        val dpm = dpModel(area)
+        if (dpm != null) {
+            val remaining = remainingRefresh(area, sh, done)
+            val want = dpSuggestRefresh
+            val can = remaining > 0 && cost != 0 && coin >= cost && (left == null || left > 0)
+            val refresh = can && want
+            val why = when {
+                cost == 0 -> "无刷新按钮"
+                remaining <= 0 -> "DP：本店刷新次数已用完"
+                coin < cost -> "刷不起（金币 $coin < 费 $cost）"
+                left != null && left <= 0 -> "游戏已无可刷次数"
+                !want -> "DP：刷新的期望不高于现在买（剩余 $remaining 次）"
+                else -> ""
+            }
+            val detail = "DP刷新评估：disc=${dpLastDisc}% 剩余=$remaining 余额=$coin 费=$cost " +
+                "建议=${if (want) "刷" else "不刷"}"
+            return RefreshDecision(refresh, null, why, detail)
+        }
 
         // ★MDP 接管（5层开启）：用 ShopMdp.shouldRefresh 替代 PC 的 q1/refresh_above 判据
         if (useMdp && area == 5) {
