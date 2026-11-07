@@ -22,13 +22,13 @@ data class JudgeResult(
     val routePerArea: Map<Int, List<Int>>,
     val actual: Int,
     val theory: Int,
+    /** 给日志/悬浮窗的一句话摘要：经典 = `价值=5690/5690`；自定义 = `节点顺序=5/5` */
+    val summary: String = "价值=$actual/$theory",
 )
 
 object RerollJudge {
     fun judge(nodes: List<LabyrinthMapNode>, config: RerollConfig): JudgeResult {
         val panels = nodes.map { toPanel(it) }
-        Route.setEventValue(config.eventValue)
-        val value = Route.checkValuePerfect(panels)
 
         val bossByArea = mutableMapOf<Int, Int>()
         val bossDiag = mutableListOf<String>()
@@ -59,18 +59,52 @@ object RerollJudge {
             fail += "5 区 Boss ${PartyPlan.bossName(a5) ?: a5} 不在白名单"
         }
 
-        // ★判价值偏差永远执行，仅由 maxValueGap（分数差）决定，不再看「偏差区数」。
         var ok = fail.isEmpty()
-        val gap = value.theory - value.actual
-        val mg = config.maxValueGap
-        val bad = mg >= 0 && gap > mg
-        if (bad) {
-            ok = false
-            fail += "价值偏差 差 ${gap} 分（允许 ${mg}）"
+        var actual = 0
+        var theory = 0
+        var routePerArea: Map<Int, List<Int>> = emptyMap()
+        var summary = ""
+
+        if (config.judgeMode == RerollConfig.MODE_CUSTOM) {
+            // ★自定义模式（2026-11-03）：不比分数，只要**5 个区域都能找到一条满足自选节点顺序的路线**。
+            val plans = AreaPattern.decode(config.areaPlan)
+            val m = AreaPattern.match(nodes, plans)
+            summary = "节点顺序=${m.routes.size}/5"
+            if (!m.ok) {
+                ok = false
+                // ★说清**哪个区卡在第几列、那一列要什么**（用户要能对着配置排查，2026-11-03）
+                val bits = m.failAt.entries.sortedBy { it.key }.map { (a, col) ->
+                    val want = plans.firstOrNull { it.area == a }?.want(col) ?: AreaPattern.ANY
+                    val tail = if (want != AreaPattern.ANY) "要${AreaPattern.name(want)}" else "该区没节点"
+                    "区域$a 第${col}列($tail)"
+                }
+                fail += "节点顺序：${bits.joinToString("、")} 找不到"
+            } else {
+                routePerArea = m.routes
+            }
+            Log.d(
+                "RerollJudge",
+                "自定义判定：" + (1..5).joinToString(" ") {
+                    if (it in m.routes) "区域$it✓" else "区域$it✗第${m.failAt[it]}列"
+                },
+            )
+        } else {
+            // ★经典模式：判价值偏差永远执行，仅由 maxValueGap（分数差）决定。
+            Route.setEventValue(config.eventValue)
+            val value = Route.checkValuePerfect(panels)
+            actual = value.actual
+            theory = value.theory
+            val gap = theory - actual
+            val mg = config.maxValueGap
+            if (mg >= 0 && gap > mg) {
+                ok = false
+                fail += "价值偏差 差 ${gap} 分（允许 ${mg}）"
+            }
+            routePerArea = value.details.associate { it.area to it.path }
+            summary = "价值=$actual/$theory"
         }
 
-        val routePerArea = value.details.associate { it.area to it.path }
-        return JudgeResult(ok, fail, bossByArea, routePerArea, value.actual, value.theory)
+        return JudgeResult(ok, fail, bossByArea, routePerArea, actual, theory, summary)
     }
 
     private fun toPanel(node: LabyrinthMapNode): JSONObject = JSONObject().apply {

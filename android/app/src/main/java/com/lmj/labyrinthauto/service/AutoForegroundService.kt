@@ -15,7 +15,10 @@ import androidx.core.app.NotificationCompat
 import com.lmj.labyrinthauto.MainActivity
 import com.lmj.labyrinthauto.R
 import com.lmj.labyrinthauto.core.Accounts
+import com.lmj.labyrinthauto.core.ExEquipService
+import com.lmj.labyrinthauto.core.ExEquipStore
 import com.lmj.labyrinthauto.core.AppState
+import com.lmj.labyrinthauto.core.CrashGuard
 import com.lmj.labyrinthauto.core.LogFile
 import com.lmj.labyrinthauto.core.OverlayStatus
 import com.lmj.labyrinthauto.frida.AbiRepair
@@ -236,6 +239,18 @@ class AutoForegroundService : Service() {
                         )
                         return@launch
                     }
+                    // ★开跑前：先把"上次没还原的"补上，再存一份新的（2026-11-06 用户）。
+                    //   跑黎明界会自动换装、把原本的拆下来，所以这里快照，整轮结束后按记录还原。
+                    //   走的是游戏 API（load/index + unit/equip_ex），不依赖 frida；失败只记日志、不拦运行。
+                    // ★先点亮"准备中…"（2026-11-06 用户：点了按钮没反应）：存快照要登录+拉数据，
+                    //   要好几秒；不先置位的话按钮一直可点，看起来像"没点上"。
+                    AppState.setMazeProgress("准备中…")
+                    try {
+                        prepareExEquipBeforeRun()
+                    } finally {
+                        AppState.setMazeProgress(null)
+                    }
+
                     // 走到这里 root 必然就绪，点击后端一定是 root（InputBackends 仅 root 一种），不会为 null
                     val input = InputBackends.pick(applicationContext)!!
                     val total = RerollSettings.loadMazeRuns(applicationContext)
@@ -338,6 +353,13 @@ class AutoForegroundService : Service() {
                             MazeSummary.summaryLines(total, done).forEach { AppState.addLog(it) }
                         }
                     }
+                    // ★整轮结束：按开跑前的快照还原 EX 装备（2026-11-06 用户）。
+                    //   异常退出时走不到这里 ⇒ 记录里留着 pending，下次开跑前/打开 App 时补还原。
+                    restoreExEquipAfterRun()
+                    // ★运行已结束 ⇒ 立刻补一次心跳（running=false）。否则进程很快被杀时，
+                    //   磁盘上最后一份心跳还是 running=true，下次启动会误报"上次突然中断"（2026-11-06 用户）。
+                    AppState.setRunning(false)
+                    CrashGuard.beatNow("运行结束")
                     AppState.addLog("═══ 运行结束：成功 $done 次 / 计划 $totalTxt ═══")
                     FridaInjector.autoRecover = false
                     refreshNotification()
@@ -443,6 +465,52 @@ class AutoForegroundService : Service() {
         scope.cancel()
         AppState.setRunning(false)
         super.onDestroy()
+    }
+
+    /**
+     * 开跑前：只**保存**快照（2026-11-06 用户：开跑时不要自动还原——玩家可能自己改过装备）。
+     * 上次异常中断留下的 pending 由 **App 启动时弹窗询问**，不在这里处理。
+     * ★API 登录会把游戏客户端挤掉线，但这和"两台手机互挤"一样，不会引发错误，无需回避。
+     */
+    private suspend fun prepareExEquipBeforeRun() {
+        when (val r = ExEquipService.snapshot(applicationContext)) {
+            is ExEquipService.Result.Ok -> {
+                val rec = ExEquipStore.save(applicationContext, r.value, "开跑前自动保存")
+                ExEquipStore.markPending(applicationContext, rec.id)
+                AppState.addLog(
+                    "EX 装备已保存：${rec.unitCount} 个角色 / ${rec.equipCount} 件（跑完会还原）",
+                )
+            }
+            is ExEquipService.Result.Err ->
+                AppState.addLog("EX 装备保存失败：${r.message}（继续运行，结束后不会自动还原）")
+        }
+    }
+
+    /** 有"未还原"的记录就还原（上次异常退出/中断的情况） */
+    private suspend fun restoreExEquipIfPending() {
+        val id = ExEquipStore.pendingRecordId(applicationContext)
+        if (id <= 0L) return
+        val rec = ExEquipStore.all(applicationContext).firstOrNull { it.id == id } ?: run {
+            ExEquipStore.clearPending(applicationContext)
+            return
+        }
+        when (val r = ExEquipService.restore(applicationContext, rec)) {
+            is ExEquipService.Result.Ok -> {
+                AppState.addLog("EX 装备：${r.value}")
+                ExEquipStore.clearPending(applicationContext)
+            }
+            is ExEquipService.Result.Err ->
+                AppState.addLog("EX 装备还原失败：${r.message}（下次打开还会提示）")
+        }
+    }
+
+    /** 整轮结束：按本轮开跑前的快照还原（受「其他」页的开关控制） */
+    private suspend fun restoreExEquipAfterRun() {
+        if (!ExEquipStore.autoRestore(applicationContext)) {
+            AppState.addLog("EX 装备：已关闭自动还原（可在「其他」页开启），本次不还原")
+            return
+        }
+        restoreExEquipIfPending()
     }
 
     private fun startIfNeeded() {
@@ -694,6 +762,7 @@ class AutoForegroundService : Service() {
         FridaInjector.stop()
         AgentBridge.stop()
         AppState.setRunning(false)
+        CrashGuard.beatNow("已停止")     // ★把 running=false 立刻落盘，别让下次启动误报"突然中断"
         AppState.addLog("⏹ 已停止")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)

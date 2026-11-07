@@ -61,13 +61,28 @@ REFRESH_FEE = {0: 300, 1: 600}     # stage0 刷一次 300；stage1 刷一次 600
 # 多出 4 档纯粹是保险（运行时按整数百分比就近取档，永不越界）。
 CURVE_DISCS = list(range(65, 101, 5))
 
-# 10 种 A 星级多重集，及其在 27 种有序组合里出现的次数（用于加权平均）
-MULTI = [
-    ((1, 1, 1), 1), ((1, 1, 2), 3), ((1, 1, 3), 3), ((1, 2, 2), 3),
-    ((1, 2, 3), 6), ((1, 3, 3), 3), ((2, 2, 2), 1), ((2, 2, 3), 3),
-    ((2, 3, 3), 3), ((3, 3, 3), 1),
+# ★2026-11-05：星级概率从"各 1/3"改为实测权重 6:3:1（线上已按这版生成）。
+#   依据：shop_samples 24 屏 72 件（排除 4 层固定货架）→ 1★ 61.1% / 2★ 31.9% / 3★ 6.9%，
+#   卡方 χ²=31.75(df=2) p≈1.2e-7，强烈拒绝"各 1/3"；且与当前持有件数无关（不是不放回）。
+#   旧版等价于 PROB = (1/3, 1/3, 1/3)。
+PROB = (0.6, 0.3, 0.1)      # 1★ / 2★ / 3★
+
+# 10 种 A 星级多重集，权重 = 排列数 × Π p^n
+_MULTI_STARS = [
+    (1, 1, 1), (1, 1, 2), (1, 1, 3), (1, 2, 2), (1, 2, 3),
+    (1, 3, 3), (2, 2, 2), (2, 2, 3), (2, 3, 3), (3, 3, 3),
 ]
-MULTI_TOTAL = sum(w for _, w in MULTI)   # = 27
+
+
+def _multi_prob(stars):
+    from math import factorial
+    n1, n2, n3 = stars.count(1), stars.count(2), stars.count(3)
+    perm = factorial(3) // (factorial(n1) * factorial(n2) * factorial(n3))
+    return perm * (PROB[0] ** n1) * (PROB[1] ** n2) * (PROB[2] ** n3)
+
+
+MULTI = [(s, _multi_prob(s)) for s in _MULTI_STARS]
+MULTI_TOTAL = sum(w for _, w in MULTI)   # = 1.0
 
 EPS = 1e-9
 

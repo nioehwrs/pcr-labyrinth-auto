@@ -39,6 +39,9 @@ object MazeRetreat {
         FAIL_3_TIMES("同一节点连续失败 3 次", "FAIL3"),
         NO_PLAN("编组页算不出可用队伍", "NOPLAN"),
         SCORE_LOW("凹分不足", "SCORE"),
+
+        /** ★凹分条件 2（断言模式）：遇到配置的事件/结果（2026-11-03） */
+        EVENT_RULE("凹分：事件条件命中", "EVENT"),
     }
 
     /**

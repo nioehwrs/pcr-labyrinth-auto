@@ -1,5 +1,6 @@
 package com.lmj.labyrinthauto.logic.team
 
+import com.lmj.labyrinthauto.core.AppState
 import com.lmj.labyrinthauto.data.Tables
 
 /**
@@ -46,8 +47,17 @@ class TeamBuild(private val tables: Tables) {
         forceTank: String? = null,
         forceJiasu: String? = null,
         failed: Boolean = false,
+        /** ★枚举结构位组合时指定"治疗"用谁（null = 按原规则 sc 最高） */
+        forceHeal: String? = null,
+        /** ★枚举结构位组合时指定"首动群充"用谁（null = 按原规则 max(tier)） */
+        forceTp: String? = null,
     ): Res {
         var pf: Map<String, Any?> = Profiles.applyFloor(Profiles.profileOf(stage), floor)
+        // ★结构位台账（2026-11-4）：只在外层主调用时打一行，列出这关要求哪些结构位
+        //   （variantBest/buildBest 内部的试探调用不打，避免刷屏）
+        if (forceTank == null && forceJiasu == null) {
+            AppState.addLog("[组队] $stage/第${floor}层 · " + StructSlots.describe(pf, relicsSkill))
+        }
         // 本节点失败过才补坦克（PC 393 行）
         if (failed && pf["tank_on_fail"] != null && !truthy(pf["need_tank"])) {
             pf = LinkedHashMap(pf).apply {
@@ -55,10 +65,12 @@ class TeamBuild(private val tables: Tables) {
                 this["tank_on_fail_used"] = true
             }
         }
-        if (forceTank != null || forceJiasu != null) {
+        if (forceTank != null || forceJiasu != null || forceHeal != null || forceTp != null) {
             pf = LinkedHashMap(pf).apply {
                 if (forceTank != null) this["force_tank"] = forceTank
                 if (forceJiasu != null) this["force_jiasu"] = forceJiasu
+                if (forceHeal != null) this["force_heal"] = forceHeal
+                if (forceTp != null) this["force_tp"] = forceTp
             }
         }
         val algo = pf["algo"] as? String ?: "burst"
@@ -115,6 +127,7 @@ class TeamBuild(private val tables: Tables) {
             failed = failed,
         )
         res.maxField = maxField
+        res.forceTp = forceTp
         if (alUnits.isNotEmpty() && forceAttr == null && !allowAttrlim && C.ATTR_FORCE) {
             val names = alUnits.joinToString("、") { tables.unit(it)?.optString("name").orEmpty() }
             res.log.add("属性限定：$names 不参与默认队（改走同属性队尝试，见 build_best）")
@@ -202,8 +215,10 @@ class TeamBuild(private val tables: Tables) {
             }
             res.log.add(msg)
         } else if (first.isNotEmpty()) {
-            // PC: max(key=tier) —— 只比评级，平局取**先出现**的（别掺 uid 做次级键）
-            val u = first.maxWithOrNull(compareBy { rules.tierOf(it) ?: 0 })!!
+            // ★枚举结构位组合时，指定谁就用谁；否则 PC: max(key=tier)（平局取先出现的）
+            val want = res.forceTp
+            val u = if (want != null && want in first) want
+            else first.maxWithOrNull(compareBy { rules.tierOf(it) ?: 0 })!!
             take(res, u, "关键角色·首动群充")
         }
     }
@@ -599,48 +614,66 @@ class TeamBuild(private val tables: Tables) {
         failed: Boolean,
     ): Res {
         val pf = Profiles.profileOf(stage)
-        if (!truthy(pf["range_spread"]) || base.score == null) return base
+        if (base.score == null) return base
         val ids = poolIn.map { it.toString() }.filter { tables.unit(it) != null }
         val w = C.W["burst"]!!
         val atk = (pf["atk"] as? String) ?: "物理"
         fun sc(u: String): Double = burstScore(u, atk, w, false, false, false)
+        fun top(list: List<String>, n: Int) = list.sortedWith(descByDoubleVal { sc(it) }).take(n)
 
+        // ★结构位候选（用户 2026-11-4）：不只坦克，凡"先占坑"的位都可能选错。
+        //   实测（220 条历史回放）Boss 关：坦克 16% / 治疗 9% / 首动 12% 可被换得更好，
+        //   EX 关：首动 11% / 治疗 8%。所以按"这一关有没有这个位"来取候选，不分 Boss/EX。
         val nt = pf["need_tank"] as? String
-        var tks: List<String> = when {
-            nt == "tank" -> {
-                val t = ids.filter { TagIds.T["tank"] in rules.tagsOf(it) }
-                if (t.isNotEmpty()) t else ids.filter { TagIds.T["mtank"] in rules.tagsOf(it) }
-            }
-            nt != null -> ids.filter {
-                val ts = rules.tagsOf(it); TagIds.T["tank"] in ts || TagIds.T["mtank"] in ts
-            }
-            else -> emptyList()
-        }
-        val jss = ids.filter { TagIds.T["jiasu"] in rules.tagsOf(it) }
-        tks = tks.sortedWith(descByDoubleVal { sc(it) }).take(3)
-        val jssTop = jss.sortedWith(descByDoubleVal { sc(it) }).take(2)
-        if (tks.size <= 1 && jssTop.size <= 1) return base        // 没有可换的
+        val tks = top(
+            when {
+                nt == "tank" -> ids.filter { TagIds.T["tank"] in rules.tagsOf(it) }
+                    .ifEmpty { ids.filter { TagIds.T["mtank"] in rules.tagsOf(it) } }
+                nt != null -> ids.filter {
+                    val ts = rules.tagsOf(it); TagIds.T["tank"] in ts || TagIds.T["mtank"] in ts
+                }
+                else -> emptyList()
+            },
+            5,
+        )
+        val hls = if (truthy(pf["need_heal"])) top(ids.filter { TagIds.T["heal"] in rules.tagsOf(it) }, 4) else emptyList()
+        val tps = top(ids.filter { TagIds.T["first"] in rules.tagsOf(it) }, 4)
+        val jss = top(ids.filter { TagIds.T["jiasu"] in rules.tagsOf(it) }, 2)
+        if (tks.size <= 1 && hls.size <= 1 && tps.size <= 1 && jss.size <= 1) return base
 
         var best = base
         val tried = mutableListOf("原方案" to base.score!!)
-        val tkOpts: List<String?> = if (tks.isEmpty()) listOf(null) else tks.map { it }
-        for (tk in tkOpts) {
-            for (js in listOf<String?>(null) + jssTop) {
-                if (tk == null && js == null) continue
-                val alt = build(
-                    stage, poolIn, relicsSkill, floor, size,
-                    forceTank = tk, forceJiasu = js, failed = failed,
-                )
-                val altScore = alt.score ?: continue
-                val nm = (if (tk != null) name(tk) else "原坦克") + (if (js != null) "+" + name(js) else "")
-                tried.add(nm to altScore)
-                if (altScore > best.score!!) {
-                    alt.log.add("★多方案：换坦克/加速成 $nm 后总分 $altScore > 原队 ${best.score} → 取这队")
-                    best = alt
-                }
+        // null = "这一位不动，交给原规则"
+        val tkOpts: List<String?> = if (tks.isEmpty()) listOf(null) else listOf<String?>(null) + tks
+        val hlOpts: List<String?> = if (hls.isEmpty()) listOf(null) else listOf<String?>(null) + hls
+        val tpOpts: List<String?> = if (tps.isEmpty()) listOf(null) else listOf<String?>(null) + tps
+        val jsOpts: List<String?> = if (jss.isEmpty()) listOf(null) else listOf<String?>(null) + jss
+        var count = 0
+        outer@ for (tk in tkOpts) for (hl in hlOpts) for (tp in tpOpts) for (js in jsOpts) {
+            if (tk == null && hl == null && tp == null && js == null) continue
+            if (++count > 300) break@outer                       // 上限：别让极端池子把单次组队拖到几秒
+            val alt = build(
+                stage, poolIn, relicsSkill, floor, size,
+                forceTank = tk, forceJiasu = js, failed = failed,
+                forceHeal = hl, forceTp = tp,
+            )
+            val altScore = alt.score ?: continue
+            val nm = listOfNotNull(
+                tk?.let { "坦:" + name(it) },
+                hl?.let { "治:" + name(it) },
+                tp?.let { "首:" + name(it) },
+                js?.let { "加:" + name(it) },
+            ).joinToString("+")
+            tried.add(nm to altScore)
+            if (altScore > best.score!!) {
+                alt.log.add("★多方案：$nm → 总分 $altScore > 原队 ${best.score} ⇒ 取这队")
+                best = alt
             }
         }
-        best.log.add("多方案比总分（坦克×加速）：" + tried.joinToString(" ｜ ") { "${it.first}=${it.second}" })
+        best.log.add(
+            "多方案比总分（坦克×治疗×首动×加速，试了 $count 组）：" +
+                tried.joinToString(" ｜ ") { "${it.first}=${it.second}" },
+        )
         return best
     }
 
@@ -831,17 +864,35 @@ class TeamBuild(private val tables: Tables) {
         val t = if (boss) rules.tierOf(uid, "boss") else rules.tierOf(uid)
         var s = (t ?: 0) * w["tier"]!!
         if (!mixed && (rules.effAtk(uid) == atk || TagIds.T["both"] in ts)) s += w["same_type"]!!
+        // ★异系惩罚（TeamTuning.mixPenalty，默认 0 = 行为不变）：
+        //   只扣"明确另一系"的角色，通用型(both)不扣；没有伤害类型("")的也不扣
+        else if (!mixed && TeamTuning.mixPenalty != 0.0 && rules.effAtk(uid).isNotEmpty() &&
+            TagIds.T["both"] !in ts
+        ) {
+            s -= TeamTuning.mixPenalty
+        }
         if (TagIds.T["dps"] in ts) {
             s += w["core"]!!
             if (TagIds.T["aoe"] in ts) s += w["aoe_core"]!!
         }
         if (TagIds.T["burst"] in ts) s += w["single"]!!
         if (TagIds.T["weaksingle"] in ts) s += w["weaksingle"]!!
-        // ★对策·美空（need_direct 关卡，2026-10-19 用户）：她的持续治疗让**没有定向手段的
-        //   单体输出**完全没用 —— 重扣（打不出有效伤害）。有 u_fix_relic（定向）才豁免。
-        //   惩罚通过 w 里带不带这个键生效：只有 need_direct 的档会加上它。
+        // ★对策·美空（need_direct 关卡）—— 判据是**打不打得得到**，不是"是不是爆发"（2026-11-5 用户）：
+        //   · 定向(u_fix_relic)：打得到 ⇒ +15（每个等效，数量不限，别当"唯一对策位"）；
+        //   · 群体(u_aoe)：当能打到（范围标注不精细）⇒ 不罚；
+        //   · 只有单体、又没定向 ⇒ 输出和破甲都打不到 ⇒ -40（贡献≈0）。
+        //   这两个权重通过 w 里带不带键生效：只有 need_direct 的档会加上它们。
+        w["fix_bonus"]?.let { fb -> if (TagIds.T["fixrelic"] in ts) s += fb }
         w["nondirect_single"]?.let { nd ->
-            if (TagIds.T["dps"] in ts && TagIds.T["burst"] in ts && TagIds.T["fixrelic"] !in ts) s += nd
+            // ★"打不到 boss 的输出"才扣（2026-11-5 用户纠正后的口径）：
+            //   · 单体 = `u_burst`（标签表：u_burst=单体输出、u_aoe=群体输出）；
+            //   · **同时是单体+群体 ⇒ 不扣**（两栖角色，`!aoe` 必须同时成立）；
+            //   · 定向(u_fix_relic) 打得到 ⇒ 豁免；
+            //   · 治疗/破甲/辅助/坦克（无 u_dps）价值与"打不打得到"无关 ⇒ 不在扣分范围。
+            val burst = TagIds.T["burst"] in ts
+            val aoe = TagIds.T["aoe"] in ts
+            val fix = TagIds.T["fixrelic"] in ts
+            if (TagIds.T["dps"] in ts && burst && !aoe && !fix) s += nd
         }
         if (!noBreak) {
             if (TagIds.T["pbreak"] in ts) {
@@ -884,7 +935,10 @@ class TeamBuild(private val tables: Tables) {
         // ★双敌/多目标：几个敌人加起来就是群体 → 「单体效果低」免扣
         if (truthy(pf["multi"])) w = w + ("weaksingle" to 0.0)
         // ★对策·美空（need_direct）：非定向的单体输出重扣（见 burstScore 里的说明）
-        if (truthy(pf["need_direct"])) w = w + ("nondirect_single" to C.NONDIRECT_SINGLE)
+        if (truthy(pf["need_direct"])) {
+            w = w + ("nondirect_single" to C.NONDIRECT_SINGLE) +
+                ("fix_bonus" to C.NONDIRECT_FIX_BONUS)
+        }
         val mixed = truthy(pf["no_type"])
         val nb = truthy(pf["no_break"])
         fun sc(u: String): Double = burstScore(u, atk, w, mixed, nb, boss)
@@ -932,7 +986,10 @@ class TeamBuild(private val tables: Tables) {
         }
         if (truthy(pf["need_heal"])) {
             val hl = cands.filter { TagIds.T["heal"] in rules.tagsOf(it) && it !in picked }
-            if (hl.isNotEmpty()) add(hl.maxWithOrNull(compareByDouble { sc(it) })!!)
+            // ★枚举结构位组合时，指定谁就用谁
+            val want = pf["force_heal"] as? String
+            val u = if (want != null && want in hl) want else hl.maxWithOrNull(compareByDouble { sc(it) })
+            if (u != null) add(u)
             else warns.add("⚠ 关卡要求 1 治疗，但池里没有治疗角色")
         }
         if (truthy(pf["need_cc"])) {
@@ -1288,6 +1345,11 @@ class TeamBuild(private val tables: Tables) {
         val t = if (boss) rules.tierOf(uid, "boss") else rules.tierOf(uid)
         var s = (t ?: 0) * w["tier"]!!
         if (rules.effAtk(uid) == atk || TagIds.T["both"] in ts) s += w["same_type"]!!
+        else if (TeamTuning.mixPenalty != 0.0 && rules.effAtk(uid).isNotEmpty() &&
+            TagIds.T["both"] !in ts
+        ) {
+            s -= TeamTuning.mixPenalty
+        }
         if (TagIds.T["aoe"] in ts) s += w["aoe"]!!
         if (TagIds.T["dps"] in ts) s += w["core"]!!
         if (TagIds.T["burst"] in ts) s += w["single"]!!
@@ -1660,6 +1722,9 @@ class Res(
 
     /** 领域硬约束：当前队允许的最多领域角色数（Int.MAX_VALUE = 不限，速通队用）；选人/交换时据此拦截 */
     var maxField: Int = Int.MAX_VALUE
+
+    /** 枚举结构位组合时指定的"首动群充"人选（null = 按原规则 max(tier)） */
+    var forceTp: String? = null
 
     // `_finish` 填的统计（★与 Python 一致：**只有走到 `_finish` 才有值**；
     //  "池子里没有可用角色"那条早退路径下它们是"没有这个键"= null）

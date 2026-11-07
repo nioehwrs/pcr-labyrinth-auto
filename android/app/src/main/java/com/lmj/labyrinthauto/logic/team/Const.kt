@@ -16,6 +16,9 @@ object TagIds {   // PC: T
     val T: Map<String, String> = mapOf(
         "clear" to "u_clear",             // 速通
         "aoe" to "u_aoe",                 // 群体输出
+        // 注：单体/群体用的都是现成标签（tag_defs.json）：
+        //   `u_burst` = 单体输出、`u_aoe` = 群体输出、`u_dps` = 输出核心。
+        //   （`t1791357917170` 是「魔法破甲」，跟攻击范围无关，别再拿它当单体。）
         "dps" to "u_dps",                 // 输出核心
         "burst" to "u_burst",             // 单体输出
         "pbreak" to "u_break",            // 物理破甲
@@ -91,10 +94,20 @@ object C {
     const val TANK_EXTRA = -8.0      // 多余坦克扣分（只扣真坦克、只扣超过关卡要求数的）
     const val RANGE_SPREAD_PENALTY = 15.0   // 站位跨度超限：每多一个角色固定扣这么多
 
-    /** ★对策·美空（need_direct）：没有定向手段的「单体输出」重扣（2026-10-19 用户：
-     *  "给不是定向输出的单体输出多扣点分——完全没有作用"）。带 u_fix_relic 豁免。
-     *  取 -20：要能压过 tier5 非定向单体（50+6+4+同系8=68 → 48），让对策卡真正让位进来。 */
-    const val NONDIRECT_SINGLE = -20.0
+    /** ★对策·美空（need_direct）：**无指向单体**（输出或破甲）重扣，定向/群攻豁免。
+     *
+     *  2026-11-5 用户口径修正：判定不看"是不是爆发"，而看**打不打得到**——
+     *  · 有 `u_fix_relic`（定向）⇒ 打得到，还额外 **+15**（[NONDIRECT_FIX_BONUS]，数量不限）；
+     *  · 有 `u_aoe`（群体）⇒ 当能打到，不罚（范围标注不精细）；
+     *  · 只有单体且无定向 ⇒ 打不到，输出/破甲贡献≈0 ⇒ 扣 40。
+     *
+     *  取 -40：tier5 单体（50+6+4+同系8≈68）扣完 ≈28，低于 tier3 定向（30+15=45）⇒
+     *  定向够就轮不到它；定向不够时才用来补位。
+     */
+    const val NONDIRECT_SINGLE = -40.0
+
+    /** need_direct 关里**定向输出**的加分（每个等效，不限数量） */
+    const val NONDIRECT_FIX_BONUS = 15.0
     const val ATTR_FORCE = true      // 属性限定：默认不取；池里有则另编"同属性队"比整队总分
     const val MAX_FIELD = 1          // 领域硬约束：非速通队领域角色上限（领域 buff 不叠加；profile 可用 max_field 覆盖）
 
@@ -218,7 +231,11 @@ object Profiles {
         "EX_261001" to mapOf("algo" to "burst", "need_cc" to true, "multi" to true),
         // 治愈·遗物+美空（怪物 265000，4/5 区）：edge="none" = **无系别偏好**（2026-10-19 用户：
         //   "去掉物理队更优的设定"）——默认的物理 +4 会把可用的魔法对策卡压出去
-        "EX_265000" to mapOf("algo" to "burst", "need_direct" to true, "multi" to true, "edge" to "none"),
+        // ★2026-11-5 用户：失败后队伍里尽量带坦克（同岛鲸/吞拿鱼那套 tank_on_fail）
+        "EX_265000" to mapOf(
+            "algo" to "burst", "need_direct" to true, "multi" to true, "edge" to "none",
+            "tank_on_fail" to "tank_or_mtank",
+        ),
     )
 
     /**

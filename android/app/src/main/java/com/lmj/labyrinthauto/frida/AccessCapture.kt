@@ -138,7 +138,7 @@ object AccessCapture {
             throw Failure("没有 root：抓取要注入游戏进程（顺便 force-stop / am start），先在设备上允许 root")
         }
         if (!FridaCore.available) {
-            throw Failure("注入桥（libfrida_bridge.so）没加载上，装的是不是不含注入的包？")
+            throw Failure("运行组件没加载上，先联网让它自动下载（约 46MB）")
         }
         // ★架构闸门（2026-10-29 实测定案）：注入硬依赖 x86_64 —— ARM 走 Houdini 转译时，
         //   x86_64 宿主进程的模块表里根本没有 libil2cpp.so，注入"成功"也摸不到 il2cpp。

@@ -23,6 +23,19 @@ data class RerollConfig(
     val bossArea3: Set<Int> = setOf(301206, 303306, 306604, 312505, 319604),
     /** 5 区 Boss 白名单（unitId），5 个固定 Boss、默认全选；空集 = 不检查该区 */
     val bossArea5: Set<Int> = setOf(301701, 302501, 310103, 315004, 319401),
+    /**
+     * 判定模式（用户 2026-11-03）：
+     *  · [MODE_CLASSIC] 经典 = 分数价值判定（事件倾向 + 价值偏差）；
+     *  · [MODE_CUSTOM]  自定义 = 按**每区每列的节点类型**判定（见 [AreaPattern]），不再算分。
+     */
+    val judgeMode: Int = MODE_CLASSIC,
+    /** 自定义模式的期望（JSON：`{"1":[1,2,4,2,5,6],…}`），空串 = 用默认值 */
+    val areaPlan: String = "",
     /** 每轮 enter/retire 之间小睡几毫秒（别把服务器打急） */
     val sleepBetweenMs: Long = 150L,
-)
+) {
+    companion object {
+        const val MODE_CLASSIC = 0
+        const val MODE_CUSTOM = 1
+    }
+}

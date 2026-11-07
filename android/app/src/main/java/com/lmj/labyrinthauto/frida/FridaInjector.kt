@@ -284,6 +284,8 @@ object FridaInjector {
         var abiChecked = false
         // ★确定性修不了（包内无 x86_64 / 没装 / 没 root）⇒ 本次进城彻底静默，别再折腾游戏。
         var abiBlocked = false
+        // ★pid 误读只报一次/局（2026-11-03，见下面 pid 校验；每拍刷屏没意义）
+        var saidPidOdd = 0
         while (true) {
             // ★注入只服务于「自动黎明界」：总闸关着就**待命** —— 不调起游戏、不注入、不自愈、不读页。
             //   这样"助手开着"也绝不碰游戏进程（用户 2026-10-16 要求：关着时没必要注入）。
@@ -371,6 +373,39 @@ object FridaInjector {
             }
 
             var pid = gamePid()
+            // ★2026-11-03 用户报障（12:26:42 那次"突然回到登录页"）：
+            //   `gamePid()` 偶尔会返回**不是游戏**的 pid（实测拿到 6185 —— 那既不是 AMS 起过的进程、
+            //   exit-info 里也没有，纯属误读：pidof/frida 枚举在内存吃紧、pushservice 反复起停时会吐垃圾）。
+            //   旧逻辑把这种 pid 当"游戏换了实例"⇒ waitGameReady 立刻判"进程提前退出"⇒ force-stop
+            //   把**健康在跑**的游戏杀掉 ⇒ 新实例停在标题/登录页，本局全废。
+            //
+            //   下面两道闸（顺序不能反）：
+            //   ① **agent 还连着 ⇒ 游戏只可能是 lastPid**（agent 在进程内，连着就证明那个进程活着）；
+            //   ② pid 变了必须先验 `/proc/<pid>/cmdline` 是不是包名本体（挡 :pushservice / su 包装 / 同名进程）。
+            if (lastPid > 0 && pid != lastPid && AgentBridge.connected.value) {
+                if (saidPidOdd == 0) {
+                    saidPidOdd++
+                    AppState.addLog("pid 读成 $pid，但 agent 还连在 pid=$lastPid 上 ⇒ 当误读，忽略（不换 pid、不杀游戏）")
+                }
+                pid = lastPid
+            }
+            if (pid > 0 && pid != lastPid) {
+                val verified = verifyMainPid(pid, GameProcess.pkg())
+                if (verified == false) {
+                    if (saidPidOdd == 0) {
+                        saidPidOdd++
+                        AppState.addLog("pid $pid 不是游戏主进程（/proc/$pid/cmdline 不是 ${GameProcess.pkg()}）⇒ 当没取到")
+                    }
+                    pidMisses++
+                    if (pidMisses < PID_MISS_LIMIT) {
+                        delay(POLL_MS)
+                        continue
+                    }
+                    // 连续几拍只看到"不是本体"的进程（如只剩 :pushservice）⇒ 当游戏没在跑，走下面调起
+                    pid = -1
+                    pidMisses = 0
+                }
+            }
             // ★单拍取不到不算死（见 [PID_MISS_LIMIT]）：进战斗 / 大加载的瞬间三路检测可能一起失败
             if (pid <= 0 && lastPid > 0) {
                 pidMisses++
@@ -417,6 +452,13 @@ object FridaInjector {
                 if (readyWhy != null) {
                     // ★僵死/提前退出 => 进程已坏，别傻等，杀游戏重开（2026-10-21 uuz 实测）
                     if (readyWhy.contains("僵死") || readyWhy.contains("提前退出")) {
+                        // ★2026-11-03 兜底闸：agent 还连着就说明进程活着（在跑迷宫），**绝不杀**。
+                        //   能走到这里正常情况已被上面的 pid 校验挡住；留这一道防将来又改出同类误判。
+                        if (AgentBridge.connected.value) {
+                            AppState.addLog("等就绪异常（$readyWhy），但 agent 还连着 ⇒ 不杀游戏（pid=$pid），继续跑")
+                            delay(POLL_MS)
+                            continue
+                        }
                         launchTries = 0
                         GameProcess.kill()
                         lastPid = -1
@@ -429,7 +471,7 @@ object FridaInjector {
                 if (lastPid <= 0) {
                     AppState.addLog("找到游戏 pid=$pid（起了 ${(SystemClock.elapsedRealtime() - startedAt) / 1000}s），开始注入")
                 }
-                AppState.setFridaStatus("注入中（注入桥 → 运行组件）…")
+                AppState.setFridaStatus("注入中（运行组件）…")
                 // ★V7（2026-10-30）：首次注入原来**没有超时** —— 进程僵住时会一直等到 frida 内部超时
                 //   （实测 25s），把"决定重试/杀游戏"整整拖后。这里补上限：取重注入上限的 2 倍
                 //   （首次 attach 要建 session + load script，比同 pid 重注入慢一点，别误杀）。
@@ -736,6 +778,25 @@ object FridaInjector {
         if (viaFrida > 0) return viaFrida
 
         return parseFirstPid(RootShell.exec("pidof $pkg", 8_000L).out)
+    }
+
+    /**
+     * 校验 pid 真的是**游戏主进程**（2026-11-03 用户报障后加，见 loop 里那两道闸）。
+     *
+     * 判据：`/proc/<pid>/cmdline` 的第一个参数 == 包名。
+     *   · Android 上 app 进程的 argv[0] 就是进程名（`com.bilibili.priconne`）；
+     *   · `:pushservice` 之类子进程是 `包名:xxx` ⇒ 不相等 ⇒ 判否；
+     *   · 我们自己的 root shell（`su`）之类更是不同 ⇒ 判否；
+     *   · 进程已经没了 ⇒ 读不到 ⇒ **null（未知）**。
+     * 返回 null 时调用方按"没把握但也不能因此杀游戏"处理（继续走原流程）。
+     * 只在 pid 变化时调（罕见），不会拖慢每拍。
+     */
+    private suspend fun verifyMainPid(pid: Int, pkg: String): Boolean? {
+        if (pid <= 0) return false
+        val r = RootShell.exec("cat /proc/$pid/cmdline", 4_000L)
+        val arg0 = r.out.substringBefore('\u0000').trim().substringAfterLast('/')
+        if (arg0.isEmpty()) return null            // 读不到（进程没了 / 没 root）
+        return arg0 == pkg
     }
 
     /** 轻量版：只跑一次 `pidof`（不碰 frida-server）。给"等进程消失"这种高频判定用。 */

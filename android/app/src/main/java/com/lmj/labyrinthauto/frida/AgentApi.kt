@@ -118,6 +118,146 @@ object AgentApi {
     suspend fun labStatus(errOut: ((String) -> Unit)? = null): JSONObject? =
         obj("labStatus", timeoutMs = T_SLOW, errOut = errOut)
 
+    /**
+     * ★轻量「当前窗口」（2026-11-06 状态机）：只返回 `{top, raw, ms}`，
+     * `top` 是**归一化**后的对话框名（去掉 `(Clone)` 之类后缀，空串 = 没有对话框）。
+     *
+     * 比 [labStatus] 快一个数量级（后者要构快照/读地图字段），可以用 60ms 级轮询。
+     */
+    suspend fun labTop(timeoutMs: Long = 1_500L): String? {
+        val o = obj("labTop", timeoutMs = timeoutMs) ?: return null
+        val top = o.optString("top", "")
+        return if (top == "null") "" else top
+    }
+
+    /** 同上，但要完整对象（含 `raw`/`ms`，调试用） */
+    suspend fun labTopRaw(timeoutMs: Long = 1_500L): JSONObject? = obj("labTop", timeoutMs = timeoutMs)
+
+    /**
+     * ★轻量「窗口 + 编组页队伍索引」（2026-11-07，Boss 三队状态机）。
+     * @return `(窗口名, 队伍索引)`；索引 -1 = 不在编组页 / 读不到
+     */
+    suspend fun labPartyIdx(timeoutMs: Long = 1_500L): Pair<String, Int> {
+        val o = obj("labPartyIdx", timeoutMs = timeoutMs) ?: return "" to -1
+        val top = o.optString("top", "").let { if (it == "null") "" else it }
+        return top to o.optInt("idx", -1)
+    }
+
+    /**
+     * ★极简「是否在战斗中」（2026-11-07）：只读 ViewManager → 当前 View 类名，
+     * 比 [labStatus] 快一个数量级（后者要构造全量快照）。
+     */
+    suspend fun labInBattle(timeoutMs: Long = 1_500L): Boolean =
+        obj("labView", timeoutMs = timeoutMs)?.optBoolean("inBattle", false) == true
+
+    /**
+     * ★轻量「战斗结果原始值」：[gameState] 是 BattleManager 状态机枚举（胜/负不同值，待标定），
+     * [resultEnable] 是结算按钮是否可点。比等按钮出现快得多。
+     */
+    data class BattleRaw(val inBattle: Boolean, val resultEnable: Boolean?, val gameState: Int?)
+
+    /**
+     * ★轻量「编队页图标清单」（2026-11-07）：只读 plate 数组长度 + 每格 unitId，
+     * 不读坐标/相机投影（那才是 `labParty` 的 893ms）。
+     *
+     * @param ids **队伍那一排**（`plate+0xC8`，5 格）的 unitId；**0 表示空槽**
+     * @param listIds **角色一览当前窗口**（`scrollController+0x70`）的 unitId
+     *        ★滚动一览时队伍那一排**不会变**、只有它会变 ⇒ 判断"滚到位了没"必须看它。
+     */
+    data class PartyIconsRaw(
+        val top: String,
+        val idx: Int,
+        val ids: List<Int>,
+        val listIds: List<Int>,
+    )
+
+    suspend fun labPartyIcons(timeoutMs: Long = 1_500L): PartyIconsRaw? {
+        val o = obj("labPartyIcons", timeoutMs = timeoutMs) ?: return null
+        val top = o.optString("top", "").let { if (it == "null") "" else it }
+        fun arr(name: String): List<Int> {
+            val a = o.optJSONArray(name) ?: return emptyList()
+            return (0 until a.length()).map { a.optInt(it, 0) }
+        }
+        return PartyIconsRaw(
+            top = top,
+            idx = o.optInt("idx", -1),
+            ids = arr("ids"),
+            listIds = arr("listIds"),
+        )
+    }
+
+    /**
+     * ★轻量「编队决策包」（2026-11-07）：`(窗口, 队伍索引, 屏上 uid 列表, 一览 uid 列表, 已编 uid 列表)`。
+     * 不读坐标、不读名字 —— 决策只需要这三样。
+     */
+    data class PartyPlanRaw(
+        val top: String,
+        val idx: Int,
+        val ids: List<Int>,
+        val listIds: List<Int>,
+        val members: List<Int>,
+    )
+
+    suspend fun labPartyPlan(timeoutMs: Long = 1_500L): PartyPlanRaw? {
+        val o = obj("labPartyPlan", timeoutMs = timeoutMs) ?: return null
+        fun arr(name: String): List<Int> {
+            val a = o.optJSONArray(name) ?: return emptyList()
+            return (0 until a.length()).map { a.optInt(it, 0) }
+        }
+        return PartyPlanRaw(
+            top = o.optString("top", "").let { if (it == "null") "" else it },
+            idx = o.optInt("idx", -1),
+            ids = arr("ids"),
+            listIds = arr("listIds"),
+            members = arr("members"),
+        )
+    }
+
+    /**
+     * ★★轻量「编队决策**精简读**」（2026-11-07 用户："只取需要的内容就好了，不用都取吧"）。
+     *
+     * `labParty` 是整页快照：29 个 icon 每个带 3 个中文 label + 40 个页签候选 + 一堆诊断字段，
+     * 每轮编队页都要序列化/传输/解析一大坨，而决策**根本用不到**那些。
+     * 这里只取决策要的：队伍名单 / 槽位 id / 一览 id+vis / 可编入 / 一览全量 / 各队成员 / 按钮坐标。
+     *
+     * ★字段名与 `labParty` 一致 ⇒ Kotlin 侧 `PartyPlan` / `MazeLoop` 不用改。
+     */
+    suspend fun labPartyLite(timeoutMs: Long = T_SLOW): JSONObject? =
+        obj("labPartyLite", timeoutMs = timeoutMs)
+
+    /**
+     * ★编组页顶部页签（`tabCand` 候选 + `partyTabs` 队伍1/2/3 坐标）。
+     * 以前每轮都从 `labParty` 里带 40 个候选回来 ⇒ 现在只在"Boss 页切队腾空"时单独调。
+     */
+    suspend fun labPartyTabs(timeoutMs: Long = T_SLOW): JSONObject? =
+        obj("labPartyTabs", timeoutMs = timeoutMs)
+
+    /**
+     * ★轻量「某个角色在当前编队页图标上的坐标」（2026-11-07）。
+     * 只对命中的那一个 icon 做投影（`labParty` 是 21 个全做，所以 893ms）。
+     *
+     * @param via **先找哪个区域**（与 [com.lmj.labyrinthauto.logic.MazeLoop.findUnitCoord] 同款）：
+     *            `"槽位"` → 队伍那一排优先（**撤人**点的是底排那张卡）；
+     *            `"一览"`/null → 角色一览优先（**加人**点的是一览里那张）。
+     * @return `(x, y)`；null = 不在本屏 / 不在编组页
+     */
+    suspend fun labPartyIconPos(uid: Int, via: String? = null, timeoutMs: Long = 1_500L): Pair<Int, Int>? {
+        val o = obj("labPartyIconPos", listOf(uid, via ?: ""), timeoutMs) ?: return null
+        if (!o.optBoolean("found", false)) return null
+        return o.optInt("x", 0) to o.optInt("y", 0)
+    }
+
+    suspend fun labBattleResult(timeoutMs: Long = 1_500L): BattleRaw? {
+        val o = obj("labBattleResult", timeoutMs = timeoutMs) ?: return null
+        val hasRe = o.has("resultEnable") && !o.isNull("resultEnable")
+        val hasGs = o.has("gameState") && !o.isNull("gameState")
+        return BattleRaw(
+            inBattle = o.optBoolean("inBattle", false),
+            resultEnable = if (hasRe) o.optBoolean("resultEnable", false) else null,
+            gameState = if (hasGs) o.optInt("gameState", 0) else null,
+        )
+    }
+
     /** 地图上所有节点面板：**是数组** `[{blockId,blockType,panelState,x,y}]`（PC `lab_nodes` 1020 同款） */
     suspend fun labNodes(): JSONArray? = arr("labNodes", timeoutMs = T_SLOW)
     suspend fun labMap(): JSONObject? = obj("labMap", timeoutMs = T_SLOW)
@@ -208,7 +348,14 @@ object AgentApi {
     suspend fun labCharaPageQuick(): JSONObject? = obj("labCharaPageQuick", timeoutMs = T_SLOW)
 
     /** 编队页只读快照；`diag=true` 带现场 dump */
-    suspend fun labParty(diag: Boolean = false): JSONObject? = obj("labParty", listOf(diag), T_SLOW)
+    /**
+     * 编队页全量快照。
+     * @param noXY **跳过每个 icon 的坐标投影**（2026-11-07）：投影约占 893ms 里的 700ms。
+     *             编队决策只需要 `icons[].unitId` / `nowMember` / `buttons`，不需要坐标；
+     *             真正要点谁时用 [labPartyIconPos] 单点取（~20ms）。
+     */
+    suspend fun labParty(diag: Boolean = false, noXY: Boolean = false): JSONObject? =
+        obj("labParty", listOf(diag, noXY), T_SLOW)
 
     /** 让编队页的读取缓存立刻失效（点完一下必须读到最新编队） */
     suspend fun labPartyFlush(): Boolean = bool("labPartyFlush") ?: false

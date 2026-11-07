@@ -207,6 +207,18 @@ object CrashGuard {
         )
     }
 
+    /**
+     * **立刻补写一次心跳**（2026-11-06）：运行结束等"状态刚变"的时刻调用，
+     * 把 `running=false` 及时落盘。
+     *
+     * 不加这个会误报：整轮跑完后进程如果很快被杀（覆盖安装/手动清后台），
+     * 磁盘上最后一份心跳仍是 `running=true` ⇒ 下次启动被当成"跑图途中突然消失"。
+     */
+    fun beatNow(why: String = "状态变更") {
+        val m = marker ?: return
+        runCatching { writeMarker(m, why) }
+    }
+
     /** 写/刷心跳（pid + 时刻 + 当前状态），供下次启动判断"是不是突然死的" */
     private fun writeMarker(m: File, why: String) {
         val now = System.currentTimeMillis()

@@ -4,8 +4,12 @@ package com.lmj.labyrinthauto.ui
 
 import android.content.Context
 import com.lmj.labyrinthauto.logic.EventEntry
+import com.lmj.labyrinthauto.logic.EventFamily
 import com.lmj.labyrinthauto.logic.EventPick
+import com.lmj.labyrinthauto.logic.EventRetreatRule
+import com.lmj.labyrinthauto.logic.EventRuleData
 import com.lmj.labyrinthauto.logic.EventSettings
+import com.lmj.labyrinthauto.logic.shop.ShopSampleLog
 import com.lmj.labyrinthauto.data.GameData
 import com.lmj.labyrinthauto.data.GuildPool
 import com.lmj.labyrinthauto.data.PoolForm
@@ -62,6 +66,9 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.runtime.Composable
@@ -95,6 +102,9 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlin.math.roundToInt
 import com.lmj.labyrinthauto.core.Accounts
+import com.lmj.labyrinthauto.core.ExEquipRecord
+import com.lmj.labyrinthauto.core.ExEquipService
+import com.lmj.labyrinthauto.core.ExEquipStore
 import com.lmj.labyrinthauto.core.AppState
 import com.lmj.labyrinthauto.core.DiagPack
 import com.lmj.labyrinthauto.core.LogFile
@@ -105,6 +115,7 @@ import com.lmj.labyrinthauto.frida.RootCheck
 import com.lmj.labyrinthauto.net.bilibili.CaptchaChallenge
 import com.lmj.labyrinthauto.net.bilibili.GameServer
 import com.lmj.labyrinthauto.net.bilibili.GeetestPageBuilder
+import com.lmj.labyrinthauto.reroll.AreaPattern
 import com.lmj.labyrinthauto.reroll.RerollConfig
 import com.lmj.labyrinthauto.reroll.RerollSettings
 import com.lmj.labyrinthauto.reroll.RerollUseCase
@@ -168,6 +179,63 @@ fun HomeScreen(
     val compDownloading = compStatus?.startsWith("运行组件下载中") == true
     // ★上次进程是否突然消失（CrashGuard 判定，启动时写一次）→ 首页横幅，点「知道了」清掉
     val abnormalExit by AppState.abnormalExit.collectAsStateWithLifecycle()
+    // ★EX 装备（2026-11-06 用户）：只有"上次没跑到结束"才需要还原，且**要问一句**——
+    //   玩家中途可能自己改过装备，不希望被覆盖。点「一键黎明界」时只保存、不还原。
+    var pendingExEquip by remember { mutableStateOf<ExEquipRecord?>(null) }
+    val exScope = rememberCoroutineScope()
+    LaunchedEffect(Unit) {
+        val id = ExEquipStore.pendingRecordId(context)
+        if (id > 0L) pendingExEquip = ExEquipStore.all(context).firstOrNull { it.id == id }
+    }
+    // ★开关关掉就**连询问也不做**（2026-11-06 用户）：pending 留着不动，等开关打开再说
+    if (pendingExEquip != null && ExEquipStore.autoRestore(context)) {
+        val rec = pendingExEquip!!
+        var restoring by remember { mutableStateOf(false) }
+        AlertDialog(
+            // 还原过程中不许点外面关掉（2026-11-06 用户：点了要能看见"正在执行"）
+            onDismissRequest = { if (!restoring) pendingExEquip = null },
+            title = { Text(if (restoring) "正在还原…" else "上次运行没有正常结束") },
+            text = {
+                Text(
+                    if (restoring) {
+                        "正在按 ${rec.unitCount} 个角色 / ${rec.equipCount} 件装备的快照还原，请稍候…"
+                    } else {
+                        "中断前保存过一份 EX 装备（${rec.unitCount} 个角色 / ${rec.equipCount} 件）。\n" +
+                            "要现在还原吗？如果你之后自己调过装备，可以选「不用了」。"
+                    },
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = !restoring,
+                    onClick = {
+                        restoring = true
+                        exScope.launch {
+                            when (val r = ExEquipService.restore(context, rec)) {
+                                is ExEquipService.Result.Ok -> {
+                                    ExEquipStore.clearPending(context)
+                                    Toast.makeText(context, r.value, Toast.LENGTH_LONG).show()
+                                    pendingExEquip = null
+                                }
+                                is ExEquipService.Result.Err ->
+                                    Toast.makeText(context, "还原失败：${r.message}", Toast.LENGTH_LONG).show()
+                            }
+                            restoring = false
+                        }
+                    },
+                ) { Text(if (restoring) "还原中…" else "还原") }
+            },
+            dismissButton = {
+                TextButton(
+                    enabled = !restoring,
+                    onClick = {
+                        ExEquipStore.clearPending(context)
+                        pendingExEquip = null
+                    },
+                ) { Text("不用了") }
+            },
+        )
+    }
     val compPct = compStatus?.let { s ->
         Regex("(\\d+)%").find(s)?.groupValues?.get(1)?.toIntOrNull()
     }
@@ -357,6 +425,7 @@ fun HomeScreen(
                 Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("自动迷宫") })
                 Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("刷开局") })
                 Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("策略") })
+                Tab(selected = tab == 3, onClick = { tab = 3 }, text = { Text("其他") })
             }
             Box(Modifier.fillMaxSize()) {
                 when (tab) {
@@ -407,7 +476,8 @@ fun HomeScreen(
                             RerollSettings.saveRerollMode(context, v)
                         },
                     )
-                    else -> StrategyTab()
+                    2 -> StrategyTab()
+                    else -> OtherTab()
                 }
                 // 日志：默认只有一条 peek（不占屏）；点开变成覆盖式面板
                 LogDock(
@@ -641,6 +711,158 @@ private fun MazeTab(
                 }
             }
         }
+        // ★EX 装备已移到「其他」标签页（2026-11-06 用户：不要放在自动迷宫页）
+    }
+}
+
+/**
+ * 「EX 装备」卡片：保存 / 还原（按记录）。**纯 API 实现**（`load/index` + `unit/equip_ex`），
+ * 不碰内存、不依赖 frida；凭证沿用账号卡里那套（B 服账密 / 渠道服 uid+access_key）。
+ */
+@Composable
+private fun ExEquipCard() {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var records by remember { mutableStateOf(ExEquipStore.all(ctx)) }
+    var busy by remember { mutableStateOf(false) }
+    var msg by remember { mutableStateOf("") }
+    var pickOpen by remember { mutableStateOf(false) }
+
+    fun fmt(rec: ExEquipRecord): String {
+        val t = java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault())
+            .format(java.util.Date(rec.ts))
+        // 来源标签：开跑前自动存的 vs 手动点的，一眼区分（2026-11-06 用户）
+        val tag = if (rec.note.contains("自动")) "【自动】" else "【手动】"
+        return "$tag $t ｜ ${rec.unitCount} 角色 / ${rec.equipCount} 件"
+    }
+
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+    ) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            SectionTitle("装备存档")
+            Text(
+                "跑黎明界会自动换装、把原本的装备拆下来。开跑前存一份，整轮结束后可以还原。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                FilledTonalButton(
+                    enabled = !busy,
+                    onClick = {
+                        busy = true
+                        msg = "正在读取…"
+                        scope.launch {
+                            when (val r = ExEquipService.snapshot(ctx)) {
+                                is ExEquipService.Result.Ok -> {
+                                    val rec = ExEquipStore.save(ctx, r.value)
+                                    records = ExEquipStore.all(ctx)
+                                    msg = "已保存：${rec.unitCount} 个角色 / ${rec.equipCount} 件装备"
+                                }
+                                is ExEquipService.Result.Err -> msg = r.message
+                            }
+                            busy = false
+                        }
+                    },
+                ) { Text("保存当前装备") }
+                Spacer(Modifier.width(8.dp))
+                OutlinedButton(
+                    enabled = !busy,
+                    onClick = {
+                        // ★点开时**重新读**：开跑前自动存的那份是别处写的，不刷新就看不到
+                        records = ExEquipStore.all(ctx)
+                        pickOpen = true
+                    },
+                ) { Text("还原…") }
+            }
+            if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+            if (msg.isNotBlank()) {
+                Text(
+                    msg,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (records.isNotEmpty()) {
+                Text(
+                    "已存 ${records.size} 条 ｜ 最近：${fmt(records.first())}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+
+    if (pickOpen) {
+        AlertDialog(
+            onDismissRequest = { pickOpen = false },
+            title = { Text("选择要还原的记录") },
+            text = {
+                Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
+                    records.forEach { rec ->
+                        TextButton(
+                            onClick = {
+                                pickOpen = false
+                                busy = true
+                                msg = "正在还原…"
+                                scope.launch {
+                                    when (val r = ExEquipService.restore(ctx, rec)) {
+                                        is ExEquipService.Result.Ok -> msg = r.value
+                                        is ExEquipService.Result.Err -> msg = "还原失败：${r.message}"
+                                    }
+                                    busy = false
+                                }
+                            },
+                        ) { Text(fmt(rec), style = MaterialTheme.typography.bodySmall) }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { pickOpen = false }) { Text("取消") }
+            },
+        )
+    }
+}
+
+/** 标签页 ④：其他 —— EX 装备保存/还原（2026-11-06 用户：从自动迷宫页挪出来单独放） */
+@Composable
+private fun OtherTab() {
+    val ctx = LocalContext.current
+    var autoRestore by remember { mutableStateOf(ExEquipStore.autoRestore(ctx)) }
+    LazyColumn(
+        Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 64.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        item {
+            Card(
+                Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+            ) {
+                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    SectionTitle("装备还原")
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("跑完自动还原", style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                "整轮运行正常结束时，按开跑前保存的快照还原；中途异常退出则在下次打开时询问。",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Switch(
+                            checked = autoRestore,
+                            onCheckedChange = {
+                                autoRestore = it
+                                ExEquipStore.setAutoRestore(ctx, it)
+                            },
+                        )
+                    }
+                }
+            }
+        }
+        item { ExEquipCard() }
     }
 }
 
@@ -842,7 +1064,246 @@ private fun ScoreChaseCard(context: Context) {
                             RerollSettings.SCORE_BASE_STEP - 1,
                     )
                 }
+                HorizontalDivider(Modifier.padding(vertical = 2.dp))
+                // ── 子条件 2（2026-11-03 用户需求）：按「遇到的事件 + 结算结果」判撤退 ──
+                //   右侧下拉框单选：无 / 断言模式 / 逻辑模式（逻辑模式暂未实现，选了等于不判定）。
+                //   ★选「无」只是**不参与判定**：断言内容原样留着，切回来立刻恢复。
+                var mode2 by remember { mutableStateOf(RerollSettings.loadScoreChaseMode2(context)) }
+                // ★两种模式**各自记住自己那套条件**（用户 2026-11-03）：切到哪个模式就显示哪个模式
+                //   上次配的，互不覆盖。没有额外的"保存"动作——改了就落盘，和别处一样。
+                var conds by remember(mode2) {
+                    mutableStateOf(RerollSettings.loadScoreChaseConds(context, mode2))
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text("条件 2 · 遇到指定事件/结果自动撤退", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            when (mode2) {
+                                EventRetreatRule.Mode.NONE -> "已关闭：不按事件/结果做任何判定"
+                                EventRetreatRule.Mode.ASSERT ->
+                                    "断言模式：命中任意一条条件就撤退（已配 ${conds.count { it.ready }} 条）"
+                                EventRetreatRule.Mode.LOGIC ->
+                                    "逻辑模式：条件照常编辑/记住，但**暂不生效**（已配 ${conds.count { it.ready }} 条）"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    SimpleDropdown(
+                        items = EventRetreatRule.Mode.entries.map { DropItem(it.cn) },
+                        selected = mode2.ordinal,
+                        onPick = { i ->
+                            val m = EventRetreatRule.Mode.entries[i]
+                            mode2 = m
+                            RerollSettings.saveScoreChaseMode2(context, m)
+                        },
+                    )
+                }
+                if (mode2 != EventRetreatRule.Mode.NONE) {
+                    EventAssertEditor(
+                        context = context,
+                        conds = conds,
+                        onChange = {
+                            conds = it
+                            RerollSettings.saveScoreChaseConds(context, it, mode2)
+                        },
+                    )
+                }
             }
+        }
+    }
+}
+
+/**
+ * ★条件 2「断言模式」编辑器（2026-11-03 用户需求）。
+ *
+ * **只有一层**：条件 2 底下就是一张条件列表，不再有"断言"那一层
+ *   （用户："这两层是一样的，不要断言 123 这样分层，只保留条件层"）。
+ *
+ * 每条条件 = 「当遇到事件是 X 时，且结果是 Y 时」—— 一个事件下拉 + 一个结果下拉，
+ *   两个下拉都是**行内式**（[InlineDropdown]），和前后文写在**同一行**里：
+ *   `当遇到事件是 #2315 料理完成了！… ▾ 时，且结果是 卡1 这样应该就足够了？ → 印记 ▾ 时`
+ *
+ * 条件之间是**「或」**：任意一条被满足就撤退；最下方「＋ 增加条件」随意加，
+ *   上限 [EventRetreatRule.MAX_CONDS] 条。
+ *
+ * ★事件的候选不是原始事件表，而是**手工整理的"事件族"**（[EventFamily]）：
+ *   钓鱼/料理/老虎机各 3 格合成一条，结果名也由那张表定（用户 2026-11-03 整理）。
+ */
+@Composable
+private fun EventAssertEditor(
+    context: Context,
+    conds: List<EventRetreatRule.Cond>,
+    onChange: (List<EventRetreatRule.Cond>) -> Unit,
+) {
+    val families = remember { EventFamily.all }
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        // ★归一化一次：事件 id 补成整族、slot 归 0、结果 id 换成"结果"的规范 id
+        LaunchedEffect(conds) {
+            val fixed = conds.map { normalizeCond(it) }
+            if (fixed != conds) onChange(fixed)
+        }
+        if (families.isEmpty()) {
+            Text(
+                "没有登记任何事件族（EventFamily.all 为空）⇒ 暂时没有可选的事件/结果",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        } else {
+            conds.forEachIndexed { i, cond ->
+                ConditionRow(
+                    cond = cond,
+                    families = families,
+                    onEdit = { nc -> onChange(conds.toMutableList().also { it[i] = nc }) },
+                    onDelete = { onChange(conds.toMutableList().also { it.removeAt(i) }) },
+                )
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                TextButton(
+                    onClick = { onChange(conds + EventRetreatRule.Cond()) },
+                    enabled = conds.size < EventRetreatRule.MAX_CONDS,
+                ) {
+                    Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("增加条件")
+                }
+                Text(
+                    " ${conds.size}/${EventRetreatRule.MAX_CONDS}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 按事件 id 找它所属的**事件族**。
+ *
+ * ★**没选事件时必须返回 null**：`ids.containsAll(空)` 恒为 true，
+ *   直接那么写会把"刚点增加条件、还没选事件"的空条件误判成第一条（还会被归一化写回）。
+ */
+private fun findFamily(ids: List<Int>): EventFamily.Family? =
+    if (ids.isEmpty()) null
+    else EventFamily.all.firstOrNull { it.eventIds.containsAll(ids) }
+
+/**
+ * ★条件的归一化（跟运行期 [MazeLoop.normalizeCond] 同一套口径）：
+ *   · 事件 id 补成**整族**（钓鱼 = 1314/2314/3314 …）；
+ *   · slot 一律归 0（选项不进句子、也不参与判定）；
+ *   · 结果 id 换成 [EventFamily] 里"结果"的规范 id（老数据存的是具体 rid）；
+ *   · 这个族**没有随机结果**（公会/竞技场）⇒ 降级成「遇到就撤」。
+ */
+private fun normalizeCond(c: EventRetreatRule.Cond): EventRetreatRule.Cond {
+    val fam = findFamily(c.eventIds) ?: return c
+    var out = if (c.slot == 0) c else c.copy(slot = 0)
+    if (out.eventIds != fam.eventIds) out = out.copy(eventIds = fam.eventIds)
+    if (!out.useResult) return out
+    // ★这个族没有随机结果 ⇒ 结果那一段没意义
+    if (!fam.hasRandom) return out.copy(resultId = 0, useResult = false)
+    // ★"已经点开【+】但还没选结果"必须原样保留：否则这里会把它关回去，
+    //   界面表现为「点 + 没反应」，运行时还会退化成"遇到就撤"（非常危险）
+    if (out.resultId <= 0) return out
+    val canon = EventFamily.canonical(out.resultId) ?: return out.copy(resultId = 0, useResult = false)
+    return if (canon != out.resultId) out.copy(resultId = canon) else out
+}
+
+/**
+ * 一条条件：整句写完「当遇到事件是 X 时（且结果是 Z 时），自动撤退」。
+ *
+ * ★句子里**没有"选项"那一截**（用户 2026-11-03："选项是…这一截压根不用出现在句子里"）。
+ * ★事件下拉列的是**手工整理的事件族**（[EventFamily]），结果下拉列的是族里登记的结果名。
+ *
+ * ★【−】/【+】是**开关**（用户 2026-11-03）：放在"且"的前面 ——
+ *   · 状态 A（要结果）：`当遇到事件是 X 时 [−] 且结果是 Z 时，自动撤退`
+ *     【−】= **仅删掉"且…结果…"这一段** ⇒ 无视随机结果，遇到这个事件就撤；
+ *   · 状态 B（不要结果）：`当遇到事件是 X 时 [+]，自动撤退`
+ *     【+】= 加回"且结果是…" ⇒ **仅在落到选中的结果时**才撤。
+ *   （状态 B 下没选结果 ⇒ 条件未配好、不生效 —— 不能退化成"无视结果"，否则两个按钮没区别。）
+ *
+ * ★族**没有随机结果**时（公会管理协会/魔物竞技场）⇒ 整段"且结果是…"不出现。
+ */
+@Composable
+private fun ConditionRow(
+    cond: EventRetreatRule.Cond,
+    families: List<EventFamily.Family>,
+    onEdit: (EventRetreatRule.Cond) -> Unit,
+    onDelete: () -> Unit,
+) {
+    val fam = findFamily(cond.eventIds)
+    val outcomes = fam?.outcomes.orEmpty()
+    val showResult = fam?.hasRandom == true
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            "当遇到事件是",
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(end = 4.dp),
+        )
+        InlineDropdown(
+            items = families.map { DropItem(it.name) },
+            // ★没选事件时必须显示「（请选择）」：不能命中第一个（`containsAll(空)` 恒为 true）
+            selected = if (cond.eventIds.isEmpty()) -1
+            else families.indexOfFirst { it.eventIds.containsAll(cond.eventIds) },
+            onPick = { i ->
+                val f = families[i]
+                // 换事件 ⇒ 结果重置（结果属于具体事件）
+                onEdit(cond.copy(eventIds = f.eventIds, slot = 0, resultId = 0, useResult = false))
+            },
+            maxWidth = 260.dp,
+        )
+        Text(
+            "时",
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(start = 4.dp),
+        )
+        if (showResult) {
+            // 【−】删掉"且结果是…" / 【+】加回来
+            IconButton(
+                onClick = { onEdit(cond.copy(useResult = !cond.useResult)) },
+                modifier = Modifier.size(26.dp),
+            ) {
+                Icon(
+                    if (cond.useResult) Icons.Filled.Remove else Icons.Filled.Add,
+                    contentDescription = if (cond.useResult) "无视随机结果" else "加上随机结果条件",
+                    modifier = Modifier.size(14.dp),
+                )
+            }
+            if (cond.useResult) {
+                Text(
+                    "且结果是",
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(horizontal = 4.dp),
+                )
+                InlineDropdown(
+                    // 结果名就是事件族表里写的那句人话（如「遗物(★1)」「成功→随机印记×2」）
+                    items = outcomes.map { DropItem(it.name) },
+                    selected = outcomes.indexOfFirst { it.id == cond.resultId },
+                    onPick = { k ->
+                        val o = outcomes.getOrNull(k) ?: return@InlineDropdown
+                        onEdit(cond.copy(slot = 0, resultId = o.id))
+                    },
+                    maxWidth = 260.dp,
+                )
+                Text(
+                    "时",
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(start = 4.dp),
+                )
+                if (cond.resultId <= 0) {
+                    Text(
+                        "（还没选结果，这条暂时不生效）",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+        }
+        Text(
+            "，自动撤退",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        IconButton(onClick = onDelete) {
+            Icon(Icons.Filled.Close, contentDescription = "删除这条条件")
         }
     }
 }
@@ -1090,7 +1551,7 @@ private fun RerollTab(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val status by AppState.rerollStatus.collectAsStateWithLifecycle()
-    val summary by AppState.rerollResultSummary.collectAsStateWithLifecycle()
+    val busy by AppState.rerollBusy.collectAsStateWithLifecycle()
     val captcha by AppState.rerollCaptcha.collectAsStateWithLifecycle()
 
     // 高级设置：选项变更即落盘（login 内部会 loadConfig 读取），无需单独的"保存"按钮
@@ -1121,32 +1582,26 @@ private fun RerollTab(
     ) {
         // 账号（2026-10-28 换成 AccountsCard：多账号切换 / 选服务器 / 渠道服抓取入口）
         item { accountSection() }
-        // 刷开局结果与状态：跟账号卡分开，收起账号时也看得见。
+        // 刷开局状态：跟账号卡分开，收起账号时也看得见。
         // ★2026-10-30 用户："还没有刷开局结果，这行提示应该去掉。刷开局只是个附带功能，
-        //   我们主要还是要用一键黎明界，不要引导到刷开局这里来" ⇒ 没有结果/状态时整块不渲染，
-        //   也不再写引导文案。真正的主线在「自动迷宫」页的「一键黎明界」。
-        if (summary != null || status != null) {
+        //   我们主要还是要用一键黎明界，不要引导到刷开局这里来" ⇒ 没有结果/状态时整块不渲染。
+        // ★2026-11-03 用户："刷开局页面里有个标签，会显示记录，感觉没有必要" ⇒
+        //   **成功后不再留一条记录**（原来 summary + 「完成：…」两行内容基本重复，还常驻页面）。
+        //   现在只显示「正在刷」的进度与失败原因 —— 进行中要能看出卡在第几次，失败要知道为什么。
+        val statusText = status?.takeIf { busy || !it.startsWith("完成") }
+        if (statusText != null) {
             item {
                 Card(
                     Modifier.fillMaxWidth(),
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
                 ) {
                     Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        if (summary != null) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    summary!!,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    fontWeight = FontWeight.Medium,
-                                    color = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.weight(1f),
-                                )
-                                TextButton(onClick = { RerollUseCase.reset() }) { Text("清除结果") }
-                            }
-                        }
-                        if (status != null) {
-                            Text(status!!, style = MaterialTheme.typography.bodyMedium)
-                        }
+                        Text(
+                            statusText!!,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = if (busy) MaterialTheme.colorScheme.onSurface
+                            else MaterialTheme.colorScheme.error,
+                        )
                     }
                 }
             }
@@ -1191,22 +1646,7 @@ private fun RerollTab(
                             REROLL_GUILDS,
                             cfg.guildId,
                         ) { updateCfg { copy(guildId = it) } }
-                        ChoiceChips(
-                            "事件倾向",
-                            listOf("偏遗物" to 100, "偏事件" to 350),
-                            cfg.eventValue,
-                        ) { updateCfg { copy(eventValue = it) } }
-                        ChoiceChips(
-                            "价值偏差",
-                            listOf("满分" to 0, "50" to 50, "100" to 100, "200" to 200),
-                            cfg.maxValueGap,
-                        ) { updateCfg { copy(maxValueGap = it) } }
-                        ChoiceChips(
-                            "最大次数",
-                            listOf("不限" to -1, "30" to 30, "50" to 50, "100" to 100),
-                            cfg.maxCount,
-                        ) { updateCfg { copy(maxCount = it) } }
-                        // ★判 Boss 白名单 / 判价值偏差：永远执行，已无开关（不判 Boss = 5 个全选即可）
+                        // ★判 Boss 白名单：两种判定模式都执行（不判 Boss = 5 个全选即可）
                         BossMultiSelect(
                             "3 区 Boss（多选，默认全选）",
                             area3Bosses,
@@ -1223,6 +1663,38 @@ private fun RerollTab(
                             bossArea5Sel = if (id in bossArea5Sel) bossArea5Sel - id else bossArea5Sel + id
                             updateCfg { copy(bossArea5 = bossArea5Sel) }
                         }
+                        // ★判定模式（2026-11-03 用户）：经典 = 分数价值；自定义 = 按每区每列的节点类型
+                        ChoiceChips(
+                            "判定模式",
+                            listOf(
+                                "经典（比分数）" to RerollConfig.MODE_CLASSIC,
+                                "自定义（选节点）" to RerollConfig.MODE_CUSTOM,
+                            ),
+                            cfg.judgeMode,
+                        ) { updateCfg { copy(judgeMode = it) } }
+                        if (cfg.judgeMode == RerollConfig.MODE_CUSTOM) {
+                            Text(
+                                "5 个区域都要能找到一条符合下面顺序的路线才算合格；" +
+                                    "灰色不可改的是该列只有一种节点（含「普通战/EX战」的列固定取 EX 战）。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            AreaPatternEditor(
+                                plans = AreaPattern.decode(cfg.areaPlan),
+                                onChange = { plans -> updateCfg { copy(areaPlan = AreaPattern.encode(plans)) } },
+                            )
+                        } else {
+                            ChoiceChips(
+                                "事件倾向",
+                                listOf("偏遗物" to 100, "偏事件" to 350),
+                                cfg.eventValue,
+                            ) { updateCfg { copy(eventValue = it) } }
+                            ChoiceChips(
+                                "价值偏差",
+                                listOf("满分" to 0, "50" to 50, "100" to 100, "200" to 200),
+                                cfg.maxValueGap,
+                            ) { updateCfg { copy(maxValueGap = it) } }
+                        }
                     }
                 }
             }
@@ -1235,6 +1707,75 @@ private fun RerollTab(
             onSolved = { validate -> scope.launch { RerollUseCase.submitCaptcha(context, validate) } },
             onDismiss = { AppState.setRerollCaptcha(null); AppState.setRerollBusy(false) },
         )
+    }
+}
+
+/**
+ * ★自定义判定模式：每个区域每个节点的类型（用户 2026-11-03）。
+ *
+ * 一行写完一条路线：`起始 → 普通战 → [印记] → 普通战 → [事件] → 遗物`
+ *  · 该列只有一种可能、或池里同时有「普通战/EX战」⇒ **固定文字**，不可点（EX 规则见 [AreaPattern.locked]）；
+ *  · 有多种可能 ⇒ 行内下拉（跟事件撤退条件同一套 [InlineDropdown]）。
+ * 宽度不够时自动换行（[FlowRow]），区域 4/5 有 8 列也不会挤爆。
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun AreaPatternEditor(
+    plans: List<AreaPattern.AreaPlan>,
+    onChange: (List<AreaPattern.AreaPlan>) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        for (plan in plans) {
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    "区域 ${plan.area}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(2.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    // ★固定文字和下拉**同字号 + 同高 + 垂直居中**，否则下拉那截看起来比前后文字
+                    //   偏下、还大一档（用户 2026-11-03 指出）
+                    val ts = MaterialTheme.typography.bodySmall
+                    val slotH = 20.dp
+                    plan.cols.forEachIndexed { i, want ->
+                        val col = i + 1
+                        val pool = AreaPattern.poolOf(plan.area, col)
+                        if (col > 1) {
+                            Box(Modifier.height(slotH), contentAlignment = Alignment.Center) {
+                                Text(
+                                    "→",
+                                    style = ts,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                        Box(Modifier.height(slotH), contentAlignment = Alignment.Center) {
+                            if (plan.locked(col) || pool.size <= 1) {
+                                Text(
+                                    AreaPattern.name(want),
+                                    style = ts,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            } else {
+                                InlineDropdown(
+                                    items = pool.map { DropItem(AreaPattern.name(it)) },
+                                    selected = pool.indexOf(want).coerceAtLeast(0),
+                                    onPick = { k ->
+                                        val n = plan.cols.toMutableList().also { it[i] = pool[k] }
+                                        onChange(plans.map { if (it.area == plan.area) it.copy(cols = n) else it })
+                                    },
+                                    maxWidth = 72.dp,
+                                    textStyle = ts,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1562,6 +2103,7 @@ private fun LogExportDialog(onDismiss: () -> Unit) {
                     item {
                         HorizontalDivider(Modifier.padding(vertical = 6.dp))
                         TeamRunEntry(remember { TeamRunLog.stats() })
+                        ShopSampleEntry()
                     }
                 }
             }
@@ -1851,6 +2393,74 @@ private fun TeamRunEntry(s: TeamRunLog.Stats) {
                 }) { Text("打开", style = MaterialTheme.typography.labelSmall) }
                 TextButton(onClick = {
                     runCatching { LogFile.copyToDownloads(ctx, file) }
+                        .onSuccess { Toast.makeText(ctx, "已复制到下载目录", Toast.LENGTH_SHORT).show() }
+                        .onFailure { Toast.makeText(ctx, "复制失败：${it.message ?: "原因未知"}", Toast.LENGTH_LONG).show() }
+                }) { Text("复制到下载", style = MaterialTheme.typography.labelSmall) }
+            }
+        }
+        HorizontalDivider()
+    }
+}
+
+/**
+ * 「商店统计」（2026-11-4 用户）：`logs/shop_samples.jsonl` 的星级分布。
+ *
+ * 用途：验证刷新出的 1/2/3★ 是否真「各 1/3」——
+ *   H_B（按星级均匀）⇒ 恒定 1/3；H_A（按件均匀）⇒ `(25−h_r)/(75−h)`，持有越多越难出。
+ * 每屏（进店 / 刷新后）记一条，含 3 件的 id/星级 + 当前持有，见 [ShopSampleLog]。
+ */
+@Composable
+private fun ShopSampleEntry() {
+    val ctx = LocalContext.current
+    val s = remember { ShopSampleLog.stats(ctx) }
+    val f = remember { ShopSampleLog.currentFile(ctx) }
+    var open by remember { mutableStateOf(false) }
+    val ready = s.screens > 0 && f.exists()
+    Column(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .clickable(enabled = ready, onClick = { open = !open })
+                .padding(vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("商店统计", style = MaterialTheme.typography.bodyLarge)
+                Text(
+                    if (ready) s.line() + " ｜ ${(s.bytes + 1023) / 1024} KB" else s.line(),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Spacer(Modifier.width(8.dp))
+            LogBadge(if (ready) "可导出" else "空", LogFile.Tone.IDLE)
+            Spacer(Modifier.width(6.dp))
+            Text(
+                if (open) "▾" else "▸",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+            )
+        }
+        if (open && ready) {
+            Text(
+                "每屏 3 件遗物。若占比明显偏离 33/33/33，或持有某星级越多该星级越少 ⇒ 说明不是「按星级均匀」。" +
+                    "样本攒到 100 屏以上再判断。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(bottom = 4.dp),
+            )
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                TextButton(onClick = {
+                    runCatching { LogFile.share(ctx, f) }
+                        .onFailure { Toast.makeText(ctx, "分享失败：${it.message ?: "原因未知"}", Toast.LENGTH_LONG).show() }
+                }) { Text("分享", style = MaterialTheme.typography.labelSmall) }
+                TextButton(onClick = {
+                    if (!LogFile.openWithViewer(ctx, f)) {
+                        Toast.makeText(ctx, "没有能打开它的应用", Toast.LENGTH_SHORT).show()
+                    }
+                }) { Text("打开", style = MaterialTheme.typography.labelSmall) }
+                TextButton(onClick = {
+                    runCatching { LogFile.copyToDownloads(ctx, f) }
                         .onSuccess { Toast.makeText(ctx, "已复制到下载目录", Toast.LENGTH_SHORT).show() }
                         .onFailure { Toast.makeText(ctx, "复制失败：${it.message ?: "原因未知"}", Toast.LENGTH_LONG).show() }
                 }) { Text("复制到下载", style = MaterialTheme.typography.labelSmall) }

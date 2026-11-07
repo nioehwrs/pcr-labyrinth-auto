@@ -1,6 +1,7 @@
 package com.lmj.labyrinthauto.logic.party
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import com.lmj.labyrinthauto.core.AppState
 import com.lmj.labyrinthauto.data.GameData
@@ -26,6 +27,79 @@ object PartyPlan {
     const val LAB_PARTY_TEAM_AUTO = true
     const val LAB_PARTY_AUTO = true
     const val LAB_PARTY_MIN_SLOTS = 1
+
+    // ══ ★★组队算法结果缓存（2026-11-07）══════════════════════════════════════════
+    //  为什么：一轮编队里 `partyPlan` 会被调**4 遍**（进场规划 / 加完一批 / 滚完 / 收尾核对），
+    //  每遍都重跑一遍完整 `buildBest`（池 26 人 × 5 组方案 × 系别各算一遍）⇒ 每遍 ~1 秒，
+    //  编队页光"算"就吃掉好几秒（用户："进编组页到出决策之间有明显间隔""点完一批到准备滑动之间也有间隔"）。
+    //
+    //  ★**目标队伍只取决于**（stage / floor / 池 / 遗物技能值 / 本节点是否失败过），
+    //  **与当前队伍无关** —— 当前队伍只决定"撤谁加谁"。
+    //  ⇒ 这五样都没变 ⇒ 目标队伍必然一样 ⇒ 直接复用，不必重算。
+    //
+    //  ★池进了 key：别队占用的角色会把人从池里剔掉（`usedOther`）⇒ 池变了目标就该重算。
+    private data class BuildKey(
+        val stage: String,
+        val floor: Int,
+        val failed: Boolean,
+        val sk: Int,
+        val pool: List<Int>,
+    )
+
+    @Volatile private var buildKey: BuildKey? = null
+    @Volatile private var buildRes: Res? = null
+    private val buildLock = Any()
+
+    /** 命中缓存时的算法结果（供 [partyPlan] 复用） */
+    private fun cachedRes(k: BuildKey): Res? {
+        synchronized(buildLock) { if (buildKey == k) return buildRes }
+        return null
+    }
+
+    private fun rememberBuild(k: BuildKey, res: Res) {
+        synchronized(buildLock) {
+            buildKey = k
+            buildRes = res
+        }
+    }
+
+    /** ★清掉缓存（关卡/层变了、或跨节点时调用） */
+    fun clearBuildCache() {
+        synchronized(buildLock) {
+            buildKey = null
+            buildRes = null
+        }
+    }
+
+    /**
+     * ★★**提前算队伍**（2026-11-07 用户："进节点的时候就知道 boss 是谁了，
+     *   此时一边处理怎么进入编组页面、一边去算队伍"）。
+     *
+     * ★**纯本地计算，不发任何 RPC** ⇒ 可以丢到后台线程跑，
+     *   与主流程的「点挑战 → 等过场动画 → 读编组页」**完全并行**
+     *   （agent 是单条 RPC 通道，后台算**不占**那条通道；反过来两个 RPC 并发只会排队）。
+     *
+     * ★池用的是**大地图阶段的「本局持有角色」**（`ctx.own`）—— 编组页的"可编入列表"要进页才拿得到。
+     *   实测两者常常是同一批人（例：持有 26 / 本页可编入 26）⇒ 进页后算出的池一样
+     *   ⇒ **直接命中缓存**，整整省掉一次算法（~1 秒）。
+     *   不一样也不影响正确性：进页后照常实算（只是这次预算是白跑的）。
+     */
+    fun precompute(ctx: PartyCtx, st: JSONObject, failed: Boolean) {
+        val tb = teamBuild ?: return
+        val (stage, _) = stageFor(st)
+        val floor = (st.opt("area") as? Number)?.toInt() ?: 1
+        val pool = ctx.own.filter { it != 0 }.sorted()
+        if (pool.isEmpty()) return
+        val t0 = SystemClock.elapsedRealtime()
+        val res = tb.buildBest(
+            stage, pool.map { it.toString() }, relicsSkill = ctx.sk, floor = floor,
+            size = LAB_PARTY_SIZE, failed = failed,
+        )
+        rememberBuild(BuildKey(stage, floor, failed, ctx.sk, pool), res)
+        AppState.addLog(
+            "… 提前算队伍 ${SystemClock.elapsedRealtime() - t0}ms（池 ${pool.size} 个，大地图持有池）",
+        )
+    }
     /** PC `LAB_SELECT_TAP_MAX`(447)：同一组候选卡最多点几次（点不动就停手，免得把游戏点卡）。
      *  ★**每次都是"真点下去"才计数**（PC 2026-10-12 的教训：卡片入场动画期坐标在屏外时点了不算一次），
      *   所以这一页允许 2 次机会，而不是"点一下没反应就永远不再点"（用户 2026-10-16 截图那个卡死）。 */
@@ -222,8 +296,10 @@ object PartyPlan {
     )
 
     /** PC `party_ctx_cached`(2443)：本页只问一次 RPC（加速遗物技能值 + 本局持有角色池） */
-    suspend fun partyCtx(): PartyCtx {
-        val own = AgentApi.labOwnRelics()
+    suspend fun partyCtx(): PartyCtx = partyCtx(AgentApi.labOwnRelics())
+
+    /** [own] 由调用方传入（避免重复 RPC）；null 表示没读到 */
+    suspend fun partyCtx(own: JSONObject?): PartyCtx {
         val (sk, det) = relicSkillTotal(own)
         val pu = AgentApi.labUnits()
         val unitIds = intListOf(pu?.optJSONArray("unitIds"))
@@ -388,7 +464,10 @@ object PartyPlan {
         val slotOf = LinkedHashMap<Int, JSONObject>()
         for (c in (pt.optJSONArray("icons") ?: JSONArray()).toListOfObj()) {
             val u = (c.opt("unitId") as? Number)?.toInt() ?: continue
-            if (u == 0 || c.opt("x") == null) continue
+            // ★2026-11-07：**不再要求 x**（`labParty(noXY=true)` 时槽位没有坐标）。
+            //   槽位坐标只在"点撤人"时要用 ⇒ 改成点击前现取（`labPartyIconPos(uid,"槽位")`）。
+            //   少了这个 x 判断，"人不在一览可见区、只能从槽位撤"的情况会被整批丢掉（撤不了人）。
+            if (u == 0) continue
             slotOf.putIfAbsent(u, c)
         }
         // 角色池（有序去重）：可用 + 一览全量；本局没持有则退用页内可编入
@@ -427,17 +506,30 @@ object PartyPlan {
         }
         val (stage, note) = stageFor(st)
         val floor = (st.opt("area") as? Number)?.toInt() ?: 1
-        var tb = teamBuild!!.buildBest(
-            stage, pool.map { it.toString() }, relicsSkill = ctx.sk, floor = floor,
-            size = LAB_PARTY_SIZE, failed = failed,          // ★失败过 ⇒ 让规则表决定要不要补坦克
-        )
-        if (tb.team.isNullOrEmpty()) {
-            // ★空队兜底（2026-10-19 用户）：放宽属性限定重编一次——过滤链（前3图屏蔽/attrlim 剔除/
-            //   tier 门槛）可能把薄池筛空（实测 4-2 HARD：池 32 个算不出目标 → 编组页死等 33 分钟）
-            tb = teamBuild!!.build(
+        // ★★走缓存（2026-11-07）：一轮编队要调 `partyPlan` 4 遍，每遍重跑一遍完整算法（~1 秒）⇒
+        //   光"算"就吃掉好几秒。目标队伍只取决于（stage/floor/池/技能值/失败过）⇒ 没变就复用。
+        val bkey = BuildKey(stage, floor, failed, ctx.sk, pool.sorted())
+        val t0 = SystemClock.elapsedRealtime()
+        var tb: Res
+        val cached = cachedRes(bkey)
+        if (cached != null) {
+            tb = cached
+            AppState.addLog("组队算法 ${SystemClock.elapsedRealtime() - t0}ms（命中缓存，池 ${pool.size} 个）")
+        } else {
+            tb = teamBuild!!.buildBest(
                 stage, pool.map { it.toString() }, relicsSkill = ctx.sk, floor = floor,
-                size = LAB_PARTY_SIZE, failed = failed, allowAttrlim = true,
+                size = LAB_PARTY_SIZE, failed = failed,          // ★失败过 ⇒ 让规则表决定要不要补坦克
             )
+            if (tb.team.isNullOrEmpty()) {
+                // ★空队兜底（2026-10-19 用户）：放宽属性限定重编一次——过滤链（前3图屏蔽/attrlim 剔除/
+                //   tier 门槛）可能把薄池筛空（实测 4-2 HARD：池 32 个算不出目标 → 编组页死等 33 分钟）
+                tb = teamBuild!!.build(
+                    stage, pool.map { it.toString() }, relicsSkill = ctx.sk, floor = floor,
+                    size = LAB_PARTY_SIZE, failed = failed, allowAttrlim = true,
+                )
+            }
+            rememberBuild(bkey, tb)
+            AppState.addLog("组队算法 ${SystemClock.elapsedRealtime() - t0}ms（实算，池 ${pool.size} 个）")
         }
         val target = tb.team?.mapNotNull { it.toIntOrNull() } ?: emptyList()
         if (target.isEmpty()) {
@@ -450,6 +542,25 @@ object PartyPlan {
                 "　池=" + pool.joinToString(",") { u -> "$u(t${rules?.tierOf(u.toString()) ?: "?"})" },
             )
             tb.log.take(8).forEach { diag.add("　$it") }
+            // ★把 warn / fail / 分档也带出来（2026-11-5）：只打 log 时看不出是"哪条过滤把池筛空"，
+            //   实测 EX_310707 反复报空队，本地同池重跑却能出队（309 分）⇒ 需要更多现场信息。
+            if (tb.warn.isNotEmpty()) diag.add("　warn=" + tb.warn.joinToString("；"))
+            tb.fail?.let { diag.add("　fail=$it") }
+            diag.add(
+                "　分档=" + pool.joinToString(",") { u ->
+                    val t = teamBuild?.rules?.tierOf(u.toString()) ?: 0
+                    "$u:t$t"
+                },
+            )
+            // ★**原样**打印真正传进 build 的列表（2026-11-5）：上面那行打的是 `pool` 变量，
+            //   而 build 收的是 `pool.map { it.toString() }` —— 元素类型不同（Double/JSONObject）
+            //   会变成 `130101.0` 这种查不到表的 key，导致 cands 空、队伍为空。
+            //   实测：用日志里的池在本地重跑都能出队，所以必须区分"池不一致"和"构建失败"。
+            diag.add("　build入参=" + pool.joinToString(",") { it.toString() })
+            diag.add(
+                "　表命中=" + pool.count { (teamBuild?.rules?.tierOf(it.toString()) ?: 0) > 0 } +
+                    "/" + pool.size,
+            )
             return Plan(false, false, emptyList(), cur, emptyList(), emptyList(), emptyList(), emptyList(), emptyList(), diag, emptyList())
         }
         val miss = target.filter { it !in cur }
@@ -458,7 +569,7 @@ object PartyPlan {
         if (offered.isNotEmpty()) {
             for (u in miss) {
                 missDetail.add(when {
-                    u in tapOf || u in slotOf -> "$u 有可点坐标却没加成功"
+                    u in tapOf || u in slotOf -> "$u 待加入（页上有可点坐标）"
                     u in offered -> "$u 在角色一览全量里、但当前不在屏上（需滚动）"
                     else -> "$u 页面未提供（本局未持有？或 Boss 页只放部分角色）"
                 })
@@ -520,30 +631,39 @@ object PartyPlan {
         if (missDetail.isNotEmpty()) lines.add("还缺成员详情：" + missDetail.joinToString("；"))
         val ops = mutableListOf<Op>()
         val skipped = mutableListOf<Int>()
-        // ★先移除"多出来"的，**按攻击范围从大到小**（= 站位最左 → 最右），再添加"缺的"。
-        //   编组页队伍是**右对齐**（空位在最左）：移除右侧角色会让左侧的人右移 ⇒ 预先算好的槽位坐标失效。
-        //   从最左（范围最大）开始移，右侧的人位置不动，后面的坐标仍然有效。
-        //   （用户 2026-10-18：这条以前修过又退化了；这次按 range 显式排，不依赖槽数组下标方向。）
+        // ★先移除"多出来"的，再添加"缺的"。
+        // ★★撤人顺序 = **槽位下标降序**（= **从左往右**，PC `_party_ops` 同款）：
+        //   编组页队伍**右对齐**（空位在最左），撤掉右边的人 ⇒ 左边的人**右移** ⇒ 预先算好的槽位坐标失效；
+        //   从最左开始撤，右边（还没撤的）人位置不动 ⇒ 一批坐标可以用到最后。
+        //   ⚠`icons` 数组下标 0 = **最右**（1 号位）⇒ 下标降序 = 从左到右。
+        //   （2026-10-18 曾改成"按 range 显式排"；现在有**槽位下标**这个更直接的依据 ⇒ 以它为主、range 为辅。）
         val rangeOf = { u: Int -> teamBuild?.attackRange(u.toString()) ?: 9999 }
-        val xOf = { u: Int ->
-            val v = slotOf[u]?.opt("x")
-            if (v is Number) v.toInt() else Int.MAX_VALUE
+        val slotIdx = HashMap<Int, Int>()
+        for ((i, c) in (pt.optJSONArray("icons") ?: JSONArray()).toListOfObj().withIndex()) {
+            val u = (c.opt("unitId") as? Number)?.toInt() ?: continue
+            if (u == 0) continue
+            if (!slotIdx.containsKey(u)) slotIdx[u] = i
         }
         val rmOrder = extra.sortedWith(
-            compareByDescending<Int> { rangeOf(it) }.thenBy { xOf(it) },
+            compareByDescending<Int> { slotIdx[it] ?: -1 }.thenByDescending { rangeOf(it) },
         )
         if (rmOrder.isNotEmpty()) {
             lines.add(
-                "移除顺序(攻击范围降序)=" +
-                    rmOrder.joinToString("→") { "$it(range=${rangeOf(it)})" },
+                "移除顺序(从左往右·槽位降序)=" +
+                    rmOrder.joinToString("→") { "$it(range=${rangeOf(it)},槽位#${slotIdx[it] ?: -1})" },
             )
         }
         for (u in rmOrder) {
-            var c = tapOf[u]
-            var via = "一览"
-            if (c == null) { c = slotOf[u]; via = "槽位" }
-            if (c != null && c.opt("x") != null) {
-                ops.add(Op("remove", u, via, c.optInt("x"), c.optInt("y")))
+            // ★撤人**一律点槽位**（PC 口径，2026-11-07 用户指出这里回归了）：
+            //   底排那张卡才是"撤下"这个动作；点"角色一览"里的同 id 卡是**切换**语义（再点=取消），
+            //   行为不保证（2026-10-16 实机踩过：点了一览卡、队伍纹丝不动）。
+            //   队里的人必然在槽位数组里 ⇒ 槽位坐标一定拿得到（真拿不到才退一览兜底）。
+            // ★坐标可能是 0（noXY 快照）——真正的坐标在**点击前现取**（MazeLoop `liveTapPos`）。
+            val sc = slotOf[u]
+            val c = sc ?: tapOf[u]
+            val via = if (sc != null) "槽位" else "一览"
+            if (c != null) {
+                ops.add(Op("remove", u, via, c.optInt("x", 0), c.optInt("y", 0)))
             } else skipped.add(u)
         }
         for (u in miss) {

@@ -28,9 +28,15 @@ import java.util.concurrent.Executors
  * 产出：`<外部files>/logs/probe/maze_seq_<yyyyMMdd_HHmmss>.jsonl`，一局一个文件，
  * 每行一条"这一页发生了什么"（含期间的动作序列），外加 `ev=run_end` 收尾行。
  *
+ * ★**2026-11-03 用户："页面序列探针先整体关掉吧"** ⇒ [seqEnabled] 默认 false，
+ *   `ev=page/stall` 这一路**不再写**（[tick]/[act] 直接返回，不累加、不开文件）。
+ *   同一份 jsonl 里还留着两个**仍在用**的记录：`ev=chain`（Boss 影子链）与
+ *   `ev=event`（事件结算，反推"每个分支实际给几个"）—— 它们不受 [seqEnabled] 影响。
+ *   本局一条记录都没有时**不建文件**（[endRun] 里的 `lines == 0` 分支）。
+ *
  * 字段（也是 `seq_report.py` 依赖的契约，改字段记得同步）：
  * ```
- * ev      "page" | "stall" | "run_end"
+ * ev      "page" | "stall" | "run_end" | "chain" | "event"
  * run     局标识；i 本局第几个页面
  * node/ptype/area/block   节点快照（ptype = NORMAL/BOSS/SHOP/EVENT/RELIC/TICKET/HARD）
  * stt/sttName/top/view/inBattle   页面快照
@@ -44,6 +50,17 @@ object PlanProbe {
     /** 总开关：出现任何异常/奇怪现象，置 false 即整体停写（不影响主流程） */
     @Volatile
     var enabled: Boolean = true
+
+    /**
+     * **页面序列探针**开关（`ev=page` / `ev=stall` / 动作列表）。
+     *
+     * ★2026-11-03 用户："页面序列探针先整体关掉吧，以后再需要链的时候再说" ⇒ 默认 **false**。
+     * 关掉后**不写页面序列**（也不累加、不打开启提示）；`ev=chain`（Boss 影子链）与
+     * `ev=event`（事件结算，反推各分支实际给了几个）仍然照写 —— 它们是这一轮要用的数据。
+     * 将来要再拆链，把这里置 true 即可（文件仍是每局一个 `maze_seq_*.jsonl`）。
+     */
+    @Volatile
+    var seqEnabled: Boolean = false
 
     /** 同一页停留超过这个时长就补一条 `ev=stall`（只报一次/页） */
     private const val STALL_MS = 30_000L
@@ -59,8 +76,10 @@ object PlanProbe {
     private val lock = Any()
 
     private var w: BufferedWriter? = null
+    private var dir: File? = null       // 本局目录（文件**惰性创建**：没有 ev 记录就不落文件）
     private var runId = ""
     private var pageSeq = 0
+    private var lines = 0               // 本局已写行数（0 ⇒ 收尾时把空文件删掉）
     private var startAt = 0L            // elapsedRealtime（算总时长用）
     private var startWall = 0L          // 墙上时间（落盘用）
     private var saidDisabled = false
@@ -82,38 +101,43 @@ object PlanProbe {
 
     private var cur: Cur? = null
 
-    /** 一局开始：开新文件。失败即整体禁用（只提示一次） */
+    /** 一局开始：备好目录/runId（文件**惰性创建**，见 [writeLine]）。失败即整体禁用（只提示一次） */
     fun startRun(ctx: Context?) {
         if (!enabled || ctx == null) return
         try {
             stopRunLocked()
-            val dir = runCatching {
+            val d = runCatching {
                 val ext = ctx.getExternalFilesDir(null)
-                val d = if (ext != null) File(ext, "logs/probe") else File(ctx.filesDir, "logs/probe")
-                d.mkdirs()
-                if (d.isDirectory) d else File(ctx.filesDir, "logs/probe").also { it.mkdirs() }
+                val dd = if (ext != null) File(ext, "logs/probe") else File(ctx.filesDir, "logs/probe")
+                dd.mkdirs()
+                if (dd.isDirectory) dd else File(ctx.filesDir, "logs/probe").also { it.mkdirs() }
             }.getOrNull() ?: return
             // 只留最近 40 局（一局一个文件、每局才几十行，但别无限长）
             runCatching {
-                dir.listFiles { f -> f.name.startsWith("maze_seq_") && f.name.endsWith(".jsonl") }
+                d.listFiles { f -> f.name.startsWith("maze_seq_") && f.name.endsWith(".jsonl") }
                     ?.sortedBy { it.lastModified() }
                     ?.dropLast(40)
                     ?.forEach { it.delete() }
             }
+            dir = d
+            w = null
+            lines = 0
             runId = runFmt.format(Date())
             pageSeq = 0
             cur = null
             startAt = SystemClock.elapsedRealtime()
             startWall = System.currentTimeMillis()
-            val f = File(dir, "maze_seq_$runId.jsonl")
-            synchronized(lock) { w = f.bufferedWriter() }
-            AppState.addLog("〔观测〕页面序列探针开启 → ${f.absolutePath}")
+            // ★2026-11-03：页面序列探针默认关；只有手动打开才报这一句（否则本局没 ev 记录就不落文件）
+            if (seqEnabled) AppState.addLog("〔观测〕页面序列探针开启 → ${File(d, "maze_seq_$runId.jsonl").absolutePath}")
         } catch (e: Throwable) {
             disable("startRun: ${e.message}")
         }
     }
 
-    /** 一局结束：补一条收尾行并关文件（[reason] 与 LogFile 的归档后缀同口径） */
+    /**
+     * 一局结束：补一条收尾行并关文件（[reason] 与 LogFile 的归档后缀同口径）。
+     * ★"本局有没有写过记录"的判断放进 io 线程里做（前面排队的 writeLine 都跑完了才准）。
+     */
     fun endRun(reason: String) {
         if (!enabled) return
         try {
@@ -122,10 +146,32 @@ object PlanProbe {
                 .put("reason", reason).put("pages", pageSeq)
                 .put("ms", SystemClock.elapsedRealtime() - startAt)
                 .put("t0", tFmt.format(Date(startWall))).put("t1", tFmt.format(Date()))
-            writeLine(obj)
-            io.execute { synchronized(lock) { runCatching { w?.flush(); w?.close() }; w = null } }
+            io.execute {
+                synchronized(lock) {
+                    if (lines == 0) {
+                        // 本局一行都没写（页面序列探针关着、也没事件/链）⇒ 不建文件
+                        runCatching { w?.close() }; w = null
+                        pruneEmpty()
+                    } else {
+                        runCatching {
+                            val ww = w ?: openLocked()
+                            ww?.write(obj.toString()); ww?.newLine(); ww?.flush()
+                        }
+                        runCatching { w?.flush(); w?.close() }; w = null
+                    }
+                }
+            }
         } catch (e: Throwable) {
             disable("endRun: ${e.message}")
+        }
+    }
+
+    /** 收尾时把本局那个（可能刚建出来的）空文件删掉 */
+    private fun pruneEmpty() {
+        runCatching {
+            val d = dir ?: return
+            val f = File(d, "maze_seq_$runId.jsonl")
+            if (f.isFile && f.length() == 0L) f.delete()
         }
     }
 
@@ -141,7 +187,7 @@ object PlanProbe {
      * @param idle     本轮 idle 计数
      */
     fun tick(st: JSONObject, tag: String, stt: Int, sttName: String, viewPart: String, idle: Int) {
-        if (!enabled) return
+        if (!enabled || !seqEnabled) return
         try {
             val now = SystemClock.elapsedRealtime()
             val c = cur
@@ -186,7 +232,7 @@ object PlanProbe {
      * 只挂到当前页的动作列表里，不单独落盘。
      */
     fun act(what: String) {
-        if (!enabled) return
+        if (!enabled || !seqEnabled) return
         try {
             val c = cur ?: return
             if (c.acts.size >= MAX_ACTS) return
@@ -203,6 +249,21 @@ object PlanProbe {
         if (!enabled) return
         try {
             o.put("ev", "chain").put("run", runId)
+            writeLine(o)
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * 供事件结算写一行 `ev=event`（同一个 jsonl）：`eventId/resultId/card/branch/desc`
+     * + 本次**持有量前后差**（角色/遗物、新增角色 id 名单、印记数）。
+     * 用途：反推"每个分支实际给几个"（1112 这类"固定角色 + 随机 2~4"只有实测才知道）。
+     * 同样**不参与任何判定**，失败静默。
+     */
+    fun eventEvent(o: JSONObject) {
+        if (!enabled) return
+        try {
+            o.put("ev", "event").put("run", runId).put("t", tFmt.format(Date()))
             writeLine(o)
         } catch (_: Throwable) {
         }
@@ -233,14 +294,23 @@ object PlanProbe {
     private fun writeLine(o: JSONObject) {
         io.execute {
             try {
-                synchronized(lock) { w?.let { it.write(o.toString()); it.newLine(); it.flush() } }
+                synchronized(lock) {
+                    val ww = w ?: openLocked() ?: return@synchronized
+                    ww.write(o.toString()); ww.newLine(); ww.flush(); lines++
+                }
             } catch (_: Throwable) {
             }
         }
     }
 
+    /** 惰性建文件：本局第一条记录落盘时才建（没有任何记录 ⇒ 不产生空文件） */
+    private fun openLocked(): BufferedWriter? {
+        val d = dir ?: return null
+        return runCatching { File(d, "maze_seq_$runId.jsonl").bufferedWriter().also { w = it } }.getOrNull()
+    }
+
     private fun stopRunLocked() {
-        io.execute { synchronized(lock) { runCatching { w?.flush(); w?.close() }; w = null } }
+        io.execute { synchronized(lock) { runCatching { w?.flush(); w?.close() }; w = null; lines = 0 } }
     }
 
     private fun disable(why: String) {

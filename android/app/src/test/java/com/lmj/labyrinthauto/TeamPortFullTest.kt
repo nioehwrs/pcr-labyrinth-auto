@@ -10,7 +10,12 @@ import java.io.File
 /**
  * P4 对拍（**第②层**）：500 条用例的**全链路**比 —— `plan/team/picked/reasons/types/attrs/attr_bonus/fail/log/warn`。
  *
- * 基准：`tests/fixtures/team_fixtures.json`（由 `tools/gen_team_fixtures.py` 跑 PC 版生成）。
+ * 基准：`tests/fixtures/team_fixtures.json`。
+ * ★**2026-11-4 起基准改为「Android 当前实现」的回归快照**（不再是 PC 版）：
+ *   `variantBest` 已扩成「坦克×治疗×首动×加速、所有需要这些位的关卡」，这是**有意的改进**，
+ *   与 PC 原行为必然不同（历史回放 467 条里 79 条变好、0 条变差）。
+ *   所以本测试现在的语义是"改动前后有没有意外漂移"，不是"和 PC 一致"。
+ *   要重新生成基准：临时写一个跑 `buildBest` 覆盖 expect 的测试（见 git 历史 TeamFixtureGenTest）。
  * 分类统计（这样移植期间也能看出进展，而不是"全红"）：
  *   ✅ 一致 ｜ ❌ 不一致（列出前几条差异）｜ ⏳ 尚未移植（`NotImplementedError`）｜ 💥 其他异常
  *

@@ -3,6 +3,7 @@ package com.lmj.labyrinthauto.reroll
 import android.content.Context
 import android.content.SharedPreferences
 import com.lmj.labyrinthauto.core.SecureStore
+import com.lmj.labyrinthauto.logic.EventRetreatRule
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -27,12 +28,17 @@ object RerollSettings {
         return d.copy(
             guildId = sp.getInt("guildId", d.guildId),
             difficulty = sp.getInt("difficulty", d.difficulty),
-            maxCount = sp.getInt("maxCount", d.maxCount),
+            // ★「最大次数」这一项 UI 已删（用户 2026-11-03）⇒ 一律不限；
+            //   旧 prefs 里残留的 30/50/100 不再生效（否则用户会被一个看不见的数字卡住）
+            maxCount = -1,
             eventValue = sp.getInt("eventValue", d.eventValue),
             maxValueGap = sp.getInt("maxValueGap", d.maxValueGap),
             // ★bossArea3/5 用新 key（*Sel）：旧 4 项 area3 数据作废，确保「默认全选」生效
             bossArea3 = readSet(sp, "bossArea3Sel", d.bossArea3),
             bossArea5 = readSet(sp, "bossArea5Sel", d.bossArea5),
+            // ★判定模式（2026-11-03）：0 经典（分数价值）/ 1 自定义（节点序列）
+            judgeMode = sp.getInt("judgeMode", d.judgeMode),
+            areaPlan = sp.getString("areaPlan", d.areaPlan) ?: d.areaPlan,
         )
     }
 
@@ -44,6 +50,8 @@ object RerollSettings {
             putInt("maxCount", config.maxCount)
             putInt("eventValue", config.eventValue)
             putInt("maxValueGap", config.maxValueGap)
+            putInt("judgeMode", config.judgeMode)
+            putString("areaPlan", config.areaPlan)
             writeSet(this, "bossArea3Sel", config.bossArea3)
             writeSet(this, "bossArea5Sel", config.bossArea5)
             apply()
@@ -265,6 +273,55 @@ object RerollSettings {
             .edit()
             .putInt("scoreChaseBase", base.coerceIn(SCORE_BASE_MIN, SCORE_BASE_MAX) / SCORE_BASE_STEP * SCORE_BASE_STEP)
             .apply()
+    }
+
+    // ── 子条件 2：按「遇到的事件 + 结果」判撤退（2026-11-03 用户需求，见 [EventRetreatRule]）──
+    //   模式下拉框：无 / 断言模式 / 逻辑模式（逻辑模式暂未实现，选了也不判定）。
+    //   断言列表整份存成一段 JSON —— 条数不定（上限 30），拆成 N 个 key 反而难维护。
+
+    /** 条件 2 的模式，默认**无**（不改变现有行为）。 */
+    fun loadScoreChaseMode2(context: Context): EventRetreatRule.Mode =
+        EventRetreatRule.Mode.of(
+            context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getString("scoreChaseMode2", null),
+        )
+
+    fun saveScoreChaseMode2(context: Context, mode: EventRetreatRule.Mode) {
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+            .edit()
+            .putString("scoreChaseMode2", mode.key)
+            .apply()
+    }
+
+    /**
+     * 条件列表（没配过 → 空表）。整份存成一段 JSON：条数不定（上限 [EventRetreatRule.MAX_CONDS]）。
+     *
+     * ★**断言 / 逻辑两种模式各存一份**（用户 2026-11-03："各自有一个本地保存"）：
+     *   切模式只是换一份配置来看，互不覆盖；"保存"和"生不生效"是两件事
+     *   （逻辑模式暂时不判定，但配置照常能编能存）。
+     */
+    fun loadScoreChaseConds(
+        context: Context,
+        mode: EventRetreatRule.Mode = EventRetreatRule.Mode.ASSERT,
+    ): List<EventRetreatRule.Cond> =
+        EventRetreatRule.decode(
+            context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getString(keyOfConds(mode), null),
+        )
+
+    fun saveScoreChaseConds(
+        context: Context,
+        conds: List<EventRetreatRule.Cond>,
+        mode: EventRetreatRule.Mode = EventRetreatRule.Mode.ASSERT,
+    ) {
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+            .edit()
+            .putString(keyOfConds(mode), EventRetreatRule.encode(conds))
+            .apply()
+    }
+
+    /** 两种模式各自的 prefs key（NONE 沿用断言那份，方便"关掉再打开"看到原配置） */
+    private fun keyOfConds(mode: EventRetreatRule.Mode): String = when (mode) {
+        EventRetreatRule.Mode.LOGIC -> "scoreChaseRulesLogic"
+        else -> "scoreChaseRules"
     }
 
     fun loadCredentials(context: Context): Pair<String, String> {

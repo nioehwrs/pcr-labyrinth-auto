@@ -18,6 +18,8 @@ sealed interface RerollResult {
         val routePerArea: Map<Int, List<Int>>,
         val actual: Int,
         val theory: Int,
+        /** 一句话摘要：经典=`价值=5690/5690`、自定义=`节点顺序=5/5`（空 = 老逻辑按 actual/theory 拼） */
+        val summary: String = "",
         /** ★true = **当前已有开局就合格 ⇒ 直接沿用、一次都没重刷**（PC `reused` 同款，2026-10-16 加）。
          *  以前没有这个标记 ⇒ 沿用和重刷打同一句"刷到合格开局"，日志看起来像重刷过（用户指出）。 */
         val reused: Boolean = false,
@@ -97,6 +99,7 @@ class RerollController(
                             routePerArea = j.routePerArea,
                             actual = j.actual,
                             theory = j.theory,
+                            summary = j.summary,
                             reused = true,                      // ★沿用：没撤退、没重刷
                         )
                     }
@@ -155,6 +158,7 @@ class RerollController(
                     routePerArea = j.routePerArea,
                     actual = j.actual,
                     theory = j.theory,
+                    summary = j.summary,
                 )
             }
 

@@ -204,6 +204,14 @@ object FridaServerInstaller {
 
     /** 保证服务在跑；true = 端口已经通了。 */
     suspend fun ensure(ctx: Context, port: Int = DEFAULT_PORT): Boolean {
+        // ★运行组件（2026-11-4 从 APK 摘出）：注入前必须就绪 —— 用户点"开始"就是在等这个，
+        //   所以这里**不限制网络**（wifiOnly=false），下完/校验通过才往下走。
+        val bridge = prepareBridge(ctx, wifiOnly = false)
+        if (bridge == null || !FridaCore.ensureLoaded(ctx)) {
+            AppState.setFridaStatus("运行组件未就绪（下载或校验失败，看日志；联网后会自动重试）")
+            return false
+        }
+
         if (portOpen(port)) return true
 
         // 正常情况启动时早就准备好了（prepare 命中缓存/设备副本）；
@@ -275,6 +283,107 @@ object FridaServerInstaller {
             if (f.isFile && f.length() == asset.rawBytes) return f
         }
         return null
+    }
+
+    // ────────────────────────── 运行组件 .so（2026-11-4 从 APK 里摘出来） ──────────────────────────
+
+    /**
+     * 运行组件的版本 = frida 版本 + **桥协议版本**。
+     *
+     * `bridge.c` 里的 JNI 方法签名一变就必须 +1：App 的 `external fun` 与它是紧耦合，
+     * 加载旧 .so 会 `UnsatisfiedLinkError`、严重时 native 崩溃 ⇒ **版本不符就绝不加载**。
+     */
+    val BRIDGE_VER: String = "$FRIDA_VERSION-1"
+
+    /** 解压后大小与摘要（由 `tools/build_frida_bridge.ps1` 产物算出；改 bridge 后要一起改） */
+    private const val BRIDGE_RAW_BYTES = 121_707_296L
+    private const val BRIDGE_SHA = "a42db0a8c380c0f310d89f76fac22d06afa7585025b08ad3f20ee6a0f881ea33"
+
+    private val bridgeLock = Mutex()
+
+    @Volatile
+    private var bridgeReady: File? = null
+
+    private fun bridgeLocal(ctx: Context): File =
+        File(File(ctx.filesDir, "lib"), "libfrida_bridge-$BRIDGE_VER.so")
+
+    /** 私有目录里那份（存在且大小对）。[FridaCore] 只认这个，不负责下载。 */
+    fun bridgeFile(ctx: Context): File? {
+        val f = bridgeLocal(ctx)
+        return if (f.isFile && f.length() == BRIDGE_RAW_BYTES) f else null
+    }
+
+    /**
+     * 把运行组件准备好（**不加载**）。幂等、并发安全；应用启动时与 [prepare] 一起调。
+     *
+     * 之前它打在 APK 里（121MB，压缩后占一半体积）；现在和 huabanxie-server 同待遇：
+     * 首次启动后台下载（gz 约 46MB，Range 续传）→ 解压 → sha256 校验 → 落盘。
+     *
+     * @return 可加载的 .so（null = 还没准备好：移动流量下跳过 / 下载或校验失败）
+     */
+    suspend fun prepareBridge(ctx: Context, wifiOnly: Boolean = false): File? = bridgeLock.withLock {
+        bridgeReady?.let { if (it.isFile && it.length() == BRIDGE_RAW_BYTES) return it }
+        bridgeFile(ctx)?.let {
+            bridgeReady = it
+            return it
+        }
+        if (wifiOnly && !canAutoDownload(ctx)) {
+            AppState.addLog("当前走的是移动流量，先不自动下载运行组件（开始跑时再下，约 46MB）")
+            return null
+        }
+
+        val dir = File(ctx.filesDir, "lib").apply { mkdirs() }
+        val gz = File(dir, "libfrida_bridge-$BRIDGE_VER.so.gz")
+        val tmp = File(dir, "libfrida_bridge-$BRIDGE_VER.so.tmp")
+        val had = if (gz.isFile) gz.length() else 0L
+        AppState.addLog(
+            "开始下载运行组件（解压后 ${BRIDGE_RAW_BYTES / 1048576}MB，压缩包约 46MB）" +
+                if (had > 0) "，从 ${had / 1048576}MB 续传" else "",
+        )
+        try {
+            download("$BASE_URL/libfrida_bridge-$BRIDGE_VER.so.gz", gz) { pct, done, total ->
+                // ★状态栏与 frida-server 共用一个口径（都叫"运行组件"），别分成两个名字
+                AppState.setComponent("运行组件下载中 $pct%（${done / 1048576}/${total / 1048576}MB）")
+                if (pct % 20 < 3) AppState.addLog("下载运行组件：$pct%（${done / 1048576}MB）")
+            }
+        } catch (t: Throwable) {
+            AppState.setComponent("运行组件下载失败")
+            AppState.addLog("运行组件下载失败：${t.message}（已下的部分保留，可续传）")
+            return null
+        }
+
+        val sha = try {
+            gunzip(gz, tmp)
+        } catch (t: Throwable) {
+            gz.delete()
+            tmp.delete()
+            AppState.setComponent("运行组件解压失败")
+            AppState.addLog("运行组件解压失败：${t.message} → 删掉重下")
+            return null
+        }
+        if (sha != BRIDGE_SHA) {
+            gz.delete()
+            tmp.delete()
+            AppState.setComponent("运行组件校验失败")
+            AppState.addLog("运行组件校验失败（sha256 ${sha.take(12)}… ≠ ${BRIDGE_SHA.take(12)}…）→ 删掉重下")
+            return null
+        }
+        val target = bridgeLocal(ctx)
+        target.delete()
+        if (!tmp.renameTo(target)) {
+            // 极少数情况下 rename 跨挂载点会失败，退回复制
+            runCatching { tmp.copyTo(target, overwrite = true) }
+            tmp.delete()
+            if (!target.isFile || target.length() != BRIDGE_RAW_BYTES) {
+                AppState.addLog("运行组件落盘失败 → 下次再试")
+                return null
+            }
+        }
+        gz.delete()
+        bridgeReady = target
+        AppState.setComponent("运行组件已就绪")
+        AppState.addLog("运行组件已就绪（${target.length() / 1048576}MB）")
+        target
     }
 
     /** 带 Range 的流式下载：已有 `.part` 就续传（206），服务器不支持就重头来（200）。 */

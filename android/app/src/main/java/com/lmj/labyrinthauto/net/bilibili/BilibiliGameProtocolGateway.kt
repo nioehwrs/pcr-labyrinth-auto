@@ -166,7 +166,9 @@ class BilibiliGameProtocolGateway(
         val root = codec.decode(crypto.decryptResponse(responseBytes)).asMap()
         val headers = root.map("data_headers") ?: error("响应头缺失")
         updateState(state, headers.string("sid"), headers.string("request_id"), headers.string("viewer_id"))
-        val data = root.map("data") ?: error("响应数据缺失")
+        // ★写入类 API（如 `unit/equip_ex`）成功时可能**不带 data**，只有 data_headers。
+        //   以前这里直接 error("响应数据缺失") ⇒ 明明改成功了却报失败（2026-11-06 实测）。
+        val data = root.map("data") ?: emptyMap()
         data.map("server_error")?.let { serverError ->
             throw GameApiFailure(stage, serverError.string("message").orEmpty())
         }

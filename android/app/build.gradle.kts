@@ -27,8 +27,8 @@ android {
         minSdk = 26
         targetSdk = 35
         // 0.4.0：渠道服支持 + 多账号 + 凭证加密 + 架构自检/修复
-        versionCode = 25
-        versionName = "0.5.1"
+        versionCode = 32
+        versionName = "0.6.6"
 
         // 本阶段只保证 MuMu（x86_64）。P0 没有 native 库；
         // 等 PLAN.md §4 方案 B（内嵌 libfrida-core.so）时这条才会真正生效。
@@ -64,9 +64,20 @@ android {
         }
     }
 
+    packaging {
+        jniLibs {
+            // ★2026-11-4：注入桥 121MB（占 APK 90%）改为**首次启动按需下载**
+            //   （与 huabanxie-server 同一套：Release 附件 `libfrida_bridge-<ver>.so.gz`）。
+            //   源文件仍留在 jniLibs/ 供构建/上传用，这里只是不让它进 APK。
+            excludes += "**/libfrida_bridge.so"
+        }
+    }
+
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // ★2026-11-4：开 R8（体积 58MB → 预期 ~30MB，见 CHANGELOG）
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",

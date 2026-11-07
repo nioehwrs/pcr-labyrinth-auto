@@ -3512,6 +3512,60 @@ function _ndXY(nd, env) {
 //       DialogQuestResultWin / DialogQuestFailed …）或 eBattleResult{WIN=0,LOSE=1,TIME_OVER=2,RETIRE=3}。
 const BATTLE_GS_NAME = { 0: "PLAY", 1: "IDLE", 2: "WAIT_WAVE_END", 3: "NEXT_WAVE_PROCESS", [-1]: "INVALID" };
 
+/**
+ * 极简「当前 View 类名 + 是否在战斗」（2026-11-07）。
+ *
+ * `labStatus` 要 150~300ms（构造全量快照），而这里只做 3 次指针读 + 一次类名解析：
+ *   ViewManager+0x110 → 当前 View → klassName 里是否含 "ViewBattle"
+ * 给状态机阶段 2 判"进战斗了吗"用。
+ */
+function labViewQuickSnapshot() {
+  const t0 = Date.now();
+  const out = { view: "", inBattle: false, ms: 0 };
+  try {
+    const vm = _viewManagerInst();
+    if (vm && !vm.isNull()) {
+      const cv = vm.add(0x110).readPointer();
+      if (cv && !cv.isNull()) {
+        out.view = klassNameOf(cv) || "";
+        out.inBattle = out.view.indexOf("ViewBattle") >= 0;
+      }
+    }
+  } catch (e) {}
+  out.ms = Date.now() - t0;
+  return out;
+}
+
+/**
+ * 轻量「战斗结果原始值」（2026-11-07）：判胜/负不该靠"等按钮出现"，字段里就有。
+ *   resultEnable = ViewBattle+0xF0（结算按钮可点）
+ *   gameState    = BattleManager+0x1DC（战斗状态机枚举，胜/负不同值 —— 待标定）
+ * 只读 3 次指针 + 3 次 int，比 labStatus 快一个数量级。
+ */
+function labBattleResultSnapshot() {
+  const t0 = Date.now();
+  const out = { inBattle: false, view: "", resultEnable: null, gameState: null, ms: 0 };
+  try {
+    const vm = _viewManagerInst();
+    if (vm && !vm.isNull()) {
+      const cv = vm.add(0x110).readPointer();
+      if (cv && !cv.isNull()) {
+        out.view = klassNameOf(cv) || "";
+        out.inBattle = out.view.indexOf("ViewBattle") >= 0;
+        if (out.inBattle) {
+          try { out.resultEnable = cv.add(0xF0).readU8() !== 0; } catch (e) {}
+          try {
+            const bm = cv.add(0x100).readPointer();
+            if (ptrOk(bm)) out.gameState = bm.add(0x1DC).readS32();
+          } catch (e) {}
+        }
+      }
+    }
+  } catch (e) {}
+  out.ms = Date.now() - t0;
+  return out;
+}
+
 function battleStateSnapshot() {
   const out = { inBattle: false, viewClass: null, gameState: null, gameStateName: null, resultEnable: null, plausible: null };
   try {
@@ -3622,6 +3676,307 @@ function _dialogAreaTr() {
     }
     return (g_dialogArea && !g_dialogArea.isNull()) ? g_dialogArea : null;
   } catch (e) { return null; }
+}
+
+/**
+ * 窗口名归一化（2026-11-06 状态机基础设施）：
+ *   `DialogLabyrinthSelection(Clone)` → `DialogLabyrinthSelection`
+ *   `DialogCommonBig(Instance)`      → `DialogCommonBig`
+ * 只去掉 Unity 实例化后缀，**不碰业务前缀**——状态机要拿它当稳定 key。
+ */
+function _normWindowName(nm) {
+  if (!nm) return "";
+  let s = String(nm);
+  // 反复剥掉末尾的 (...) 后缀（可能嵌套，如 Name(Clone)(1)）
+  for (let i = 0; i < 3; i++) {
+    const t = s.replace(/\s*\([^()]*\)\s*$/, "").trim();
+    if (t === s) break;
+    s = t;
+  }
+  return s;
+}
+
+/**
+ * 轻量「当前窗口 + 编组页队伍索引」（2026-11-07，Boss 三队状态机）。
+ *
+ * Boss 战的 3 个队挤在同一个 `DialogCommonPartyEdit` 里，点「战斗开始」多数是**切到下一队**，
+ * 窗口名不变 ⇒ 只看窗口判不出"点没点上"。`nowSelectParty`（DialogCommonPartyEdit+0x208 → +0x148）
+ * 就是当前选中的队伍索引，把它和窗口名组合成二元判据。
+ *
+ * 返回 `{ top, idx, ms }`：top=归一化窗口名，idx=当前队伍（-1 = 读不到/不在编组页）。
+ */
+/**
+ * 轻量「单个角色的图标坐标」（2026-11-07）：只对**命中 uid 的那一个** icon 做投影。
+ *
+ * `labParty` 慢的根源是一次给 21 个 icon 全做 world-to-screen（~700ms），
+ * 而编队时每次只需要"我要点的那个人"在哪 ⇒ 1 次投影 ≈ 20ms。
+ *
+ * ★`via` 决定**先找哪个区域**（2026-11-07，与 Kotlin 端 `findUnitCoord` 同款，两边不能混用）：
+ *   · `"槽位"` → 队伍那一排（`plate+0xC8`）优先 —— **撤人**点的是底排那张卡，
+ *     点角色一览里的同 id 卡**不会撤人**；
+ *   · `"一览"`/其它 → 角色一览（`scrollController+0x70 useUnitIconList`）优先 —— **加人**点的是一览里那张。
+ *   一览的卡还必须落在**裁剪带**内才算可点（同 `labPartySnapshot` 的 `vis` 规则）。
+ *
+ * @param uid 目标角色 id
+ * @param via "槽位" / "一览"（可空 = 一览优先）
+ * @return `{ top, uid, via, src, found, x, y, ms }`
+ */
+function labPartyIconPosSnapshot(uid, via) {
+  const t0 = Date.now();
+  const out = { top: "", uid: uid | 0, via: (via || ""), src: "", found: false, x: 0, y: 0, ms: 0 };
+  try {
+    out.top = _normWindowName(_topDialogName() || "");
+    if (out.top === "DialogCommonPartyEdit") {
+      let d = g_partyDlg;
+      if (!d || d.isNull()) {
+        const f = labPartyFind();
+        if (f && f.ok) { d = f.ptr; g_partyDlg = d; }
+      }
+      if (d && !d.isNull()) {
+        const abs = d.add(0x208).readPointer();
+        if (ptrOk(abs)) {
+          const env = _camEnv();
+          const slotIcons = [];        // 队伍那一排（plate+0xC8，5 格）
+          const listIcons = [];        // 角色一览（scrollController+0x70）
+          let band = null;             // 一览的裁剪带（可见性判定）
+          try {
+            const plate = abs.add(0x68).readPointer();
+            if (ptrOk(plate)) {
+              const arr = plate.add(0xC8).readPointer();
+              let size = 0; try { size = arr.add(0x18).readS32(); } catch (e) {}
+              if (size > 0 && size <= 30) {
+                for (let i = 0; i < size; i++) {
+                  let ic = null; try { ic = arr.add(0x20 + i * 8).readPointer(); } catch (e) { continue; }
+                  if (ptrOk(ic)) slotIcons.push(ic);
+                }
+              }
+            }
+          } catch (e) {}
+          try {
+            const sc = abs.add(0x70).readPointer();
+            if (ptrOk(sc)) {
+              const lst = sc.add(0x70).readPointer();
+              let n = ptrOk(lst) ? listCount(lst) : 0;
+              if (n > 0) n = Math.min(n, 64);
+              const items = ptrOk(lst) ? lst.add(0x10).readPointer() : ptr(0);
+              for (let i = 0; i < n; i++) {
+                const ic = ptrOk(items) ? items.add(0x20 + i * 8).readPointer() : ptr(0);
+                if (ptrOk(ic)) listIcons.push(ic);
+              }
+              try {
+                const cc = sc.add(0x20).readPointer();
+                if (ptrOk(cc)) {
+                  const pan = cc.add(0x28).readPointer();
+                  if (ptrOk(pan)) band = (_panelClipScreen(pan, env) || {}).band || null;
+                }
+              } catch (e) {}
+            }
+          } catch (e) {}
+          const wantSlot = (out.via === "槽位" || out.via === "slot");
+          const order = wantSlot ? ["slot", "list"] : ["list", "slot"];
+          for (const src of order) {
+            const arr = src === "slot" ? slotIcons : listIcons;
+            for (const icon of arr) {
+              let u = 0; try { u = partyUnitIdOfIcon(icon).unitId; } catch (e) {}
+              if (u !== out.uid) continue;
+              if (!env) break;
+              let ss = null;
+              try { ss = _screenOf(icon, env.cam, env.mW2S); } catch (e) {}
+              if (!ss) continue;
+              const x = Math.round(ss.x), y = Math.round(env.H - ss.y);
+              if (src === "list" && band) {
+                const m = 10;
+                if (!(x >= band.left + m && x <= band.right - m && y >= band.top + m && y <= band.bottom - m)) continue;
+              }
+              out.x = x; out.y = y; out.found = true; out.src = src;
+              break;
+            }
+            if (out.found) break;
+          }
+        }
+      }
+    }
+  } catch (e) {}
+  out.ms = Date.now() - t0;
+  return out;
+}
+
+/**
+ * ★「角色一览」当前窗口的 unitId 列表（2026-11-07，**不投影** ⇒ ~1ms）。
+ *
+ * 来源：`abs(DialogCommonPartyEdit+0x208) +0x70` = scrollController → `+0x70 useUnitIconList`
+ *   （滑走就换内容的那一屏"内容对象"）。
+ *
+ * ★为什么单独要这个：**滚动一览**时"队伍那一排"（`plate+0xC8`）**不会变**，只有一览会变 ⇒
+ *   判断"滚到位了没"必须看**一览**的列表，不能看槽位。
+ */
+function _partyListIds(abs) {
+  const out = [];
+  try {
+    if (!ptrOk(abs)) return out;
+    const sc = abs.add(0x70).readPointer();
+    if (!ptrOk(sc)) return out;
+    const lst = sc.add(0x70).readPointer();
+    let n = ptrOk(lst) ? listCount(lst) : 0;
+    if (n > 0) n = Math.min(n, 64);
+    const items = ptrOk(lst) ? lst.add(0x10).readPointer() : ptr(0);
+    for (let i = 0; i < n; i++) {
+      const ic = ptrOk(items) ? items.add(0x20 + i * 8).readPointer() : ptr(0);
+      // ★空指针**跳过**（与 `labPartySnapshot` 的 `scrollIcons` 循环同款）——
+      //   两边列表必须逐项一致，否则"Kotlin 侧快照签名"和"agent 侧轻量签名"对不上。
+      if (!ptrOk(ic)) continue;
+      let uid = 0;
+      try { uid = partyUnitIdOfIcon(ic).unitId; } catch (e) {}
+      out.push(uid);
+    }
+  } catch (e) {}
+  return out;
+}
+
+/**
+ * 轻量「编队决策包」（2026-11-07）：决策真正需要的三样东西，**不读坐标、不读名字**。
+ *
+ * `labParty` 是"全量压缩包"（21 个 icon 各做一次投影 + 3 个 label，893ms），
+ * 而编队决策只用：屏上是谁（ids）、已编了谁（members）、当前第几队（idx）。
+ *
+ * 返回 `{ top, idx, ids[], listIds[], members[], ms }`；ids 里 0 = 空槽。
+ */
+function labPartyPlanSnapshot() {
+  const t0 = Date.now();
+  const out = { top: "", idx: -1, ids: [], listIds: [], members: [], ms: 0 };
+  try {
+    out.top = _normWindowName(_topDialogName() || "");
+    if (out.top === "DialogCommonPartyEdit") {
+      let d = g_partyDlg;
+      if (!d || d.isNull()) {
+        const f = labPartyFind();
+        if (f && f.ok) { d = f.ptr; g_partyDlg = d; }
+      }
+      if (d && !d.isNull()) {
+        const abs = d.add(0x208).readPointer();
+        if (ptrOk(abs)) {
+          try { out.idx = abs.add(0x148).readS32(); } catch (e) {}
+          out.listIds = _partyListIds(abs);
+          const plate = abs.add(0x68).readPointer();
+          if (ptrOk(plate)) {
+            try {
+              const nm = plate.add(0x178).readPointer();
+              out.members = _intListOf(nm) || [];
+            } catch (e) {}
+            const arr = plate.add(0xC8).readPointer();
+            let size = -1;
+            try { size = arr.add(0x18).readS32(); } catch (e) {}
+            if (size > 0 && size <= 30) {
+              for (let i = 0; i < size; i++) {
+                let icon = null;
+                try { icon = arr.add(0x20 + i * 8).readPointer(); } catch (e) { continue; }
+                // ★空指针**跳过**（与 `labPartySnapshot` 的 `icons` 循环同款）——
+                //   两边列表必须逐项一致，否则"Kotlin 侧快照签名"和"agent 侧轻量签名"对不上。
+                if (!ptrOk(icon)) continue;
+                let uid = 0;
+                try { uid = partyUnitIdOfIcon(icon).unitId; } catch (e) {}
+                out.ids.push(uid);
+              }
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {}
+  out.ms = Date.now() - t0;
+  return out;
+}
+
+/**
+ * 轻量「编队页图标清单」（2026-11-07）：只读 `PartsPartyEditPlate+0xC8` 数组的
+ * **长度 + 每格 unitId**，不读坐标/名字/相机投影（那些才是 `labParty` 的大头）。
+ *
+ * 用途：替代编队流程里的两个固定等待（进场 1.5s、滚动后 1.5s）——
+ *   · 进场：轮询到 `ids` 非空且连续两次相同 ⇒ 卡片铺好了；
+ *   · 滚动：轮询到 `ids` 变化 ⇒ 滚到位了。
+ *
+ * 返回 `{ top, idx, count, ids[], ms }`；**ids 里的 0 = 空槽/读不到**。
+ */
+function labPartyIconsSnapshot() {
+  const t0 = Date.now();
+  const out = { top: "", idx: -1, count: -1, ids: [], listIds: [], ms: 0 };
+  try {
+    out.top = _normWindowName(_topDialogName() || "");
+    if (out.top === "DialogCommonPartyEdit") {
+      let d = g_partyDlg;
+      if (!d || d.isNull()) {
+        const f = labPartyFind();
+        if (f && f.ok) { d = f.ptr; g_partyDlg = d; }
+      }
+      if (d && !d.isNull()) {
+        const abs = d.add(0x208).readPointer();
+        if (ptrOk(abs)) {
+          try { out.idx = abs.add(0x148).readS32(); } catch (e) {}
+          out.listIds = _partyListIds(abs);
+          const plate = abs.add(0x68).readPointer();
+          if (ptrOk(plate)) {
+            const arr = plate.add(0xC8).readPointer();
+            let size = -1;
+            try { size = arr.add(0x18).readS32(); } catch (e) {}
+            out.count = size;
+            if (size > 0 && size <= 30) {
+              for (let i = 0; i < size; i++) {
+                let icon = null;
+                try { icon = arr.add(0x20 + i * 8).readPointer(); } catch (e) { continue; }
+                // ★空指针**跳过**（与 `labPartySnapshot` 的 `icons` 循环同款）——
+                //   两边列表必须逐项一致，否则"Kotlin 侧快照签名"和"agent 侧轻量签名"对不上。
+                if (!ptrOk(icon)) continue;
+                let uid = 0;
+                try { uid = partyUnitIdOfIcon(icon).unitId; } catch (e) {}
+                out.ids.push(uid);
+              }
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {}
+  out.ms = Date.now() - t0;
+  return out;
+}
+
+function labPartyIdxSnapshot() {
+  const t0 = Date.now();
+  const out = { top: "", idx: -1, ms: 0 };
+  try {
+    out.top = _normWindowName(_topDialogName() || "");
+    if (out.top === "DialogCommonPartyEdit") {
+      let d = g_partyDlg;
+      if (!d || d.isNull()) {
+        const f = labPartyFind();
+        if (f && f.ok) { d = f.ptr; g_partyDlg = d; }
+      }
+      if (d && !d.isNull()) {
+        const abs = d.add(0x208).readPointer();
+        if (ptrOk(abs)) out.idx = abs.add(0x148).readS32();
+      }
+    }
+  } catch (e) {}
+  out.ms = Date.now() - t0;
+  return out;
+}
+
+/**
+ * 轻量「当前窗口」：只走 DialogArea 的子节点，**不构造快照、不扫全树**。
+ * 给状态机做 60ms 级轮询用（`labStatus` 要 150~300ms，太慢）。
+ *
+ * 返回 `{ top, raw, ms }`：top = 归一化名（空串 = 没有对话框），raw = 原始名。
+ */
+function labTopSnapshot() {
+  const t0 = Date.now();
+  const out = { top: "", raw: "", ms: 0 };
+  try {
+    const raw = _topDialogName() || "";
+    out.raw = raw;
+    out.top = _normWindowName(raw);
+  } catch (e) {}
+  out.ms = Date.now() - t0;
+  return out;
 }
 
 function _topDialogName() {
@@ -3892,7 +4247,7 @@ function _dictIntKeys(d) {
   return out;
 }
 
-let g_partyCache = null, g_partyAt = 0;
+let g_partyCache = null, g_partyAt = 0, g_partyCacheXY = true;   // ★g_partyCacheXY=true 表示缓存里**带坐标**
 const PARTY_TTL_MS = 1000;
 
 // ── ★编组页"定案版"定位（2026-10-11 加）──
@@ -4436,9 +4791,18 @@ function labPartyFind() {
   return out;
 }
 
-function labPartySnapshot(diag) {
+/**
+ * @param diag   诊断模式（多打一些字段）
+ * @param skipXY **跳过「队伍那一排」每个 icon 的坐标投影**（2026-11-07）：
+ *               槽位坐标只在**点撤人**时要用 ⇒ 改成点击前调 `labPartyIconPos(uid, "槽位")` 现取（~20ms）。
+ *               ⚠**角色一览（`scrollIcons`）的坐标仍然要算** —— 决策靠它的 `vis`（裁剪带可见性）
+ *                 判断"这个人在不在屏上可点 / 要往哪边滚"，跳了就没法决策了。
+ */
+function labPartySnapshot(diag, skipXY) {
   const _now = Date.now();
-  if (!diag && g_partyCache && (_now - g_partyAt) < PARTY_TTL_MS) return g_partyCache;
+  // ★缓存**按"带不带坐标"分叉**（2026-11-07）：带坐标（full）和 noXY 两种快照内容不同，
+  //   共用一个缓存 ⇒ 1s 内先读 noXY 再读 full 会拿到**没有坐标的旧读** ⇒ 槽位坐标读成 null。
+  if (!diag && g_partyCache && g_partyCacheXY === !skipXY && (_now - g_partyAt) < PARTY_TTL_MS) return g_partyCache;
   const res = { jsBuild: JS_BUILD, pageTop: null, dlg: null, dlgNode: null, abs: null, absCls: null,
                 ltdOk: null, partyEditType: null, nowSelectParty: null, fixedUnitId: null,
                 limited: [], limitChara: [], usable: [], special: [], partyDic: {}, scrollIds: [],
@@ -4607,7 +4971,7 @@ function labPartySnapshot(diag) {
           it.statusName = partyLabelText(icon, 0x50);
           it.statusValue = partyLabelText(icon, 0x60);
         }
-        if (env) {
+        if (env && !skipXY) {
           try { const ss = _screenOf(icon, env.cam, env.mW2S);
                 if (ss) { it.x = Math.round(ss.x); it.y = Math.round(env.H - ss.y); } } catch (e) {}
         }
@@ -4666,7 +5030,236 @@ function labPartySnapshot(diag) {
     if (ptrOk(plate)) res.diag.plate = _slotDump(plate, 0x10, 0x1B0);
     if (ptrOk(sc)) res.diag.scroll = _slotDump(sc, 0x10, 0xD0);
   }
-  if (!diag) { g_partyCache = res; g_partyAt = _now; }
+  if (!diag) { g_partyCache = res; g_partyAt = _now; g_partyCacheXY = !skipXY; }
+  return res;
+}
+
+/**
+ * ★★「编队决策**精简读**」（2026-11-07 用户："只取需要的内容就好了，不用都取吧"）。
+ *
+ * `labParty` 是**整页快照**：29 个 icon 每个带 3 个中文 label（87 次 native 读）+ 40 个页签候选
+ *   + 一堆诊断字段（plate/limited/special/dict/…）⇒ 每轮编队页都要序列化/传输/解析一大坨，
+ *   而**决策根本用不到**（Kotlin 侧从来没读过 name/statusName/statusValue/limited/special/…）。
+ *
+ * 这里只取**决策真正要用的**：
+ *   · `nowMember`   权威队伍名单（谁在队里）
+ *   · `icons`       槽位：unitId + **x/y**（撤人按 x 从小到大一批点完 ⇒ 坐标必须带；
+ *                  只投影这 5 个，便宜）
+ *   · `scrollIcons` 一览当前窗口：unitId + x/y + vis（**要投影**：vis 决定"谁能直接点、谁要滚"）
+ *   · `usable` / `scrollIds` / `partyDic` / `nowSelectParty` / `band`
+ *   · `buttons`     「战斗开始」「特别装备」坐标（要点 ⇒ 必须）
+ *   · `err` / `ltdOk`
+ * **去掉**：每个 icon 的 name/statusName/statusValue、页签候选（另走 `labPartyTabs`）、全部诊断字段。
+ *
+ * ⚠字段名与 `labParty` **保持一致** ⇒ Kotlin 侧 `PartyPlan` / `MazeLoop` 一行都不用改。
+ */
+function labPartyLiteSnapshot() {
+  const res = { top: "", nowMember: [], icons: [], scrollIcons: [], usable: [], scrollIds: [],
+                partyDic: {}, nowSelectParty: null, buttons: {}, band: null,
+                ltdOk: null, err: null };
+  try {
+    res.top = _normWindowName(_topDialogName() || "");
+    let d = null;
+    try { if (g_partyDlg && !g_partyDlg.isNull() && _partyDlgValid(g_partyDlg)) d = g_partyDlg; } catch (e) {}
+    if (!d) {
+      const f = labPartyFind();
+      if (f && f.ok) { d = f.ptr; try { g_partyDlg = d; } catch (e) {} }
+    }
+    if (!d || d.isNull()) { res.err = "没找到编组页真实例"; return res; }
+    const abs = d.add(0x208).readPointer();
+    if (!ptrOk(abs)) { res.err = "编组页 abs 读不到"; return res; }
+    try { res.ltdOk = _partyLtdOk(abs); } catch (e) {}
+    try { res.nowSelectParty = abs.add(0x148).readS32(); } catch (e) {}
+    try { res.usable = _intListOf(abs.add(0x150).readPointer()); } catch (e) {}
+    try { res.scrollIds = _intArrayOf(abs.add(0x178).readPointer(), 512); } catch (e) {}
+    try {
+      const pd = abs.add(0x160).readPointer();
+      if (ptrOk(pd)) {
+        for (const r of enumDict(pd)) {
+          if (r && r.key !== undefined && r.key !== null) res.partyDic[String(r.key)] = _intListOf(r.val);
+        }
+      }
+    } catch (e) {}
+    const env = _camEnv();
+    // ── 按钮（要点 ⇒ 坐标必须有）──
+    {
+      const BTN = { decide: 0x110, cancel: 0x120, exequip: 0x158 };
+      for (const nm in BTN) {
+        try {
+          const b = d.add(BTN[nm]).readPointer();
+          if (!ptrOk(b)) continue;
+          const it = { x: null, y: null };
+          if (env) {
+            const ss = _screenOf(b, env.cam, env.mW2S);
+            if (ss) { it.x = Math.round(ss.x); it.y = Math.round(env.H - ss.y); }
+          }
+          res.buttons[nm] = it;
+        } catch (e) {}
+      }
+    }
+    // ── 槽位（**要坐标**：撤人按 x 从小到大一批点完，见下方说明）──
+    const plate = abs.add(0x68).readPointer();
+    if (ptrOk(plate)) {
+      try { res.nowMember = _intListOf(plate.add(0x178).readPointer()); } catch (e) {}
+      const arr = plate.add(0xC8).readPointer();
+      let size = -1; try { size = arr.add(0x18).readS32(); } catch (e) {}
+      if (size > 0 && size <= 30) {
+        for (let i = 0; i < size; i++) {
+          let ic = null;
+          try { ic = arr.add(0x20 + i * 8).readPointer(); } catch (e) { continue; }
+          if (!ptrOk(ic)) continue;
+          let uid = 0;
+          try { uid = partyUnitIdOfIcon(ic).unitId; } catch (e) {}
+          const it = { i: i, unitId: uid, x: null, y: null };
+          if (env) {
+            try { const ss = _screenOf(ic, env.cam, env.mW2S);
+                  if (ss) { it.x = Math.round(ss.x); it.y = Math.round(env.H - ss.y); } } catch (e) {}
+          }
+          res.icons.push(it);
+        }
+      }
+    }
+    // ── 一览（要坐标 + vis：vis 决定"谁能直接点、谁要滚"）──
+    const sc = abs.add(0x70).readPointer();
+    if (ptrOk(sc)) {
+      try {
+        const _cc = sc.add(0x20).readPointer();
+        if (ptrOk(_cc)) {
+          const _pan = _cc.add(0x28).readPointer();
+          if (ptrOk(_pan)) res.band = (_panelClipScreen(_pan, env).band) || null;
+        }
+      } catch (e) {}
+      const lst = sc.add(0x70).readPointer();
+      const n = ptrOk(lst) ? Math.min(listCount(lst), 64) : 0;
+      const items = ptrOk(lst) ? lst.add(0x10).readPointer() : ptr(0);
+      for (let i = 0; i < n; i++) {
+        const ic = ptrOk(items) ? items.add(0x20 + i * 8).readPointer() : ptr(0);
+        if (!ptrOk(ic)) continue;
+        const it = { i: i, unitId: 0, x: null, y: null, vis: false };
+        try { it.unitId = partyUnitIdOfIcon(ic).unitId; } catch (e) {}
+        if (env) {
+          try { const ss = _screenOf(ic, env.cam, env.mW2S);
+                if (ss) { it.x = Math.round(ss.x); it.y = Math.round(env.H - ss.y); } } catch (e) {}
+        }
+        if (it.x != null && it.y != null && res.band) {
+          const _b = res.band, _m = 10;
+          it.vis = (it.x >= _b.left + _m && it.x <= _b.right - _m
+                    && it.y >= _b.top + _m && it.y <= _b.bottom - _m);
+        } else {
+          it.vis = (it.x != null);            // 没 band 兜底：有坐标就算可见（旧行为）
+        }
+        res.scrollIcons.push(it);
+      }
+    }
+  } catch (e) { res.err = "" + e; }
+  return res;
+}
+
+/**
+ * ★「编组页顶部页签」（队伍1/2/3）。
+ *
+ * ★★**直接命中，不用遍历整棵对话框子树**（2026-11-07 用户问"boss页会不会有直接命中的方法"——有）：
+ *   `abs(DialogCommonPartyEdit+0x208)` → `+0x50` = **PartsPartyEditSelectPlate**
+ *     → `+0x28` = **PartsPartySelectButton[]**（dump.cs 实证）← 就是「队伍1/2/3」那排页签
+ *       每个元素 `PartsPartySelectButton`：`+0x20` = CustomUIButton btn（投影取坐标），
+ *       GameObject 名字里带队伍号（`PartsPartySelectButton2(Clone)`）。
+ *   ⇒ 普通战数组里**只有 1 个**（没有 2/3 队）⇒ 一眼就知道"不用切队"，**连遍历都不用**。
+ *
+ * 兜底：直接命中失败（偏移对不上 / 类名不符）才退回老的 `_rawWalk` 整树遍历。
+ */
+function labPartyTabsSnapshot() {
+  const res = { top: "", tabCand: [], partyTabs: {}, err: null };
+  try {
+    res.top = _normWindowName(_topDialogName() || "");
+    let d = null;
+    try { if (g_partyDlg && !g_partyDlg.isNull() && _partyDlgValid(g_partyDlg)) d = g_partyDlg; } catch (e) {}
+    if (!d) {
+      const f = labPartyFind();
+      if (f && f.ok) { d = f.ptr; try { g_partyDlg = d; } catch (e) {} }
+    }
+    if (!d || d.isNull()) { res.err = "没找到编组页真实例"; return res; }
+    const env = _camEnv();
+    const abs = d.add(0x208).readPointer();
+    if (ptrOk(abs)) {
+      // ── ① 直接命中：`abs+0x50` = PartsPartyEditSelectPlate → `+0x28` = 页签数组 ──
+      try {
+        const plate = abs.add(0x50).readPointer();
+        if (ptrOk(plate)) {
+          const arr = plate.add(0x28).readPointer();
+          let n = -1; try { n = arr.add(0x18).readS32(); } catch (e) {}
+          if (n > 0 && n <= 8) {
+            const cand = [], tabs = {};
+            let okAll = true;
+            for (let i = 0; i < n; i++) {
+              // ★★2026-11-07 修（实测 19:56:32「[slow] labPartyTabs 749ms」）：
+              //   IL2CPP **数组**：length 在 +0x18、**数据从 +0x20 开始**（+0x10 是 bounds 指针！）。
+              //   原来多读了一层 `arr.add(0x10).readPointer()` ⇒ 元素指针全是垃圾 ⇒ 类名校验失败
+              //   ⇒ **每次都退回整树遍历**（~750ms）。别的地方读数组都是直接 `arr+0x20+i*8`（见 labPartyIconPos）。
+              const psb = ptrOk(arr) ? arr.add(0x20 + i * 8).readPointer() : ptr(0);
+              if (!ptrOk(psb)) { okAll = false; break; }
+              const cls = klassNameOf(psb);
+              // ★类名校验：偏移猜错时会读到别的东西 ⇒ 别硬用
+              if (cls && cls.indexOf("PartsPartySelectButton") < 0) { okAll = false; break; }
+              let nm = "";
+              try { nm = _str(_inv(_inv(psb, "get_transform"), "get_name")); } catch (e) {}
+              let x = null, y = null;
+              try {
+                const btn = psb.add(0x20).readPointer();
+                if (ptrOk(btn) && env) {
+                  const ss = _screenOf(btn, env.cam, env.mW2S);
+                  if (ss) { x = Math.round(ss.x); y = Math.round(env.H - ss.y); }
+                }
+              } catch (e) {}
+              cand.push({ name: nm, x: x, y: y });
+              const m = /^PartsPartySelectButton(\d+)/.exec(nm || "");
+              if (m && x != null && y != null) tabs[m[1]] = { x: x, y: y };
+            }
+            if (okAll) {
+              res.tabCand = cand;
+              res.partyTabs = tabs;
+              res.hit = "direct";           // 命中方式（direct=直接读数组 / walk=整树兜底）
+              return res;
+            }
+            res.err = "直接命中失败（offset 或类名对不上）→ 退回整树遍历";
+          } else {
+            res.err = "页签数组读不到（n=" + n + "）→ 退回整树遍历";
+          }
+        }
+      } catch (e) { res.err = "" + e; }
+    }
+    // ── ② 兜底：整棵对话框子树遍历（老办法，慢 ~900ms）──
+    const tr = _topDialogTr();
+    if (!tr) { res.err = "没有顶层对话框"; return res; }
+    const _pk = String(tr);
+    const _hit = (g_partyTabsCache && g_partyTabsCache.key === _pk) ? g_partyTabsCache : null;
+    if (_hit) {
+      res.tabCand = _hit.cand;
+      res.partyTabs = _hit.tabs;
+      res.hit = "walk(cached)";
+      return res;
+    }
+    const cand = [];
+    _rawWalk(function (nd) {
+      if (nd.active !== true) return;
+      if (!/party|team|tab|select/i.test(nd.name)) return;
+      cand.push(nd);
+    }, false, tr);
+    const out = [];
+    for (const nd of cand) {
+      let p = null;
+      try { p = env ? _ndXY(nd, env) : null; } catch (e2) {}
+      out.push({ name: nd.name, x: p && p.onscreen ? p.x : null,
+                 y: p && p.onscreen ? p.y : null });
+    }
+    res.tabCand = out.slice(0, 40);
+    res.partyTabs = {};
+    for (const o of out) {
+      const m = /^PartsPartySelectButton(\d+)/.exec(o.name || "");
+      if (m && o.x != null && o.y != null) res.partyTabs[m[1]] = { x: o.x, y: o.y };
+    }
+    res.hit = "walk";
+    g_partyTabsCache = { key: _pk, cand: res.tabCand, tabs: res.partyTabs };
+  } catch (e) { res.err = "" + e; }
   return res;
 }
 
@@ -6492,6 +7085,30 @@ rpc.exports = {
   // 迷宫内完整状态快照（同 labStatus()，但返回对象给 Python）。
   // 额外带 pageTop = 当前最上层对话框名，供 Python 判"现在到底是哪一页"
   // （statusType 在换页时可能不变、view 也可能不变，只有这个能准确区分）。
+  // ★轻量「当前窗口」（2026-11-06 状态机）：只读 DialogArea 顶层的对话框名并归一化，
+  //   不构造快照、不扫树。给 60ms 级轮询用（labStatus 要 150~300ms）。
+  labTop: _rpcSafe(function () { try { return labTopSnapshot(); } catch (e) { return null; } }),
+  // ★轻量「窗口 + 队伍索引」（Boss 三队：切队不换窗口，需要 idx 才判得出）
+  labPartyIdx: _rpcSafe(function () { try { return labPartyIdxSnapshot(); } catch (e) { return null; } }),
+  // ★极简「当前 View + 是否在战斗」（比赛了 labStatus 快一个数量级）
+  labView: _rpcSafe(function () { try { return labViewQuickSnapshot(); } catch (e) { return null; } }),
+  // ★轻量「战斗结果原始值」（inBattle / resultEnable / gameState，用于标定胜负判据）
+  labBattleResult: _rpcSafe(function () { try { return labBattleResultSnapshot(); } catch (e) { return null; } }),
+  // ★轻量「编队页图标清单」（只读长度 + unitId，替代进场/滚动后的固定 1.5s 等待）
+  //   ids = 队伍那一排（plate+0xC8）；listIds = 角色一览当前窗口（scrollController+0x70）
+  labPartyIcons: _rpcSafe(function () { try { return labPartyIconsSnapshot(); } catch (e) { return null; } }),
+  // ★轻量「单个角色图标坐标」（只给命中 uid 的那一个做投影，~20ms）
+  //   via="槽位" → 撤人（点队伍那一排）；via="一览"/空 → 加人（点角色一览）
+  labPartyIconPos: _rpcSafe(function (uid, via) { try { return labPartyIconPosSnapshot(uid, via); } catch (e) { return null; } }),
+  // ★轻量「编队决策包」（ids + members + idx，不读坐标/名字，~25ms）
+  labPartyPlan: _rpcSafe(function () { try { return labPartyPlanSnapshot(); } catch (e) { return null; } }),
+  // ★★轻量「编队决策**精简读**」（2026-11-07 用户："只取需要的内容就好了"）：
+  //   只取决策真正要的字段（队伍/槽位 id/一览 id+vis/按钮坐标…），**不读**每个 icon 的中文 label、
+  //   **不返回**页签候选与诊断字段 ⇒ 每轮省掉一大坨序列化+传输+解析。
+  //   字段名与 `labParty` 一致 ⇒ Kotlin 侧不用改。
+  labPartyLite: _rpcSafe(function () { try { return labPartyLiteSnapshot(); } catch (e) { return null; } }),
+  // ★编组页顶部页签（切队伍腾空用；以前每轮都从 labParty 里带 40 个候选回来）
+  labPartyTabs: _rpcSafe(function () { try { return labPartyTabsSnapshot(); } catch (e) { return null; } }),
   labStatus: _rpcSafe(function () {
     try {
       const t0 = Date.now();
@@ -6619,7 +7236,9 @@ rpc.exports = {
   // 本局已持有角色（角色池）：{unitIds:[...], units:[{unitId,unitType}], err} —— NPC 形态也含在内
   labUnits: _rpcSafe(function () { try { return labUnitsSnapshot(); } catch (e) { return null; } }),
   // 编队页（DialogCommonPartyEdit）**只读**：已编成角色（左→右）/ 按钮坐标 / 固定编入 / 本关限定
-  labParty: _rpcSafe(function (diag) { try { return labPartySnapshot(diag ? true : null); } catch (e) { return null; } }),
+  // ★第二个参数 `noXY`：跳过"每个 icon 的坐标投影"（那是 labParty 893ms 的大头）。
+  //   需要点某个角色时，再用 `labPartyIconPos(uid)` 单点取坐标（~20ms）。
+  labParty: _rpcSafe(function (diag, noXY) { try { return labPartySnapshot(diag ? true : null, noXY ? true : null); } catch (e) { return null; } }),
   // 只做"定位"（不读字段）：验证 DialogArea 子树能不能拿到编组页真实例
   labPartyFind: _rpcSafe(function () { try { return labPartyFind(); } catch (e) { return { ok: false, err: String(e) }; } }),
   // ★让编组页的读取缓存立刻失效（点完一下必须读到最新编队 —— 移除会让人右移，

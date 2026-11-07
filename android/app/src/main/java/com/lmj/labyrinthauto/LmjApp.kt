@@ -5,6 +5,7 @@ import com.lmj.labyrinthauto.core.AppState
 import com.lmj.labyrinthauto.core.CrashGuard
 import com.lmj.labyrinthauto.core.LogFile
 import com.lmj.labyrinthauto.core.UpdateChecker
+import com.lmj.labyrinthauto.frida.FridaCore
 import com.lmj.labyrinthauto.frida.FridaServerInstaller
 import com.lmj.labyrinthauto.logic.team.TeamRunLog
 import com.lmj.labyrinthauto.ui.OverlayWindow
@@ -74,6 +75,12 @@ class LmjApp : Application() {
         appScope.launch {
             runCatching { FridaServerInstaller.prepare(this@LmjApp, wifiOnly = true) }
                 .onFailure { AppState.addLog("运行组件预热失败：${it.message}") }
+            // ②b 注入桥 .so（2026-11-4 从 APK 里摘出来，首次启动下载 ~46MB）
+            //    准备好就立刻加载；没下载完/失败也不影响 App 其他功能，注入前还会兜底再试。
+            runCatching {
+                FridaServerInstaller.prepareBridge(this@LmjApp, wifiOnly = true)
+                    ?.let { FridaCore.ensureLoaded(this@LmjApp) }
+            }.onFailure { AppState.addLog("注入桥预热失败：${it.message}") }
         }
     }
 }

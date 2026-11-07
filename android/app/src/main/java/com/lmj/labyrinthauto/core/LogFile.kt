@@ -534,6 +534,7 @@ object LogFile {
         "ABORT_RETREAT" -> "按策略撤退"
         // ★细分到"哪一条策略"（2026-11-02 用户）：老文件仍是上面那条笼统的说法
         "ABORT_RETREAT_SCORE" -> "凹分不足撤退"
+        "ABORT_RETREAT_EVENT" -> "凹分：事件条件撤退"
         "ABORT_RETREAT_NOPLAN" -> "编组算不出队伍，撤退"
         "ABORT_RETREAT_FAIL3" -> "连败 3 次撤退"
         "ABORT_RETREAT_OTHER" -> "按策略撤退（原因未知）"

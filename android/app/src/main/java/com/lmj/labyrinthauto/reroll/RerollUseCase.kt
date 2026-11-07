@@ -200,7 +200,7 @@ object RerollUseCase {
                 if (p.attempt > 0 && p.stage != "命中目标路线开局") {
                     AppState.addLog(
                         "刷开局·第 ${p.attempt} 次：" + p.stage +
-                            (if (p.lastFail.isNullOrBlank()) "" else "（${p.lastFail.take(24)}）"),
+                            (if (p.lastFail.isNullOrBlank()) "" else "（${p.lastFail.take(60)}）"),
                     )
                 }
                 lastAttempt = p.attempt
@@ -215,12 +215,14 @@ object RerollUseCase {
                 val head = if (r.reused) "当前开局已合格 → 直接沿用（未重刷）" else "刷到合格开局（重开过）"
                 val summary =
                     "$head：enter_id=${r.enterId} 难度=${r.difficulty} " +
-                        "3区Boss=${r.bossByArea[3]} 5区Boss=${r.bossByArea[5]} 价值=${r.actual}/${r.theory}"
+                        "3区Boss=${r.bossByArea[3]} 5区Boss=${r.bossByArea[5]} " +
+                        r.summary.ifBlank { "价值=${r.actual}/${r.theory}" }
                 AppState.setRerollResultSummary(summary)
                 AppState.setRerollStatus("完成：$summary")
                 AppState.addLog(
-                    if (r.reused) "当前开局已符合目标路线，直接沿用（未重刷）"
-                    else "命中目标路线开局，总尝试次数：$lastAttempt",
+                    (if (r.reused) "当前开局已符合目标路线，直接沿用（未重刷）"
+                    else "命中目标路线开局，总尝试次数：$lastAttempt") +
+                        " ｜ " + r.summary.ifBlank { "价值=${r.actual}/${r.theory}" },
                 )
                 AppState.setRerollBusy(false)
                 true

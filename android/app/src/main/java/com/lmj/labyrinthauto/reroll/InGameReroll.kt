@@ -204,7 +204,7 @@ object InGameReroll {
             val j = RerollJudge.judge(nodes, cfg)
             if (j.ok) {
                 // ★悬浮窗第三格：合格了就写一句好消息（下一局开跑前都看得见）
-                OverlayStatus.setState("合格 ✓ 价值 ${j.actual}/${j.theory}")
+                OverlayStatus.setState("合格 ✓ ${j.summary}")
                 RerollState.result = RerollResult.Success(
                     enterId = 0L,                       // 局内开的不一定有 enter_id（不对外暴露），迷宫侧不用它
                     guildId = cfg.guildId,
@@ -214,11 +214,12 @@ object InGameReroll {
                     routePerArea = j.routePerArea,
                     actual = j.actual,
                     theory = j.theory,
+                    summary = j.summary,
                 )
                 AppState.addLog(
                     "局内刷开局完成（第 $i 次）：3区Boss=${PartyPlan.bossName(j.bossByArea[3]) ?: "?"} " +
                         "5区Boss=${PartyPlan.bossName(j.bossByArea[5]) ?: "?"} " +
-                        "价值=${j.actual}/${j.theory} → 停在选人页，直接开始",
+                        "${j.summary} → 停在选人页，直接开始",
                 )
                 return true
             }
@@ -644,7 +645,7 @@ object InGameReroll {
         }
         val j = nodes?.let { RerollJudge.judge(it, cfg) }
         if (j?.ok == true) {
-            AppState.addLog("局内刷开局：当前这局合格（价值=${j.actual}/${j.theory}）→ 不用管，直接沿用/继续推进")
+            AppState.addLog("局内刷开局：当前这局合格（${j.summary}）→ 不用管，直接沿用/继续推进")
             RerollState.result = RerollResult.Success(
                 enterId = 0L,
                 guildId = cfg.guildId,
@@ -654,6 +655,7 @@ object InGameReroll {
                 routePerArea = j.routePerArea,
                 actual = j.actual,
                 theory = j.theory,
+                summary = j.summary,
             )
             OverlayStatus.setState("沿用当前局 ✓")
             return true
@@ -1019,7 +1021,15 @@ object InGameReroll {
         //   （战斗面板要点「取消」→「查看地图」才回得到地图）。所以撤退前先**判断处在哪条链的哪个位置**，
         //   处理完回到地图，再走【地图页主链】撤退。
         //   分类用便宜调用：viewId(1ms) + labStatus(7ms) + labCharaPageQuick(12ms)，不碰 labBtn。
-        for (round in 1..4) {
+        // ★**按时间预算重试**（2026-11-4 用户）：原来是固定 4 轮，一轮失败就少一次机会 ——
+        //   而事件结算后会连弹一串奖励窗，中间还有"地图可见但输入锁着"的过渡帧（`pageTop` 是空的，
+        //   任何顶框判据都抓不到）⇒ 固定轮次必然提前放弃。
+        //   现在改成"直到 30 秒还没撤出去才算失败"，期间每次失败都等 800ms 重判，
+        //   既能吃掉弹窗串，也能吞掉过渡帧；**只在真的要撤退时走这里**，不影响平时的移动节奏。
+        val deadline = SystemClock.elapsedRealtime() + 30_000L
+        var round = 0
+        while (SystemClock.elapsedRealtime() < deadline) {
+            round++
             val sc = classifyScene()
             AppState.addLog("局内刷开局：撤退前现场 = ${sceneName(sc)}（${pageSig()}）")
             when (sc) {
@@ -1030,17 +1040,36 @@ object InGameReroll {
                 Scene.MAP -> {
                     if (!stableTopGone(5_000L)) {
                         AppState.addLog("[!] 撤退②：顶框没稳定消失（${pageSig()}）→ 重新判定现场")
+                        delay(600)
                         continue
                     }
                     if (retreatFromMap(input)) return true
-                    AppState.addLog("[!] 撤退主链失败（第 $round/4 轮）→ 重新判定现场")
+                    // 没撤出去：可能是"地图看得见但点不动"的过渡帧 ⇒ 等一会再来，别当成失败
+                    AppState.addLog("[!] 撤退主链没成功（第 $round 次，剩 ${(deadline - SystemClock.elapsedRealtime()) / 1000}s）→ 等 800ms 重判")
+                    delay(800)
                 }
-                Scene.CHARA_PANEL -> if (!dismissCharaPanel(input)) return false
-                Scene.BATTLE -> if (!leaveBattlePanel(input)) return false
-                Scene.OTHER -> if (!clearOtherDialog(input)) return false
+                Scene.CHARA_PANEL -> {
+                    if (!dismissCharaPanel(input)) {
+                        AppState.addLog("[!] 撤退：选人面板没让开（第 $round 次）→ 等 800ms 重判")
+                        delay(800)
+                    }
+                }
+                Scene.BATTLE -> {
+                    if (!leaveBattlePanel(input)) {
+                        AppState.addLog("[!] 撤退：战斗面板没退出（第 $round 次）→ 等 800ms 重判")
+                        delay(800)
+                    }
+                }
+                Scene.OTHER -> {
+                    // 一次连点最多 3 个；点完还判 OTHER 也不立刻放弃，等下一轮
+                    if (!clearOtherDialog(input)) {
+                        AppState.addLog("[!] 撤退：未知面板点不掉（第 $round 次）→ 等 800ms 重判")
+                        delay(800)
+                    }
+                }
             }
         }
-        AppState.addLog("[✗] 撤退：4 轮都没能把现场恢复成「地图页并撤出去」（${pageSig()}）")
+        AppState.addLog("[✗] 撤退：30 秒内没把现场恢复成「地图页并撤出去」（第 $round 次，${pageSig()}）")
         return false
     }
 
@@ -1154,15 +1183,24 @@ object InGameReroll {
         val d = AgentApi.dialog()
         val a = d?.optJSONArray("buttons")
         if (a != null) {
-            for (i in 0 until a.length()) {
-                val b = a.optJSONObject(i) ?: continue
-                if (whitelist.contains(b.optString("name"))) {
-                    AppState.addLog("局内刷开局：未知面板 → 点掉「${b.optString("name")}」(${b.optInt("x")},${b.optInt("y")})")
-                    input.tap(b.optInt("x"), b.optInt("y"))
-                    delay(SETTLE_MS)
-                    return true
+            // ★一次最多连点 3 个（2026-11-4）：奖励弹窗是一串，一次只点一个会把轮次白白耗光
+            for (pass in 1..3) {
+                val dd = if (pass == 1) d else AgentApi.dialog()
+                val aa = dd?.optJSONArray("buttons") ?: break
+                var hit = false
+                for (i in 0 until aa.length()) {
+                    val b = aa.optJSONObject(i) ?: continue
+                    if (whitelist.contains(b.optString("name"))) {
+                        AppState.addLog("局内刷开局：未知面板 → 点掉「${b.optString("name")}」(${b.optInt("x")},${b.optInt("y")})")
+                        input.tap(b.optInt("x"), b.optInt("y"))
+                        delay(SETTLE_MS)
+                        hit = true
+                        break
+                    }
                 }
+                if (!hit) break
             }
+            return true
         }
         AppState.addLog("[!] 撤退：未知面板且没有白名单按钮（${pageSig()}）→ 只等不点")
         delay(SETTLE_MS)
