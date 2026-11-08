@@ -6,6 +6,8 @@ import com.lmj.labyrinthauto.core.SecureStore
 import com.lmj.labyrinthauto.logic.EventRetreatRule
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.Calendar
+import java.util.TimeZone
 
 /**
  * 刷开局配置 + B 站账号/密码的本地持久化。
@@ -14,6 +16,42 @@ import org.json.JSONObject
  */
 object RerollSettings {
     private const val PREF = "reroll"
+
+    /**
+     * ★黎明界「初始公会」id 范围（2026-11-13 维护新增 5 家）。
+     * 公告只给了名单、没给 id ⇒ **暂按公告顺序假设为 6..10**；维护后拿到 master 库
+     * `labyrinth_enter_guild` 再校准。UI 选项 / 局数持久化 / 运行计划 / 校验都引用这里。
+     */
+    const val GUILD_MAX = 10
+    val GUILD_IDS: IntRange = 1..GUILD_MAX
+
+    /** 2026-11-13 维护新增的公会从 id 6 开始（6..10）；维护结束前一律不可用。 */
+    const val NEW_GUILD_FROM = 6
+
+    /**
+     * ★新公会开放时刻，按 **UTC+8** 定义（换算成绝对 epoch 毫秒再比较，
+     *   所以设备改时区 / 换地区都不影响判定）。
+     * 维护结束时刻由用户确认（2026-11-09）：**2026-11-13 14:00 (UTC+8)** = 当天 06:00 UTC。
+     * ★要改时刻只动这一处；设 `Long.MAX_VALUE` = 永不自动开放。
+     */
+    private val NEW_GUILD_OPEN_MILLIS: Long =
+        Calendar.getInstance(TimeZone.getTimeZone("GMT+08:00")).apply {
+            clear()
+            set(2026, Calendar.NOVEMBER, 13, 14, 0, 0)
+            set(Calendar.MILLISECOND, 0)
+        }.timeInMillis
+
+    /** 是否已到开放时刻（now = UTC 纪元毫秒） */
+    fun newGuildsEnabled(now: Long = System.currentTimeMillis()): Boolean =
+        now >= NEW_GUILD_OPEN_MILLIS
+
+    /** 单个公会当前能否用：老的 1..5 一直可用，6..10 到点才可用 */
+    fun guildEnabled(id: Int, now: Long = System.currentTimeMillis()): Boolean =
+        id < NEW_GUILD_FROM || newGuildsEnabled(now)
+
+    /** 当前可用的公会 id（UI / 运行计划 / 校验共用，避免各处各写一套） */
+    fun enabledGuildIds(now: Long = System.currentTimeMillis()): List<Int> =
+        GUILD_IDS.filter { guildEnabled(it, now) }
 
     private const val KEY_ACCOUNT = "account"
     private const val KEY_PASSWORD = "password"
@@ -70,6 +108,69 @@ object RerollSettings {
             .edit()
             .putInt("mazeRuns", n)
             .apply()
+    }
+
+    /**
+     * ★**「选择多项」模式**（2026-11-08 用户需求）：按**初始公会**分别设局数。
+     *
+     * 开启后：「运行次数」输入框换成 5 个（每个初始公会一个次数），点「一键黎明界」会
+     * **按公会依次执行**；悬浮窗仍显示 `第 X/总局数 局`。
+     *
+     * ★为什么实现很简单：换公会 = 改**刷开局的「初始公会」**（`RerollConfig.guildId`）。
+     *   每次刷开局都会 `loadConfig()` 现读（`RerollUseCase` / `InGameReroll`），
+     *   所以只要能"每局开跑前把 guildId 改成这一局该跑的那家"就够了，不涉及游戏内 UI 自动化。
+     */
+    fun loadMultiGuild(context: Context): Boolean =
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getBoolean("mazeMultiGuild", false)
+
+    fun saveMultiGuild(context: Context, on: Boolean) {
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean("mazeMultiGuild", on)
+            .apply()
+    }
+
+    /**
+     * 各初始公会的局数：**下标 = 公会 id（1..[GUILD_MAX]）**，`[0]` 恒 0 占位；长度 GUILD_MAX+1。
+     * 全 0 = 没配（此时「一键黎明界」应当被拦住）。
+     * ★旧版只存 6 段（0..5）：短字符串照样能读，新增的 6..10 默认 0 ⇒ 老配置不丢。
+     */
+    fun loadGuildRuns(context: Context): IntArray {
+        val raw = context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+            .getString("mazeGuildRuns", null) ?: return IntArray(GUILD_MAX + 1)
+        val out = IntArray(GUILD_MAX + 1)
+        raw.split(",").forEachIndexed { i, s ->
+            if (i in 0..GUILD_MAX) out[i] = (s.trim().toIntOrNull() ?: 0).coerceAtLeast(0).coerceAtMost(999)
+        }
+        return out
+    }
+
+    fun saveGuildRuns(context: Context, runs: IntArray) {
+        val txt = (0..GUILD_MAX).joinToString(",") { runs.getOrElse(it) { 0 }.coerceAtLeast(0).toString() }
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+            .edit()
+            .putString("mazeGuildRuns", txt)
+            .apply()
+    }
+
+    /** 多公会模式下这条计划一共有几局；**未开放公会填的局数不计入**，
+     *  否则会出现「按钮能点、实际一局都不跑」。 */
+    fun multiGuildTotal(runs: IntArray, now: Long = System.currentTimeMillis()): Int =
+        enabledGuildIds(now).sumOf { runs.getOrElse(it) { 0 } }
+
+    /** 初始公会的显示名（日志用；与 `REROLL_GUILDS` 一一对应） */
+    fun guildName(id: Int): String = when (id) {
+        1 -> "美食殿堂"
+        2 -> "破晓之星"
+        3 -> "咲恋救济院"
+        4 -> "王宫骑士团"
+        5 -> "拉比林斯"
+        6 -> "慈乐之音"
+        7 -> "恶魔伪王国军"
+        8 -> "伊丽莎白牧场"
+        9 -> "墨丘利财团"
+        10 -> "暮光流星群"
+        else -> "公会$id"
     }
 
     /**
@@ -361,7 +462,7 @@ object RerollSettings {
     }
 
     /**
-     * ★黎明界开局「自选角色」：迷宫公会 id(1~5) → 选中的 unitId 列表（空=用花名册默认 trio）。
+     * ★黎明界开局「自选角色」：迷宫公会 id → 选中的 unitId 列表（空=用花名册默认 trio）。
      * 存成一份 JSON（"1":[...],"2":[...]）；读不到/解析失败 → 空 map（走默认）。
      */
     fun loadGuildPicks(context: Context): Map<Int, List<Int>> {

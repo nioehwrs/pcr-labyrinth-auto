@@ -253,12 +253,50 @@ class AutoForegroundService : Service() {
 
                     // 走到这里 root 必然就绪，点击后端一定是 root（InputBackends 仅 root 一种），不会为 null
                     val input = InputBackends.pick(applicationContext)!!
-                    val total = RerollSettings.loadMazeRuns(applicationContext)
+                    // ★★「选择多项」= 按**初始公会**分别设局数（2026-11-08 用户需求）。
+                    //   展开成"每局该跑哪个公会"的计划表（`guildPlan[i]` = 第 i 局（0 基）的公会 id）；
+                    //   单公会模式下这张表是空的（不切公会）。
+                    //   ★换公会 = 改**刷开局的「初始公会」**（`RerollConfig.guildId`），而每次刷开局都会
+                    //     `loadConfig()` 现读 ⇒ 局间改它就生效，不涉及任何游戏内 UI 操作。
+                    val multi = RerollSettings.loadMultiGuild(applicationContext)
+                    val guildRuns = RerollSettings.loadGuildRuns(applicationContext)
+                    // ★未开放的新公会（6..10）：单公会模式直接拦，多公会模式从计划里剔除
+                    //   （开放时刻按 UTC+8 判定，见 RerollSettings.newGuildsEnabled）
+                    if (!multi) {
+                        val curGuild = RerollSettings.loadConfig(applicationContext).guildId
+                        if (!RerollSettings.guildEnabled(curGuild)) {
+                            AppState.addLog(
+                                "初始公会 ${RerollSettings.guildName(curGuild)} 不可用 → 已停止",
+                            )
+                            return@launch
+                        }
+                    }
+                    val guildPlan: List<Int> = if (multi) {
+                        RerollSettings.enabledGuildIds().flatMap { g ->
+                            List(guildRuns.getOrElse(g) { 0 }.coerceAtLeast(0)) { g }
+                        }
+                    } else {
+                        emptyList()
+                    }
+                    val total = if (multi) guildPlan.size else RerollSettings.loadMazeRuns(applicationContext)
                     if (total <= 0) {
-                        AppState.addLog("运行次数需要大于 0 ~")
+                        AppState.addLog(
+                            if (multi) "各公会局数都是 0 —— 至少要给一个公会给 1 局"
+                            else "运行次数需要大于 0 ~",
+                        )
                         return@launch
                     }
                     val totalTxt = "$total"
+                    if (multi) {
+                        AppState.addLog(
+                            "── 多公会模式：共 $total 局 ── " +
+                                RerollSettings.enabledGuildIds()
+                                    .filter { guildRuns.getOrElse(it) { 0 } > 0 }
+                                    .joinToString(" · ") {
+                                        "${RerollSettings.guildName(it)}×${guildRuns.getOrElse(it) { 0 }}"
+                                    },
+                        )
+                    }
                     // ★每轮运行单独一份 session（2026-11-02 用户）：否则同一次 app 启动里
                     //   连着跑「1 局」和「3 局」，日志页会并成"成功 4/3 局 · 有未完成"
                     LogFile.rotateSession()
@@ -273,6 +311,32 @@ class AutoForegroundService : Service() {
                     try {
                         while (isActive && idx < total) {
                             idx++
+                            // ★多公会：开跑前把"刷开局的初始公会"切到这一局该跑的那家。
+                            //   同一公会内不重复设置（避免每局都写配置 + 无谓强刷）。
+                            if (multi) {
+                                val g = guildPlan.getOrElse(idx - 1) { 0 }
+                                if (g > 0) {
+                                    val cfgNow = RerollSettings.loadConfig(applicationContext)
+                                    if (cfgNow.guildId != g) {
+                                        RerollSettings.saveConfig(
+                                            applicationContext, cfgNow.copy(guildId = g),
+                                        )
+                                        // ★★必须强制重刷：不重刷就会沿用一个**别的公会**刷出来的开局
+                                        //   （角色池/Boss 都不对）。
+                                        //   ★两种刷法各有自己的标志位，**必须都置位**：
+                                        //     · 接口刷 → `RerollUseCase.forceRerollNext`（跳过"沿用已合格开局"）
+                                        //     · 局内刷 → `InGameReroll.forceRerollNext`（跳过 `takeoverCurrentMaze`
+                                        //       的"当前局合格就沿用"分支，直接撤退重开）
+                                        RerollUseCase.forceRerollNext = true
+                                        InGameReroll.forceRerollNext = true
+                                        val n = guildPlan.take(idx).count { it == g }
+                                        AppState.addLog(
+                                            "── 初始公会 → ${RerollSettings.guildName(g)}" +
+                                                "（该公会第 $n/${guildRuns.getOrElse(g) { 0 }} 局）──",
+                                        )
+                                    }
+                                }
+                            }
                             AppState.setMazeProgress("第 $idx/$totalTxt 局")
                             OverlayStatus.setRun("第 $idx/$totalTxt 局")   // ★悬浮窗第一段
                             OverlayStatus.setLevel(OverlayStatus.Level.RUNNING)

@@ -25,6 +25,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -153,6 +154,20 @@ fun HomeScreen(
     val rerollBusy by AppState.rerollBusy.collectAsStateWithLifecycle()
 
     var mazeRuns by remember { mutableStateOf(RerollSettings.loadMazeRuns(context).toString()) }
+    // ★「选择多项」= 按初始公会分别设局数（2026-11-08）：状态**提到首页层**，
+    //   因为底部主按钮要按它判断"能不能点"（放 MazeTab 内部 remember 的话外面拿不到）。
+    var multiGuild by remember { mutableStateOf(RerollSettings.loadMultiGuild(context)) }
+    var guildRuns by remember { mutableStateOf(RerollSettings.loadGuildRuns(context)) }
+    // ★新增 5 个公会按 UTC+8 时间自动开放（公告「11/13 维护后」）：每 60s 刷一次，
+    //   App 一直开着也能到点解锁，不用重进；判定集中在 RerollSettings.newGuildsEnabled。
+    var nowMillis by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(60_000L)
+            nowMillis = System.currentTimeMillis()
+        }
+    }
+    val newGuildsOn = RerollSettings.newGuildsEnabled(nowMillis)
     var overlayOn by remember { mutableStateOf(RerollSettings.loadOverlayOn(context)) }
     var failStrategy by remember { mutableStateOf(RerollSettings.loadFailStrategy(context)) }
     // 账号/密码提到首页层：刷开局主按钮挪到「拇指区」底部栏，需要在这里拿到。
@@ -302,6 +317,13 @@ fun HomeScreen(
         },
         // ★主操作放在底部「拇指区」：自动迷宫页 = 一键黎明界 + 停止；刷开局页 = 登录并刷开局
         bottomBar = {
+            // ★次数是否有效（用户 2026-11-08："选择多项时都是 0 或没输入 / 不选多项时是 0 或没输入
+            //   ⇒ 一键黎明界不可点"）。做成**按钮不可点**，而不是点了再弹提示。
+            val runsValid = if (multiGuild) {
+                RerollSettings.multiGuildTotal(guildRuns, nowMillis) > 0
+            } else {
+                (mazeRuns.toIntOrNull() ?: 0) > 0
+            }
             when (tab) {
                 0 -> Row(
                     Modifier
@@ -314,11 +336,38 @@ fun HomeScreen(
                         onClick = {
                             // ★出发前校验（2026-10-18 用户："一键黎明界启动的时候还需要检查一下选项，
                             //   开局角色选择必须每个公会都选了3人"）
-                            val missingGuilds = guildPicksIncomplete(context)
+                            // ★多公会模式：只校验**这次真的要跑的那几个公会**的开局角色
+                            //   （不然只跑公会 1 时，其它公会没配也会被拦）
+                            val multiNow = RerollSettings.loadMultiGuild(context)
+                            val guildRunsNow = RerollSettings.loadGuildRuns(context)
+                            val multiTotal = RerollSettings.multiGuildTotal(guildRunsNow, nowMillis)
+                            val onlyGuilds = if (multiNow) {
+                                RerollSettings.enabledGuildIds(nowMillis)
+                                    .filter { guildRunsNow.getOrElse(it) { 0 } > 0 }.toSet()
+                            } else {
+                                null
+                            }
+                            val missingGuilds = guildPicksIncomplete(context, onlyGuilds)
                             // ★刷开局方式=接口时才需要账号（2026-10-19 用户确认：免账号模式两个启动按钮都不查账号）
                             val needAccount =
                                 RerollSettings.loadRerollMode(context) == RerollSettings.REROLL_API
                             when {
+                                // ★多公会模式下各次数都是 0 ⇒ 不给跑（用户 2026-11-08 明确要求）
+                                multiNow && multiTotal <= 0 ->
+                                    Toast.makeText(
+                                        context,
+                                        "多公会模式：各公会的局数都是 0，至少给一个公会给 1 局",
+                                        Toast.LENGTH_LONG,
+                                    ).show()
+                                // ★单公会模式配置里残留了未开放的新公会（老配置/旧包选过）⇒ 不给跑
+                                !multiNow && !RerollSettings.guildEnabled(
+                                    RerollSettings.loadConfig(context).guildId, nowMillis,
+                                ) ->
+                                    Toast.makeText(
+                                        context,
+                                        "当前初始公会不可用，请先在「刷开局」换一个",
+                                        Toast.LENGTH_LONG,
+                                    ).show()
                                 bossWhitelistEmpty(context) ->
                                     Toast.makeText(context, "3 区 / 5 区各至少选一个 Boss", Toast.LENGTH_LONG).show()
                                 missingGuilds.isNotEmpty() ->
@@ -350,7 +399,8 @@ fun HomeScreen(
                             }
                         },
                         // ★组件还在下（首次约 42MB）时按钮自己说清在等什么，别让它看起来"点了没反应"
-                        enabled = mazeProgress == null && !compDownloading,
+                        // ★次数为 0（或没输入）⇒ 也不可点（见上面 `runsValid`）
+                        enabled = mazeProgress == null && !compDownloading && runsValid,
                         modifier = Modifier
                             .weight(1f)
                             .heightIn(min = 48.dp),
@@ -377,6 +427,14 @@ fun HomeScreen(
                 ) {
                     Button(
                         onClick = {
+                            // ★单公会模式：配置里残留未开放的新公会时，这个独立入口也要拦
+                            if (!RerollSettings.guildEnabled(
+                                    RerollSettings.loadConfig(context).guildId, nowMillis,
+                                )
+                            ) {
+                                Toast.makeText(context, "当前初始公会不可用", Toast.LENGTH_LONG).show()
+                                return@Button
+                            }
                             if (bossWhitelistEmpty(context)) {
                                 Toast.makeText(context, "3 区 / 5 区各至少选一个 Boss", Toast.LENGTH_LONG).show()
                                 return@Button
@@ -445,6 +503,17 @@ fun HomeScreen(
                             mazeRuns = it
                             RerollSettings.saveMazeRuns(context, mazeRuns.toIntOrNull() ?: 0)
                         },
+                        multiGuild = multiGuild,
+                        onMultiGuild = {
+                            multiGuild = it
+                            RerollSettings.saveMultiGuild(context, it)
+                        },
+                        guildRuns = guildRuns,
+                        newGuildsOn = newGuildsOn,
+                        onGuildRuns = {
+                            guildRuns = it
+                            RerollSettings.saveGuildRuns(context, it)
+                        },
                         mazeProgress = mazeProgress,
                         failStrategy = failStrategy,
                         onFailStrategy = { v ->
@@ -471,6 +540,7 @@ fun HomeScreen(
                             )
                         },
                         rerollMode = rerollMode,
+                        newGuildsOn = newGuildsOn,
                         onRerollMode = { v ->
                             rerollMode = v
                             RerollSettings.saveRerollMode(context, v)
@@ -546,6 +616,14 @@ private fun MazeTab(
     onRequestOverlay: () -> Unit,
     mazeRuns: String,
     onMazeRuns: (String) -> Unit,
+    /** ★多公会模式（按初始公会分别设局数）；状态在首页层，主按钮也要用它判可点性 */
+    multiGuild: Boolean,
+    onMultiGuild: (Boolean) -> Unit,
+    /** 下标 = 初始公会 id（1..[RerollSettings.GUILD_MAX]），[0] 占位 */
+    guildRuns: IntArray,
+    /** ★新增公会（6..10）是否已到 UTC+8 开放时刻；未开放时输入框禁用 */
+    newGuildsOn: Boolean,
+    onGuildRuns: (IntArray) -> Unit,
     mazeProgress: String?,
     failStrategy: Int,
     onFailStrategy: (Int) -> Unit,
@@ -553,6 +631,7 @@ private fun MazeTab(
     overlayDraggable: Boolean,
     onOverlayDraggable: (Boolean) -> Unit,
 ) {
+    val context = LocalContext.current   // ★「选择多项」要直接读写设置
     LazyColumn(
         Modifier.fillMaxSize(),
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 64.dp),
@@ -658,9 +737,86 @@ private fun MazeTab(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
             ) {
                 Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    SectionTitle("运行次数")
+                    // ★「选择多项」（2026-11-08 用户需求）：按**初始公会**分别设局数。
+                    //   ★形式：**按钮**（点一下生效、再点取消），不用 Switch
+                    //     （用户 2026-11-08："原来点和不点的切换挺好的，改成开关不好看"）；
+                    //   位置：紧挨标题右边（不是最右）；状态落盘，重开应用保持。
                     Row(verticalAlignment = Alignment.CenterVertically) {
+                        SectionTitle("运行次数")
+                        Spacer(Modifier.width(10.dp))
+                        if (!multiGuild) {
+                            OutlinedButton(
+                                onClick = { onMultiGuild(true) },
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                                modifier = Modifier.height(30.dp),
+                            ) {
+                                Text("选择多项", style = MaterialTheme.typography.labelMedium)
+                            }
+                        } else {
+                            Button(
+                                onClick = { onMultiGuild(false) },
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                                modifier = Modifier.height(30.dp),
+                            ) {
+                                Text("选择多项 ✓", style = MaterialTheme.typography.labelMedium)
+                            }
+                        }
+                    }
+                    if (!multiGuild) {
                         NumberField("运行次数", mazeRuns, onMazeRuns, hint = "必须 ≥ 1（0 会被拒绝）")
+                    } else {
+                        // ★每行最多 5 个，但每个框**不小于 96dp**（用户 2026-11-08 确认）：
+                        //   固定 5 个在窄屏 / 分屏 / 大字体下会被 weight 压到 label 与数字都看不清，
+                        //   这里按可用宽度动态算列数（宽屏仍 5 个，窄屏自动降为 4/3/2 个一行）。
+                        BoxWithConstraints(Modifier.fillMaxWidth()) {
+                            val gap = 6.dp
+                            val minField = 96.dp
+                            // n 个框 + (n-1) 个间距 ⇒ 每框宽 = (W-(n-1)·gap)/n ≥ minField
+                            //   ⇔ n ≤ (W+gap)/(minField+gap)
+                            val perRow = ((maxWidth + gap) / (minField + gap)).toInt().coerceIn(1, 5)
+                            Column(verticalArrangement = Arrangement.spacedBy(gap)) {
+                                RerollSettings.GUILD_IDS.chunked(perRow).forEach { rowIds ->
+                                    Row(
+                                        Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(gap),
+                                    ) {
+                                        for (g in rowIds) {
+                                            OutlinedTextField(
+                                                // ★★始终有内容（0 也算）：Compose 的 label 只有"框里有值/获得焦点"
+                                                //   才浮到边框上 ⇒ 空串时公会名会**缩回框内居中**，和「运行次数」不一致。
+                                                //   用户 2026-11-08："原来必须里面有内容才会在边缘显示，初始值设一个 0 吧"。
+                                                value = "${guildRuns[g]}",
+                                                onValueChange = { s ->
+                                                    val n = s.filter { it.isDigit() }.take(3).toIntOrNull() ?: 0
+                                                    onGuildRuns(
+                                                        guildRuns.copyOf().also { it[g] = n.coerceAtMost(999) },
+                                                    )
+                                                },
+                                                label = {
+                                                    Text(
+                                                        REROLL_GUILDS.firstOrNull { it.second == g }?.first ?: "$g",
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        maxLines = 1,
+                                                        overflow = TextOverflow.Clip,
+                                                        softWrap = false,
+                                                    )
+                                                },
+                                                singleLine = true,
+                                                textStyle = MaterialTheme.typography.bodyMedium,
+                                                // ★未开放的新公会：灰掉、不能填（已存的值保留，但不计入计划）
+                                                enabled = newGuildsOn || g < RerollSettings.NEW_GUILD_FROM,
+                                                modifier = Modifier.weight(1f),
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Text(
+                            "共 ${RerollSettings.multiGuildTotal(guildRuns)} 局（0 = 跳过该公会）",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     }
                     Text(
                         "自动迷宫的开局继承刷开局配置",
@@ -1489,13 +1645,22 @@ private fun EventRow(entry: EventEntry, selected: Int, onPick: (Int) -> Unit) {
     }
 }
 
-/** 黎明界「初始公会」表（来自 PC reroll.py GUILDS，master 库 labyrinth_enter_guild）。默认 id=3 = 咲恋救济院 */
+/**
+ * 黎明界「初始公会」表（master 库 `labyrinth_enter_guild`）。默认 id=3 = 咲恋救济院。
+ * ★2026-11-13 维护新增 5 家：公告只给名单没给 id ⇒ **暂按公告顺序假设为 6..10**，
+ *   维护后拿到正式 master 库再校准（同时看 [RerollSettings.GUILD_MAX]）。
+ */
 private val REROLL_GUILDS: List<Pair<String, Int>> = listOf(
     "美食殿堂" to 1,
     "破晓之星" to 2,
     "咲恋救济院" to 3,
     "王宫骑士团（NIGHTMARE）" to 4,
     "拉比林斯" to 5,
+    "慈乐之音" to 6,
+    "恶魔伪王国军" to 7,
+    "伊丽莎白牧场" to 8,
+    "墨丘利财团" to 9,
+    "暮光流星群" to 10,
 )
 
 /**
@@ -1526,12 +1691,14 @@ private fun bossWhitelistEmpty(context: Context): Boolean {
  *
  * @return 没选满的公会中文名（空 = 全部合格；读不到花名册时不拦，交给运行时兜底）
  */
-private fun guildPicksIncomplete(context: Context): List<String> {
+private fun guildPicksIncomplete(context: Context, onlyGuilds: Set<Int>? = null): List<String> {
     val data = runCatching { GameData.guildPool(context) }.getOrNull() ?: return emptyList()
     if (data.guilds.isEmpty()) return emptyList()
     val saved = RerollSettings.loadGuildPicks(context)
     val bad = ArrayList<String>()
     for ((labId, g) in data.guilds.toSortedMap()) {
+        // ★多公会模式只校验这次真的要跑的公会（2026-11-08）
+        if (onlyGuilds != null && labId !in onlyGuilds) continue
         val formIds = g.pool.flatMap { it.forms }.mapTo(HashSet()) { it.unitId }
         val chosen = (saved[labId] ?: emptyList()).ifEmpty { g.defaultPicks }
         if (chosen.count { it in formIds } < 3) bad.add(g.cn)
@@ -1546,6 +1713,8 @@ private fun RerollTab(
     accountSection: @Composable () -> Unit,
     // ★刷开局方式提到首页（底部「刷开局」按钮也要用），这里只负责改
     rerollMode: Int,
+    /** ★新增公会（6..10）是否已到 UTC+8 开放时刻；未开放时 chip 禁用 */
+    newGuildsOn: Boolean,
     onRerollMode: (Int) -> Unit,
 ) {
     val context = LocalContext.current
@@ -1641,10 +1810,11 @@ private fun RerollTab(
                             (1..5).map { "$it" to it },
                             cfg.difficulty,
                         ) { updateCfg { copy(difficulty = it) } }
-                        ChoiceChips(
+                        GuildChoiceChips(
                             "初始公会",
                             REROLL_GUILDS,
                             cfg.guildId,
+                            newGuildsOn,
                         ) { updateCfg { copy(guildId = it) } }
                         // ★判 Boss 白名单：两种判定模式都执行（不判 Boss = 5 个全选即可）
                         BossMultiSelect(
@@ -1797,6 +1967,41 @@ private fun ChoiceChips(
         ) {
             options.forEach { (text, value) ->
                 FilterChip(
+                    selected = value == selected,
+                    onClick = { onSelect(value) },
+                    label = { Text(text, style = MaterialTheme.typography.labelMedium) },
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 「初始公会」专用：每行最多 5 个，chip 按文字**自然宽度**（不 weight 拉长、不截断），
+ * 放不下自动换行（用户 2026-11-08："不用像第一页的输入框那样强行拉长，还是保持自然长度"）。
+ * ★`selected` 仍是单个 Int、点某个 chip 就把 cfg.guildId 换成它 ⇒ 始终**只能选一个**。
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun GuildChoiceChips(
+    label: String,
+    options: List<Pair<String, Int>>,
+    selected: Int,
+    /** ★新增公会（6..10）是否已到 UTC+8 开放时刻；未开放时那 5 个 chip 灰掉不可点 */
+    newGuildsOn: Boolean,
+    onSelect: (Int) -> Unit,
+) {
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(label, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        FlowRow(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+            maxItemsInEachRow = 5,
+        ) {
+            options.forEach { (text, value) ->
+                FilterChip(
+                    enabled = newGuildsOn || value < RerollSettings.NEW_GUILD_FROM,
                     selected = value == selected,
                     onClick = { onSelect(value) },
                     label = { Text(text, style = MaterialTheme.typography.labelMedium) },

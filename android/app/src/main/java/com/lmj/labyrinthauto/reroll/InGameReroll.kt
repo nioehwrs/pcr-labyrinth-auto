@@ -122,13 +122,19 @@ object InGameReroll {
      */
     private var appCtx: Context? = null
 
-    /** 迷宫公会 id → 公会选择页上的名字（卡内 `GuildNameLabel` 的文字） */
+    /** 迷宫公会 id → 公会选择页上的名字（卡内 `GuildNameLabel` 的文字）。
+     *  ★2026-11-13 维护新增 5 家：id 暂按公告顺序假设为 6..10（与 `RerollSettings.GUILD_IDS` 对齐）。 */
     private val GUILD_CN = mapOf(
         1 to "美食殿堂",
         2 to "破晓之星",
         3 to "咲恋救济院",
         4 to "王宫骑士团",
         5 to "拉比林斯",
+        6 to "慈乐之音",
+        7 to "恶魔伪王国军",
+        8 to "伊丽莎白牧场",
+        9 to "墨丘利财团",
+        10 to "暮光流星群",
     )
 
     /**
@@ -521,7 +527,8 @@ object InGameReroll {
      * ⚠2026-10-19 实测：**救济院第一屏就在**，但按 `GuildNameLabel` 文字匹配失败 ⇒ 白白拖了一屏
      * （拖完顺序变了，还在可能点错卡）。原因多半是文字读取为空/写法不同。
      * 所以：**列表在最左时直接按卡片顺序点**（第 guildId 张 = 该公会），文字只用来"确认/兜底"；
-     * 只有目标卡根本不在屏上（如 5 号公会，一屏只露 4 张）才拖。
+     * 只有目标卡根本不在屏上（一屏只露 4 张）才拖。
+     * ★2026-11-13 后共 10 家公会 ⇒ 拖动轮数放宽到 12，够覆盖最后一家的卡。
      */
     private suspend fun selectGuild(input: InputBackend, guildId: Int): Boolean {
         val want = GUILD_CN[guildId] ?: return false
@@ -532,7 +539,7 @@ object InGameReroll {
             delay(400)                                   // 等列表惯性停住（拖完立刻读会读到旧位置）
         }
         var scrolled = 0
-        for (round in 1..6) {
+        for (round in 1..12) {
             // ★必须**按屏幕横坐标排序**再取第 guildId 张（2026-10-19 修）：
             //   `findList` 返回的是 DFS 顺序，实测是**从右往左**（1907→1367→827→286），
             //   直接按下标取会选错公会（要第 3 个「咲恋救济院」，结果点了第 2 张卡 = 827）。
@@ -630,6 +637,27 @@ object InGameReroll {
             AppState.addLog("局内刷开局：上一局已按策略作废（凹分不足）→ 不沿用，直接撤退重刷")
             return if (retreat(input)) null else false
         }
+        // ★★2026-11-08（用户："读当前地图时应该能读到是从什么公会开局的"）：
+        //   局内刷原来**只判"地图合不合格"**，完全不看公会和难度 ⇒ 手动开着 A 公会/难度4 的局、
+        //   配置是 B 公会/难度5 时会直接沿用，跑完当成目标配置的成绩（接口刷那条路一直有
+        //   `guildOk` / `diffOk` 两道校验，这里没有）。
+        //   现在一次 `labStatusLite` 拿两个字段（都是 `LabyrinthTempData` 的内存读）：
+        //     · `guildId` @ 0x1C —— 这一局是从哪个初始公会开的
+        //     · `difficulty` @ 0x5C —— 这一局的难度
+        val stNow = runCatching { AgentApi.labStatusLite() }.getOrNull()
+        val curGuild = stNow?.optInt("guildId", -1) ?: -1
+        val curDiff = stNow?.optInt("difficulty", -1) ?: -1
+        if (curGuild > 0 && curGuild != cfg.guildId) {
+            AppState.addLog(
+                "局内刷开局：当前这局是「${GUILD_CN[curGuild] ?: curGuild}」≠ 目标「" +
+                    "${GUILD_CN[cfg.guildId] ?: cfg.guildId}」→ 撤退重开",
+            )
+            return if (retreat(input)) null else false
+        }
+        if (curDiff > 0 && curDiff != cfg.difficulty) {
+            AppState.addLog("局内刷开局：当前这局难度 $curDiff ≠ 目标 ${cfg.difficulty} → 撤退重开")
+            return if (retreat(input)) null else false
+        }
         AppState.addLog("局内刷开局：当前在迷宫里（${Navigator.viewLabel(vid0)}）→ 先看这局合不合格")
         // 先直接读图：子菜单（角色选择/奖励/强化/商店…）是叠在地图上的对话框，地图数据通常还能读
         delay(SETTLE_MS)
@@ -648,8 +676,9 @@ object InGameReroll {
             AppState.addLog("局内刷开局：当前这局合格（${j.summary}）→ 不用管，直接沿用/继续推进")
             RerollState.result = RerollResult.Success(
                 enterId = 0L,
-                guildId = cfg.guildId,
-                difficulty = cfg.difficulty,
+                // ★填**实际读到的**（校验已通过，正常情况下与配置一致；读不到才回落到配置）
+                guildId = if (curGuild > 0) curGuild else cfg.guildId,
+                difficulty = if (curDiff > 0) curDiff else cfg.difficulty,
                 nodes = nodes!!,
                 bossByArea = j.bossByArea,
                 routePerArea = j.routePerArea,
