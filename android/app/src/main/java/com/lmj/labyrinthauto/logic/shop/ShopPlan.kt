@@ -57,6 +57,17 @@ class ShopPlan(
     private var lastQuota: Quota? = null
 
     /**
+     * 最近一次 DP 的**候选件数**（= [dpCandidates] 大小）。
+     *
+     * 用途（2026-11-08）：给调用方判"空清单是不是不可信"——
+     * **空清单 + 候选非空 = 自相矛盾**（DP 只要有一件买得起、品类认得，就一定会买，
+     * 因为"买 k 件"的分数严格大于空集）。实测那类清单来自"进店第一帧 `availability` 还没填"，
+     * 一旦缓存就会让**整家店**一件都不买。
+     */
+    var lastCandCount: Int = 0
+        private set
+
+    /**
      * ★**购买清单**（2026-11-02 用户："每轮决策一次，拉一个清单就行了，清单写的内容比如说
      * 1星:x件；2星:x件；3星:x件；印记:x件"）。
      *
@@ -445,6 +456,7 @@ class ShopPlan(
         val model = dpModel(area)
         if (model != null) {
             val cand = dpCandidates(area, sh, relicCtx, buy2Star)
+            lastCandCount = cand.size          // ★给调用方判"空清单可不可信"（见 lastCandCount 注释）
             val discPct = discPercent(sh)
             val remaining = remainingRefresh(area, sh, done)
             if (quota != null) {

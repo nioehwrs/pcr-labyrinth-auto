@@ -157,6 +157,12 @@ object MazeLoop {
     private const val SHOP_AUTO = true
 
     /**
+     * "空清单但货架上有候选"最多丢弃几次。
+     * 连续超过这个次数就不再纠缠（照清单执行），避免因为判据本身出错把流程卡在商店页。
+     */
+    private const val SHOP_QUOTA_REJECT_MAX = 6
+
+    /**
      * 同一件点击**最多重试几次**（2026-11-02）：点完下一轮读回货架，若该槽位仍可买说明没点中，
      * 就再点一次；超过这个次数仍没买到 → 放弃该件（清单扣件继续下一件），避免死循环。
      */
@@ -2525,6 +2531,9 @@ object MazeLoop {
     private var shopQuota: ShopPlan.Quota? = null
     private var shopQuotaKey: String? = null
 
+    /** "空清单但货架有候选"被丢弃的**连续**次数（超过 [SHOP_QUOTA_REJECT_MAX] 就不再纠缠，防卡死） */
+    private var shopQuotaRejectN = 0
+
     /**
      * ★**待确认的一次购买**（2026-11-02 用户："判断'买了'的依据是什么，持有数量增加了？"）。
      *
@@ -2704,6 +2713,7 @@ object MazeLoop {
         if (rkey != shopRefreshKey) {
             // 换店 ⇒ 买过标记也清；★购买清单/待确认件同样作废（不同店的货架/金币无关）
             shopRefreshCount = 0; shopRefreshKey = rkey; shopBought = false; shopQuota = null
+            shopQuotaRejectN = 0
             shopPendKind = null; shopPendGi = -1; shopPendRetry = 0
             shopBuyStep = 0; shopBuyAt = 0L          // 换店 ⇒ 购买子链作废（新店的交易与上家无关）
         }
@@ -2792,6 +2802,52 @@ object MazeLoop {
                 )
             }
         }
+        // ★★2026-11-08 修（用户反馈 0.6.6：3 层商店 1.2 万金币一件没买）：
+        //   **"货架/商品还没读全"的检查必须放在跑 DP 之前**。
+        //   原来它在 [shopPlan] 之后 ⇒ 进店那一帧 `items`/`slots` 不全时，
+        //   DP 会算出「买 0 件」的清单并被缓存（`shopQuota`）；而清单 key 只含 `blockId|area|已刷次数`
+        //   ⇒ **整家店都按这张空清单执行**，一件都不买。
+        //   实测日志特征：`金币=12090 可买=6/6 优先候选=[] 槽=[]` + `DP清单：1★0 2★0 3★0 印记0`。
+        //   现在：没读全就**只重读、不跑 DP、不产出清单**。
+        run {
+            val slots0 = sh.optJSONArray("slots")
+            val items0 = sh.optJSONArray("items")
+            // ★★2026-11-08：**件数也要查**。agent 的 `_shopValid` 只要求 lineup 里
+            //   `listCount >= 1`（它用来排除"过期的旧商店实例"），所以进店那一帧若只建好 1~2 件
+            //   也能通过校验、`labShop` 正常返回 —— 半成品货架照样被拿去跑 DP。
+            //   而游戏商店**恒为 6 件**（3 层=3 遗物+3 印记；5 层=3 遗物+1 定向+2 印记）
+            //   ⇒ `items < 6` 就是"还没铺满"，此时**不决策、不产出清单**。
+            // ★★2026-11-08：`availability` 是**运行时字段**，刚打开商店那一帧可能还是 0（未就绪）
+            //   ⇒ `shelf` 为空 ⇒ DP 只能选"空集" ⇒ 清单全 0 ⇒ 被缓存成整店清单 ⇒ 之后一件都不买。
+            //   （离线复现证明：正常输入下 DP 一定买满 ⇒ 问题只可能出在"输入还没就绪"这一瞬。）
+            //   ★商品件数**不按 6 判**（用户 2026-11-08："商店没理由一个个上架"，
+            //     而且各层件数不一定都是 6）—— 只有"一件都没有"才算异常。
+            var avail = 0
+            if (items0 != null) {
+                for (i in 0 until items0.length()) {
+                    val it0 = items0.optJSONObject(i) ?: continue
+                    if (Py.truthy(it0.opt("isSold"))) continue
+                    if ((Py.num(it0, "availability")?.toInt() ?: -1) == 1) avail++
+                }
+            }
+            // ★只在"本店**一件都没买过**、也没刷过"时才把 `avail==0` 当"未就绪"。
+            //   买空之后（或已刷过）`avail==0` 是**正常状态**（该刷新/该关店）——
+            //   那种情况必须往下走，否则会卡在商店页出不去。
+            val neverTouched = !shopBought && shopRefreshCount == 0
+            if (slots0 == null || slots0.length() == 0 ||
+                items0 == null || items0.length() == 0 ||
+                (avail == 0 && neverTouched)
+            ) {
+                if (n == 1 || n % 20 == 0) {
+                    AppState.addLog(
+                        "商店：货架还没就绪（商品 ${items0?.length() ?: 0} 件、可买 $avail 件、" +
+                            "槽位 ${slots0?.length() ?: 0}）→ 重读，本轮不决策",
+                    )
+                }
+                delay(300)
+                return
+            }
+        }
         // ★清单生命周期（2026-11-02 用户："每轮决策一次，拉一个清单"）：
         //   key 里带 `shopRefreshCount` ⇒ **刷新后自动作废**重新决策；换店上面已清。
         //   清单存在时 [ShopPlan.shopPlan] 不跑 DP，只按清单从当前货架挑件（具体哪个遗物照旧现排序现取）。
@@ -2800,6 +2856,22 @@ object MazeLoop {
         val (picked, desc) = shopPlan.shopPlan(
             area, sh, done = shopRefreshCount, relicCtx = relicCtx, quota = shopQuota,
         )
+        // ★★2026-11-08 排障（用户反馈 0.6.6："3 层商店 1.2 万金币却没买遗物/印记"）：
+        //   把"决定买不买"的**输入**全打出来 —— 以后这类"钱够却不买"能一眼定位是
+        //   ① 商品没识别出品类（kind=?）② 不在货架 ③ DP 没启用 ④ 清单是空的。
+        if (n == 1) {
+            val brief = items.joinToString(" ") { it0 ->
+                val k0 = shopPlan.shopItemKind(it0.opt("rewardId")?.toString() ?: "").first
+                "$k0/${Py.num(it0, "price")?.toInt() ?: -1}" +
+                    (if (Py.truthy(it0.opt("isSold"))) "(已售)" else "") +
+                    (if ((Py.num(it0, "availability")?.toInt() ?: -1) != 1) "(不在货架)" else "")
+            }
+            AppState.addLog(
+                "商店：进店快照 dp=${shopPlan.dpEnabled(area)} 清单=${if (shopQuota == null) "无(将重算)" else "有"}" +
+                    " 金币=${coinRead ?: -1} items=${items.size}" +
+                    " slots=${sh.optJSONArray("slots")?.length() ?: -1}｜$brief",
+            )
+        }
         // ★商店抽样（2026-11-4 用户）：记录"进店 / 每次刷新后"这一屏的星级构成 + 当前持有遗物，
         //   用来验证「1/2/3★ 各 1/3」是否与持有量相关（H_A 按件均匀 vs H_B 按星级均匀）。
         //   详见 [ShopSampleLog]；同一 (货架, 刷新次数) 只记一次。
@@ -2834,19 +2906,36 @@ object MazeLoop {
         var freshQuota = false
         if (shopQuota == null && shopPlan.dpEnabled(area)) {
             // 刚跑完 DP → 取走新清单，后续每轮按它买
-            shopQuota = shopPlan.takeQuota()
+            val qNew = shopPlan.takeQuota()
+            // ★★2026-11-08 **防"空清单中毒"**：空清单 + 货架上有候选 = **自相矛盾**
+            //   （DP 只要有一件买得起且品类认得，分数就严格大于空集 ⇒ 必买；离线复现也印证了）。
+            //   实测它来自"进店第一帧 `availability` 还没填"，一旦缓存 ⇒ 整家店一件都不买。
+            //   ⇒ 这种清单一律**丢弃**（下轮重算），宁可多跑一次 DP，也不让整家店空转。
+            if (qNew != null && qNew.isEmpty() && shopPlan.lastCandCount > 0 &&
+                shopQuotaRejectN < SHOP_QUOTA_REJECT_MAX
+            ) {
+                // 丢弃后**这一轮什么都不做**（不买、不刷新、也不关店）—— 否则会顺着空清单走到"关店"。
+                shopQuotaRejectN++
+                if (shopQuotaRejectN == 1) {
+                    AppState.addLog(
+                        "[!] 商店：DP 给出空清单、但货架上有 ${shopPlan.lastCandCount} 件可买 → " +
+                            "丢弃这张清单，重读后再算（多半是进店那一帧还没就绪）",
+                    )
+                }
+                delay(300)
+                return
+            }
+            if (qNew != null && qNew.isEmpty() && shopPlan.lastCandCount > 0) {
+                // 兜底：连续这么多次都"矛盾" ⇒ 不再纠缠（怕卡死在商店），照它执行
+                AppState.addLog("[!] 商店：连续 $shopQuotaRejectN 次空清单仍矛盾 → 照它执行，不再重算")
+            }
+            shopQuotaRejectN = 0
+            shopQuota = qNew
             freshQuota = shopQuota != null
             // ★全货架诊断：每件标 已售/不在货架/✓买/✗不买 —— "某件为什么没买" 一眼可判
             shopQuota?.let { AppState.addLog("商店：本次清单 $it${shopPlan.shelfBrief(sh, picked)}") }
         }
-        // ★货架为空 = **没读到**（刚进商店不可能一件都没有，2026-11-07 用户）：
-        //   此时不做决策（否则会得出"买 0 件 + 不刷新"然后关店走人），只重读。
-        val slotsNow = sh.optJSONArray("slots")
-        if (slotsNow == null || slotsNow.length() == 0) {
-            if (n == 1) AppState.addLog("商店：货架为空（读取未就绪）→ 重读，本轮不做决策")
-            delay(300)
-            return
-        }
+        // （"货架为空"的检查已于 2026-11-08 移到跑 DP **之前**，见上面。）
         if (n == 1 || n % 20 == 0) {
             // ★`desc` 与 PC 逐字一致（对拍测试守着），末尾这两段是给**人**看的可读口径
             //   （2026-10-17 用户："买完余=-2620 —— 日志修一下"：原来那个数会算上买不起的件）
