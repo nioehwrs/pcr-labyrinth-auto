@@ -187,8 +187,7 @@ object Navigator {
                 // 迷宫子菜单 → 点它的返回按钮回 259（找不到就本轮不点，等它自己变）
                 val p = findNode("btn_back")
                 if (p != null) {
-                    tap(input, p.first, p.second, "迷宫菜单返回（${viewLabel(vid)}）")
-                    delay(700)
+                    tapUntilChange(input, p.first, p.second, "迷宫菜单返回（${viewLabel(vid)}）", vid)
                     return@repeat
                 }
             }
@@ -210,8 +209,8 @@ object Navigator {
                         )
                     }
                 } else {
-                    tap(input, dlg.second, dlg.third, "对话框「${dlg.first}」")
-                    delay(700)
+                    // ★点完**探到对话框没了**就往下走（不再固定 delay 700）
+                    tapUntilChange(input, dlg.second, dlg.third, "对话框「${dlg.first}」", vid)
                     return@repeat
                 }
             }
@@ -222,8 +221,8 @@ object Navigator {
                 // ★同一条避让：加载/瞬态页不做 `find`（全树遍历 ✗ —— 它的 1.5s 遍历缓存一次也要几百 ms~2s）
                 val p = if (vid in NO_HEAVY_VIEWS) null else findNode(btnName)
                 if (p != null) {
-                    tap(input, p.first, p.second, btnName)
-                    delay(900)
+                    // ★点完**探到换页**就走（原来固定 delay 900ms）
+                    tapUntilChange(input, p.first, p.second, btnName, vid)
                     return@repeat
                 }
                 AppState.addLog("这一页没有节点「$btnName」（${viewLabel(vid)}），下一轮再看")
@@ -233,7 +232,9 @@ object Navigator {
                 val sc = AgentApi.screen()
                 val cw = (sc?.optInt("w", 0) ?: 0).let { if (it > 0) it else REF_W }
                 val ch = (sc?.optInt("h", 0) ?: 0).let { if (it > 0) it else REF_H }
-                tap(input, cw / 2, ch / 2, "屏幕中心")
+                // ★标题/加载页要等**登录+加载**（可能好几秒）⇒ 探针窗口给长一点
+                //   （探到"进到下一页"就立刻走，所以给长了也不亏）
+                tapUntilChange(input, cw / 2, ch / 2, "屏幕中心", vid, settleMs = 300L, probe = 6, probeMs = 300L)
             } else {
                 // ★未知页面（2026-10-19 用户定的**通用策略**）：活动页之类的没有通用确认按钮可点时，
                 //   只要**底部有导航栏**就直接点「冒险」（ButtonQuest，同名多个时 findNode 取最靠下的
@@ -245,8 +246,7 @@ object Navigator {
                         lastUnknownVid = vid
                         AppState.addLog("未知页面 ${viewLabel(vid)} 有底部导航 → 点「冒险」回正常线")
                     }
-                    tap(input, q.first, q.second, "底部导航「冒险」")
-                    delay(900)
+                    tapUntilChange(input, q.first, q.second, "底部导航「冒险」", vid)
                     return@repeat
                 }
                 // 真·异常页：不猜着点，但**不立刻失败** —— 冷启动/换页会经过 0(NONE) 这类瞬态，
@@ -420,11 +420,56 @@ object Navigator {
         return null
     }
 
-    private suspend fun tap(input: InputBackend, x: Int, y: Int, what: String) {
-        when (val r = input.tap(x, y)) {
-            is InputResult.Ok -> AppState.addLog("点了 $what ($x,$y)［${input.name}］")
-            is InputResult.Failed -> AppState.addLog("点 $what 失败：${r.reason}")
-            InputResult.Unavailable -> AppState.addLog("点 $what 失败：${input.name} 后端不可用")
+    private suspend fun tap(input: InputBackend, x: Int, y: Int, what: String): Boolean {
+        return when (val r = input.tap(x, y)) {
+            is InputResult.Ok -> {
+                AppState.addLog("点了 $what ($x,$y)［${input.name}］")
+                true
+            }
+            is InputResult.Failed -> { AppState.addLog("点 $what 失败：${r.reason}"); false }
+            InputResult.Unavailable -> { AppState.addLog("点 $what 失败：${input.name} 后端不可用"); false }
         }
+    }
+
+    /**
+     * "当前在哪"的组合签名：`viewId|最上层对话框名` —— 两者**任一变化**都算"页面变了"。
+     *
+     * ★为什么要合起来：进入迷宫之前的流程里，点「确定」关掉公告时 **viewId 不变**（还在首页），
+     *   只有顶层对话框消失；而点「冒险」/「黎明界」时是 **viewId 变**、顶层对话框没动。
+     *   只看其中一个都会漏判。
+     *
+     * @return `"!read"` = 这一轮读不到（[TapCheck] 会把它当成"还没离开"，绝不误判成"点生效了"）
+     */
+    private suspend fun locSig(vid: Int): String {
+        if (vid < 0) return "!read"
+        val top = runCatching { AgentApi.labTop() }.getOrNull() ?: return "!read"
+        return "$vid|$top"
+    }
+
+    /**
+     * ★**点一下 → 探到页面真的变了就立刻往下走**（2026-11-08 用户："这个流程是很顺的，
+     *   符合 tapAndCheck 的使用场景"）。
+     *
+     * 原来这里每点一下都**固定 `delay(700~900ms)`**：
+     *   · 切完得早 ⇒ 白等（首页那一段实测 `冒险 → 公告 → 冒险 → 黎明界` 来回花了 7 秒）；
+     *   · 切完得晚 ⇒ 下一轮再读一次，还可能重复点同一个按钮（日志里 `ButtonQuest` 点了两次）。
+     * 现在改成探针：**变了就走，没变就继续探**（[probe]×[probeMs] 的窗口）。
+     *
+     * @param fromVid 点之前的 viewId（判据 = `viewId|顶框` 不再是它）
+     */
+    private suspend fun tapUntilChange(
+        input: InputBackend, x: Int, y: Int, what: String, fromVid: Int,
+        settleMs: Long = 150L, probe: Int = 4, probeMs: Long = 150L,
+    ): Boolean {
+        val from = locSig(fromVid)
+        if (from == "!read") return false        // 连"现在在哪"都读不到 ⇒ 不点（跟主循环同口径）
+        return TapCheck.run(
+            tapFn = { tx, ty, tw -> tap(input, tx, ty, tw) },
+            x = x, y = y, what = what,
+            from = setOf(from),
+            readTop = { locSig(currentViewId()) },
+            unknownTop = "!read",
+            settleMs = settleMs, probe = probe, probeMs = probeMs,
+        )
     }
 }

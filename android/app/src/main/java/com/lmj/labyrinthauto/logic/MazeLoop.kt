@@ -33,7 +33,9 @@ import org.json.JSONObject
  *
  * ```
  * 读一次地图 → 循环：
- *   labStatus() ──null──→ "不在迷宫/换区途中"（第 1 次 + 每 10 次报一次）；若已过结算 → 收工
+ *   labStatusLite() ──null──→ "不在迷宫/换区途中"（第 1 次 + 每 10 次报一次）；若已过结算 → 收工
+ *      │   ★2026-11-08"需要什么读什么"：分派读只带**分派用得到**的字段；
+ *      │     eventId/questId/choices 等由 handler 自己按需读（[extraIds]）。
  *      │
  *      └─ tag = 节点/节点类型/状态/视图/顶框 —— 换页才重置各计数（PC 6004~6029）
  *           ├─ statusType != 0 → STATUS_HANDLERS[状态]（1 召唤 2 门票 4 事件 5/6 战斗 7 商店 8 演出）
@@ -568,7 +570,10 @@ object MazeLoop {
                 }
             }
 
-            val st = AgentApi.labStatus()
+            // ★★**分派读**（2026-11-08"需要什么读什么"）：这轮只用它来**分派**（页面/状态/战场），
+            //   不再拉整包 —— eventId/questId/choices 这些**只有个别 handler 用得到**的字段，
+            //   由那些 handler 自己按需读（[AgentApi.labExtra]，纯内存读，~0ms）。
+            val st = AgentApi.labStatusLite()
             if (st == null) {
                 nullReads++
                 // ★"读不到"（不在迷宫 / 换区途中 / 游戏重启中）不算"同一现场的延续"——把心跳计时往前推，
@@ -581,7 +586,7 @@ object MazeLoop {
                 }
                 // 最常见成因：换区途中的一瞬间，游戏自己会切完，等就是了（PC 5993~5998）
                 if (nullReads == 1 || nullReads % 10 == 0) {
-                    AppState.addLog("[!] labStatus 为空（不在迷宫/换区途中/读取失败），等待…（第 $nullReads 次）")
+                    AppState.addLog("[!] 分派读为空（不在迷宫/换区途中/读取失败），等待…（第 $nullReads 次）")
                 }
                 // ★2026-11-03：读不到时**顺手看一眼视图**。掉回标题/登录页或主界面说明客户端掉线/被重启了
                 //   （上次就在这里静默等了 16 分钟，日志只有"等待…（第 460 次）"）。
@@ -908,7 +913,7 @@ object MazeLoop {
                     }   // PC 2120 / 战后选人
                     2 -> handleLabSelection(input, st, tag, charaPick, tries, "门票")   // PC 门票页（同 DialogLabyrinthSelection）
                     3 -> { /* USE_RELIC 演出，仅等待、不做决策（PC MAZE_WAIT_ONLY={3}） */ }
-                    4 -> handleEventChoice(input, st, tag, tries)        // PC EVENT_CHOICE(1088)
+                    4 -> handleEventChoice(input, tag, tries, jStr(st, "pageTop"))   // PC EVENT_CHOICE(1088)
                     7 -> handleShop(input, st, tag, tries, screenW, screenH, shopPlan)   // PC SHOP(4728)
                     8 -> handleEventEffect(input, st, tag, tries, screenW, screenH)  // PC EVENT_EFFECT(1190)
                     // 遗物三选一：读候选卡 rewardId+按钮坐标，按 RelicPick.pickCard 选一张（PC RELIC_CHOICE 6297）
@@ -1523,7 +1528,7 @@ object MazeLoop {
     private const val EXEQ_FB_MAX = 3              // ★主循环兜底接管 EX 页的次数上限（超了 ⇒ 让用户手动关）
     private const val EXEQ_RETRY_WAIT_MS = 300L      // "这一轮点了没生效"时的等待（别把 agent 读爆）
     private const val EXEQ_AUTO_WAIT_MS = 900L       // 点完「自动装备」后等页面切到②的上限（超了 ⇒ 再点一次）
-    private const val EXEQ_READ_FULL_MS = 4000L      // 整包读（要按钮坐标）的超时（别占住 agent 单通道太久）
+    private const val EXEQ_READ_FULL_MS = 4000L      // 按需读按钮（要坐标那次）的超时（别占住 agent 单通道太久）
     private const val EXEQ_TOTAL_BUDGET_MS = 30000L  // 整个 EX 流程的时间上限（超了 ⇒ 收手交回主循环）
     private const val EXEQ_OPEN_WAIT_MS = 30000L     // 就绪却读不到「特别装备」按钮的等待上限（PC EXEQ_OPEN_WAIT=30s）
 
@@ -1591,7 +1596,7 @@ object MazeLoop {
         var exStuck: Boolean = false,
         /** ★主循环**兜底接管**的次数（EX 页还在 ⇒ 再接管一次；超过上限就放弃） */
         var fbN: Int = 0,
-        /** ★整包读（要按钮坐标那次）的**累计耗时** —— 用来定轮询/探针间隔（别想当然） */
+        /** ★按需读按钮（要坐标那次）的**累计耗时** —— 用来定轮询/探针间隔（别想当然） */
         var fullMs: Long = 0L,
         /** ★**最后一次点击**的时刻（用来算"这一步从点到生效"用了多久） */
         var lastTapAt: Long = 0L,
@@ -1615,30 +1620,16 @@ object MazeLoop {
     private fun exeqSess(): ExeqSess = exeqSessCur ?: ExeqSess().also { exeqSessCur = it }
 
     /**
-     * 取某个名字的按钮。
+     * ★（已下沉到 agent 侧，2026-11-08）取某个名字的按钮。
      *
-     * ★★2026-11-08 修（实测 10:02 那轮日志）：
-     *   同一页里**可能有多棵同名按钮**（嵌套弹窗/槽位里的也叫 ThreeButtonRight…），
-     *   而"数组里第一个"在重读整包时**不稳定** ⇒ 多点时第二轮会点到**另一个目标**：
-     *     ②「确认」 (1179,960) → (1150,904)；①「装备确定」 (1626,960) → (1160,666) ✗。
-     *   ⇒ 两条规则：
-     *     ① [preferId]（**GameObject 指针**）命中 ⇒ 就用它 —— 把多点**锁在同一个按钮实例**上；
-     *     ② 没命中 ⇒ 取**最靠下**的那个（y 最大 = 底部主按钮行）—— 主按钮行才是
-     *        「取消/自动装备/装备确定」「确认」该点的那一排。
+     * ~~同一页里**可能有多棵同名按钮**（嵌套弹窗/槽位里的也叫 ThreeButtonRight…），
+     *   而"数组里第一个"在重读整包时**不稳定** ⇒ 多点时第二轮会点到**另一个目标**
+     *   （②「确认」 (1179,960) → (1150,904)；①「装备确定」 (1626,960) → (1160,666) ✗）。~~
      *
-     * @param preferId ★**优先取这个实例**（GameObject 指针）
+     * ★现在由 [AgentApi.labExBtn] 在 agent 侧处理：① 传 `preferId`（GameObject 指针）命中就用它
+     *   —— 把多点**锁在同一个按钮实例**上；② 没命中取**最靠下**的那个（y 最大 = 底部主按钮行）。
+     *   而且**正常路径根本不走遍历**：通用按钮按**字段**取（DialogFundationObject）⇒ 天然唯一。
      */
-    private fun _exeqBtn(buttons: org.json.JSONArray?, name: String, preferId: String? = null): JSONObject? {
-        if (buttons == null) return null
-        var best: JSONObject? = null
-        for (i in 0 until buttons.length()) {
-            val b = buttons.optJSONObject(i) ?: continue
-            if (b.optString("name") != name) continue
-            if (!preferId.isNullOrEmpty() && b.optString("id") == preferId) return b
-            if (best == null || b.optInt("y") > best.optInt("y")) best = b
-        }
-        return best
-    }
 
     /**
      * ★从**签名**里取页身份（party / setting / sort）—— 签名格式 `页身份@容器名|状态…`
@@ -1655,9 +1646,9 @@ object MazeLoop {
     /**
      * ★**轻量**读 EX 三连页的当前签名（agent 侧算好，只回一个字符串 —— 不带坐标、不带按钮）。
      *
-     * 轮询用这个（几十 ms）；要按钮坐标时才走整包读 [AgentApi.labExEquip]。
-     * ★签名与整包是**同一个 agent 函数**算的（`_exeqSigOf`）⇒ 两边口径永远一致，
-     *   所以"整包读到的签名 == 轻量读到的签名"这个校验是可靠的。
+     * 轮询用这个（几十 ms）；要按钮坐标时才走**按需读** [AgentApi.labExBtn]。
+     * ★签名与按钮读是**同一个 agent 函数**算的（`_exeqSigOf` / `_exeqPageState`）⇒ 两边口径永远一致，
+     *   所以"读按钮时带回来的签名 == 轻量读到的签名"这个校验是可靠的。
      *
      * @return 签名；`""`（[EXEQ_OFF_PAGE]）= 当前**不在**三连页里；`"?"`（[EXEQ_UNKNOWN]）= 读不到
      */
@@ -1914,6 +1905,21 @@ object MazeLoop {
      */
     private const val EVENT_CHOICE_BTN_RE = "^labyrinth_btn_main_square"
 
+    /** 事件页对话框的类名前缀 —— 顶框不是它 ⇒ **页面还没铺开**，先别去树里找选项卡（2026-11-08） */
+    private const val EVENT_DLG_PREFIX = "DialogLabyrinthEvent"
+    /** 连续「顶框不是事件对话框」的轮数上限：到这儿就退回老行为（顶框名对不上也不能把整局卡住） */
+    private const val EVENT_NOTREADY_MAX = 10
+    /** 前几轮只在 `DialogArea` 子树里找；连续这么多轮都找不到才退到**父层**（节点多得多，别每轮都扫） */
+    private const val EVENT_LAYER_AFTER_N = 3
+    /**
+     * ★"最上层对话框里找到的选项卡**数量不够**"时，等这么多轮才怀疑"真不在 top 里"并退 `dialog`。
+     *
+     * 正常情况下不够 = **按钮还在逐个建出来**（实测：顶框刚出现那一帧只有 1 颗，下一轮就齐了）
+     * ⇒ 只需等一轮。给 3 轮（≈300ms）留余量，避免动画慢一点就白扫一次全树。
+     */
+    private const val EVENT_DIALOG_AFTER_N = 3
+
+
     /**
      * 事件选择页（EVENT_CHOICE=4）：按 eventId 选第 N 张选项卡（PC `handle_event_choice` 1088）。
      * 读取走 agent 的 `labEvent`（返回每张卡的按钮屏幕坐标）；选项序号由 P4 `EventPick.pick` 给出（默认第 1 项）。
@@ -1921,46 +1927,149 @@ object MazeLoop {
      */
     private suspend fun handleEventChoice(
         input: InputBackend,
-        st: JSONObject,
         tag: String,
         tries: MutableMap<String, Int>,
+        pageTop: String,
     ) {
+        // ★★2026-11-08 修（用户："这个找的逻辑明显错了"）：**页面还没铺开就别去树里找**。
+        //   实测 12:44:47 那轮：`statusType` 已经是 EVENT_CHOICE，但**事件对话框还没建出来**（顶框=无）
+        //   ⇒ 我们照样去 DialogArea 里按素材名（`labyrinth_btn_main_square`）找选项卡，必然 0 个
+        //   ⇒ 白跑一趟遍历 + 打一条假告警 `[!] 事件页没有可点选项卡`，下一轮顶框变成
+        //   `DialogLabyrinthEvent(Clone)` 才读得到。
+        //   ⇒ 现在：顶框还不是事件对话框 = **还没就绪**，直接等下一轮（不找、不报错、不消耗处理轮次）。
+        //   ★但**不能死等**：顶框名万一与预期不同（新的事件页变体）⇒ 等 [EVENT_NOTREADY_MAX] 轮
+        //     就退回老行为（照找不误），别把整局卡在这一页。
+        val kWait = "$tag|notready"
+        val waited = tries[kWait] ?: 0
+        if (!pageTop.startsWith(EVENT_DLG_PREFIX) && waited < EVENT_NOTREADY_MAX) {
+            tries[kWait] = waited + 1
+            if (waited == 0) {
+                AppState.addLog(
+                    "… 事件页还没铺开（顶框=${pageTop.ifBlank { "无" }}）→ 等下一轮再看（先不找选项卡）",
+                )
+            }
+            return
+        }
         val n = bump(tries, tag)
-        val eid = (st.opt("eventId") as? Number)?.toInt()
+        // ★★2026-11-08 定案：**首选 `labEvent`**（字段读，实测首读 143ms、之后 2~3ms 有实例缓存）。
+        //   它一次给全三样东西，比"多调几个接口 + 遍历 UI 树"强得多：
+        //     ① `eventId`（`DialogLabyrinthEvent+0x170`，**真实值**；`labStatus` 里那个字段实测恒 0）；
+        //     ② 每张卡的**文案**（`comment`/`result`）；
+        //     ③ 每张卡的**按钮坐标**（`btnX`/`btnY`）。
+        //   ★★最关键：实测事件页有 **3 个 `PartsLabyrinthEventSelectInfo` 槽位**，但只有 **2 张卡**
+        //     —— 第 3 个槽的按钮在 **(960,893)（屏幕正中）**，`activeInHierarchy=true` 但**文案全空**。
+        //     用 UI 树找必然多出这一颗 ⇒ 按 x 排序取第 2 项会点到它 ⇒ **选错卡**（15:53 事故的另一半）。
+        //     而 `labEvent` 里空槽的 `comment`/`result` 就是空串 ⇒ **一次就能筛掉**。
+        val ev = runCatching { AgentApi.labEvent() }.getOrNull()
+        val eidEv = ev?.optInt("eventId")?.takeIf { it > 0 }
+        val eid = eidEv ?: (extraIds()?.opt("eventId") as? Number)?.toInt()
         // ★事件切换（2026-11-03）：先把**上一个事件**的效果差结算掉（它就是本事件的"before"），再给本事件拍快照
         if (n == 1) {
             if (evSnapId != null && evSnapId != eid) settleEventDiff(eid, "事件切换")
             snapshotEvent(eid)
         }
-        // ★照 PC `handle_event_choice`：选项卡按钮**从 UI 树**取（`^labyrinth_btn_main_square` × 卡片数，
-        //   按 x 升序 ↔ choice_id_1/2/3）。原实现用类读取 `labEvent()`，实测返回空卡 → 事件页卡死。
-        //   `findList` 只返回**屏内**节点（自带 onscreen 过滤），与 PC/我们的屏外口径一致。
-        // ★根顺序（2026-10-17 三次改）：`dialog`（DialogArea 子树）→ `layer`（DialogArea 的父层）。
-        //   去掉的两条：① **`view`（当前视图子树）** —— 事件页顶框还是"无"时它 = 整张地图页，
-        //      实测一次 2.2s ✗（12:07:30/40/50 三次都是它）；② **全树**（更贵，从不用）。
-        //   事件选项卡就在对话框里（或它的父层），这两个根都只要几十 ms ✓
-        var arr = AgentApi.findList(EVENT_CHOICE_BTN_RE, "dialog")
-        if (arr == null || arr.length() == 0) {
-            arr = AgentApi.findList(EVENT_CHOICE_BTN_RE, "layer")     // DialogArea 的父层（同层兄弟）
+        // ★★取选项卡按钮：**首选 `labEvent` 给的卡片**（字段读，2~3ms），UI 树只作兜底。
+        //
+        //   为什么 UI 树不能当首选（2026-11-08 实测父链后搞清楚的）：
+        //   ```
+        //     这个事件只有 2 张卡，但 EventSelectInfoParent 下有 **3 个** PartsLabyrinthEventSelectInfo 槽：
+        //       (683,893)  左卡「选择」   ← 真卡
+        //       (1238,893) 右卡「选择」   ← 真卡
+        //       (960,893)  屏幕正中       ← **空槽**（activeInHierarchy=true，但没有内容）
+        //     三颗按钮的父链完全一样，`top`/`dialog`/`layer` 都能找到这 3 颗。
+        //   ```
+        //   ⇒ 按 x 排序取第 2 项会点到那颗**空槽按钮**（在屏幕正中，什么都不是）⇒ 选错卡。
+        //   ⇒ 而 `labEvent` 里空槽的 `comment`/`result` 就是**空串**，一次就能筛掉；
+        //     它同时还给出真实 `eventId` 和卡面文案。
+        //
+        //   ⚠UI 树那条路保留，仅在 `labEvent` 读不到卡片时兜底（旧版该接口有过返回空的历史）。
+        val expectN = EventPick.totalChoices(eid)
+        val evCards = (0 until (ev?.optJSONArray("cards")?.length() ?: 0)).mapNotNull { i ->
+            ev?.optJSONArray("cards")?.optJSONObject(i)
+        }.filter { c ->
+            // ★"有内容的卡"：文案非空（空槽全空）+ 有按钮坐标
+            (c.optString("comment").isNotEmpty() || c.optString("result").isNotEmpty()) &&
+                (c.opt("btnX") as? Number) != null && (c.opt("btnY") as? Number) != null
+        }.sortedBy { (it.opt("btnX") as? Number)?.toInt() ?: 0 }
+
+        val btns: List<JSONObject> = if (evCards.isNotEmpty()) {
+            evCards.map { c ->
+                JSONObject()
+                    .put("x", (c.opt("btnX") as? Number)?.toInt() ?: 0)
+                    .put("y", (c.opt("btnY") as? Number)?.toInt() ?: 0)
+                    .put("name", "E${c.opt("i")}")
+            }
+        } else {
+            // ── 兜底：从 UI 树找（`^labyrinth_btn_main_square`），根用 `top`（最上层对话框子树）
+            var arr = AgentApi.findList(EVENT_CHOICE_BTN_RE, "top")
+            val gotTop = arr?.length() ?: 0
+            // 数量不够 ⇒ 先当"按钮还在逐个建出来"等一轮；连续多轮还不够才退 DialogArea
+            if (expectN > 0 && gotTop < expectN && n >= EVENT_DIALOG_AFTER_N) {
+                if (n == EVENT_DIALOG_AFTER_N) {
+                    AppState.addLog(
+                        "… 事件(${eid ?: "?"}) labEvent 没给卡片、最上层对话框连续 $n 轮只找到 $gotTop/$expectN 个 → 退 DialogArea 再找",
+                    )
+                }
+                arr = AgentApi.findList(EVENT_CHOICE_BTN_RE, "dialog")
+            }
+            if ((arr == null || arr.length() == 0) && n >= EVENT_LAYER_AFTER_N) {
+                if (n == EVENT_LAYER_AFTER_N) {
+                    AppState.addLog("… 事件选项卡在对话框里连续 $n 轮没找到 → 退到父层再找一次")
+                }
+                arr = AgentApi.findList(EVENT_CHOICE_BTN_RE, "layer")
+            }
+            (0 until (arr?.length() ?: 0))
+                .mapNotNull { arr?.optJSONObject(it) }
+                .filter { (it.opt("x") as? Number) != null && (it.opt("y") as? Number) != null }
+                .sortedBy { (it.opt("x") as? Number)?.toInt() ?: 0 }
         }
-        val btns = (0 until (arr?.length() ?: 0))
-            .mapNotNull { arr?.optJSONObject(it) }
-            .filter { (it.opt("x") as? Number) != null && (it.opt("y") as? Number) != null }
-            .sortedBy { (it.opt("x") as? Number)?.toInt() ?: 0 }
         if (btns.isEmpty()) {
-            if (n <= 2) AppState.addLog("[!] 事件页没有可点选项卡（树里没找到 ${EVENT_CHOICE_BTN_RE}）→ 本轮不点")
+            // ★★2026-11-08 修：**别把"页面还在铺开"报成故障**。
+            //   实测 12:44:48 顶框已经是 DialogLabyrinthEvent，但选项卡按钮还没 active/还没落位
+            //   ⇒ 读 0 个是正常的，下一轮（~1s 后）就读到了。原来第 1、2 轮都打 `[!]`，纯噪声。
+            //   现在：第 1 轮说"还在铺"，连续 [EVENT_LAYER_AFTER_N] 轮才升级成告警。
+            val kNoBtn = "$tag|nobtn"
+            val c = (tries[kNoBtn] ?: 0) + 1
+            tries[kNoBtn] = c
+            if (c == 1) {
+                AppState.addLog("… 事件选项卡还没铺好 → 等下一轮（先不点）")
+            } else if (c == EVENT_LAYER_AFTER_N) {
+                AppState.addLog("[!] 事件页连续 $c 轮读不到选项卡（树里没找到 ${EVENT_CHOICE_BTN_RE}）→ 继续等，不猜")
+            }
             return
         }
+        tries.remove("$tag|nobtn")
+        // ★★数量仍不足（连 DialogArea 全树都只找到部分）⇒ **不点**：少一张就可能选错卡（15:53 事故）。
+        //   等下一轮（按钮在逐个建出来）；真的一直不足就靠下面的 `pick` 返回 null + 超时停手兜底。
+        if (expectN > 0 && btns.size < expectN) {
+            val kShort = "$tag|short"
+            val c = (tries[kShort] ?: 0) + 1
+            tries[kShort] = c
+            if (c == 1 || c % 10 == 0) {
+                AppState.addLog(
+                    "[!] 事件(${eid ?: "?"})：只找到 ${btns.size}/$expectN 个选项卡 → 不点（等它铺全；第 $c 轮）",
+                )
+            }
+            return
+        }
+        tries.remove("$tag|short")
         val want = EventPick.pick(eid, btns.size)
         if (want == null) {
             // ★这个事件**没配置选项** ⇒ **不猜**（用户 2026-10-16："事件也有二选一/三选一，都不要随便选"）。
             //   ① 把 event id + 屏上选项卡（序号/名字/坐标）打出来，方便往 `event_choice.json` 补一行；
             //   ② 不点，等人工点一次（页面推进后本函数自然不再被调用）；
             //   ③ 一直停在这页 [EVENT_NOPICK_GIVEUP_S] 秒 ⇒ 停手留人工（不无声空转）。
+            // ★★2026-11-08：null 现在有**两个**原因（没配置 / 配置要的那项超出找到的数量），
+            //   日志必须分开说 —— 否则"少找到一颗"会被写成"没配置"，看日志的人会被带偏。
             if (n == 1) {
+                val cfg = eid?.let { EventPick.EVENT_PICK[it] }
+                val reason = if (cfg != null) {
+                    "**配置要选第 $cfg 项，但屏上只找到 ${btns.size} 个选项卡**（读数不全 → 等下一轮重读）"
+                } else {
+                    "**没配置选项**（event_choice.json 里没有它）→ **不猜、不点**；请人工选一次，或补一行配置"
+                }
                 AppState.addLog(
-                    "[!] 事件(${eid ?: "?"}) **没配置选项**（event_choice.json 里没有它）→ **不猜、不点**；" +
-                        "请人工选一次，或补一行配置。候选=" +
+                    "[!] 事件(${eid ?: "?"}) $reason。候选=" +
                         btns.mapIndexed { i, b -> "#${i + 1}${b.optString("name")}@(${b.optInt("x")},${b.optInt("y")})" }
                             .joinToString(" "),
                 )
@@ -1992,7 +2101,18 @@ object MazeLoop {
             OverlayStatus.setState("事件选择：" + cm.ifBlank { "第 $want 项" }.take(28))
         }
         val chosen = btns[(want - 1).coerceIn(0, btns.size - 1)]
-        tap(input, chosen.optInt("x"), chosen.optInt("y"), "事件选项卡#$want")
+        val cx = chosen.optInt("x")
+        val cy = chosen.optInt("y")
+        // ★★2026-11-08（实测 16:27:12 / 16:35:04）：卡片是从屏幕下方**滑入**的，某些帧 `btnY` 还是
+        //   `1193`（> 屏高 1080）⇒ 交给 [tap] 会被它的屏外闸门拒掉，还打一条误导性的
+        //   `[!] … 读取/换算出错了？`。这里**先自己判**：这一轮不点，下一轮重读（下一轮通常就是 893）。
+        if (cx !in 0 until scrW || cy !in 0 until scrH) {
+            if (n <= 2) {
+                AppState.addLog("… 事件选项卡#$want 坐标 ($cx,$cy) 还在屏外（卡片滑入动画）→ 等下一轮重读")
+            }
+            return
+        }
+        tap(input, cx, cy, "事件选项卡#$want")
     }
 
     /**
@@ -2112,6 +2232,18 @@ object MazeLoop {
         val rid = evRid
         evRid = null
         val hit = rid?.let { EventResult.hitOf(it) }
+        // ★★2026-11-08：**事后核对** ——「实际落在第几张卡」vs「event_choice.json 里配的第几项」。
+        //   能抓到"选项卡没找全 ⇒ 被静默压成第 1 项"这类问题（实测 15:53:18 就是这样选错的：
+        //   配置要卡2 金币750，屏上只找到 1 颗按钮 ⇒ 点了卡1 金币500，整条链一声不吭）。
+        hit?.let { h ->
+            val want = EventPick.EVENT_PICK[h.eid]
+            if (want != null && want != h.slot) {
+                AppState.addLog(
+                    "[!] 事件${h.eid}：**实际落在卡${h.slot}，配置要的是卡$want** → 上次选择可能出错" +
+                        "（选项卡没找全 / 点到了别的卡）",
+                )
+            }
+        }
         // ★"获得角色<N"型：只能用**结算后**的角色差判（演出页那一刻差恒为 0，见 [eventRuleCheck]）
         if (rid != null && du != null && EventFamily.isUnitRid(rid)) judgeUnitOutcome(hit, rid, du)
         // ★新增了哪些角色（不只是个数）：持有池为空（读失败）时算不出来，留空
@@ -2186,10 +2318,12 @@ object MazeLoop {
      *   实测抓到的是「地图 ｜ 状况 ｜ 角色 ｜ 迷宫遗物 …」这种**顶栏菜单**，不是结果文案，
      *   而且每次多花 1~2 次慢 RPC ⇒ 结果已能由 id + 结果表精确解出，抓取整段删掉。
      */
-    private fun observeEventResult(st: JSONObject) {
-        val eidRaw = (st.opt("eventId") as? Number)?.toInt()
-        val erid = (st.opt("eventResultId") as? Number)?.toInt()
-        val eff = (st.opt("effectNum") as? Number)?.toInt()
+    private suspend fun observeEventResult(st: JSONObject) {
+        // ★ids 是**按需读**的（分派读里没有 eventId/eventResultId/effectNum）⇒ 到这儿才读
+        val x = extraIds()
+        val eidRaw = (x?.opt("eventId") as? Number)?.toInt()
+        val erid = (x?.opt("eventResultId") as? Number)?.toInt()
+        val eff = (x?.opt("effectNum") as? Number)?.toInt()
         // ★记下来给 [settleEventDiff] 用：结算那一行要能对上「走了哪个分支 → 实际给了什么」
         if (erid != null && erid > 0) evRid = erid
         val decoded = erid?.let { EventResult.describe(it) } ?: "（结果表里没有这个 id）"
@@ -2216,7 +2350,7 @@ object MazeLoop {
      * ★事件 id **以结果表反查为准** —— status 里的 `eventId` 实测一直是 0
      *   （日志里 8 条结果观测全是 `eventId=0 eventResultId=…`），而 rid → (事件, 卡, 分支) 是确定的。
      */
-    private suspend fun eventRuleCheck(st: JSONObject) {
+    private suspend fun eventRuleCheck() {
         if (pendingEventRetreat != null) return
         val ctx = appCtx ?: return
         if (!RerollSettings.loadScoreChaseOn(ctx)) return
@@ -2235,10 +2369,11 @@ object MazeLoop {
         // 用户可能中途改条件 ⇒ 每次都重读（SharedPreferences 是内存缓存，几乎零成本）
         tracker.conds = RerollSettings.loadScoreChaseConds(ctx, EventRetreatRule.Mode.ASSERT).map { c -> normalizeCond(c) }
         if (tracker.conds.isEmpty()) return
-        val erid = (st.opt("eventResultId") as? Number)?.toInt()?.takeIf { it > 0 } ?: return
+        val x = extraIds()                                   // ★按需读 ids（分派读里没有）
+        val erid = (x?.opt("eventResultId") as? Number)?.toInt()?.takeIf { it > 0 } ?: return
         val hitInfo = EventResult.hitOf(erid)
         val eid = hitInfo?.eid
-            ?: (st.opt("eventId") as? Number)?.toInt()?.takeIf { it > 0 }
+            ?: (x?.opt("eventId") as? Number)?.toInt()?.takeIf { it > 0 }
             ?: return
         // ★选项（卡片槽位）也要喂进去：条件可以只认某一张卡（"选了卡1 一试身手吧"）
         val slot = hitInfo?.slot ?: 0
@@ -2342,7 +2477,7 @@ object MazeLoop {
     ) {
         val n = bump(tries, tag)
         // ★条件 2（断言）：每轮都判一次，等 [pendingEventRetreat] 兑现（回地图时撤）
-        eventRuleCheck(st)
+        eventRuleCheck()
         // ★事件结果观测（2026-11-03）：演出页停留很短，第一轮就把 eventResultId 读一次（只读不点，见 [observeEventResult]）
         if (n == 1) observeEventResult(st)
         // ★根顺序（2026-10-17 四次改）：`dialog`（DialogArea 子树）→ `layer`（DialogArea 的父层）。
@@ -3158,15 +3293,17 @@ object MazeLoop {
             AppState.addLog("   $kind 候选：${rows.joinToString("  ")}")
         }
         if (CharaPick.AUTO) {
-            // ★★等"决定"按钮出来（2026-10-16 用户："选角色的卡片现在通过字段读，太快了，导致按钮还没出来"）
-            //   现在卡片是**字段读**（几十 ms ✓）⇒ 常常"卡面已就绪、但下方「决定」按钮的入场动画还没结束"
-            //   ⇒ 按坐标点下去就是**空点**（点不到按钮，还会白耗点击额度 ✗）。
-            //   本页**第一次点**前等 [SEL_TAP_LEAD_MS]=700ms；重试不再等（`lastSelSig` 已标记 ⇒ 每页只付一次 ✓）。
+            // ★★2026-11-08 用户："三选一的页面上，多点几次选择是没关系的，不太怕点的快了"
+            //   ⇒ 去掉原来"首点前死等 [SEL_TAP_LEAD_MS]=500ms"的做法（那是为了**一次点准**），
+            //     改成 **tapAndCheck 模型**：点一下 → 探到离开就停；没离开就**用最新坐标**再点。
+            //   · 为什么原来会点空：按钮从屏外滑入，三帧读到 (405,1187)→(944)→(887)，
+            //     而旧代码重试时用的是**第一次算好的坐标** ⇒ 第二下还点在 944（按钮已经到 887）。
+            //     ⇒ 现在每一下都走 [selDecideXY] **现取坐标**（屏外就跳过这一下，不计数）。
+            //   · 多点安全：这页反复点**同一张卡**只会重复"选中它"，不会选错（三张卡各自独立）。
             var left = false      // 点完是否已离开选人页（快速重试用，两个点击分支都要用）
-            if (lastSelSig != sig) {
-                if (n <= 2) AppState.addLog("… $kind 页：字段读已就绪 → 等 ${SEL_TAP_LEAD_MS}ms 让「决定」按钮出来再点")
-                delay(SEL_TAP_LEAD_MS)
-            }
+            // ★本轮**真取到坐标 / 没取到**的次数 —— 用来区分"点了没生效"和"一次都没点"（见下）
+            var xyOk = 0
+            var xyNull = 0
             if (viaTree) {
                 val btns = findSelButtons(12)
                 val cands = (0 until (btns?.length() ?: 0)).mapNotNull { btns?.optJSONObject(it) }
@@ -3186,23 +3323,72 @@ object MazeLoop {
                     input, pb.optInt("x"), pb.optInt("y"), "$kind：选 $cid（树·选择）",
                     from = setOf("DialogLabyrinthSelection"),
                     expect = selExpect(kind),
+                    // ★不猜设备速度（见下面 xyAt 分支的说明）
+                    retries = 8, settleMs = 200L, probe = 2, probeMs = 150L,
                 )
             } else {
                 left = tapAndCheck(
                     input, dx, dy, "$kind：选 $cid",
                     from = setOf("DialogLabyrinthSelection"),
                     expect = selExpect(kind),
+                    // ★★**不猜设备速度**（用户 2026-11-08："动画时间可能和设备有关，不能完全确定，
+                    //   按快的写慢设备点两次都点不到；按慢的写快设备又要白等"）：
+                    //   密集点 + 点完**立刻探**，页面一变就停 ⇒
+                    //     · 快设备：第 2~3 下就中，不白等；
+                    //     · 慢设备：多点几下也能中，不会点不到；
+                    //     · `retries` 大**不会**让快设备多点（探到就 break），只是给慢设备留余量。
+                    //   ★**点击间隔 = 200 + 150 = 350ms**（一秒最多 3 下）。用户 2026-11-08：
+                    //     "350~500ms 这个范围挺好，200ms 一秒五次就太快了" ⇒ 别再往密里调。
+                    retries = 8, settleMs = 200L, probe = 2, probeMs = 150L,
+                    // ★每一下**现取坐标**（按钮还在滑入 ⇒ 旧坐标会点空；屏外则这一下不点）
+                    // ★★兜底（2026-11-08 事故）：重读失败就退回**决策时那个坐标**（外层刚判过它在屏内）。
+                    //   宁可点一下"稍微旧一点的坐标"（这页多点同一张卡没关系），也不要
+                    //   "取不到坐标 ⇒ 一次都不点 ⇒ 空转"。
+                    xyAt = {
+                        val xy = selDecideXY(
+                            // ★与**决策**同一个读法：门票页走 labChoices，选人页走 labSelection
+                            reread = {
+                                if (kind == "门票") AgentApi.labChoices(force = true)?.optJSONArray("cards")
+                                else AgentApi.labSelection(force = true)?.optJSONArray("cards")
+                            },
+                            rid = chosen.opt("rewardId"),
+                            idx = res.index,
+                        ) ?: if (dx in 0 until scrW && dy in 0 until scrH) dx to dy else null
+                        if (xy != null) xyOk++ else xyNull++
+                        xy
+                    },
                 )
             }
-            lastSelSig = sig   // ★点下去后才标记"这页已点"（否则屏外那次会把它误标成已完成 → 卡死）
-            lastSelTaps++      // ★计数 = "真点了几次"（PC 同口径），到 LAB_SELECT_TAP_MAX 才停手
+            // ★★"一次都没点出去"要说出来（2026-11-08 事故：取不到坐标 ⇒ 静默空转 20 秒，
+            //   日志里只有一屏幕 `⏸ 3 选 1`，完全看不出为什么）。节流：本轮第一次 + 每 10 次。
+            if (xyOk == 0 && xyNull > 0) {
+                val kNoXY = "$tag|noxy"
+                val c = (tries[kNoXY] ?: 0) + 1
+                tries[kNoXY] = c
+                if (c == 1 || c % 10 == 0) {
+                    AppState.addLog(
+                        "[!] $kind 页一次都没点出去：取不到「决定」坐标（${selXYWhy.ifBlank { "?" }}）" +
+                            "（第 $c 轮；本页决策=${if (cid == 0) "?" else cid}）",
+                    )
+                }
+            } else if (xyOk > 0) {
+                tries.remove("$tag|noxy")
+            }
+            // ★★2026-11-08 修死循环：`lastSelSig` 现在**不管点没点都记**（= "这一组卡已经处理过一轮"），
+            //   而 `lastSelTaps` **只在真点出去过时才 +1**（= "真点了几次"）。
+            //   原来两个都无条件更新 + 递归前把 sig 清成 null ⇒ 递归进来走"卡片签名变了"分支
+            //   ⇒ `lastSelTaps` 每轮被清零 ⇒ 永远到不了上限 ⇒ 既不退树兜底也不停手
+            //   （实测空转 20 秒，日志只有一屏幕 `⏸ 3 选 1`）。
+            lastSelSig = sig
+            if (xyOk > 0) lastSelTaps++
             lastSelTapAt = SystemClock.elapsedRealtime()
             // ★★快速重试（2026-11-07 用户）：点了没离开就**立刻重读卡片 + 重新决策 + 再点**，
             //   不等主循环下一轮（那要 1s+）。卡片滑入动画/位置刷新时这样能秒级自我修正。
-            // ★超时 = 最后读到的仍是 Selection ⇒ 页面没走，重读卡片再点即可
-            //   （2026-11-07 用户：不用再补一次判页，超时本身就说明没变）
             if (!left && lastSelTaps < SEL_RETRY_MAX) {
-                lastSelSig = null            // 允许重读（否则会被"同一组卡已点过"挡住）
+                // ★只有"点过但没生效"才清 sig（允许立刻重读重决策）；
+                //   "一次都没点出去"则保留 sig ⇒ 递归进去会走节流分支（等 [LAB_SELECT_RETAP_MS]
+                //   再试），既不会无限快转，也不会把计数清零。
+                if (xyOk > 0) lastSelSig = null
                 kotlinx.coroutines.delay(120)
                 // ★带上本次的卡片签名：下一轮读出来若不同 ⇒ 是新一轮（Boss 两轮），不是没点上
                 return handleLabSelection(input, st, tag, pick, tries, kind, prevSig = sig)
@@ -3210,14 +3396,10 @@ object MazeLoop {
         }
     }
 
-    /** ★选人/门票页：本页**第一次点**「决定」前的等待（让按钮的入场动画走完，见调用处注释）。
-     *  2026-10-17 用户："选人的 0.7 改成 0.5" ⇒ 700 → 500。 */
-    private const val SEL_TAP_LEAD_MS = 500L
-
-    /** ★遗物页：**第一次点**「决定」前的等待（2026-10-17 用户："选遗物加上 0.5（仅第一次点击）"）。
-     *  同理选人页：卡片是**字段读**（几十 ms ✓）⇒ 卡面就绪 ≠ 按钮就绪（刚见过"决定坐标还在屏外
-     *  (1515,1228)、下一轮才落位到 (1515,935)"）⇒ 第一次点前等一下，免得点空。 */
-    private const val REL_TAP_LEAD_MS = 500L
+    // ★（2026-11-08 删）`SEL_TAP_LEAD_MS` / `REL_TAP_LEAD_MS` = 500ms 的"首点前死等"。
+    //   用户："三选一的页面上，多点几次选择是没关系的，不太怕点的快了" ⇒ 改成
+    //   **点一下 → 探到离开就停 → 没走就现取坐标再点**（见 [tapAndCheck] 的 `xyAt`/`probe`）。
+    //   ★原来那 500ms 治的是"点空"（按钮还在从屏外滑入），而"点空"的真因是**重试时用了旧坐标**。
 
     /** ★「选择」按钮（选人/门票/遗物页都在 DialogArea 里）：**先限根 `dialog`**（几十 ms ✓）、
      *  空了再全树兜底（2026-10-17：全树一次实测 ~3s ✗，这些页每轮都要找它 ⇒ 单通道常被占住 ⇒
@@ -3227,6 +3409,73 @@ object MazeLoop {
         if (a != null && a.length() > 0) return a
         return AgentApi.findTextList("选择", max)
     }
+
+    /**
+     * ★★点「决定」前**现取坐标**（2026-11-08 用户："三选一的页面上，多点几次选择是没关系的，
+     *   不太怕点的快了"）。
+     *
+     * 为什么不能"一次算好坐标就反复点"：按钮带**从屏外滑入的入场动画**，实测同一张卡三帧读到
+     * ```
+     * 12:41:54 (405,1187)  ← 屏外
+     * 12:41:56 (405,944)   ← 点了，空
+     * 12:41:57 (405,887)   ← 点了，中
+     * ```
+     * ⇒ 第一下拿旧坐标**必然点空**（这才是"总要点两下"的真正原因，不是需要等 500ms）。
+     *
+     * @param reread **重读卡片的那个接口** —— 必须是**决策时用的同一个**（见下）
+     * @param rid 目标卡的 `rewardId` —— 用来锁定**同一张卡**
+     * @param idx 目标卡下标（`rewardId` 对不上时兜底）
+     * @return 屏内坐标；`null` = **这一下不该点**（还没落位 / 卡片已换）
+     *
+     * ★★★2026-11-08 事故（用户："选人一直没点下去"）：这个函数原来**写死**用 `labChoices` 重读。
+     *   但选人页（`SUMMON_UNIT` + `DialogLabyrinthSelection`）的卡片是 `labSelection` 读出来的，
+     *   **`labChoices` 在那页永远返回空**（实测 `{"cards":[],"why":"结构列表=n=3 找到DecideButton=0"}`）
+     *   ⇒ 取不到坐标 ⇒ `tapAndCheck` **一次都不点** ⇒ 空转 20 秒，日志里只有一屏幕 `⏸ 3 选 1`。
+     *   ⇒ 现在把"怎么重读"作为参数传进来，由调用方按页面类型给（与决策同源）。
+     */
+    private suspend fun selDecideXY(
+        reread: suspend () -> org.json.JSONArray?,
+        rid: Any?,
+        idx: Int,
+    ): Pair<Int, Int>? {
+        val arr = runCatching { reread() }.getOrNull()
+        if (arr == null || arr.length() == 0) {
+            selXYWhy = "重读拿不到卡片（${if (arr == null) "接口报错/超时" else "空列表"}）"
+            return null
+        }
+        var hit: JSONObject? = null
+        if (rid != null && rid !== JSONObject.NULL && rid.toString().isNotEmpty()) {
+            for (i in 0 until arr.length()) {
+                val c = arr.optJSONObject(i) ?: continue
+                if (c.opt("rewardId")?.toString() == rid.toString()) { hit = c; break }
+            }
+        }
+        if (hit == null) {
+            // ★★rewardId 对不上 ⇒ **退回下标**（2026-11-08 实测事故：这里原来直接 return null，
+            //   于是"取不到坐标 ⇒ tapAndCheck 一次都不点 ⇒ 外层递归又把计数清零 ⇒ 无限循环 20 秒"）。
+            //   ★只在张数够的情况下退，避免"3 张变 2 张"时错位点到别人。
+            if (idx in 0 until arr.length()) {
+                hit = arr.optJSONObject(idx)
+                if (hit != null) selXYWhy = "rid=$rid 对不上，退回 idx=$idx"
+            } else {
+                selXYWhy = "rid=$rid 对不上且张数不足（${arr.length()} 张，idx=$idx）"
+            }
+        }
+        if (hit == null) { if (selXYWhy.isEmpty()) selXYWhy = "取不到目标那张卡"; return null }
+        if (!hasDecideXY(hit)) { selXYWhy = "目标那张没有 decideX/Y"; return null }
+        val x = hit.optInt("decideX")
+        val y = hit.optInt("decideY")
+        // ★坐标在屏外（按钮还在从屏外滑入）⇒ 这一下不点（等落位）
+        if (x !in 0 until scrW || y !in 0 until scrH) {
+            selXYWhy = "坐标在屏外（$x,$y / 屏幕 ${scrW}x$scrH）"
+            return null
+        }
+        selXYWhy = ""
+        return x to y
+    }
+
+    /** 上一次 [selDecideXY] 返回 null 的原因（诊断日志用；成功时清空） */
+    private var selXYWhy: String = ""
 
     /** 这张卡有没有可用的「决定」按钮坐标（`decideX/decideY`；JSON null 不算） */
     private fun hasDecideXY(c: JSONObject): Boolean {
@@ -3292,6 +3541,9 @@ object MazeLoop {
         return true
     }
 
+    /** 上一次因为"地图被弹窗盖着"而没点节点的顶框名（同值只报一次，别刷屏） */
+    private var moveBlockedTop: String = ""
+
     /**
      * PC 版 `maze_loop` 的**"移动"分支**（6373~6458）：`statusType==0` 时点地图上的目标节点前进。
      *
@@ -3303,6 +3555,20 @@ object MazeLoop {
      * @return true = 本轮点了或拖了（有效动作）；false = 什么也没找到（调用方据此加 `idle`）
      */
     private suspend fun handleMove(input: InputBackend, st: JSONObject, screenW: Int, screenH: Int): Boolean {
+        // ★★2026-11-08 修（实测 12:43:01）：**遗物选中之后** `statusType` 会先变成 NONE(0)，
+        //   而"收到遗物的确认框"还没盖上来 ⇒ 这一轮就走到这里去点**地图节点**，
+        //   而顶框其实还是遗物框（`DialogLabyrinthSelection`）⇒ 那一下打在框上
+        //   （运气好点空，运气不好点点到别的卡/别的按钮）。
+        //   ⇒ 顶框不为空 = 地图被弹窗盖着 ⇒ **这一轮不点也不拖**，等弹窗被处理掉。
+        val topNow = jStr(st, "pageTop")
+        if (topNow.isNotEmpty()) {
+            if (moveBlockedTop != topNow) {
+                moveBlockedTop = topNow
+                AppState.addLog("… 地图上还盖着「$topNow」→ 先不点节点（等弹窗处理完）")
+            }
+            return true
+        }
+        moveBlockedTop = ""
         val nodesArr = AgentApi.labNodes()
         // ★别用 optJSONObject(Int)：各 org.json 实现里这个重载不一样（Android 运行时 / 单测的 json-java
         //   甚至会被解析成 "optJSONObject(String)"）→ 统一走 opt(i) as? JSONObject
@@ -3434,7 +3700,8 @@ object MazeLoop {
     ) {
         // 遇到 BOSS 节点：记下本区 Boss unitId（遗物特殊条件要用；PC 靠 labyrinth_state.json 的 boss 列表）
         if (st.optInt("statusType") == 6) {
-            val q = st.optString("questId")
+            // ★questId 是**按需读**的（分派读里没有）⇒ 只有 BOSS 节点才读一次
+            val q = extraIds()?.optString("questId").orEmpty()
             val a = (st.opt("area") as? Number)?.toInt()
             if (q.isNotBlank() && a != null) PartyPlan.bossOf(q)?.let { bossByArea[a] = it }
         }
@@ -3510,7 +3777,7 @@ object MazeLoop {
                 val r = AgentApi.labResetCaches()
                 AppState.addLog(
                     "[遗物] 候选不干净（认表 $known/${cards.size} 张，应有 3 张：$idsBrief）→ 疑似读数异常 ⇒ " +
-                        "**丢缓存重解析**（清 ${r?.opt("cleared") ?: "?"} 项）后重读 ｜LTD候选=${ltdChoicesBrief(st)}",
+                        "**丢缓存重解析**（清 ${r?.opt("cleared") ?: "?"} 项）后重读 ｜LTD候选=${ltdChoicesBrief()}",
                 )
                 return false
             }
@@ -3557,13 +3824,39 @@ object MazeLoop {
             return false
         }
         // ★真点下去才算一次尝试（PC `tap_xy` 同款语义）
-        // ★★第一次点前等 [REL_TAP_LEAD_MS]（2026-10-17 用户："选遗物加上 0.5（仅第一次点击）"）
-        //   判据用"这一组候选的点击次数 `n`"（`n == 1` = 第一次；重试不再等 ✓，同选人页口径）。
-        if (n == 1) {
-            if (rn <= 2) AppState.addLog("… [遗物] 第一次点前等 ${REL_TAP_LEAD_MS}ms 让「决定」按钮落位")
-            delay(REL_TAP_LEAD_MS)
-        }
-        if (tap(input, dx, dy, "选择遗物：${c.opt("rewardId")}${if (n > 1) "（第 $n 次）" else ""}")) {
+        // ★★2026-11-08：**不再首点前死等 500ms**（同选人页 —— 用户："三选一多点几次没关系，不太怕点快"）。
+        //   原来那 500ms 是在赌"再等一会儿按钮就落位"；现在上面已经判过"坐标在屏内"才走到这儿，
+        //   而且每轮都是 `force 重读`拿到的最新坐标 ⇒ 直接点，点不中还有 [REL_TAP_MAX] 次机会。
+        // ★★2026-11-08 三次改（实测 15:41:47）：**判据不能用顶框名**。
+        //   遗物选中后 `statusType` 立刻变（RELIC_CHOICE(9) → SUMMON_UNIT(1)/NONE(0)），
+        //   但**顶框名 3.9 秒都不变**（实测 15:41:47→15:41:52 才出现 DialogCommonBig）⇒
+        //   只认顶框名 ⇒ 探 580ms 也判不出"已离开" ⇒ 白点第二下。
+        //   ⇒ 判据改成 `statusType|pageTop` 组合签名（同一个思路见 [Navigator.locSig]）：
+        //     任一变化就算"这一下生效了"。
+        val fromSig = "${st.optInt("statusType", -1)}|${jStr(st, "pageTop")}"
+        val tapped = tapAndCheck(
+            input, dx, dy, "选择遗物：${c.opt("rewardId")}${if (n > 1) "（第 $n 次）" else ""}",
+            from = setOf(fromSig),
+            // 探针读**状态**（内存读 4ms）：statusType 一变就立刻确认，不必等顶框名
+            readTop = {
+                val l = runCatching { AgentApi.labStatusLite(timeoutMs = 1_200L) }.getOrNull()
+                if (l == null) "!read" else "${l.optInt("statusType", -1)}|${l.optString("pageTop")}"
+            },
+            unknownTop = "!read",          // 读不到 ⇒ 当成"还没离开"（绝不误判成生效）
+            // 不传 expect：离开遗物框就算完成（后面是确认框还是地图，交给状态机）
+            // ★不猜设备速度（同选人页）：密集点 + 点完立刻探，页面一变就停
+            retries = 8, settleMs = 200L, probe = 2, probeMs = 150L,
+            xyAt = {
+                // ★每一下都重读**这张卡**的坐标（按钮在滑入 ⇒ 旧坐标会点空）；
+                //   重读失败就退回本轮算好的坐标（外层刚判过它在屏内）
+                selDecideXY(
+                    reread = { AgentApi.labChoices(force = true)?.optJSONArray("cards") },
+                    rid = c.opt("rewardId"),
+                    idx = k,
+                ) ?: if (dx in 0 until scrW && dy in 0 until scrH) dx to dy else null
+            },
+        )
+        if (tapped) {
             relicChoiceTries[tag] = sig to n
             // ★悬浮窗：遗物三选一选中了谁（`2★ xxx`；查不到表就显示 rewardId）
             OverlayStatus.setState(
@@ -3571,7 +3864,7 @@ object MazeLoop {
             )
             AppState.addLog(
                 "[遗物] 选 ${c.opt("rewardId")}（${cards.size} 张里认表 $known 张）：候选=[${cards.map { it.opt("rewardId") }}] " +
-                    "理由=${relicPick.relicPickNote(c, ctx)} ｜LTD候选=${ltdChoicesBrief(st)}",
+                    "理由=${relicPick.relicPickNote(c, ctx)} ｜LTD候选=${ltdChoicesBrief()}",
             )
             return true
         }
@@ -3758,6 +4051,9 @@ object MazeLoop {
         preTeamJob = null
         // ★把"本节点失败过"传给规划：个别关卡档会据此补 1 个坦克/兼职坦克（`tank_on_fail`，用户 2026-10-16）
         val _tPlan = SystemClock.elapsedRealtime()
+        // ★★按需补 ids：组队判定（`PartyPlan.stageFor`）要看 **questId** 才知道"这是不是 Boss 格"
+        //   （分派读里没有 questId ⇒ 这里补读一次，~0ms）。
+        fillIds(st)
         val plan = PartyPlan.partyPlan(st, pt, ctx, failed = (nodeFailed[nodeKey(st)] ?: 0) > 0)
         val _planMs = SystemClock.elapsedRealtime() - _tPlan
         // ★★"进编组页 → 算出目标队伍"的分段耗时（2026-11-07 用户："这段中间可能有些地方慢"）。
@@ -4355,9 +4651,9 @@ object MazeLoop {
      * ★★特别装备三连页：**打包自己跑完**（2026-11-08，不走主循环）。
      *
      * · 编组页点开「特别装备」后**当场**把三连页走完，主循环**根本不会看到 EX 页**
-     *   ⇒ 也就不会在 EX 页上读 `labStatus`（全量 150~300ms，EX 页上根本用不上）。
+     *   ⇒ 也就不会在 EX 页上读 `labStatus`（EX 页上根本用不上那些字段）。
      * · 内部循环 = 「读签名（状态检测）→ 决策 → 点一下 → 再读签名看变了没」，
-     *   每步只有**一次**轻量读（签名）+ **一次**整包读（要按钮坐标）。
+     *   每步只有**一次**轻量读（签名）+ **一次**按需读（只要那一个按钮的坐标）。
      * · 流程是确定的线性序列：编组页 →（点「特别装备」）→ ①特别装备设定 → ②自动特别装备设定
      *   → ③优先属性值 → ② → ① →（点「装备确定」）→ 编组页。
      */
@@ -4450,10 +4746,10 @@ object MazeLoop {
             if (sess.tapSig != sigNow) {
                 sess.tapSig = sigNow
                 sess.tapN = 0
-                // ★把两种读的耗时都打出来（轻量签名读 vs 整包读）——
+                // ★把两种读的耗时都打出来（轻量签名读 vs 按需读按钮）——
                 //   间隔取值（轮询/探针）要照着真实耗时定，不能想当然。
                 AppState.addLog(
-                    "    · 状态检测 ${detMs}ms（签名=$sigNow）｜整包读累计 ${sess.fullMs}ms",
+                    "    · 状态检测 ${detMs}ms（签名=$sigNow）｜按钮读累计 ${sess.fullMs}ms",
                 )
             }
             if (fullFail >= 3) {
@@ -4475,15 +4771,15 @@ object MazeLoop {
                 }
                 delay(EXEQ_POLL_MS); continue
             }
-            // ★"此刻该等"（刚点完「自动装备」、页面正在切到②）⇒ 不点，等一下再看（省一次整包读）
+            // ★"此刻该等"（刚点完「自动装备」、页面正在切到②）⇒ 不点，等一下再看（省一次读）
             if (rule.waitWhile?.invoke(sess) == true) { delay(EXEQ_POLL_MS); continue }
             // ── ④ 执行转移：**点一下，等到达目标页**（tapAndCheck 阶段 1 的语义）──
-            //   · ★**整包读（~400ms）每轮只做一次**：拿动作 + 按钮坐标，之后**复用同一个坐标** ⇒
+            //   · ★**按需读按钮（~10ms）每轮只做一次**：拿动作 + 按钮坐标，之后**复用同一个坐标** ⇒
             //     多点也点在**同一个位置**上（不会落到别的目标）；页面若在动 ⇒ 下一轮外层会重读拿新坐标。
-            //   · ★整包读到的签名必须与外层的轻量签名**一致**（不一致 ⇒ 页面正在切 ⇒ 这一轮不点）。
+            //   · ★读回来的签名必须与外层的轻量签名**一致**（不一致 ⇒ 页面正在切 ⇒ 这一轮不点）。
             //   · ★★方案 B：判据是**"到达目标页了没"**（不是"签名变了没"）：
             //     没到目标 ⇒ 这次没生效 ⇒ **重试同一个动作**（同一按钮实例），不重新决策点别的。
-            var cachedAct: ExeqAct? = null          // ★本轮的动作缓存（整包读只做一次）
+            var cachedAct: ExeqAct? = null          // ★本轮的动作缓存（读按钮只做一次）
             val ok = tapAndCheck(
                 input, 0, 0, rule.what,
                 from = setOf(sigNow),
@@ -4500,27 +4796,29 @@ object MazeLoop {
                 xyAt = xyAt@{
                     // ① 页面已经切走？⇒ 这一次不点（外层循环会重新读页面状态）
                     if (exeqSigNow() != sigNow) return@xyAt null
-                    // ② 拿动作：★**本轮只读一次整包**（~400ms），之后复用同一个按钮/坐标
+                    // ② 拿动作：★**本轮只读一次那一个按钮**（按需读，~10ms），之后复用同一个坐标
                     val act = cachedAct ?: run {
                         val tFull = android.os.SystemClock.elapsedRealtime()
-                        // ★只投影**要点的那个**按钮（agent 侧）—— ①页实测全投影要 380ms
-                        val xr = AgentApi.labExEquip(true, rule.btnKey, timeoutMs = EXEQ_READ_FULL_MS)
+                        // ★★**按需读**（2026-11-08）：只要**这一步要点的那个按钮** + 当前签名，
+                        //   不再读"整包"（整包会把页里其它控件也过一遍：setting 的 4 行文字/复选框、
+                        //   sort 的 11 个 toggle 文字 —— 每个都是一次游戏线程调用 ⇒ 纯浪费）。
+                        val xr = AgentApi.labExBtn(rule.btnKey, sess.tapBtnId, timeoutMs = EXEQ_READ_FULL_MS)
                         sess.fullMs += android.os.SystemClock.elapsedRealtime() - tFull
                         if (xr == null) {
                             fullFail++
-                            exeqSay(sess, "整包读失败（agent 没回包）→ 这一轮不点")
+                            exeqSay(sess, "按钮读失败（agent 没回包）→ 这一轮不点")
                             return@xyAt null
                         }
                         fullFail = 0
                         val sr = xr.optString("sig")
                         // ★读数与外层不一致 ⇒ 页面正在切/状态在变 ⇒ 这一轮**不点**（避免点到别的按钮）
                         if (sr != sigNow) {
-                            exeqSay(sess, "整包签名≠轻量签名（页面在切）→ 这一轮不点")
+                            exeqSay(sess, "读数签名≠轻量签名（页面在切）→ 这一轮不点")
                             return@xyAt null
                         }
                         // ★按**转移表**的动作取按钮（外层已用签名定好"这一步做什么、去哪"；
                         //   这里只补上按钮实例 + 最新坐标）
-                        val a = exeqActOf(rule, xr, sess) ?: run {
+                        val a = exeqActOf(rule, xr) ?: run {
                             exeqSay(sess, "${rule.what}：按钮读不到（页面数据不全）→ 这一轮不点")
                             return@xyAt null
                         }
@@ -4629,13 +4927,12 @@ object MazeLoop {
         val cond: (String, ExeqSess) -> Boolean,
         val what: String,
         val target: String,
-        val pick: (JSONObject, ExeqSess) -> JSONObject?,
-        /** ★**要点的那个按钮**的键**（agent 侧"只投影这一个"，省掉几百 ms 的坐标投影）：
-         *  按钮名（ThreeButtonRight…）或 "prio0" / "check" / "rare" */
+        /** ★**要点的那个按钮**的键**（agent 侧"按需读"这一个：按钮名 / "prio0" / "check" / "rare"）
+         *  —— 读法见 [AgentApi.labExBtn]（只读这一个按钮 + 当前签名，不读整包）。 */
         val btnKey: String,
         val markAuto: Boolean = false,
         val isFinal: Boolean = false,
-        /** ★"此刻该等"（如：刚点完「自动装备」、页面正在切）⇒ 不点，等一下再看（省一次整包读） */
+        /** ★"此刻该等"（如：刚点完「自动装备」、页面正在切）⇒ 不点，等一下再看（省一次读） */
         val waitWhile: ((ExeqSess) -> Boolean)? = null,
     )
 
@@ -4648,7 +4945,6 @@ object MazeLoop {
                 cond = { sig, _ -> exeqTriOf(sig, "change") == true },
                 what = "装备确定",
                 target = EXEQ_OFF_PAGE,
-                pick = { p, s -> _exeqBtn(p.optJSONArray("buttons"), "ThreeButtonRight", s.tapBtnId) },
                 btnKey = "ThreeButtonRight",
                 isFinal = true,
             ),
@@ -4657,13 +4953,9 @@ object MazeLoop {
                 cond = { sig, s -> exeqTriOf(sig, "change") == false && s.auto && !s.sawSetting },
                 what = "自动装备（等切到②·超时重试）",
                 target = EXEQ_PAGE_SETTING,
-                pick = { p, s ->
-                    // ★刚点完「自动装备」，页面正在切到② ⇒ change=false 只是**中间态**，
-                    //   绝不能据此判"自动装备后无改动"（那会跳到「取消」⇒ 点错按钮，2026-11-08 实测）。
-                    //   超过 [EXEQ_AUTO_WAIT_MS] 还没切过去 ⇒ 那次点击没生效 ⇒ 再点一次。
-                    if (System.currentTimeMillis() - s.autoAt < EXEQ_AUTO_WAIT_MS) null
-                    else _exeqBtn(p.optJSONArray("buttons"), "ThreeButtonCenter", s.tapBtnId)
-                },
+                // ★刚点完「自动装备」，页面正在切到② ⇒ change=false 只是**中间态**，
+                //   绝不能据此判"自动装备后无改动"（那会跳到「取消」⇒ 点错按钮，2026-11-08 实测）。
+                //   超过 [EXEQ_AUTO_WAIT_MS] 还没切过去 ⇒ 那次点击没生效 ⇒ 再点一次（见 waitWhile）。
                 btnKey = "ThreeButtonCenter",
                 markAuto = true,
                 waitWhile = { s -> System.currentTimeMillis() - s.autoAt < EXEQ_AUTO_WAIT_MS },
@@ -4673,7 +4965,6 @@ object MazeLoop {
                 cond = { sig, s -> exeqTriOf(sig, "change") == false && s.auto && s.sawSetting },
                 what = "取消（自动装备后无改动）",
                 target = EXEQ_OFF_PAGE,
-                pick = { p, s -> _exeqBtn(p.optJSONArray("buttons"), "ThreeButtonLeft", s.tapBtnId) },
                 btnKey = "ThreeButtonLeft",
                 isFinal = true,
             ),
@@ -4682,7 +4973,6 @@ object MazeLoop {
                 cond = { sig, _ -> exeqTriOf(sig, "change") == false },
                 what = "自动装备",
                 target = EXEQ_PAGE_SETTING,
-                pick = { p, s -> _exeqBtn(p.optJSONArray("buttons"), "ThreeButtonCenter", s.tapBtnId) },
                 btnKey = "ThreeButtonCenter",
                 markAuto = true,
             ),
@@ -4695,7 +4985,6 @@ object MazeLoop {
                 },
                 what = "「全部」行 进「优先属性值」",
                 target = EXEQ_PAGE_SORT,
-                pick = { p, _ -> p.optJSONArray("prioBtn")?.optJSONObject(0) },
                 btnKey = "prio0",
             ),
             ExeqRule(
@@ -4706,7 +4995,6 @@ object MazeLoop {
                 },
                 what = "复选框(补勾)",
                 target = EXEQ_PAGE_SETTING,
-                pick = { p, _ -> p.optJSONObject("checkBtn") },
                 btnKey = "check",
             ),
             ExeqRule(
@@ -4717,7 +5005,6 @@ object MazeLoop {
                 },
                 what = "复选框(取消勾选·不抢别队装备)",
                 target = EXEQ_PAGE_SETTING,
-                pick = { p, _ -> p.optJSONObject("checkBtn") },
                 btnKey = "check",
             ),
             ExeqRule(
@@ -4728,7 +5015,6 @@ object MazeLoop {
                 },
                 what = "确认",
                 target = EXEQ_PAGE_PARTY,
-                pick = { p, s -> _exeqBtn(p.optJSONArray("buttons"), "TwoButtonRight", s.tapBtnId) },
                 btnKey = "TwoButtonRight",
             ),
             // ── ③ 优先属性值（sort）──
@@ -4737,7 +5023,6 @@ object MazeLoop {
                 cond = { sig, _ -> exeqFieldOf(sig, "sel") == "稀有度" },
                 what = "确认",
                 target = EXEQ_PAGE_SETTING,
-                pick = { p, s -> _exeqBtn(p.optJSONArray("buttons"), "TwoButtonRight", s.tapBtnId) },
                 btnKey = "TwoButtonRight",
             ),
             ExeqRule(
@@ -4745,15 +5030,6 @@ object MazeLoop {
                 cond = { _, _ -> true },
                 what = "「稀有度」",
                 target = EXEQ_PAGE_SORT,
-                pick = { p, _ ->
-                    val tg = p.optJSONArray("toggles") ?: org.json.JSONArray()
-                    var hit: JSONObject? = null
-                    for (i in 0 until tg.length()) {
-                        val t = tg.optJSONObject(i) ?: continue
-                        if (hit == null && t.optString("label") == "稀有度") hit = t
-                    }
-                    hit
-                },
                 btnKey = "rare",
             ),
         )
@@ -4776,10 +5052,9 @@ object MazeLoop {
         return null
     }
 
-    /** ★按转移表的动作，从**整包**里取要点的那个按钮（取不到 ⇒ 不点） */
-    private fun exeqActOf(r: ExeqRule, x: JSONObject, sess: ExeqSess): ExeqAct? {
-        val p = x.optJSONObject("page") ?: JSONObject()
-        val btn = r.pick(p, sess) ?: return null
+    /** ★按转移表的动作，取**按需读回来的那一个按钮**（取不到 ⇒ 不点） */
+    private fun exeqActOf(r: ExeqRule, x: JSONObject): ExeqAct? {
+        val btn = x.optJSONObject("btn") ?: return null
         if (btn.opt("x") == null) return null
         return ExeqAct(r.what, btn, r.target, r.markAuto, r.isFinal)
     }
@@ -5363,6 +5638,8 @@ object MazeLoop {
             //   ⇒ 进编组页后 [handlePartyEdit] 直接命中缓存，省掉整整一次算法（~1 秒）。
             runCatching {
                 val preCtx = PartyPlan.partyCtx()          // 2 个 RPC：持有池 + 遗物技能值（大地图就能读）
+                // ★按需补 ids：预计算也要 questId（判断是不是 Boss 格）⇒ 分派读里没有，这里补一次
+                fillIds(st)
                 preTeamJob = teamScope.async {
                     PartyPlan.precompute(preCtx, st, (nodeFailed[nodeKey(st)] ?: 0) > 0)
                 }
@@ -6649,156 +6926,29 @@ object MazeLoop {
         x: Int,
         y: Int,
         what: String,
-        /** 当前所在窗口（可以是多个：结算页就有 ResultWin / ExResult / BackKeyCapture 几种壳） */
         from: Set<String>,
         settleMs: Long = SEL_TICK_MS,
-        /** 同一坐标最多点几次（选人页传 1，由调用方重读卡片再重算坐标） */
         retries: Int = 1,
-        /** **阶段 2** 要等的目标窗口；传空集表示"离开 from 就算完成，不等后续页面" */
         expect: Set<String> = emptySet(),
-        /** 阶段 2 的等待上限（不点击，只轮询） */
         expectTimeoutMs: Long = 6_000L,
-        /** ★"当前在哪"的探针（默认用 [AgentApi.labTop]） */
         readTop: (suspend () -> String)? = null,
-        /** 探针读失败时的标记（默认 `""`；给了 [readTop] 时它会被当成"**没离开**"） */
         unknownTop: String = "",
-        /** ★每次点击前现取坐标（null = 这一轮不点，也不消耗重试次数） */
         xyAt: (suspend () -> Pair<Int, Int>?)? = null,
-        /**
-         * ★★点完**探**几次再决定要不要重试（>0 时启用；EX 流程用）。
-         *
-         * 为什么要"探"而不是"等一下就重试"（2026-11-08 实测）：
-         *   页面切换**动画**要 300~500ms 才走完，而"页面变了没"（签名）只在**动画结束**、
-         *   最上层容器真的换了之后才反映出来。⇒ "点完等 200ms 读一次，没变就再点"
-         *   **必然**误判成"没生效" ⇒ 必然多点，而且多点那下正好点在按钮收缩途中
-         *   （实测 ②「确认」 (1179,960) → 移动中 (1026,666)）。
-         *   ⇒ 改成：点完**连续探 [probe] 次**（每次隔 [probeMs]），探到"变了"就停；
-         *     探完还没变 ⇒ 才判"这次真没生效"（那时动画早结束、按钮已静止，再点才点得准）。
-         *   —— 这不是"加等待换精准"，是**用探针替代盲重试**（更快知道还没就绪）。
-         */
         probe: Int = 0,
-        /** 探针之间的间隔 */
         probeMs: Long = 150L,
-        /**
-         * ★阶段 1 的**目标达成判据**（可选，2026-11-08 方案 B）。
-         *
-         * 传了它 ⇒ 阶段 1 **只**认它：
-         *   · 读到的页面**到达目标** ⇒ 这次转移完成（进入阶段 2 / 返回 true）；
-         *   · "离开了 `from`，但没到目标" ⇒ 这次**没生效** ⇒ **重试同一个动作**
-         *     （由调用方保证 `xyAt` 重取同一按钮的坐标 ⇒ 多点也点在同一个按钮上）。
-         * 不传 ⇒ 老行为（离开 `from` 就算生效）。
-         */
         reached: (suspend (String) -> Boolean)? = null,
-    ): Boolean {
-        // ── 阶段 1：反复点，直到**离开 from**（证明这一下生效了）──
-        var attempt = 0
-        var skip = 0                        // ★"这一刻不该点"的次数（不消耗重试次数，但要有上限防死循环）
-        var left = false
-        var nowTop = ""
-        val maxProbe = probe.coerceAtLeast(1)
-        while (attempt < retries.coerceAtLeast(1)) {
-            // ★坐标：给了 [xyAt] 就**每次点击前现取**（切页动画期间坐标在动 ⇒ 旧坐标会点空）。
-            //   null = "此刻不该点"（页面正在切 / 读数不一致）⇒ 稍后再来，**不消耗** [retries]。
-            var px = x
-            var py = y
-            if (xyAt != null) {
-                val p = runCatching { xyAt() }.getOrNull()
-                if (p == null) {
-                    skip++
-                    if (skip > EXEQ_SKIP_MAX) return false
-                    kotlinx.coroutines.delay(EXEQ_POLL_MS)
-                    continue
-                }
-                px = p.first
-                py = p.second
-            }
-            attempt++
-            if (!tap(input, px, py, what)) return false
-            // ── 点完**探**一下"页面变没变" ──
-            var probed = 0
-            while (probed < maxProbe) {
-                kotlinx.coroutines.delay(if (probed == 0) settleMs else probeMs)
-                probed++
-                nowTop = if (readTop != null) {
-                    runCatching { readTop() }.getOrDefault(unknownTop)
-                } else {
-                    runCatching { AgentApi.labTop() }.getOrNull() ?: ""
-                }
-                // ★探针读失败（= unknownTop）⇒ **不算"离开"**（EX 流程里签名读不到时最上层的读数是陈旧的，
-                //   当成"点生效了"会让状态机直接跳到下一步 ⇒ 点错按钮）。
-                if (readTop != null && nowTop == unknownTop) continue
-                // ★★方案 B：判据优先用 [reached]（"到达目标页了没"）；
-                //   没传就退回老行为（离开 from 就算生效）。
-                val hit = if (reached != null) reached(nowTop) else (nowTop !in from)
-                if (hit) {
-                    left = true
-                    if (TRANS_VERBOSE) {
-                        AppState.addLog(
-                            "⤷ [${from.joinToString("/")}] --$what--> [$nowTop] " +
-                                "（第 $attempt 次点击，探 $probed 次已离开）",
-                        )
-                    }
-                    break
-                }
-                // ★★"**进战斗了**"也要算"离开"（2026-11-08 实测 10:39:55 修）：
-                //   进战斗时**编组页那个对话框可能还留在场景里** ⇒ labTop 仍是 DialogCommonPartyEdit
-                //   ⇒ 只看窗口名**永远判不出"点生效了"** ⇒ 一直重试（实测连点 6 下，其中 5 下
-                //   是点在战斗视图里的编组页坐标上，纯属浪费）。
-                //   ⇒ 真正的判据是 [AgentApi.labInBattle]（极轻：只读 ViewManager→当前 View 类名）。
-                if ("@battle" in from &&
-                    runCatching { AgentApi.labInBattle() }.getOrDefault(false)
-                ) {
-                    left = true
-                    if (TRANS_VERBOSE) {
-                        AppState.addLog(
-                            "⤷ [${from.joinToString("/")}] --$what--> [已进入战斗] " +
-                                "（第 $attempt 次点击，探 $probed 次）",
-                        )
-                    }
-                    break
-                }
-            }
-            if (left) break
-        }
-        if (!left) return false
-        if (expect.isEmpty()) return true
-
-        // ── 阶段 2：**停手**，只等目标页面出现（2026-11-07 用户：
-        //    "离开前一个页面就结束点击，但要等到后一个页面出现，才算状态机完成"）──
-        val t0 = android.os.SystemClock.elapsedRealtime()
-        // ★★2026-11-07 修（实测 19:44:06~19:44:12 白等 6 秒）：
-        //   原来只要 `expect` 里带 "@battle"，就**只**查 inBattle、**再也不查窗口名**（continue 掉了）
-        //   ⇒ "进编组页"这种目标永远等不到 ⇒ 白等满 expectTimeoutMs。
-        //   现在**两个都查**：先看窗口名（便宜、准），再看 inBattle。
-        while (android.os.SystemClock.elapsedRealtime() - t0 < expectTimeoutMs) {
-            // ①窗口名
-            val t = runCatching { AgentApi.labTop() }.getOrNull() ?: ""
-            if (t in expect) {
-                if (TRANS_VERBOSE) {
-                    AppState.addLog(
-                        "⤷ 阶段2 [$from] --$what--> 到达 [$t] 用时 ${android.os.SystemClock.elapsedRealtime() - t0}ms",
-                    )
-                }
-                return true
-            }
-            // ②特殊目标 `@battle`：进战斗后**没有对话框**（labTop 是空串），只能用 `inBattle` 判
-            //   （2026-11-07 用户提醒）。它要读全量状态，所以间隔放到 300ms。
-            if ("@battle" in expect) {
-                // 用极简 `labView`（只读 ViewManager→当前 View 类名），比 labStatus 快一个数量级
-                if (runCatching { AgentApi.labInBattle() }.getOrDefault(false)) {
-                    if (TRANS_VERBOSE) {
-                        AppState.addLog(
-                            "⤷ 阶段2 [$from] --$what--> 已进入战斗 用时 ${android.os.SystemClock.elapsedRealtime() - t0}ms",
-                        )
-                    }
-                    return true
-                }
-            }
-            kotlinx.coroutines.delay(100)
-        }
-        AppState.addLog("⤷ 阶段2 [$from] --$what--> 等 $expectTimeoutMs ms 仍未到达（期望 $expect）")
-        return false
-    }
+    ): Boolean = TapCheck.run(
+        tapFn = { tx, ty, tw -> tap(input, tx, ty, tw) },
+        x = x, y = y, what = what, from = from,
+        settleMs = settleMs, retries = retries,
+        expect = expect, expectTimeoutMs = expectTimeoutMs,
+        readTop = readTop, unknownTop = unknownTop,
+        xyAt = xyAt, probe = probe, probeMs = probeMs, reached = reached,
+        // ★下面三个就是原来写死在本文件里的常量，值完全一致（别在这里改行为）
+        skipMax = EXEQ_SKIP_MAX,
+        skipDelayMs = EXEQ_POLL_MS,
+        verbose = TRANS_VERBOSE,
+    )
 
     /**
      * **等编队页卡片铺好 / 滚到位**（2026-11-07）：替代原来固定的 `LAB_PARTY_SETTLE_MS`(1.5s)
@@ -7119,9 +7269,11 @@ object MazeLoop {
 
     /** LTD（`labStatus.choices`）里的候选简报：`序号:rewardId`，最多 6 条 —— 遗物选择排障用。
      *  它和"卡片上的 id"是**两条独立读法**（`LabyrinthStatus.Choices` vs 卡片 `choiceInfo`），
-     *  两边都对得上 ⇒ 读数正常；只有卡片那侧是垃圾 ⇒ 是卡片路径坏了（2026-10-17 那次就是这个形状）。 */
-    private fun ltdChoicesBrief(st: JSONObject): String {
-        val a = st.optJSONArray("choices") ?: return "(无字段)"
+     *  两边都对得上 ⇒ 读数正常；只有卡片那侧是垃圾 ⇒ 是卡片路径坏了（2026-10-17 那次就是这个形状）。
+     *
+     *  ★`choices` 是**按需读**的（分派读里没有）⇒ 这儿现读一次（~0ms，纯内存读）。 */
+    private suspend fun ltdChoicesBrief(): String {
+        val a = extraIds()?.optJSONArray("choices") ?: return "(无字段)"
         if (a.length() == 0) return "(空)"
         val sb = StringBuilder()
         for (i in 0 until minOf(a.length(), 6)) {
@@ -7136,5 +7288,28 @@ object MazeLoop {
     private fun jStr(o: JSONObject, key: String): String {
         val v = o.opt(key) ?: return ""
         return if (v === JSONObject.NULL) "" else v.toString()
+    }
+
+    /**
+     * ★★**按需读：非分派字段**（ids）—— 见 [AgentApi.labExtra]。
+     *
+     * 分派读（`labStatusLite`）里**没有** eventId/questId/eventResultId/effectNum/curChoice/remainChoice
+     * —— 那些只有个别 handler 用得到（事件页要 eventId、编组判定要 questId…）⇒ 要时再读。
+     * 全是**内存读**，实测 ~0ms。
+     */
+    private suspend fun extraIds(): JSONObject? = runCatching { AgentApi.labExtra() }.getOrNull()
+
+    /**
+     * ★把**按需读**到的 ids 补进状态对象（就地补，省得下游再改签名）。
+     *
+     * 只在**真的要用**的那条线上调：编组判定（[PartyPlan.stageFor]）要看 questId 才知道
+     * "这是不是 Boss 格"⇒ 不能每轮都读，但走到编组/预览那条线时必须补上。
+     */
+    private suspend fun fillIds(st: JSONObject): JSONObject {
+        val x = extraIds() ?: return st
+        for (k in arrayOf("questId", "eventId", "eventResultId", "effectNum", "curChoice", "remainChoice")) {
+            if (x.has(k) && !x.isNull(k)) st.put(k, x.get(k))
+        }
+        return st
     }
 }

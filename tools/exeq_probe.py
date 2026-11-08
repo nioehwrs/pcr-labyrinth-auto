@@ -44,9 +44,12 @@ def main() -> int:
     cases = [('sig', 'labExEquipSig', []), ('all', 'labExEquip', [True]),
              ('nocoord', 'labExEquip', [False]),
              ('TwoBtnRight', 'labExEquip', [True, 'TwoButtonRight']),
+             ('ThreeBtnRight', 'labExEquip', [True, 'ThreeButtonRight']),
              ('prio0', 'labExEquip', [True, 'prio0']),
              ('check', 'labExEquip', [True, 'check']),
-             ('rare', 'labExEquip', [True, 'rare'])]
+             ('rare', 'labExEquip', [True, 'rare']),
+             ('labStatus', 'labStatus', []),
+             ('labStatusLite', 'labStatusLite', [])]
     try:
         for name, fn, args in cases:
             times = []

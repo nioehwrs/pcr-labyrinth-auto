@@ -119,6 +119,18 @@ object AgentApi {
         obj("labStatus", timeoutMs = T_SLOW, errOut = errOut)
 
     /**
+     * ★★**分派读**（2026-11-08，"需要什么读什么"）：主循环每轮只用来**分派**的那些字段。
+     *
+     * 含 `area/blockId/enterId/difficulty/panelType/statusType/next/viewId/viewClass/pageTop`
+     * + `inBattle/battleView/battleState/battleResultEnable`。
+     *
+     * ★**不含** `eventId/questId/eventResultId/effectNum/curChoice/remainChoice/choices` ——
+     *   那些只有个别 handler 用得到 ⇒ 要时再调 [labExtra]（按需读）。
+     */
+    suspend fun labStatusLite(timeoutMs: Long = T_SLOW): JSONObject? =
+        obj("labStatusLite", emptyList(), timeoutMs)
+
+    /**
      * ★轻量「当前窗口」（2026-11-06 状态机）：只返回 `{top, raw, ms}`，
      * `top` 是**归一化**后的对话框名（去掉 `(Clone)` 之类后缀，空串 = 没有对话框）。
      *
@@ -390,6 +402,28 @@ object AgentApi {
 
     /** 最上层是不是"特别装备三连页"之一 */
     suspend fun labExEquipTop(): JSONObject? = obj("labExEquipTop", timeoutMs = T_FAST)
+
+    /**
+     * ★★**按需读按钮**（2026-11-08）：三连页"这一步只点一个按钮" ⇒ 只读**那一个** + 当前签名。
+     *
+     * @param key 按钮名（`ThreeButtonRight` / `TwoButtonRight` …）或 `"prio0"` / `"check"` / `"rare"`
+     * @param preferId ★**优先取这个实例**（GameObject 指针）—— 同一页可能有多个同名按钮，
+     *   传上次点的那个 ⇒ 多点时锁死在同一个实例上（取不到时 agent 侧回退"最靠下"的主按钮行）
+     * @return `{sig, top, btn:{name,x,y,id}}`；`btn` 为 null = 这页上没有这个按钮
+     *
+     * ★为什么不用 [labExEquip]：整包读会把**页里其它控件**也过一遍（setting 的 4 行文字 + 复选框、
+     *   sort 的 11 个 toggle 文字 —— 每个都是一次游戏线程调用）⇒ 纯浪费；本流程每步只点一个按钮。
+     */
+    suspend fun labExBtn(key: String, preferId: String? = null, timeoutMs: Long = T_SLOW): JSONObject? =
+        obj("labExBtn", listOf(key, preferId ?: ""), timeoutMs)
+
+    /**
+     * ★★**按需读：非分派字段**（2026-11-08）—— ids + LTD 候选清单。
+     *
+     * `{eventId, questId, eventResultId, effectNum, curChoice, remainChoice, choices[]}`。
+     * 只有个别 handler 用得到（事件页要 eventId、编组页要 questId…）⇒ 不塞进每轮都跑的分派读。
+     */
+    suspend fun labExtra(timeoutMs: Long = T_FAST): JSONObject? = obj("labExtra", emptyList(), timeoutMs)
 
     /**
      * 战斗格子预览页一步到位：`{top, start:{name,x,y}, party, nodes, ms}`。

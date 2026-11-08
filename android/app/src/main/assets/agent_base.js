@@ -5366,6 +5366,73 @@ function _findExTopPart() {
 
 // 某层对话框**子树内**的按钮（按名字）→ 坐标。
 // ★必须限定在该子树里：Two/ThreeButton* 在别的弹窗里也有同名的，全树找会串坐标
+// ★★通用按钮的**字段偏移**（dump.cs `DialogFundationObject`）：
+//   oneButtonWhite 0x28 / oneButtonBlue 0x38 / twoLeft 0x48 / twoRight 0x58
+//   threeLeft 0x70 / threeCenter 0x80 / threeRight 0x98
+//   路径：对话框组件(DialogCommonAbstract) → +0x118 fundationObject → +偏移 = CustomUIButton
+const _DLG_BTN_OFF = {
+  OneButtonWhite: 0x28, OneButtonBlue: 0x38,
+  TwoButtonLeft: 0x48, TwoButtonRight: 0x58,
+  ThreeButtonLeft: 0x70, ThreeButtonCenter: 0x80, ThreeButtonRight: 0x98,
+};
+let _dlgAbsType = null;
+
+/**
+ * ★★**按需**取对话框的通用按钮（**不遍历子树**）—— 2026-11-08。
+ *
+ * 为什么要它：遍历整棵子树找按钮，在①页要 **350ms+**（DialogCommonFullSize =
+ * 编组页的大容器，树里有几十张卡 + 一堆按钮）⇒ 这就是"点一下等半秒"的大头。
+ * 而按钮其实是**对话框的固定字段** ⇒ 直接按偏移取 ⇒ 几 ms。
+ */
+function _dlgBtnByField(dlgComp, name, env) {
+  const off = _DLG_BTN_OFF[name];
+  if (off == null || !dlgComp || dlgComp.isNull() || !env) return null;
+  try {
+    const fo = dlgComp.add(0x118).readPointer();      // DialogCommonAbstract.foundationObject
+    if (!ptrOk(fo)) return null;
+    const btn = fo.add(off).readPointer();            // CustomUIButton
+    if (!ptrOk(btn)) return null;
+    // ★★**必须核对名字 + 激活状态**（2026-11-08 实测踩到）：
+    //   对话框的按钮**字段全都存在**（不管这一页显示的是 One/Two/Three 哪种行），
+    //   例如①页显示 ThreeButton 行时，twoRightButton 字段仍指向一个对象 ⇒
+    //   直接按偏移取会**拿到"这一页根本没显示的按钮"**（坐标还是投影得出来）⇒ 点错。
+    //   ⇒ 名字要对得上、而且必须**在层级里是激活的**。
+    let g = null;
+    try { g = _inv(btn, "get_gameObject"); } catch (e) {}
+    if (!g || g.isNull()) return null;
+    let nm = "";
+    try { nm = _str(_inv(g, "get_name")); } catch (e) {}
+    if (nm !== name) return null;
+    let act = false;
+    try { act = _invBool(g, "get_activeInHierarchy"); } catch (e) {}
+    if (!act) return null;
+    const tr = _inv(btn, "get_transform");
+    if (!ptrOk(tr)) return null;
+    const p = _ndXY({ tr: tr }, env);
+    if (!p || !p.onscreen) return null;
+    return { name: name, x: p.x, y: p.y, id: String(g) };
+  } catch (e) { return null; }
+}
+
+/** ★拿最上层对话框的 `DialogCommonAbstract` 组件（按钮地基在它里面） */
+function _dlgCommonComp(go) {
+  try {
+    if (!_dlgAbsType) {
+      const k = findClass("DialogCommonAbstract");
+      if (!k || k.isNull()) return null;
+      const t = _typeOf(k);
+      if (!t || t.isNull()) return null;
+      _dlgAbsType = t;
+    }
+    let c = null;
+    try { c = _inv1o(go, "GetComponent", _dlgAbsType); } catch (e) {}
+    if (!c || c.isNull()) {
+      try { c = _inv2oi(go, "GetComponentInChildren", _dlgAbsType, 1); } catch (e) {}
+    }
+    return (c && !c.isNull()) ? c : null;
+  } catch (e) { return null; }
+}
+
 function _exeqButtons(rootTr, only) {
   const out = [];
   if (!rootTr || rootTr.isNull()) return out;
@@ -5415,45 +5482,38 @@ function _exeqSigOf(top, dlgName, change, row, checked, sel) {
   return top;
 }
 
-// ★**极轻**：只读特别装备三连页的**签名**（就一个字符串）。
-//   不算坐标、不读按钮、不回传整包 JSON —— 状态机轮询专用。
-//   （labels 只读第 0 个、toggles 只读"选中那个"的文字 ⇒ 比整包快照轻得多）
-function labExEquipSig() {
-  const out = { sig: null, err: null };
+// ★★EX 三连页的**页内状态**（签名里那几个字段）—— 抽出来给 [labExEquipSig]（只要签名）
+//   和 [labExBtn]（要按钮 + 签名）**共用** ⇒ 两边的签名口径永远一致（构造上就一致）。
+//   · party  → change（有没有改动）
+//   · setting→ row（第一行文字）+ checked（复选框状态）
+//   · sort   → sel（当前选中的那个 toggle 文字）
+function _exeqPageState(f) {
+  const st = { change: "null", row: "?", checked: "null", sel: "?" };
   try {
-    const f = _findExTopPart();
-    if (!f) { out.sig = ""; return out; }                 // 不在三连页里
-    const top = f.top;
-    if (top === "party") {
-      let ch = "null";
+    if (f.top === "party") {
       try {
         const b = _invBool(f.comp, "isChangeExtraEquip");
-        ch = (b === true) ? "true" : ((b === false) ? "false" : "null");
+        st.change = (b === true) ? "true" : ((b === false) ? "false" : "null");
       } catch (e) {}
-      out.sig = _exeqSigOf(top, f.dlgName, ch, "?", "null", "?");
-    } else if (top === "setting") {
-      let row = "?";
+    } else if (f.top === "setting") {
       try {
         const arr = f.comp.add(0x90).readPointer();        // CustomUILabel[]
         if (ptrOk(arr)) {
           const n = arr.add(0x18).readS32();
           if (n > 0) {
             const l = arr.add(0x20).readPointer();          // ★只读第 0 个（签名只要第一行）
-            if (ptrOk(l)) row = _str1(_inv(l, "get_text"));
+            if (ptrOk(l)) st.row = _str1(_inv(l, "get_text"));
           }
         }
       } catch (e) {}
-      let checked = "null";
       try {
         const cb = f.comp.add(0x98).readPointer();
         if (ptrOk(cb)) {
           const tg = cb.add(0x38).readPointer();
-          if (ptrOk(tg)) checked = (tg.add(0x81).readU8() !== 0) ? "true" : "false";
+          if (ptrOk(tg)) st.checked = (tg.add(0x81).readU8() !== 0) ? "true" : "false";
         }
       } catch (e) {}
-      out.sig = _exeqSigOf(top, f.dlgName, "null", row, checked, "?");
     } else {
-      let sel = "?";
       try {
         const lst = f.comp.add(0xA0).readPointer();         // List<PartsUnitSortTypeToggle>
         const n = ptrOk(lst) ? _listCount(lst) : -1;
@@ -5462,14 +5522,99 @@ function labExEquipSig() {
           if (!ptrOk(it)) continue;
           if (!_invBool(it, "get_IsSelected")) continue;     // ★只读选中那个的文字
           const lb = it.add(0x30).readPointer();             // typeLabel
-          if (ptrOk(lb)) sel = _str1(_inv(lb, "get_text"));
+          if (ptrOk(lb)) st.sel = _str1(_inv(lb, "get_text"));
           break;
         }
       } catch (e) {}
-      out.sig = _exeqSigOf(top, f.dlgName, "null", "?", "null", sel);
     }
+  } catch (e) {}
+  return st;
+}
+
+// ★**极轻**：只读特别装备三连页的**签名**（就一个字符串）。
+//   不算坐标、不读按钮、不回传整包 JSON —— 状态机轮询专用。
+function labExEquipSig() {
+  const out = { sig: null, err: null };
+  try {
+    const f = _findExTopPart();
+    if (!f) { out.sig = ""; return out; }                 // 不在三连页里
+    const ps = _exeqPageState(f);
+    out.sig = _exeqSigOf(f.top, f.dlgName, ps.change, ps.row, ps.checked, ps.sel);
   } catch (e) { out.err = String(e); }
   return out;
+}
+
+// ── ★★**按需读按钮**（2026-11-08）：EX 三连页"这一步只要点的那个按钮" ──
+//   返回 {sig, top, btn:{name,x,y,id}} —— **不读** labels/terms/toggles/按钮全家桶（那是"整包"）。
+//   ★为什么单独一个读：整包读会把**页里其它控件**也过一遍（setting 的 4 行文字 + 复选框、
+//     sort 的 11 个 toggle 文字 —— 每个都是一次游戏线程调用）⇒ 纯浪费；本流程每步只点一个按钮。
+//   ★按钮的取法（和"按需"配套）：
+//     · 对话框自带按钮（ThreeButtonRight…）→ **按字段**取（DialogFundationObject），
+//       快路径取不到才回退遍历（见 [_dlgBtnByField] / [_exeqButtons]）。
+//     · prio0（setting 页 4 行右侧按钮的第 0 个）/ check（复选框）/ rare（sort 页「稀有度」）
+//       → 各自的字段直取。
+function _exeqXY(compPtr, env, name) {
+  try {
+    if (!ptrOk(compPtr) || !env) return null;
+    const p = _screenOf(compPtr, env.cam, env.mW2S);
+    if (!p) return null;
+    const x = Math.round(p.x), y = Math.round(env.H - p.y);
+    if (!(x >= 0 && x <= env.W && y >= 0 && y <= env.H)) return null;
+    let id = "";
+    try { const g = _inv(compPtr, "get_gameObject"); if (g && !g.isNull()) id = String(g); } catch (e) {}
+    return { name: name, x: x, y: y, id: id };
+  } catch (e) { return null; }
+}
+
+function labExBtn(key, preferId) {
+  const res = { sig: null, top: null, btn: null, err: null };
+  try {
+    const f = _findExTopPart();
+    if (!f) return res;                                  // 不在三连页
+    res.top = f.top;
+    const ps = _exeqPageState(f);
+    res.sig = _exeqSigOf(f.top, f.dlgName, ps.change, ps.row, ps.checked, ps.sel);
+    const env = _camEnv();
+    let btn = null;
+    if (_DLG_BTN_OFF[key]) {
+      const dc = _dlgCommonComp(f.dlg);
+      if (dc) btn = _dlgBtnByField(dc, key, env);
+      if (!btn) {                                         // 兜底：字段取不到才遍历
+        const arr = _exeqButtons(_inv(f.dlg, "get_transform"), key);
+        // ★★同名按钮可能**不止一个**（嵌套弹窗/槽位里的也叫 ThreeButtonRight…）⇒ 口径与老实现一致：
+        //   ① preferId（GameObject 指针）命中 ⇒ 就用它（把多点**锁在同一个按钮实例**上）；
+        //   ② 否则取**最靠下**的那个（y 最大 = 底部主按钮行 —— 「取消/自动装备/装备确定」「确认」那一排）。
+        let best = null;
+        for (const b of arr) {
+          if (b.name !== key) continue;
+          if (preferId && b.id === preferId) { best = b; break; }
+          if (best == null || b.y > best.y) best = b;
+        }
+        btn = best;
+      }
+    } else if (key === "prio0" && f.top === "setting") {
+      const arr = f.comp.add(0x88).readPointer();           // 4 行右侧按钮（CustomUIButton[]）
+      if (ptrOk(arr)) {
+        const el = arr.add(0x20).readPointer();             // 第 0 个
+        btn = _exeqXY(el, env, "prio0");
+      }
+    } else if (key === "check" && f.top === "setting") {
+      const cb = f.comp.add(0x98).readPointer();
+      if (ptrOk(cb)) btn = _exeqXY(cb.add(0x48).readPointer(), env, "check");
+    } else if (key === "rare" && f.top === "sort") {
+      const lst = f.comp.add(0xA0).readPointer();           // List<PartsUnitSortTypeToggle>
+      const n = ptrOk(lst) ? _listCount(lst) : -1;
+      for (let i = 0; i < (n > 0 ? Math.min(n, 24) : 0); i++) {
+        const it = _listItem(lst, i);
+        if (!ptrOk(it)) continue;
+        let t = null;
+        try { const lb = it.add(0x30).readPointer(); if (ptrOk(lb)) t = _str1(_inv(lb, "get_text")); } catch (e) {}
+        if (t === "稀有度") { btn = _exeqXY(it, env, "rare"); break; }
+      }
+    }
+    res.btn = btn;
+  } catch (e) { res.err = String(e); }
+  return res;
 }
 
 // 只读快照：**只读"当前最上层"那一页**（wantBtns=false 时连按钮坐标都不算，省掉一次子树遍历）
@@ -5516,13 +5661,20 @@ function labExEquipSnapshot(diag, wantBtns, only) {
     res.top = f.top;
     // ★★2026-11-08 实测：整包读的耗时**大头不是坐标投影，而是 `_rawWalk` 遍历整棵子树**
     //   （①页 DialogCommonFullSize = 编组页的大容器 ⇒ 遍历要 350ms+）。
-    //   ⇒ 只要的不是**对话框按钮**（prio0 / check / rare 都能从组件的字段直接拿到）时，
-    //     **别去遍历找按钮** —— 这一步省掉就是几十 ms。
+    //   ⇒ **按需**：知道要哪个按钮时，按**字段**直接取（几 ms），绝不遍历。
     const needDlgBtns = (wantBtns || diag) &&
       !(only === "prio0" || only === "check" || only === "rare");
     const o = { cls: f.cls, ptr: String(f.comp), dlg: String(f.dlg), dlgName: f.dlgName,
-                buttons: needDlgBtns ? _exeqButtons(_inv(f.dlg, "get_transform"), only) : [],
-                slots: null };
+                buttons: [], slots: null };
+    if (needDlgBtns) {
+      // ★快路径：按字段取（只有"对话框自带按钮"才有字段；prio0/check/rare 走各自的字段）
+      let got = null;
+      if (!diag && only && _DLG_BTN_OFF[only]) {
+        const dc = _dlgCommonComp(f.dlg);
+        if (dc) got = _dlgBtnByField(dc, only, env);
+      }
+      o.buttons = got ? [got] : _exeqButtons(_inv(f.dlg, "get_transform"), only);
+    }
     if (f.top === "party") {                             // ① 特别装备设定
       o.change = _invBool(f.comp, "isChangeExtraEquip"); // ★有没有改动
       o.canChange = null; o.unitIds = []; o.plateSlots = -1;
@@ -5610,7 +5762,7 @@ function labExEquipTop() {
 // ── 选角色页（SUMMON_UNIT=1 且 pageTop 是对话框）：初始编成 / 门票召唤（★只读）──
 // ★构建号：改过读逻辑就 +1。attach 时 pcr_auto 会打出来（rpc jsBuild）——用来确认
 //   "正在跑的到底是哪一版脚本"，免得拿旧输出讨论半天（2026-10-10 踩过）。
-const JS_BUILD = "cs69";     // ★cs69（2026-11-08）：**EX 整包读改成"只投影要点的那个"**（labExEquip(full, only)）—— ①页实测有 ~90 个 One/Two/ThreeButton，全投影坐标要 380ms（"点一下等半秒"的大头）⇒ now 只投影 1 个（~12ms）。cs68：**"当前最上层"统一成一个实现**（_topDialogGo）—— ①_exeqFind 只查**最上层那一层**、**绝不往回退**（回退会永远读到下面那层仍 active 的①页 ⇒ 签名不变 ⇒ 误判"没生效"⇒多点⇒点错按钮）；②签名里带**最上层容器名**（"页面切了"能立刻看见）。cs67：去掉 agent 侧坐标"稳定化"（Thread.sleep 堵死单通道）；cs64：_findExTopPart 组件查找缓存；cs63：labExEquipSig 轻量签名读
+const JS_BUILD = "cs72";     // ★cs72（2026-11-08）：**"最上层"只剩一个实现 + 根没了不再扫全树** —— ①`_topDialogTr`（`findList(...,"top")` 的根）改为复用 `_topDialogGo`，不再自己写一遍判据（原来有 3 份实现，正是 EX 三连页多点/点错的根源）；②`_rootWalkNodes` 的遍历缓存**加校验"根是不是同一个"**（原来只看 key ⇒ `"top"` 这个根会变，1.5s 内会把上一个对话框的子树当成当前的返回）；③新增 `_walkForRoot`：**显式给了根却取不到（如当前没有对话框）⇒ 返回空，不再退化成全树**（`findList(…,"top")` 实测 2633ms → 3ms；而且全树会捞到别处的同名节点）。cs71：**读取全面"按需"** —— ①新增 `labExBtn(key)`：EX 三连页只读**要点的那个按钮** + 当前签名（不再读整包：整包会把 setting 的 4 行文字/复选框、sort 的 11 个 toggle 文字都过一遍，纯浪费）；②新增 `labExtra()`：非分派字段（eventId/questId/eventResultId/effectNum/curChoice/remainChoice + LTD choices）拆成独立读，handler 要时才调；③`labStatusLite` 补 `next`（移动分支用，一次内存读）。cs70：**EX 整包读的按钮改按字段取**（DialogFundationObject：twoLeft 0x48 / twoRight 0x58 / threeLeft 0x70 / threeCenter 0x80 / threeRight 0x98，经对话框组件 +0x118 foundationObject），**不再遍历整棵子树**（①页遍历要 350ms+）。cs69：labExEquip(full, only) 只投影要点的那个；cs68：**"当前最上层"统一成一个实现**（_topDialogGo）—— ①_exeqFind 只查**最上层那一层**、**绝不往回退**（回退会永远读到下面那层仍 active 的①页 ⇒ 签名不变 ⇒ 误判"没生效"⇒多点⇒点错按钮）；②签名里带**最上层容器名**（"页面切了"能立刻看见）。cs67：去掉 agent 侧坐标"稳定化"（Thread.sleep 堵死单通道）；cs64：_findExTopPart 组件查找缓存；cs63：labExEquipSig 轻量签名读
 // ★cs62（2026-10-22）：新增 battleSettingsStart/Poll（战斗设定只读；getter 是 IFix 模板 ⇒ 投递游戏线程执行）
 // ★JS 侧详细日志开关（2026-10-11 加）：默认关。
 //   关掉的是"每次调用都会打、但正常情况没信息量"的那几条（如 findMap 的"跳过堆扫描"、
@@ -6789,28 +6941,29 @@ function labUnitsSnapshot() {
   return res;
 }
 
-// 取某个**子树**当根：kind="battle" = 当前视图的 Canvas 子树（战斗画布）。
-//   为什么需要：整棵树 661 个节点、每个几次调用 ⇒ 几百 ms；而战斗结算那颗「下一步」就在战斗画布里。
-// 最上层那个 **Dialog*** 子节点的 Transform（同一套"后入者在上层"的判据，见 _topDialogName）。
-//   用途：结算/奖励这类页面的文字**只在最上层**，整棵树扫到的是被盖住的地图页（2026-10-12 实测）。
+// 最上层那个 **Dialog*** 子节点的 Transform。
+//   用途：结算/奖励/事件这类页面的按钮**只在最上层**；扫整个 DialogArea 会把被盖住的旧对话框
+//   一起扫进去（实测 DialogArea 里同时挂着 10 个对话框）⇒ 又慢、又可能捞到**别的对话框里的同名按钮**。
+// ★★2026-11-08：**改为复用 [_topDialogGo]**（不再自己写一遍判据）。
+//   同一个"最上层"必须只有一个实现 —— 否则几处判定各说各话（EX 三连页就栽在这上面：
+//   labTop 说最上层已是 setting，而查找还在读下面那层仍 active 的旧页 ⇒ 签名永不变化 ⇒ 多点 ⇒ 点错）。
 function _topDialogTr() {
   try {
-    const d = _dialogAreaTr();
-    if (!d) return null;
-    let cc = 0; try { const r = _inv(d, "get_childCount"); cc = r.isNull() ? 0 : r.add(0x10).readS32(); } catch (e) {}
-    let top = null;
-    for (let i = 0; i < cc; i++) {          // 正序：后者覆盖前者 = 更上层
-      const ch = _inv1i(d, "GetChild", i);
-      if (ch.isNull()) continue;
-      const gobj = _inv(ch, "get_gameObject");
-      if (gobj.isNull()) continue;
-      const nm = _str(_inv(gobj, "get_name"));
-      if (!/^Dialog/.test(nm)) continue;
-      if (_goActive(gobj) !== true) continue;
-      top = ch;
-    }
-    return top;
+    const t = _topDialogGo();
+    if (!t || !t.go) return null;
+    const tr = _inv(t.go, "get_transform");
+    return (tr && !tr.isNull()) ? tr : null;
   } catch (e) { return null; }
+}
+
+// ★★2026-11-08：**"给了根但根取不到"≠"扫全树"**。
+//   实测：当前没有对话框时 `_subtreeRoot("top")` = null ⇒ 老的写法退化成 `_walkNodes()`（全树）
+//   ⇒ 一次 **2633ms**（`findList(…,"top")` 实测），而且会把**别处**的同名节点一起捞出来。
+//   而所有调用方本来就是"按根列表逐个试"（`top` → `dialog` → `layer`）⇒ 返回空最合适：
+//   立刻试下一个根（`dialog` 7ms），或下一轮再看。全树只在**调用方没给根**时才用。
+function _walkForRoot(rootName, root) {
+  if (rootName && !root) return null;          // 显式要根、根却没了 ⇒ 空（不退化）
+  return root ? _rootWalkNodes(root, rootName) : _walkNodes();
 }
 
 function _subtreeRoot(kind) {
@@ -6854,10 +7007,14 @@ const ROOT_WALK_TTL_MS = 1500;
 function _rootWalkNodes(rootTr, key) {
   const now = Date.now();
   const c = g_rootWalk[key];
-  if (c && (now - c.at) < ROOT_WALK_TTL_MS) return c.list;
+  // ★★2026-11-08：缓存必须**校验根是不是同一个**。原来只看 key ⇒ `"top"` 这个根会变
+  //   （最上层对话框换了），1.5s 内会把**上一个对话框的子树**当成当前的返回 ⇒ 读到别的页的按钮。
+  //   （NativePointer 是对象、每次都是新引用 ⇒ 只能比 String()。）
+  const rootStr = String(rootTr);
+  if (c && c.rootStr === rootStr && (now - c.at) < ROOT_WALK_TTL_MS) return c.list;
   const out = [];
   try { _rawWalk(function (nd) { out.push(nd); }, false, rootTr); } catch (e) {}
-  g_rootWalk[key] = { at: Date.now(), list: out };
+  g_rootWalk[key] = { at: Date.now(), rootStr: rootStr, list: out };
   return out;
 }
 
@@ -6963,8 +7120,9 @@ rpc.exports = {
       const re = new RegExp(String(reStr), "i");
       const uk = findClass("CustomUILabel");
       const root = rootName ? _subtreeRoot(rootName) : null;
+      const list = _walkForRoot(rootName, root);
+      if (!list) return null;                 // ★显式要的根没了 ⇒ 空（不扫全树，见 [_walkForRoot]）
       let env = null;
-      const list = root ? _rootWalkNodes(root, rootName) : _walkNodes();
       for (const nd of list) {
         if (nd.active !== true) continue;
         if (!re.test(nd.name)) continue;
@@ -7016,8 +7174,9 @@ rpc.exports = {
       //   **每个节点**都算一次屏幕坐标（≈3 次 il2cpp 调用/节点，几百节点 = 上千次 invoke ⇒ 十几秒），
       //   而 `cb` 里本来就只对**名字匹配**的节点算坐标 ⇒ 纯重复劳动。这一句就是"单次探测 16s"的来源。
       //   顺带：带根的遍历走 [_rootWalkNodes]（250ms TTL）⇒ 一轮里 root×名单 多次查询只遍历一次。
-      if (root) { for (const nd of _rootWalkNodes(root, rootName)) cb(nd); }
-      else { for (const nd of _walkNodes()) cb(nd); }
+      // ★显式要的根没了 ⇒ 什么都不走（不扫全树，见 [_walkForRoot]）
+      const _l = _walkForRoot(rootName, root);
+      if (_l) { for (const nd of _l) cb(nd); }
     } catch (e) { console.log("[findTextIn] " + e); }
     return (max && out.length > max) ? out.slice(0, max) : out;
   }),
@@ -7035,8 +7194,9 @@ rpc.exports = {
       const re = new RegExp(String(reStr), "i");
       const uk = findClass("CustomUILabel");
       const root = rootName ? _subtreeRoot(rootName) : null;
+      const list = _walkForRoot(rootName, root);
+      if (!list) return out;                  // ★显式要的根没了 ⇒ 空（不扫全树，见 [_walkForRoot]）
       let env = null;
-      const list = root ? _rootWalkNodes(root, rootName) : _walkNodes();
       for (const nd of list) {
         if (nd.active !== true) continue;
         if (!re.test(nd.name)) continue;
@@ -7060,13 +7220,49 @@ rpc.exports = {
   }),
   // ★加了可选根 `rootName`（2026-10-16）：事件页原来只能**全树**找选项卡（实测 `[slow] findList 2.4~2.7s` ✗），
   //   而事件对话框就在 DialogArea 里 ⇒ 传 `"dialog"` 只走那棵子树（几十个节点 ✓）。不传则维持全树（兼容旧调用）。
+  // ★★诊断用（2026-11-08）：同 `findList`，但每个命中额外带**父链**（末 6 层）。
+  //   为什么需要：事件选项卡按钮在 `top`（最上层对话框子树）里只找到 **1/2** 颗，另一颗
+  //   一定挂在**别的地方**。要决定"抽哪一层当根"（比整个 DialogArea 小、比最上层对话框大），
+  //   必须先看清每一颗的父链。
+  findListPath: _rpcSafe(function (reStr, rootName, maxDepth) {
+    const out = [];
+    try {
+      const re = new RegExp(String(reStr), "i");
+      const root = rootName ? _subtreeRoot(rootName) : null;
+      if (!root) return out;
+      const env = _camEnv();
+      const lim = (maxDepth == null) ? 30 : maxDepth;
+      let visited = 0;
+      const walk = function (tr, chain, depth) {
+        if (!tr || tr.isNull() || depth > lim || visited > 12000) return;
+        visited++;
+        const cc = _childCountOf(tr);
+        for (let i = 0; i < cc; i++) {
+          const ch = _inv1i(tr, "GetChild", i);
+          if (ch.isNull()) continue;
+          let nm = "";
+          try { nm = _str(_inv(_inv(ch, "get_gameObject"), "get_name")) || ""; } catch (e) {}
+          const nc = chain.concat([nm]);
+          if (re.test(nm)) {
+            let xy = null;
+            if (env) { try { const ss = _screenOf(ch, env.cam, env.mW2S); if (ss) xy = { x: Math.round(ss.x), y: Math.round(env.H - ss.y) }; } catch (e) {} }
+            out.push({ name: nm, x: xy ? xy.x : null, y: xy ? xy.y : null, depth: depth + 1, path: nc.slice(-6) });
+          }
+          walk(ch, nc, depth + 1);
+        }
+      };
+      walk(root, [], 0);
+    } catch (e) { out.push({ err: String(e) }); }
+    return out;
+  }),
   findList: _rpcSafe(function (reStr, rootName) {
     const out = [];
     try {
       const re = new RegExp(String(reStr), "i");
       const root = rootName ? _subtreeRoot(rootName) : null;
+      const list = _walkForRoot(rootName, root);
+      if (!list) return out;                  // ★显式要的根没了 ⇒ 空（不扫全树，见 [_walkForRoot]）
       let env = null;
-      const list = root ? _rootWalkNodes(root, rootName) : _walkNodes();
       for (const nd of list) {
         if (nd.active !== true) continue;
         if (!re.test(nd.name)) continue;
@@ -7259,6 +7455,12 @@ rpc.exports = {
   labPartyLite: _rpcSafe(function () { try { return labPartyLiteSnapshot(); } catch (e) { return null; } }),
   // ★编组页顶部页签（切队伍腾空用；以前每轮都从 labParty 里带 40 个候选回来）
   labPartyTabs: _rpcSafe(function () { try { return labPartyTabsSnapshot(); } catch (e) { return null; } }),
+  // ★★**极简分派读**（2026-11-08）：只读分派要的字段（全是内存读）⇒ ~10ms；
+  //   全量 labStatus 是 150~300ms（里面有一串同步调游戏方法的 decOI）。 
+  labStatusLite: _rpcSafe(function () { try { return labStatusLite(); } catch (e) { return null; } }),
+  // ★★**按需读：非分派字段**（2026-11-08）—— ids（event/quest/result/effect/choice）+ LTD 候选清单。
+  //   只有个别 handler 用得到 ⇒ 不塞进每轮都跑的分派读（见 [labStatusLite]）。
+  labExtra: _rpcSafe(function () { try { return labExtra(); } catch (e) { return null; } }),
   labStatus: _rpcSafe(function () {
     try {
       const t0 = Date.now();
@@ -7422,6 +7624,9 @@ rpc.exports = {
   // ★★**极轻**：只读三连页的**签名**（一个字符串）—— 状态机轮询专用
   //   不算坐标、不读按钮、不回传整包 JSON（只要 labels[0] / checked / 选中的那一项）
   labExEquipSig: _rpcSafe(function () { try { return labExEquipSig(); } catch (e) { return { sig: null, err: String(e) }; } }),
+  // ★★**按需读按钮**（2026-11-08）：三连页"这一步只点一个按钮" ⇒ 只读那一个 + 当前签名。
+  //   返回 {sig, top, btn:{name,x,y,id}} —— **不读**整包（labels/terms/toggles/按钮全家桶）。
+  labExBtn: _rpcSafe(function (key, preferId) { try { return labExBtn(key || "", preferId || ""); } catch (e) { return { sig: null, top: null, btn: null, err: String(e) }; } }),
   // 诊断版：带"每个对象槽挂的是什么类"的现场 dump（★不再把内部 diag 覆盖成空对象）
   labPartyDiag: _rpcSafe(function () { try { return labPartySnapshot(true); } catch (e) { return null; } }),
   // 选角色页旧读法（PartsDialogLabyrinthSelectableChara + 堆扫描）已在 2026-10-11 退役：
@@ -7764,6 +7969,96 @@ function labSnapshot() {
       }
     }
   }
+  return out;
+}
+
+// ★★**极简分派读**（2026-11-08）：主循环每轮都要读状态来**分派**。
+//   全量 `labSnapshot` 里除了分派字段，还带 choices / curChoice / questId / eventId …
+//   —— 那些**只有个别 handler 用得到**（事件页要 eventId、编组页要 questId…），
+//   而分派本身一个都用不上 ⇒ 按"需要什么读什么"的原则拆开：
+//     · 分派读 = 本函数（纯内存读，实测 ~1ms）
+//     · 按需读 = [labExtra]（ids/choices，handler 要时才调）
+//   ★实测更正（2026-11-08）：`decOI` **不是**"同步调游戏方法"（它就是 hidden^key 的内存读），
+//     所以全量快照本身只有 ~1ms；真正贵的是 `_topDialogName()`（6ms，逐个子节点调游戏方法）。
+function labStatusLite() {
+  const ltd = _findLTD();
+  if (!ltd || ltd.isNull()) return null;
+  const out = {
+    area: ltd.add(0x40).readS32(), blockId: ltd.add(0x44).readS32(),
+    enterId: ltd.add(0x58).readS32(), difficulty: ltd.add(0x5C).readS32(),
+    panelType: null, panelTypeName: null,
+    statusType: null, statusTypeName: null,
+    next: [],
+  };
+  try { out.viewId = getViewId(); } catch (e) { out.viewId = null; }
+  try {
+    const vm2 = _viewManagerInst();
+    const cv2 = vm2.isNull() ? ptr(0) : vm2.add(0x110).readPointer();
+    out.viewClass = cv2.isNull() ? null : klassNameOf(cv2);
+  } catch (e) { out.viewClass = null; }
+  const cp = ltd.add(0xD0).readPointer();
+  if (ptrOk(cp)) {
+    const mi = cp.add(0x10).readPointer();
+    if (ptrOk(mi)) {
+      out.panelType = mi.add(0x40).readS32();
+      out.panelTypeName = BLOCK_TYPE[out.panelType] || ("?" + out.panelType);
+      // ★"可前往"（移动分支用；一次内存读，零成本 ⇒ 留在分派读里，省一次往返）
+      try { out.next = safeEnumListOI(mi.add(0x60).readPointer()); } catch (e) { out.next = []; }
+    }
+  }
+  const st = ltd.add(0xE8).readPointer();
+  if (ptrOk(st)) {
+    out.statusType = st.add(0x10).readS32();
+    out.statusTypeName = LAB_STATUS_TYPE[out.statusType] || ("?" + out.statusType);
+  }
+  out.pageTop = _topDialogName();
+  const bs = battleStateSnapshot();          // 纯内存读，几乎零成本
+  out.inBattle = bs.inBattle;
+  out.battleView = bs.viewClass;
+  out.battleState = bs.gameStateName;
+  out.battleResultEnable = bs.resultEnable;
+  return out;
+}
+
+// ★★**按需读：非分派字段**（2026-11-08）—— ids + 候选清单。
+//   只有个别 handler 用得到：事件页要 eventId/eventResultId、编组页要 questId、
+//   遗物三选一要 LTD 的 choices（诊断用）⇒ 不塞进每轮都跑的分派读里。
+//   全是**内存读**（decOI / 列表内部数组），实测 ~0ms。
+function labExtra() {
+  const out = {
+    eventId: null, questId: null, eventResultId: null, effectNum: null,
+    curChoice: null, remainChoice: null, choices: [],
+  };
+  try {
+    const ltd = _findLTD();
+    if (!ltd || ltd.isNull()) return out;
+    const st = ltd.add(0xE8).readPointer();
+    if (!ptrOk(st)) return out;
+    out.eventId = decOI(st.add(0x34));
+    out.questId = decOI(st.add(0x28));
+    out.eventResultId = decOI(st.add(0x40));
+    out.effectNum = decOI(st.add(0x4C));
+    out.curChoice = decOI(st.add(0x88));
+    out.remainChoice = decOI(st.add(0x94));
+    const ch = st.add(0x80).readPointer();
+    if (ptrOk(ch)) {
+      let items = [];
+      try { items = safeEnumListRef(ch); } catch (e) {}
+      if (!items.length) {   // 兜底：走 get_Count/get_Item
+        const n = _listCount(ch);
+        if (n > 0 && n < 32) for (let i = 0; i < n; i++) { const it = _listItem(ch, i); if (ptrOk(it)) items.push(it); }
+      }
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        if (!ptrOk(it)) continue;
+        out.choices.push({
+          i: i, ptr: String(it),
+          choiceNum: decOI(it.add(0x10)), rewardType: decOI(it.add(0x1C)),
+          rewardId: decOI(it.add(0x28)), rewardCount: decOI(it.add(0x34)),
+        });
+      }
+    }
+  } catch (e) {}
   return out;
 }
 

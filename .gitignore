@@ -42,6 +42,9 @@ __pycache__/
 #   而且**可能含账号/凭证信息**，绝不入库。
 tools/lmj_*.txt
 tools/lmj_*_keys.txt
+# 探针脚本的临时产物（截图 / dump 出来的 JSON）—— 就地生成、只用于当时排查
+tools/lmj_*.png
+tools/lmj_*.json
 # 一次性对比分析的输出目录（同 tools/out/）
 tools/out_*/
 

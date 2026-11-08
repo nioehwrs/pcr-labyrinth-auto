@@ -55,12 +55,23 @@ object EventPick {
     val EVENT_PICK: MutableMap<Int, Int> = mutableMapOf()
 
     /**
-     * 复刻 PC `load_event_choice`(5507)：读 `event_choice.json` → 填入 [EVENT_PICK]
-     * （event_id -> `pick` 字段，缺省/非数字按 1）。读不到或解析失败 → 留空（退化为永远选第 1 项）。
+     * ★★eventId -> 该事件**有几个可选项**（`event_choice.json` 里 `choices` 数组的长度）。
+     *
+     * 用途（2026-11-08）：事件页要从 UI 树里找 N 颗选项卡按钮（`labyrinth_btn_main_square`）。
+     *   - 用"最上层对话框子树（`top`）"找**快**，但实测可能只扫到一部分（2 张只找到 1 张 ⇒ 选错卡）；
+     *   - 用"整个 DialogArea（`dialog`）"找**全**，但慢。
+     * ⇒ 有了这个数字就能"**先 top，数量够了就用；不够再 dialog 补全**"，两头占。
+     */
+    val EVENT_TOTAL: MutableMap<Int, Int> = mutableMapOf()
+
+    /**
+     * 复刻 PC `load_event_choice`(5507)：读 `event_choice.json` → 填入 [EVENT_PICK] / [EVENT_TOTAL]
+     * （event_id -> `pick` 字段）。读不到或解析失败 → 留空（遇到事件不点，不猜）。
      * 与 `Tables`/`RelicTables` 同款 source-agnostic 设计：app 传 assets，单测传文件。
      */
     fun load(reader: (String) -> String) {
         EVENT_PICK.clear()
+        EVENT_TOTAL.clear()
         try {
             val raw = JSONObject(reader("event_choice.json"))
             val it = raw.keys()
@@ -69,6 +80,9 @@ object EventPick {
                 val k = it.next()
                 val eid = k.toIntOrNull() ?: continue
                 val v = raw.optJSONObject(k) ?: continue
+                // ★先记"有几个可选项"——**即使没写 pick 也要记**（它决定"找几颗按钮才算找全"）
+                val n = v.optJSONArray("choices")?.length() ?: 0
+                if (n > 0) EVENT_TOTAL[eid] = n
                 val p = v.opt("pick")
                 val pick = (p as? Number)?.toInt() ?: p?.toString()?.toIntOrNull()
                 // ★没写 `pick`（或写得不是正数）**不再当成"第 1 项"**（用户 2026-10-16："都不要随便选"）
@@ -78,12 +92,20 @@ object EventPick {
             }
             AppState.addLog(
                 "[事件] 已载入 event_choice.json：${EVENT_PICK.size} 个事件" +
+                    "（其中 ${EVENT_TOTAL.size} 个知道可选项数）" +
                     (if (bad > 0) "（另有 $bad 个没写 pick → 视为未配置、遇到时不猜）" else ""),
             )
         } catch (e: Exception) {
             AppState.addLog("[事件] 未找到/读取失败 event_choice.json：${e.message} → **未配置的事件一律不点**（不猜）")
         }
     }
+
+    /**
+     * 该事件**应该有几颗选项卡按钮**。
+     *
+     * @return `>0` = 配置里写明了几项；`0` = 不知道（没配置 `choices`）⇒ 调用方只能保守用 `dialog` 根
+     */
+    fun totalChoices(eventId: Int?): Int = eventId?.let { EVENT_TOTAL[it] } ?: 0
 
     /**
      * 解析 `event_choice.json` → 事件列表（含提示与选项文字），供策略页「事件」做成可修改单选。
@@ -171,6 +193,11 @@ object EventPick {
     fun pick(eventId: Int?, n: Int): Int? {
         if (n <= 0) return null
         val want = eventId?.let { EVENT_PICK[it] } ?: return null
+        // ★★2026-11-08 修（实测 15:53:18 选错卡）：**要选的项超出"找到的选项卡数"⇒ 不猜**。
+        //   原来 `coerceIn(1, n)` 会把"想选第 2 项"**悄悄压成第 1 项** ⇒ 静默选错卡
+        //   （那次事件 1117 该选第 2 项=金币 750，但只找到 1 颗选项卡 ⇒ 点了第 1 项=500）。
+        //   少找到 = 这一轮读数不全 ⇒ 返回 null，交给调用方"下一轮重读"（它自带超时停手兜底）。
+        if (want > n) return null
         return want.coerceIn(1, n)
     }
 }
