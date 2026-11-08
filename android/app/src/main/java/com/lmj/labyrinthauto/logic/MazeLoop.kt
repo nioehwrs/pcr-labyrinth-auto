@@ -338,11 +338,13 @@ object MazeLoop {
         partyFillSaid.clear()                   // 多分队：编队策略日志去重
         partyCleaned.clear()                    // Boss 页"腾空继承队"标记
         // ★★特别装备的两个"跨局残留"缓存（2026-10-22 用户："选完人之后有时候不选 ex 装备"）：
-        //   ① `exeqSessions` 按节点缓存，`exDone=true` 会让**下一局同一节点静默跳过装备**（连日志都没有）；
+        //   ① `exeqSessCur`（★2026-11-08 改成**单例**了：EX 只出现在当前这个节点的编组页上，
+        //      原来按 nodeKey 存的 map 已经不需要），里面的 `exDone=true` 会让
+        //      **下一局同一节点静默跳过装备**（连日志都没有）；
         //   ② `exequipLastTeam1`（同队 ⇒ 认为装备没被动过）只在 `GameProcess.kill()` 时清过，
         //      局内刷开局/不杀进程连跑时，上一局的会留到本局 ⇒ 首战同队就直接跳过。
         //   新一局的装备是重置的，这两条假设只在本局内成立 ⇒ 每局开头必须清。
-        exeqSessions.clear()
+        exeqSessCur = null
         exequipLastTeam1 = null
         selNoCardHeals.clear()                  // 选人页"读不到卡片"的自愈计数
         relicBadHeals.clear()                   // 遗物候选"读数全是垃圾"的自愈计数
@@ -506,7 +508,7 @@ object MazeLoop {
             if (GameProcess.kills != seenKills) {
                 seenKills = GameProcess.kills
                 exequipLastTeam1 = null                 // ⇒ 本场强制重设一次特别装备
-                exeqSessions.clear()                    // ★同节点不能沿用"已配好装备"（游戏侧重建了，2026-10-22）
+                exeqSessCur = null                      // ★同节点不能沿用"已配好装备"（游戏侧重建了，2026-10-22）
                 partyCleaned.clear()                    // Boss 页"腾空继承队"标记（游戏侧重置了）
                 partyTeams.clear()                      // 多分队：已确认过的各队（重新确认一遍）
                 AppState.addLog(
@@ -718,19 +720,33 @@ object MazeLoop {
             // 能走到这里 ⇒ 已不在战斗视图（或失败结算已落回）→ 计时/档位复位（PC 6196~6201）
             resetBattleTimers()
 
-            // 1.5) ★特别装备三连页（叠在编队页之上、独立 DialogCommonBig/FullSize）：交给专属 handler，
-            //     **绝不走下面的通用弹窗白名单**——白名单命中 ThreeButton*/TwoButton*，会误点"装备确定/确认"
-            //     打乱三步顺序（PC 同款规避：exequip 由自己驱动，不进白名单）。只在战斗节点(5/6)出现。
-            // ★照 PC `EXEQ_CONTAINERS`(2906)：**只有 pageTop 是这两个容器**时才可能出这三页，否则**别每轮扫**
-            //   —— `labExEquipTop` 要遍历 DialogArea 子节点 + 逐个 GetComponentInChildren，很贵；
-            //   在预览页/编组页上每轮空扫会把"预览页出现→点挑战"拖到 7~8s（实测 2026-10-16）。
-            if ((stt == 5 || stt == 6) && top in EXEQ_CONTAINERS) {
-                val et = AgentApi.labExEquipTop()
-                // ★必须用 jStr：agent 非特别装备页返回 {top:null}，optString 会得到字符串 "null"（非空！），
-                //   误判成"特别装备页在上层"→ 静默 continue → 永不分派到 handleBattleNode（预览页点不了挑战）。
-                val exTop = et?.let { jStr(it, "top") } ?: ""
+            // 1.5) ★特别装备三连页（叠在编队页之上、独立 DialogCommonBig/FullSize）。
+            //     ★★2026-11-08 改法：三连页改成**由编组页 handler 打包跑完**（[handleExequipPacked]：
+            //     点开「特别装备」后在**同一次调用里**把①②③走完）⇒ 主循环**正常情况下根本看不到 EX 页**。
+            //     这里留的是**兜底**：万一 EX 页还压在上面（上一轮没收干净 / 用户手动开的），
+            //     就**自己把它走完** —— 绝不能交给下面的通用弹窗白名单：那会命中
+            //     ThreeButton*/TwoButton* ⇒ 误点"装备确定/确认"打乱三步顺序（2026-11-08 实测）。
+            //     ★照 PC `EXEQ_CONTAINERS`(2906)：**只有 pageTop 是这两个容器**时才可能出这三页，否则**别每轮扫**
+            //       —— `labExEquipTop` 要遍历 DialogArea 子节点 + 逐个 GetComponentInChildren，很贵；
+            //       在预览页/编组页上每轮空扫会把"预览页出现→点挑战"拖到 7~8s（实测 2026-10-16）。
+            if ((stt == 5 || stt == 6) && top in EXEQ_CONTAINERS && !exeqSess().exStuck) {
+                val exTop = runCatching { AgentApi.labExEquipTop() }
+                    .getOrNull()?.let { jStr(it, "top") } ?: ""
                 if (exTop.isNotEmpty()) {
-                    handleExequip(input, st, exTop)
+                    // ★★只要检测到 EX 页就接管（**不再看 exDone**）：
+                    //   打包流程是幂等的（按当前页面状态决定该点哪个），而且能补上
+                    //   "上次没点「装备确定」就走了"的缺口 —— 否则 EX 页留在屏幕上，
+                    //   后面所有操作都在**错的页面**上做（2026-11-08 实测 10:29:36~10:29:45）。
+                    val es = exeqSess()
+                    es.fbN++
+                    if (es.fbN > EXEQ_FB_MAX) {
+                        es.exStuck = true
+                        AppState.addLog(
+                            "[!] 特别装备三连页连续 $EXEQ_FB_MAX 次收不掉 → 停止自动处理，请手动关掉它",
+                        )
+                    } else {
+                        handleExequipPacked(input)
+                    }
                     idle = 0
                     delay(POLL_MS)
                     continue
@@ -745,7 +761,7 @@ object MazeLoop {
             //    · 选角色页（statusType=1 且有顶框）是"我们 handler 自己驱动的页"（PC `_own_skip`）：
             //      那个"对话框"就是页面本身，别每轮全树去查弹窗
             //    ★还没搬的（PC 同位置有）：战斗失败页的"两颗按钮"识别（2026-10-12 那套）、
-            //      特别装备三连页已搬：在上方 1.5) 处、白名单之前拦截，交给 handleExequip（不进白名单，
+            //      特别装备三连页已搬：在上方 1.5) 处、白名单之前拦截，交给 handleExequipPacked（不进白名单，
             //        否则 ThreeButton*/TwoButton* 会被误点"装备确定/确认"打乱三步顺序）。
             // ★照 PC `_own_page/_own_skip`(6211~6235)：按**页面**认"我们自己 handler 驱动的页"，不再按 statusType。
             //   旧写法 `stt == 1` 两头错：
@@ -1481,12 +1497,44 @@ object MazeLoop {
     //   只读由 agent 的 labExEquip / labExEquipTop 提供（字段与 PC 探针一致）。
     private const val LAB_EXEQUIP_AUTO = true        // 是否自动走这套流程（PC LAB_EXEQUIP_AUTO）
     private const val LAB_EXEQUIP_SKIP_SAME = true   // 与上场同一套队才跳过（PC LAB_EXEQUIP_SKIP_SAME）
-    private const val EXEQ_SETTLE_MIN_MS = 250L      // 点完至少等这么久（PC EXEQ_SETTLE_MIN=0.25s）
-    private const val EXEQ_POLL_MS = 150L            // 本轮内连推多步的间隔（PC EXEQ_POLL=0.15s）
-    private const val EXEQ_FAST_BUDGET_MS = 3000L    // 本轮内最多花多少秒推进（PC EXEQ_FAST_BUDGET=3s）
-    private const val EXEQ_WAIT_MAX_MS = 3000L       // 等页面变样的上限（PC EXEQ_WAIT_MAX=3s）
-    private const val EXEQ_MAX_STEPS = 8             // 一次流程最多几步（PC EXEQ_MAX_STEPS=8）
+    private const val EXEQ_POLL_MS = 60L             // 打包流程内部的轮询间隔（签名读很轻，60ms 一探）
+    private const val EXEQ_WAIT_MAX_MS = 3000L       // 等"三连页开出来"的上限（超了 ⇒ 放弃这次装备）
+    private const val EXEQ_MAX_STEPS = 18            // 一次流程最多点几下（PC EXEQ_MAX_STEPS=8；
+                                                       //   ★这里要多留：整条链最少 6 下（自动装备→优先→稀有度→确认→确认→装备确定），
+                                                       //   每一下还有"没生效重试"的余量）
+    private const val EXEQ_TAP_TRIES = 3             // 同一次调用里最多点几下（tapAndCheck 的 retries）
+    private const val EXEQ_TAP_MAX = 6               // 同一个按钮最多点几下（防止在一个按钮上狂点）
+    private const val EXEQ_TAP_SETTLE_MS = 300L      // ★点完等一下再看"签名变了没"（等切页动画走一走）
+    //   ★★2026-11-08 用户定的口径："对于容易点错出问题的页面，可以把 settleMs 稍稍调大" ——
+    //     EX 三连页就是最容易点错的一页（②页的「确认」和①页的按钮挨着，点偏就点到别的），
+    //     所以这里 200ms → 300ms。探针制下"切走立刻停"，所以多等这 100ms 只在**没切走**时才付。
+    private const val EXEQ_BTN_MOVE_PX = 12         // ★同一个按钮两次读出的坐标差多少就算"在动"（页面在切）
+    private const val EXEQ_STILL_MS = 140L        // ★双读之间的间隔（要跨帧，否则两次读必然一样）
+    // ★★"点击后探测"的通用参数（2026-11-08）：点完不是"等固定时长再读一次"，而是**连探几次**。
+    //   页面切换动画 300~500ms，签名只在动画**结束**时才会变 ⇒ 固定短等待必然误判"没生效" ⇒ 多点。
+    private const val PROBE_N = 4               // ★探几次（200ms 起步 + 3×150ms = 650ms 窗口）
+    private const val PROBE_MS = 150L           // ★探针间隔
+    private const val EXEQ_IDLE_WAIT_MS = 250L  // ★过渡态（EX 页在收尾、还没接管）的轮询间隔
+    private const val EXEQ_FB_MAX = 3              // ★主循环兜底接管 EX 页的次数上限（超了 ⇒ 让用户手动关）
+    private const val EXEQ_RETRY_WAIT_MS = 300L      // "这一轮点了没生效"时的等待（别把 agent 读爆）
+    private const val EXEQ_AUTO_WAIT_MS = 900L       // 点完「自动装备」后等页面切到②的上限（超了 ⇒ 再点一次）
+    private const val EXEQ_READ_FULL_MS = 4000L      // 整包读（要按钮坐标）的超时（别占住 agent 单通道太久）
+    private const val EXEQ_TOTAL_BUDGET_MS = 30000L  // 整个 EX 流程的时间上限（超了 ⇒ 收手交回主循环）
     private const val EXEQ_OPEN_WAIT_MS = 30000L     // 就绪却读不到「特别装备」按钮的等待上限（PC EXEQ_OPEN_WAIT=30s）
+
+    /**
+     * ★特别装备三连页的**页身份**（= agent 侧 `labExEquip` 的 `top`）。
+     *
+     * 不用容器窗口名（`DialogCommonFullSize` / `DialogCommonBig`）：三个页可能都挂在同一个容器下，
+     * 容器名**分不开**是哪一页；页身份是 agent 按**类**认的（PartsDialog*ExtraEquip），一一对应。
+     */
+    private const val EXEQ_PAGE_PARTY = "party"      // ① 特别装备设定
+    private const val EXEQ_PAGE_SETTING = "setting"  // ② 自动特别装备设定
+    private const val EXEQ_PAGE_SORT = "sort"        // ③ 优先属性值
+    /** "当前**不在**特别装备三连页里"（[exeqSigNow] 返回空串 = 回到编组页了） */
+    private const val EXEQ_OFF_PAGE = ""
+    /** 读窗口失败时的标记（状态机里当"**没离开**"处理 ⇒ 不算这一步生效） */
+    private const val EXEQ_UNKNOWN = "?"
 
     /** 单个节点（按 nodeKey）的特别装备流程会话（PC `_EXEQ_SESS` 按 (节点,状态,视图) 记） */
     private data class ExeqSess(
@@ -1497,34 +1545,126 @@ object MazeLoop {
         var exDone: Boolean = false,
         var exShare: Boolean = true,
         var team1Sig: List<Int>? = null,
-        var pendSig: String? = null,
-        var pendAt: Long = 0L,
+        /** ★上一次点击时的**页面签名**（签名没变 ⇒ 还没生效 ⇒ 别重复点） */
+        var tapSig: String? = null,
+        /** ★**正在点的那个按钮名**（多点时按"同一个按钮"计数，换按钮就清零） */
+        var tapBtn: String? = null,
+        /**
+         * ★**正在点的那个按钮实例**（GameObject 指针，agent 侧给）——
+         *   多点重试时用它把点击**锁在同一个按钮上**（同名按钮在同一页里可能有好几棵）。
+         */
+        var tapBtnId: String? = null,
+        /**
+         * ★★**上一次读到**的按钮坐标**（2026-11-08 实测加的）：
+         *   同一个按钮实例（id 相同！）两次读出的坐标会**差很多** ——
+         *     ②「确认」 (1179,960) → (1150,904)；①「装备确定」 (1626,960) → (1160,666)；
+         *   那是**页面切换动画**里按钮在位移（第一次点击其实**已经生效**了，只是签名还没更新）。
+         *   ⇒ 重试前拿它比对：位移大 ⇒ 按钮在动（页面在切）⇒ **这一次不点**（那个"移动中的位置"
+         *     很可能压在**别的控件**上 —— 这才是真正的"多点落到不同目标"）；等它停稳了再点。
+         */
+        var tapX: Int = -1,
+        var tapY: Int = -1,
+        /** ★**同一个按钮**已经点了几下（防止在一个按钮上狂点） */
+        var tapN: Int = 0,
+        /**
+         * ★"特别装备流程**还没走完**"（2026-11-08）——
+         *   打包流程里 = "**正在跑**"；主循环的兜底段靠它判断要不要再跑一遍。
+         */
+        var pending: Boolean = false,
+        /** ★三连页**确实打开过**（区分"还在开"和"已经走完回到编组页"——两者签名都是空串） */
+        var exStarted: Boolean = false,
+        /** ★**确实进过**②自动特别装备设定页**（⇒ "从②回来了" ⇒ change=false 才是"自动装备真没改动"） */
+        var sawSetting: Boolean = false,
+        /** ★点「自动装备」的**时刻**（用来判断"页面是不是还在切" ⇒ 等 vs 再点一次） */
+        var autoAt: Long = 0L,
+        /** ★**连续**读到"不在 EX 页"的次数（≥2 才判"真走完了"—— 防"最上层被别的东西盖住"误判） */
+        var offN: Int = 0,
+        /**
+         * ★EX 三连页**收不了手**（已经收尾却还压在该页上）⇒ 停止自动处理，
+         *   别让主循环每轮都重跑一遍打包流程（每轮 30s 太贵）。
+         */
+        var exStuck: Boolean = false,
+        /** ★主循环**兜底接管**的次数（EX 页还在 ⇒ 再接管一次；超过上限就放弃） */
+        var fbN: Int = 0,
+        /** ★整包读（要按钮坐标那次）的**累计耗时** —— 用来定轮询/探针间隔（别想当然） */
+        var fullMs: Long = 0L,
+        /** ★**最后一次点击**的时刻（用来算"这一步从点到生效"用了多久） */
+        var lastTapAt: Long = 0L,
     )
-    private val exeqSessions = HashMap<String, ExeqSess>()
+
+    /**
+     * ★当前的特别装备会话（**单例**，2026-11-08）。
+     *
+     * 原来按 `nodeKey` 存 map，但 EX 只出现在**当前这一个节点**的编组页上（换节点时清），
+     * 实质上同时只有一个 ⇒ 改成单例后，**EX 流程不需要 `labStatus` 里的 blockId**，
+     * 就能完全自己跑完（主循环不再为它读全量快照）。
+     */
+    private var exeqSessCur: ExeqSess? = null
     /** 最近配好的队伍1 签名（sorted unitId，只记一套）—— 用于 SKIP_SAME（PC `_EXEQUIP_LAST`，Boss 只看队伍1） */
     private var exequipLastTeam1: List<Int>? = null
 
-    private fun exeqSess(key: String): ExeqSess = exeqSessions.getOrPut(key) { ExeqSess() }
+    private fun exeqSess(): ExeqSess = exeqSessCur ?: ExeqSess().also { exeqSessCur = it }
 
-    private fun _exeqBtn(buttons: org.json.JSONArray?, name: String): JSONObject? {
+    /**
+     * 取某个名字的按钮。
+     *
+     * ★★2026-11-08 修（实测 10:02 那轮日志）：
+     *   同一页里**可能有多棵同名按钮**（嵌套弹窗/槽位里的也叫 ThreeButtonRight…），
+     *   而"数组里第一个"在重读整包时**不稳定** ⇒ 多点时第二轮会点到**另一个目标**：
+     *     ②「确认」 (1179,960) → (1150,904)；①「装备确定」 (1626,960) → (1160,666) ✗。
+     *   ⇒ 两条规则：
+     *     ① [preferId]（**GameObject 指针**）命中 ⇒ 就用它 —— 把多点**锁在同一个按钮实例**上；
+     *     ② 没命中 ⇒ 取**最靠下**的那个（y 最大 = 底部主按钮行）—— 主按钮行才是
+     *        「取消/自动装备/装备确定」「确认」该点的那一排。
+     *
+     * @param preferId ★**优先取这个实例**（GameObject 指针）
+     */
+    private fun _exeqBtn(buttons: org.json.JSONArray?, name: String, preferId: String? = null): JSONObject? {
         if (buttons == null) return null
+        var best: JSONObject? = null
         for (i in 0 until buttons.length()) {
             val b = buttons.optJSONObject(i) ?: continue
-            if (b.optString("name") == name) return b
+            if (b.optString("name") != name) continue
+            if (!preferId.isNullOrEmpty() && b.optString("id") == preferId) return b
+            if (best == null || b.optInt("y") > best.optInt("y")) best = b
         }
-        return null
+        return best
     }
 
-    /** 这一刻"这一页长什么样"的签名 —— 点完要等它变了才允许下一步（状态变化驱动，PC `_exeq_sig`） */
-    private fun _exeqSig(top: String, p: JSONObject): String {
-        val arr = { k: String -> p.optJSONArray(k)?.toString() ?: "" }
-        return when (top) {
-            "party" -> "party|${p.opt("change")}|${arr("unitIds")}"
-            "setting" -> "setting|${arr("labels")}|${p.opt("checked")}|${arr("terms")}"
-            "sort" -> "sort|${p.opt("cur")}|${arr("toggles")}"
-            else -> top
+    /**
+     * ★从**签名**里取页身份（party / setting / sort）—— 签名格式 `页身份@容器名|状态…`
+     * （容器名是 agent 侧"当前最上层"的归一化名，2026-11-08 加的：
+     *   这样"页面切了"能被立刻看见，而不必等页内状态变）。
+     */
+    private fun exeqPageOf(sig: String): String? = when {
+        sig.startsWith("$EXEQ_PAGE_PARTY@") -> EXEQ_PAGE_PARTY
+        sig.startsWith("$EXEQ_PAGE_SETTING@") -> EXEQ_PAGE_SETTING
+        sig.startsWith("$EXEQ_PAGE_SORT@") -> EXEQ_PAGE_SORT
+        else -> null
+    }
+
+    /** ★从**签名**里取 `change`（只有①页有）：true / false / null（读不到） */
+    private fun exeqChangeOf(sig: String): Boolean? {
+        val i = sig.indexOf("|change=")
+        if (i < 0) return null
+        return when (sig.substring(i + 8)) {
+            "true" -> true
+            "false" -> false
+            else -> null
         }
     }
+
+    /**
+     * ★**轻量**读 EX 三连页的当前签名（agent 侧算好，只回一个字符串 —— 不带坐标、不带按钮）。
+     *
+     * 轮询用这个（几十 ms）；要按钮坐标时才走整包读 [AgentApi.labExEquip]。
+     * ★签名与整包是**同一个 agent 函数**算的（`_exeqSigOf`）⇒ 两边口径永远一致，
+     *   所以"整包读到的签名 == 轻量读到的签名"这个校验是可靠的。
+     *
+     * @return 签名；`""`（[EXEQ_OFF_PAGE]）= 当前**不在**三连页里；`"?"`（[EXEQ_UNKNOWN]）= 读不到
+     */
+    private suspend fun exeqSigNow(): String =
+        runCatching { AgentApi.labExEquipSig() }.getOrNull() ?: EXEQ_UNKNOWN
 
     // 编队页缓存（PC `party_ctx_cached`：本局持有角色池 + 加速遗物技能值，进迷宫读一次）
     @Volatile
@@ -3437,8 +3577,8 @@ object MazeLoop {
      *     点完等游戏生效、下轮**按实际队伍重算**；
      *   · 只能点"当前可见"的：不在可见区的缺员由滚动分支滚进屏，下一轮再点一批（**滚→点→滚→点**）；
      *   · 集合一致（`plan.done`）且 `LAB_PARTY_AUTO` 且到下限 → 点「战斗开始」（`ButtonDecide`）；
-     *   · **特别装备三连页**由 `handleExequip` 驱动（在白名单之前拦截，不进弹窗白名单，免得误点按钮坏队）；
-     *     编队就绪后自动点开「特别装备」，走完才点「战斗开始」（顺序见下方 ②）。
+     *   · **特别装备三连页**由 `handleExequipPacked` 驱动（编队就绪后**当场**把三连页走完，
+     *     不进弹窗白名单，免得误点按钮坏队）；编队就绪后自动点开「特别装备」，走完才点「战斗开始」。
      *   · 多分队走 [PartyPlan.partyFillOk]：**5 层 Boss 默认编满 3 队**；3 层/其它层只编第 1 队
      *     （本节点失败过才补后备队）；**不该编的那一队空队放行**（点「决定」走过去，游戏允许不编满就挑战）。
      */
@@ -3457,7 +3597,8 @@ object MazeLoop {
      *   现在改成**循环**：[partyEditRound] 一圈做一件事，做完还有下一步就再来一圈（同一调用内）。
      *
      * ★注意两个"必须交回主循环"的地方：
-     *   · **打开「特别装备」** —— 那个三连页由 [handleExequip] 接管，必须交回去；
+     *   · **打开「特别装备」** —— 三连页由 [handleExequipPacked] **当场**跑完（2026-11-08 改法：
+     *     不再"交回主循环"，主循环也就不会在 EX 页上读 labStatus / 命中弹窗白名单）；
      *   · **点「战斗开始」/「决定」之后** —— 页面要换，等主循环去看新页面。
      */
     private suspend fun handlePartyEdit(input: InputBackend, st: JSONObject, tag: String) {
@@ -3965,7 +4106,7 @@ object MazeLoop {
         // ② 已就绪（或"这一队不编 ⇒ 放行"）→ 决定「特别装备」+ 点「决定/战斗开始」（防抖：gap 内不重复点）
         if ((plan.done || bossAdv) && PartyPlan.LAB_PARTY_AUTO) {
             val key = nk                               // nodeKey(st)，上面已算过
-            val sess = exeqSess(key)
+            val sess = exeqSess()
             // ★同一节点"重挑战但第 1 队换人" ⇒ 上次的 exDone 不能复用（2026-10-22）：
             //   装备是跟着人走的。失败重试时编队会按 `tank_on_fail` 补坦克/换人，若不重置就会
             //   静默沿用"已配好"直接开打。只判第 1 队（team1Sig 只记第 1 队；2/3 队本来就不覆盖基线）。
@@ -3979,7 +4120,7 @@ object MazeLoop {
                     sess.opened = false
                 }
             }
-            // ── ★特别装备：编队就绪后自动点开（LAB_EXEQUIP_AUTO）→ 之后由 handleExequip 单步接管 ──
+            // ── ★特别装备：编队就绪后自动点开（LAB_EXEQUIP_AUTO）→ 之后**打包**走完三连页 ──
             //   每页只点开一次（手动关掉后不再自动重开，避免来回拉扯）；
             //   优化：当前队 == 上一场同一套人 → 直接放行（装备没被动过，省掉这步）。
             //   ⚠ 只能比"相邻上一场"：中途换过队就可能把装备拆走了（PC 2026-10-13 纠正）。
@@ -4002,11 +4143,13 @@ object MazeLoop {
                         tap(input, eq.optInt("x"), eq.optInt("y"),
                             "打开特别装备${if (sess.exShare) "" else "（第2/3队：不共用其他角色装备）"}")
                         delay(PartyPlan.LAB_PARTY_TAP_MS)
-                        // ★★点开「特别装备」后**本轮到此为止**（2026-10-17 用户指出）：
-                        //   原来同一轮继续往下，又点了「战斗开始/决定」——而此刻已经在特别装备页上，
-                        //   那个坐标处**没有按钮**（空点）；万一碰巧压在装备页某颗按钮上还会误操作 ✗。
-                        //   下一轮由 handleExequip 接管，走完装备再回来开打（顺序本来就是这么设计的）。
-                        return PARTY_STEP_DONE      // ★交回主循环：特别装备三连页由 handleExequip 接管
+                        // ★★2026-11-08：三连页改成**打包跑完**（原来是"点开就交回主循环、由 handleExequip 单步接管"）。
+                        //   现在在**同一次调用里**把①②③走完 ⇒ 走完就回到编组页 ⇒ 下一轮重新读页再点「战斗开始」。
+                        //   （旧做法的坑：主循环下一轮看到的是 EX 页，顶框 DialogCommonBig ⇒ 通用弹窗白名单
+                        //     会命中 ThreeButton*/TwoButton* ⇒ 误点"装备确定/确认"；而且 EX 页上读 labStatus
+                        //     是纯浪费 —— 打包之后主循环根本不会看到 EX 页。）
+                        handleExequipPacked(input)
+                        return PARTY_STEP_AGAIN      // ★重读编组页 ⇒ 接着点「战斗开始」
                     } else {
                         // 编队已就绪却读不到「特别装备」按钮 → 等 EXEQ_OPEN_WAIT 后放行（别为装备卡住流程）
                         val nel = System.currentTimeMillis() - sess.openedAt
@@ -4166,14 +4309,23 @@ object MazeLoop {
                         return PARTY_STEP_DONE
                     } else {
                         // ★普通战：「战斗开始」的终点是**战斗中**（顶框为空）——离开编组页即算生效
-                        // ★★2026-11-07 用户：settleMs 200 → **800ms**。实测（16:08:51）点完 200ms 顶框
-                        //   还没变（过场要先盖一层 DialogQuestDetail）⇒ 被判成"没生效"连点 3 下。
-                        //   而【战斗开始】(1676,908) 与预览页【挑战】(1635,915) 只差 41px ⇒ 多点很危险。
+                        // ★★2026-11-08 改成**探针制**（原来是 settleMs=800 固定等一次）：
+                        //   · 原来"点完死等 800ms 再读一次"——切走了也得等满；而 2026-11-07 实测
+                        //     200ms 又太快（过场要先盖一层 DialogQuestDetail）⇒ 被判"没生效"连点 3 下。
+                        //   · 现在：**200ms 起步 + 最多探 4 次**（每次隔 150ms）⇒ 覆盖同样的 650ms 窗口，
+                        //     但**切走立刻停**（不用等满）；没切走就继续探，探完才重试 ⇒ 不会连点。
+                        //   · 【战斗开始】(1676,908) 与预览页【挑战】(1635,915) 只差 41px ⇒ 多点很危险，
+                        //     所以宁可多探也别多点。
                         tapAndCheck(
                             input, dec.optInt("x"), dec.optInt("y"), "战斗开始",
-                            from = setOf("DialogCommonPartyEdit"),
-                            settleMs = 800L,
+                            // ★★from 里带 "@battle"：**进战斗了也算"离开"** ——
+                            //   进战斗时编组页对话框可能还在（labTop 不变）⇒ 只看窗口名判不出生效
+                            //   ⇒ 会连点（实测 10:39:55 连点 6 下，5 下是点在战斗视图里，纯浪费）。
+                            from = setOf("DialogCommonPartyEdit", "@battle"),
+                            settleMs = 200L,
                             retries = 6,
+                            probe = PROBE_N,
+                            probeMs = PROBE_MS,
                             // 阶段2 等"进入战斗"（无对话框，用 inBattle 判）
                             expect = setOf("@battle"),
                         )
@@ -4189,118 +4341,341 @@ object MazeLoop {
     }
 
     /**
-     * 特别装备三连页：读出来 + 按 `LAB_EXEQUIP_AUTO` 走单步动作（PC `handle_exequip`）。
-     * 调用方已在白名单之前拦截并 `continue`，这里直接驱动、不用担心被通用弹窗误点。
-     * 多步在本轮内连推（`EXEQ_FAST_BUDGET_MS`），某步在"等页面变样"或流程结束即交回主循环。
+     * ★★特别装备三连页：**打包自己跑完**（2026-11-08，不走主循环）。
+     *
+     * · 编组页点开「特别装备」后**当场**把三连页走完，主循环**根本不会看到 EX 页**
+     *   ⇒ 也就不会在 EX 页上读 `labStatus`（全量 150~300ms，EX 页上根本用不上）。
+     * · 内部循环 = 「读签名（状态检测）→ 决策 → 点一下 → 再读签名看变了没」，
+     *   每步只有**一次**轻量读（签名）+ **一次**整包读（要按钮坐标）。
+     * · 流程是确定的线性序列：编组页 →（点「特别装备」）→ ①特别装备设定 → ②自动特别装备设定
+     *   → ③优先属性值 → ② → ① →（点「装备确定」）→ 编组页。
      */
-    private suspend fun handleExequip(input: InputBackend, st: JSONObject, top: String) {
+    private suspend fun handleExequipPacked(input: InputBackend) {
         if (!LAB_EXEQUIP_AUTO) {
-            AppState.addLog("    ⏸ 特别装备页：$top（LAB_EXEQUIP_AUTO=false → 不自动，等手动）")
+            AppState.addLog("    ⏸ 特别装备：LAB_EXEQUIP_AUTO=false → 不自动，等手动")
             return
         }
-        val key = nodeKey(st)
+        val sess = exeqSess()
         val t0 = System.currentTimeMillis()
-        val sess = exeqSess(key)
-        while (System.currentTimeMillis() - t0 < EXEQ_FAST_BUDGET_MS) {
-            val before = sess.n
-            _exeqStep(input, st, top, key)
-            if (sess.n == before || sess.exDone) break   // 这步没点（在等页面变）或流程结束 ⇒ 交回主循环
-            delay(EXEQ_POLL_MS)
+        var fullFail = 0                              // 连续读不到整包的次数（agent 不在状态 ⇒ 收手）
+        sess.n = 0                                   // ★每次进入 = 一轮新的尝试（决策基于当前页面状态，幂等）
+        // ★★每次尝试都要把"上一轮的现场"清干净（2026-11-08）：
+        //   · `exStarted` 不清的话 ⇒ 上一轮走完（exStarted=true）后，这一轮刚点开「特别装备」
+        //     读到"不在页上"就会被当成"已经走完" ⇒ 立刻退出，装备根本没设。
+        //   · `sawSetting`/`auto` 是"**这一轮**有没有进过②/点过自动装备"，跨轮复用会误判。
+        sess.exStarted = false
+        sess.offN = 0
+        sess.sawSetting = false
+        sess.auto = false
+        sess.autoAt = 0L
+        sess.tapSig = null
+        sess.tapBtn = null
+        sess.tapBtnId = null
+        sess.tapX = -1
+        sess.tapY = -1
+        sess.tapN = 0
+        sess.pending = true                          // ★"流程进行中"（收尾处靠它判"异常收手"）
+        OverlayStatus.setState("特别装备")
+        while (System.currentTimeMillis() - t0 < EXEQ_TOTAL_BUDGET_MS) {
+            // ── ① 状态检测（轻量：只回一个签名字符串）──
+            val tDet = android.os.SystemClock.elapsedRealtime()
+            val sigNow = exeqSigNow()
+            val detMs = android.os.SystemClock.elapsedRealtime() - tDet
+            if (sigNow == EXEQ_UNKNOWN) { delay(EXEQ_POLL_MS); continue }   // 读不到 ⇒ 等一下再试
+            if (sigNow == EXEQ_OFF_PAGE) {
+                // ★空签名 = 不在三连页里 ⇒ 两种含义：**还没开出来**，或**已经走完回到编组页**
+                if (!sess.exStarted) {
+                    val el = System.currentTimeMillis() - t0
+                    if (el > EXEQ_WAIT_MAX_MS) {
+                        // ★三连页压根没开出来（点没生效 / 页面没弹）⇒ **放弃这次装备**，别卡住流程
+                        AppState.addLog("    [!] 点了「特别装备」但 ${el}ms 后三连页还没出来 → 放弃装备，直接准备开打")
+                        sess.pending = false
+                        sess.exDone = true
+                        break
+                    }
+                    delay(EXEQ_POLL_MS); continue         // 页面正在开 ⇒ 等它
+                }
+                // ★连续两次读到空才判"真走完"（一次可能是"最上层被别的东西盖住"的误判）
+                sess.offN++
+                if (sess.offN < 2) { delay(EXEQ_POLL_MS); continue }
+                // ★★★2026-11-08 实测 10:29:36 修：**光看签名空是不够的** ——
+                //   切页动画期间会**短暂读空**（②页正在关、①页还没接管，最上层一时没有 EX 组件）。
+                //   那时若就判"走完" ⇒ ①页其实还开着、**「装备确定」根本没点**（装备没设上！），
+                //   而且 EX 页留在屏幕上 ⇒ 后面的操作全在错的页面上做。
+                //   ⇒ 空签名 + **顶层仍是 EX 容器** ⇒ 是过渡态，继续等（等①页露出来再点「装备确定」）。
+                //   ★实测 10:39:41~10:39:52 这个过渡态**持续了 11 秒** ⇒
+                //     ① 轮询别那么密（60ms → 250ms，agent 单通道也省点）② 日志**别刷屏**（同一句只打一次）。
+                val topNow = runCatching { AgentApi.labTop() }.getOrNull() ?: ""
+                if (EXEQ_CONTAINERS.any { topNow.startsWith(it.substringBefore("(")) }) {
+                    if (sess.offN == 2) {
+                        AppState.addLog("    · 签名读空但顶层还是 EX 容器($topNow) ⇒ 过渡态，继续等（等①页接管）")
+                    }
+                    delay(EXEQ_IDLE_WAIT_MS)
+                    continue
+                }
+                AppState.addLog(
+                    "    ✓ 特别装备三连页走完（回到编组页）" +
+                        "｜从最后一次点击算起用了 ${System.currentTimeMillis() - sess.lastTapAt}ms" +
+                        "（含等 EX 页容器从顶层消失的动画时间）",
+                )
+                sess.pending = false                    // ★走完了 ⇒ 主循环不用再轻量探测
+                sess.fbN = 0                            // ★干净收尾 ⇒ 兜底接管计数归零
+                // ★兜底：正常流程最后一击是「装备确定」（那时已置 exDone），
+                //   走到这儿还没置 ⇒ 是被**别的方式**关掉的（用户手动关 / 页面自己收回）。
+                //   不置 exDone 的话编组页会一直卡在"等装备"（永远不点「战斗开始」）⇒ 这里补上。
+                if (!sess.exDone) {
+                    sess.exDone = true
+                    AppState.addLog("    · （没点过「装备确定」就回到了编组页 ⇒ 按“已处理”放行）")
+                }
+                break
+            }
+            sess.offN = 0
+            sess.exStarted = true                       // ★三连页确实开着
+            // ── ② 页身份 / 阶段位（签名里就有，不用再读整包）──
+            val page = exeqPageOf(sigNow)
+            if (page == EXEQ_PAGE_SETTING) sess.sawSetting = true     // ★进过② ⇒ 之后 change=false 才是"真没改动"
+            if (page == EXEQ_PAGE_PARTY && sess.auto && !sess.sawSetting &&
+                exeqChangeOf(sigNow) == false
+            ) {
+                // ★★刚点完「自动装备」、页面正在切到② —— 这时 change=false 只是**中间态**，
+                //   **绝不能**据此判"自动装备后无改动"（那会跳到「取消」⇒ 点错按钮，2026-11-08 实测）。
+                //   等一小会儿；超过 [EXEQ_AUTO_WAIT_MS] 还没切过去 ⇒ 说明那次点击没生效 ⇒ 再点一次（多点）。
+                val el = System.currentTimeMillis() - sess.autoAt
+                if (el < EXEQ_AUTO_WAIT_MS) {
+                    delay(EXEQ_POLL_MS); continue
+                }
+            }
+            if (sess.tapSig != sigNow) {
+                sess.tapSig = sigNow
+                sess.tapN = 0
+                // ★把两种读的耗时都打出来（轻量签名读 vs 整包读）——
+                //   间隔取值（轮询/探针）要照着真实耗时定，不能想当然。
+                AppState.addLog(
+                    "    · 状态检测 ${detMs}ms（签名=$sigNow）｜整包读累计 ${sess.fullMs}ms",
+                )
+            }
+            if (fullFail >= 3) {
+                AppState.addLog("    [!] 特别装备：连续 $fullFail 次读不到页面（agent 不在状态）→ 收手")
+                break
+            }
+            if (sess.n >= EXEQ_MAX_STEPS) {
+                AppState.addLog("    [!] 特别装备流程点了 $EXEQ_MAX_STEPS 下仍未结束 → 停手")
+                break
+            }
+            // ── ③ 决策 + 点：**在当前页上一直点到生效**（tapAndCheck 阶段 1 的语义）──
+            //   · 每次点击前都**重读整包**：① 当前页是权威（不会点到别的目标）② 坐标是**最新**的
+            //     （切页动画期间坐标在动 ⇒ 第一次可能点空 ⇒ 再点一次就中了 —— 多点是手段）。
+            //   · ★整包读到的签名必须与外层的轻量签名**一致**（不一致 ⇒ 页面正在切 ⇒ 这一轮不点）。
+            //   · 没生效就在**同一次调用里**接着点（retries 次），不空等、不跨轮。
+            val ok = tapAndCheck(
+                input, 0, 0, "特别装备",
+                from = setOf(sigNow),
+                settleMs = EXEQ_TAP_SETTLE_MS,
+                retries = EXEQ_TAP_TRIES,
+                readTop = { exeqSigNow() },
+                unknownTop = EXEQ_UNKNOWN,
+                // ★★点完**探**几次（不是"等一下就重试"）—— 页面动画没走完时签名不会变，
+                //   探到"变了"就停；探完还没变才判"真没生效"（那时按钮已静止，再点才点得准）。
+                probe = PROBE_N,
+                probeMs = PROBE_MS,
+                xyAt = xyAt@{
+                    // ① 页面已经切走？⇒ 这一次不点（外层循环会重新读页面状态）
+                    if (exeqSigNow() != sigNow) return@xyAt null
+                    // ② 重读整包（当前页 + 最新坐标）
+                    val tFull = android.os.SystemClock.elapsedRealtime()
+                    val xr = AgentApi.labExEquip(true, timeoutMs = EXEQ_READ_FULL_MS)
+                    sess.fullMs += android.os.SystemClock.elapsedRealtime() - tFull
+                    if (xr == null) { fullFail++; return@xyAt null }
+                    fullFail = 0
+                    val sr = xr.optString("sig")
+                    // ★读数与外层不一致 ⇒ 页面正在切/状态在变 ⇒ 这一轮**不点**（避免点到别的按钮）
+                    if (sr != sigNow) return@xyAt null
+                    val act = exeqDecide(xr, sess) ?: return@xyAt null
+                    // ③ 多点按**同一个按钮实例**计数（换按钮/换实例就清零）
+                    val bn = act.btn.optString("name")
+                    val bid = act.btn.optString("id")
+                    if (sess.tapBtn != bn || (bid.isNotEmpty() && sess.tapBtnId != bid)) {
+                        sess.tapBtn = bn
+                        sess.tapBtnId = bid
+                        sess.tapN = 0
+                        sess.tapX = -1
+                        sess.tapY = -1
+                    }
+                    if (sess.tapN >= EXEQ_TAP_MAX) return@xyAt null
+                    // ★★"按钮在动" ⇒ 页面正在切 ⇒ **这一轮不点**（2026-11-08 实测 10:29:36）：
+                    //   同一个按钮实例（id 相同）两次读出的坐标能差很多 —— ②「确认」
+                    //   (1179,960) → (1026,666)：那是**页面切换动画**里它在位移，
+                    //   说明**上一下其实已经点中了**（只是签名还没更新，200ms 内没更新）。
+                    //   点那个"移动中的位置"会落在**别的控件**上 ⇒ 这才是真正的"多点落到不同目标"。
+                    //   ⇒ 判据做成**自洽**的（不依赖"上次点的坐标"作为结论）：
+                    //     **再读一次整包**，同一实例两次坐标一致 ⇒ 停稳了，才可以点。
+                    //   ★但**平时不做**这个双读 —— 整包读 ~700ms，白读一次就是白等 0.7s
+                    //     （实测这 1.4s 的双读就是"点完还在发呆"的大头）。
+                    //     ⇒ 只有**疑似在动**（与上次读到的不一致）才多读一次。
+                    val bx0 = act.btn.optInt("x")
+                    val by0 = act.btn.optInt("y")
+                    var bx = bx0
+                    var by = by0
+                    if (sess.tapX >= 0 &&
+                        (Math.abs(bx0 - sess.tapX) > EXEQ_BTN_MOVE_PX ||
+                            Math.abs(by0 - sess.tapY) > EXEQ_BTN_MOVE_PX)
+                    ) {
+                        // ★两次读之间**必须隔开一点**（2026-11-08 实测 10:39:41）：
+                        //   同一帧内连读两次 ⇒ 坐标当然一样 ⇒ 误判"已停稳" ⇒ 照样点在移动中的位置。
+                        delay(EXEQ_STILL_MS)
+                        val xr2 = AgentApi.labExEquip(true, timeoutMs = EXEQ_READ_FULL_MS)
+                        sess.fullMs += android.os.SystemClock.elapsedRealtime() - tFull
+                        if (xr2 == null) { fullFail++; return@xyAt null }
+                        val sr2 = xr2.optString("sig")
+                        if (sr2 != sigNow) return@xyAt null          // 页面在切 ⇒ 不点
+                        val b2 = _exeqBtn(
+                            xr2.optJSONObject("page")?.optJSONArray("buttons"), bn, sess.tapBtnId,
+                        ) ?: return@xyAt null
+                        val bx2 = b2.optInt("x")
+                        val by2 = b2.optInt("y")
+                        if (Math.abs(bx2 - bx0) > EXEQ_BTN_MOVE_PX ||
+                            Math.abs(by2 - by0) > EXEQ_BTN_MOVE_PX
+                        ) {
+                            // 还在动 ⇒ 记下新位置，等它**停稳**（下一轮再读，两次一致就点）
+                            sess.tapX = bx2
+                            sess.tapY = by2
+                            AppState.addLog(
+                                "    · 按钮还在动（$bn ${bx2},${by2} ⇄ ${bx0},${by0}）→ 这一轮不点，等它停稳",
+                            )
+                            return@xyAt null
+                        }
+                        bx = bx2
+                        by = by2
+                    }
+                    sess.tapN++
+                    sess.n++
+                    sess.tapX = bx
+                    sess.tapY = by
+                    sess.lastTapAt = System.currentTimeMillis()
+                    if (act.markAuto) { sess.auto = true; sess.autoAt = System.currentTimeMillis() }
+                    if (act.isFinal) {
+                        sess.exDone = true
+                        // 只有队伍1（exShare）配完才更新基线（PC：Boss 只看队伍1，队伍2/3 不覆盖）
+                        if (sess.exShare) {
+                            val sig1 = sess.team1Sig
+                            if (!sig1.isNullOrEmpty()) exequipLastTeam1 = sig1
+                        }
+                    }
+                    // ★把**按钮实例 id**（指针尾 8 位）打进日志：多点重试时用它核对"点的是不是同一个按钮"
+                    AppState.addLog(
+                        "特别装备：${act.what}（按钮=${act.btn.optString("name")}" +
+                            "@${act.btn.optString("id").takeLast(8)} 签名=$sr）",
+                    )
+                    act.btn.optInt("x") to act.btn.optInt("y")
+                },
+            )
+            // ★生效了 ⇒ 立刻进下一步（不等）；没生效 ⇒ 等一下再来（别把 agent 读爆）
+            if (!ok) delay(EXEQ_RETRY_WAIT_MS)
+        }
+        // ── 收尾：正常走完（回到编组页）已在循环里清了 pending；
+        //   能走到这儿 = **异常收手**（步数/预算用尽）⇒ 放弃这次装备，
+        //   别让主循环的兜底探测把它变成"每轮重试"的死循环。
+        if (sess.pending) {
+            AppState.addLog("    [!] 特别装备流程异常收手（步数/预算用尽）→ 放弃这次装备，直接准备开打")
+            sess.pending = false
+            sess.exDone = true
         }
     }
 
+    /** 一次 EX 点击的**决策结果**（点哪个按钮 + 这次点击的副作用） */
+    private data class ExeqAct(
+        /** 人话描述（打日志用） */
+        val what: String,
+        /** 要点的按钮（整包里的一项：x/y/name/id） */
+        val btn: JSONObject,
+        /** ★点完这个按钮后，"已经点过自动装备"要置真 */
+        val markAuto: Boolean = false,
+        /** ★这一步是**收尾**（装备确定 / 取消）—— 点完整个流程就结束了 */
+        val isFinal: Boolean = false,
+    )
+
     /**
-     * 特别装备流程的**单步**动作（PC `_exeq_step`）：一轮最多点一下；点完**等"页面变样"**再走下一步。
+     * 决策：当前三连页上，下一步该点哪个？（**纯读，不点**）
+     *
      * 顺序：① 点「自动装备」→ ② 若「全部」≠稀有度 点那一行 →（③ 选「稀有度」+ 确认）
      *       ② 若未勾 点复选框 → 点「确认」→ ① 按 isChangeExtraEquip() 点「装备确定」；
-     *       若点过自动装备后**仍然没有改动** → 点「取消」退出。
+     *       若从②回来、确实没改动 → 点「取消」退出。
+     * @return null = 现在点不了（页面数据没读全 / 找不到按钮 / **正在切页，不该点**）
      */
-    private suspend fun _exeqStep(input: InputBackend, st: JSONObject, top: String, key: String) {
-        val sess = exeqSess(key)
-        if (sess.n >= EXEQ_MAX_STEPS) {
-            if (sess.n == EXEQ_MAX_STEPS) {
-                sess.n += 1
-                AppState.addLog("    [!] 特别装备流程走了 $EXEQ_MAX_STEPS 步仍未结束 → 停手")
-            }
-            return
-        }
-        val x = AgentApi.labExEquip(true) ?: return        // 要点了才取"带按钮坐标"的读数
-        if (jStr(x, "top") != top) return                  // 页面已经变了 → 本轮不点（jStr 防 top:null 变 "null"）
+    private fun exeqDecide(x: JSONObject, sess: ExeqSess): ExeqAct? {
+        val page = jStr(x, "top")
+        if (page.isEmpty()) return null
         val p = x.optJSONObject("page") ?: JSONObject()
-        val sig = _exeqSig(top, p)
-        sess.pendSig?.let { ps ->
-            val el = System.currentTimeMillis() - sess.pendAt
-            if (ps == sig && el < EXEQ_WAIT_MAX_MS) return  // ★上一步点完页面还没变 → 继续等，不抢着点
-            if (ps == sig) AppState.addLog("    [!] 特别装备上一步 ${el / 1000}s 后页面没变 → 重判")
-            sess.pendSig = null
-        }
         var what: String? = null
         var tapBtn: JSONObject? = null
         var markAuto = false
         var isFinal = false
-        when (top) {
-            "party" -> {
+        when (page) {
+            EXEQ_PAGE_PARTY -> {
                 val ch = p.opt("change")
                 when {
-                    ch == true -> { what = "装备确定"; tapBtn = _exeqBtn(p.optJSONArray("buttons"), "ThreeButtonRight"); isFinal = true }
-                    ch == false -> {
-                        if (sess.auto) { what = "取消（自动装备后无改动）"; tapBtn = _exeqBtn(p.optJSONArray("buttons"), "ThreeButtonLeft"); isFinal = true }
-                        else { what = "自动装备"; tapBtn = _exeqBtn(p.optJSONArray("buttons"), "ThreeButtonCenter"); markAuto = true }
+                    ch == true -> {
+                        what = "装备确定"; tapBtn = _exeqBtn(p.optJSONArray("buttons"), "ThreeButtonRight", sess.tapBtnId)
+                        isFinal = true
                     }
-                    else -> { if (sess.n < 2) AppState.addLog("    [!] ① 读不到 isChangeExtraEquip → 本轮不点"); return }
+                    ch == false -> {
+                        if (sess.auto && !sess.sawSetting) {
+                            // ★★2026-11-08：**不能**在这里判"自动装备后无改动" ——
+                            //   刚点完「自动装备」，页面正在切到②（自动特别装备设定），
+                            //   这时读到的 change=false 只是"**还没装备完**"的中间态。
+                            //   ⇒ 等待期间**一律不点**；超过 [EXEQ_AUTO_WAIT_MS] 还没切过去
+                            //     ⇒ 说明那次点击没生效 ⇒ **再点一次**（多点是手段）。
+                            val el = System.currentTimeMillis() - sess.autoAt
+                            if (el < EXEQ_AUTO_WAIT_MS) return null
+                            what = "自动装备（重试）"; tapBtn = _exeqBtn(p.optJSONArray("buttons"), "ThreeButtonCenter", sess.tapBtnId)
+                            markAuto = true
+                        } else if (sess.auto) {
+                            // ★从②回来、确实没改动 ⇒ 取消退出（PC 同款）
+                            what = "取消（自动装备后无改动）"; tapBtn = _exeqBtn(p.optJSONArray("buttons"), "ThreeButtonLeft", sess.tapBtnId)
+                            isFinal = true
+                        } else {
+                            what = "自动装备"; tapBtn = _exeqBtn(p.optJSONArray("buttons"), "ThreeButtonCenter", sess.tapBtnId)
+                            markAuto = true
+                        }
+                    }
+                    else -> { if (sess.n < 2) AppState.addLog("    [!] ① 读不到 isChangeExtraEquip → 本轮不点"); return null }
                 }
             }
-            "setting" -> {
+            EXEQ_PAGE_SETTING -> {
                 val labels = p.optJSONArray("labels")
-                if (labels == null || labels.length() == 0) return
+                if (labels == null || labels.length() == 0) return null
                 val share = sess.exShare
+                val checked = p.opt("checked")
                 when {
                     labels.optString(0, "") != "稀有度" -> {
                         what = "「全部」行(当前=${labels.optString(0, "?")}) 进「优先属性值」"
                         tapBtn = p.optJSONArray("prioBtn")?.optJSONObject(0)
                     }
-                    p.opt("checked") == false && share -> { what = "复选框(补勾)"; tapBtn = p.optJSONObject("checkBtn") }
-                    p.opt("checked") == true && !share -> { what = "复选框(取消勾选·不抢别队装备)"; tapBtn = p.optJSONObject("checkBtn") }
-                    p.opt("checked") != null -> { what = "确认"; tapBtn = _exeqBtn(p.optJSONArray("buttons"), "TwoButtonRight") }
-                    else -> { if (sess.n < 2) AppState.addLog("    [!] ② 读不到复选框状态 → 本轮不点"); return }
+                    checked == false && share -> { what = "复选框(补勾)"; tapBtn = p.optJSONObject("checkBtn") }
+                    checked == true && !share -> { what = "复选框(取消勾选·不抢别队装备)"; tapBtn = p.optJSONObject("checkBtn") }
+                    checked != null -> { what = "确认"; tapBtn = _exeqBtn(p.optJSONArray("buttons"), "TwoButtonRight", sess.tapBtnId) }
+                    else -> { if (sess.n < 2) AppState.addLog("    [!] ② 读不到复选框状态 → 本轮不点"); return null }
                 }
             }
-            "sort" -> {
+            EXEQ_PAGE_SORT -> {
                 val tg = p.optJSONArray("toggles") ?: org.json.JSONArray()
                 var hit: JSONObject? = null
-                for (i in 0 until tg.length()) {
-                    val t = tg.optJSONObject(i)
-                    if ((t?.optString("label") ?: "") == "稀有度") { hit = t; break }
-                }
-                if (hit == null) { AppState.addLog("    [!] ③ 页里找不到「稀有度」选项 → 不点"); return }
                 var cur: JSONObject? = null
                 for (i in 0 until tg.length()) {
-                    val t = tg.optJSONObject(i)
-                    if (t?.optBoolean("sel") == true) { cur = t; break }
+                    val t = tg.optJSONObject(i) ?: continue
+                    if (hit == null && t.optString("label") == "稀有度") hit = t
+                    if (cur == null && t.optBoolean("sel")) cur = t
                 }
-                if (cur != null && (cur.optString("label") ?: "") == "稀有度") {
-                    what = "确认"; tapBtn = _exeqBtn(p.optJSONArray("buttons"), "TwoButtonRight")
+                if (hit == null) { AppState.addLog("    [!] ③ 页里找不到「稀有度」选项 → 不点"); return null }
+                if (cur != null && cur.optString("label") == "稀有度") {
+                    what = "确认"; tapBtn = _exeqBtn(p.optJSONArray("buttons"), "TwoButtonRight", sess.tapBtnId)
                 } else {
                     what = "「稀有度」"; tapBtn = hit
                 }
             }
         }
-        if (what == null || tapBtn == null || tapBtn.opt("x") == null) return
-        sess.n += 1
-        if (markAuto) sess.auto = true
-        sess.pendSig = sig
-        sess.pendAt = System.currentTimeMillis()
-        if (isFinal) {
-            sess.exDone = true
-            // 只有队伍1（exShare）配完才更新基线（PC：Boss 只看队伍1，队伍2/3 不覆盖）
-            if (sess.exShare) {
-                val sig1 = sess.team1Sig
-                if (!sig1.isNullOrEmpty()) exequipLastTeam1 = sig1
-            }
-        }
-        tap(input, tapBtn.optInt("x"), tapBtn.optInt("y"), "特别装备·${tapBtn.optString("name")}")
-        AppState.addLog("特别装备：$what")
-        delay(EXEQ_SETTLE_MIN_MS)
+        if (what == null || tapBtn == null || tapBtn.opt("x") == null) return null
+        return ExeqAct(what, tapBtn, markAuto, isFinal)
     }
 
     /** 角色一览里"当前屏上"的 unitId（升序）—— 只用来判"滚完到底动没动"（PC `_vis` 同款：不过滤 vis） */
@@ -6009,6 +6384,22 @@ object MazeLoop {
         /** ★2026-10-27：非 null 表示这颗按钮参与"点早了就下次多等"的自学习（见 [tapProbeKey]）。 */
         learnKey: String? = null,
     ): Boolean {
+        // ★★★**前台闸门**（2026-11-08 实测 10:39:55 补的）：前台不是游戏 ⇒ **这一下不点**。
+        //   实测：用户切到助手前台看日志，助手**还在连点「战斗开始」6 下** ——
+        //   那 6 下全打在**助手窗口**上（用户看到的"乱点"），游戏一根手指都没收到。
+        //   主循环开头本来也有这道闸门，但 handler 在**同一次主循环迭代里**连点很多下
+        //   （编组页一次点 6 个角色、EX 页连点），等它回到循环开头已经晚了好几秒。
+        //   ⇒ 放到 [tap] 里：**每次点击前**都查一次。
+        //     · [Foreground.packageName] 有 500ms TTL 缓存 ⇒ 命中时几乎零成本；
+        //     · **读不到(null) ≠ 切走** ⇒ 照点（与主循环口径一致，宁可不误停也别漏点）。
+        val fp = Foreground.packageName()
+        if (fp != null && fp != GameProcess.pkg()) {
+            if (lastFrontBlockPkg != fp) {
+                lastFrontBlockPkg = fp
+                AppState.addLog("停手：前台已切到 $fp（这一下不点游戏）")
+            }
+            return false
+        }
         if (x !in 0..scrW || y !in 0..scrH) {
             if (lastOOR != (x to y)) {
                 lastOOR = x to y
@@ -6091,6 +6482,14 @@ object MazeLoop {
      * 跟 [tapAndAwait] 的区别：这里没有"超时"这个维度，只回答"这一下有没有生效"。
      * 没生效由调用方决定再点几次（`handleLabSelection` 的 `SEL_RETRY_MAX`），
      * 所以两条控制线不会互相穿透。
+     *
+     * ★2026-11-08 加了三个参数（给"特别装备三连页"用）：
+     *   · [readTop] —— "当前在哪"的探针。EX 流程里"在哪"= **页面签名**（不是窗口名），
+     *     所以这里不能写死 [AgentApi.labTop]。
+     *   · [unknownTop] —— 探针**读失败**时返回什么。默认 `""`；EX 流程给 `"?"`，
+     *     并且**读失败不算"离开 from"**（否则会把"读不到"误判成"点生效了"）。
+     *   · [xyAt] —— **每次点击前现取坐标**。切页动画期间按钮坐标在动（实测 setting「确认」
+     *     动画中 (1182,965) vs 稳定 (1179,960)）⇒ 用旧坐标会点空。返回 null = "这一刻不该点"。
      */
     private suspend fun tapAndCheck(
         input: InputBackend,
@@ -6106,25 +6505,94 @@ object MazeLoop {
         expect: Set<String> = emptySet(),
         /** 阶段 2 的等待上限（不点击，只轮询） */
         expectTimeoutMs: Long = 6_000L,
+        /** ★"当前在哪"的探针（默认用 [AgentApi.labTop]） */
+        readTop: (suspend () -> String)? = null,
+        /** 探针读失败时的标记（默认 `""`；给了 [readTop] 时它会被当成"**没离开**"） */
+        unknownTop: String = "",
+        /** ★每次点击前现取坐标（null = 这一轮不点，也不消耗重试次数） */
+        xyAt: (suspend () -> Pair<Int, Int>?)? = null,
+        /**
+         * ★★点完**探**几次再决定要不要重试（>0 时启用；EX 流程用）。
+         *
+         * 为什么要"探"而不是"等一下就重试"（2026-11-08 实测）：
+         *   页面切换**动画**要 300~500ms 才走完，而"页面变了没"（签名）只在**动画结束**、
+         *   最上层容器真的换了之后才反映出来。⇒ "点完等 200ms 读一次，没变就再点"
+         *   **必然**误判成"没生效" ⇒ 必然多点，而且多点那下正好点在按钮收缩途中
+         *   （实测 ②「确认」 (1179,960) → 移动中 (1026,666)）。
+         *   ⇒ 改成：点完**连续探 [probe] 次**（每次隔 [probeMs]），探到"变了"就停；
+         *     探完还没变 ⇒ 才判"这次真没生效"（那时动画早结束、按钮已静止，再点才点得准）。
+         *   —— 这不是"加等待换精准"，是**用探针替代盲重试**（更快知道还没就绪）。
+         */
+        probe: Int = 0,
+        /** 探针之间的间隔 */
+        probeMs: Long = 150L,
     ): Boolean {
         // ── 阶段 1：反复点，直到**离开 from**（证明这一下生效了）──
         var attempt = 0
+        var skip = 0                        // ★"这一刻不该点"的次数（不消耗重试次数，但要有上限防死循环）
         var left = false
         var nowTop = ""
+        val maxProbe = probe.coerceAtLeast(1)
         while (attempt < retries.coerceAtLeast(1)) {
-            attempt++
-            if (!tap(input, x, y, what)) return false
-            kotlinx.coroutines.delay(settleMs)
-            nowTop = runCatching { AgentApi.labTop() }.getOrNull() ?: ""
-            if (nowTop !in from) {
-                left = true
-                if (TRANS_VERBOSE) {
-                    AppState.addLog(
-                        "⤷ [${from.joinToString("/")}] --$what--> [$nowTop] ${settleMs}ms（第 $attempt 次点击已离开）",
-                    )
+            // ★坐标：给了 [xyAt] 就**每次点击前现取**（切页动画期间坐标在动 ⇒ 旧坐标会点空）。
+            //   null = "此刻不该点"（页面正在切 / 读数不一致）⇒ 稍后再来，**不消耗** [retries]。
+            var px = x
+            var py = y
+            if (xyAt != null) {
+                val p = runCatching { xyAt() }.getOrNull()
+                if (p == null) {
+                    skip++
+                    if (skip > EXEQ_TAP_MAX * 2) return false
+                    kotlinx.coroutines.delay(EXEQ_POLL_MS)
+                    continue
                 }
-                break
+                px = p.first
+                py = p.second
             }
+            attempt++
+            if (!tap(input, px, py, what)) return false
+            // ── 点完**探**一下"页面变没变" ──
+            var probed = 0
+            while (probed < maxProbe) {
+                kotlinx.coroutines.delay(if (probed == 0) settleMs else probeMs)
+                probed++
+                nowTop = if (readTop != null) {
+                    runCatching { readTop() }.getOrDefault(unknownTop)
+                } else {
+                    runCatching { AgentApi.labTop() }.getOrNull() ?: ""
+                }
+                // ★探针读失败（= unknownTop）⇒ **不算"离开"**（EX 流程里签名读不到时最上层的读数是陈旧的，
+                //   当成"点生效了"会让状态机直接跳到下一步 ⇒ 点错按钮）。
+                if (readTop != null && nowTop == unknownTop) continue
+                if (nowTop !in from) {
+                    left = true
+                    if (TRANS_VERBOSE) {
+                        AppState.addLog(
+                            "⤷ [${from.joinToString("/")}] --$what--> [$nowTop] " +
+                                "（第 $attempt 次点击，探 $probed 次已离开）",
+                        )
+                    }
+                    break
+                }
+                // ★★"**进战斗了**"也要算"离开"（2026-11-08 实测 10:39:55 修）：
+                //   进战斗时**编组页那个对话框可能还留在场景里** ⇒ labTop 仍是 DialogCommonPartyEdit
+                //   ⇒ 只看窗口名**永远判不出"点生效了"** ⇒ 一直重试（实测连点 6 下，其中 5 下
+                //   是点在战斗视图里的编组页坐标上，纯属浪费）。
+                //   ⇒ 真正的判据是 [AgentApi.labInBattle]（极轻：只读 ViewManager→当前 View 类名）。
+                if ("@battle" in from &&
+                    runCatching { AgentApi.labInBattle() }.getOrDefault(false)
+                ) {
+                    left = true
+                    if (TRANS_VERBOSE) {
+                        AppState.addLog(
+                            "⤷ [${from.joinToString("/")}] --$what--> [已进入战斗] " +
+                                "（第 $attempt 次点击，探 $probed 次）",
+                        )
+                    }
+                    break
+                }
+            }
+            if (left) break
         }
         if (!left) return false
         if (expect.isEmpty()) return true
@@ -6213,6 +6681,9 @@ object MazeLoop {
 
     /** 上次报过的"屏外坐标"（同值只报一次，照 PC `_TAP_OOR`） */
     private var lastOOR: Pair<Int, Int>? = null
+
+    /** ★上一次被"前台闸门"拦下的包名（同一句只打一次，别刷屏） */
+    private var lastFrontBlockPkg: String? = null
 
     // ── 窗口转移观测（2026-11-06 状态机前置）──────────────────────────
     //   只记录、不改变任何行为：点击前记下"当时窗口"，主循环下一轮看到窗口变了就落一行。

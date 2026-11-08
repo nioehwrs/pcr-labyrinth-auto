@@ -3981,24 +3981,40 @@ function labTopSnapshot() {
 
 function _topDialogName() {
   try {
+    const t = _topDialogGo();
+    return t ? t.name : null;
+  } catch (e) { return null; }
+}
+
+// ★★"当前最上层对话框"—— **唯一权威实现**（2026-11-08）。
+//   DialogArea 的子节点里，取**索引最大的、active 的、名字以 "Dialog" 开头**的那个。
+//   ★`_topDialogName`（labTop，仪表盘/状态机用）和 `_findExTopPart`（EX 三连页查找用）
+//     **必须用同一个**判定 —— 否则两边认为"最上层"是不同的一层：
+//     实测 2026-11-08：labTop 说最上层已是 DialogCommonBig(setting 页)，
+//     而 EX 查找因为"这一层没命中就往下一层退" ⇒ 一直读到下面那层仍 active 的
+//     ①特别装备设定(party) ⇒ 签名永远不变 ⇒ 误判"点击没生效" ⇒ 多点
+//     ⇒ 决策跳成「取消」⇒ **点到了不该点的按钮**。
+function _topDialogGo() {
+  try {
     if (!g_dialogArea || g_dialogArea.isNull() ||
         _str(_inv(_inv(g_dialogArea, "get_gameObject"), "get_name")) !== "DialogArea") {
       g_dialogArea = _findDialogAreaTr();
     }
     if (!g_dialogArea || g_dialogArea.isNull()) return null;
-    let cc = 0; try { const r = _inv(g_dialogArea, "get_childCount"); cc = r.isNull() ? 0 : r.add(0x10).readS32(); } catch (e) {}
-    let top = null;
+    let cc = 0;
+    try { const r = _inv(g_dialogArea, "get_childCount"); cc = r.isNull() ? 0 : r.add(0x10).readS32(); } catch (e) {}
+    let go = null, nm = "";
     for (let i = 0; i < cc; i++) {          // 正序：后者覆盖前者 = 更上层
       const ch = _inv1i(g_dialogArea, "GetChild", i);
       if (ch.isNull()) continue;
       const gobj = _inv(ch, "get_gameObject");
       if (gobj.isNull()) continue;
-      const nm = _str(_inv(gobj, "get_name"));
-      if (!/^Dialog/.test(nm)) continue;
+      const n = _str(_inv(gobj, "get_name"));
+      if (!/^Dialog/.test(n)) continue;
       if (_goActive(gobj) !== true) continue;
-      top = nm;
+      go = gobj; nm = n;
     }
-    return top;
+    return go ? { go: go, name: nm } : null;
   } catch (e) { return null; }
 }
 
@@ -5293,6 +5309,17 @@ function _invBool(obj, name) {
   } catch (e) { return null; }
 }
 
+// ★★特别装备三连页的**组件查找缓存**（2026-11-08）：
+//   `GetComponentInChildren` 要遍历整棵子树 —— 在**编组页**上问签名极贵（那棵树很大，
+//   实测能把"预览页出现→点挑战"拖到 7~8s）。
+//   缓存"上一次查过的那个对话框对象 ⇒ 结果"，指针相同就直接复用：
+//     · 正缓存：命中 ⇒ 直接拿 comp/top（省掉整棵子树遍历，EX 页内轮询几乎零成本）
+//     · 负缓存：这个对话框**里没有** EX 组件（编组页）⇒ 直接返回"不在三连页"（同样省掉遍历）
+//   指针不同（换对话框 / 游戏重启后地址复用）⇒ 重新查并更新缓存。
+//   ⚠ 负缓存成立的前提：EX 三连页是 DialogArea 下**独立的**顶层对话框（不是编组页 go 的子对象）——
+//     否则编组页上 `GetComponentInChildren` 会假命中 EX 类。实测在编组页上签名恒为 ""，前提成立。
+let _exeqCache = null;   // { dlg: NativePointer, top: 'party'|'setting'|'sort'|null, comp: ptr, dlgName: string }
+
 // ★找出"当前这一层"是哪一页：从 DialogArea **最上层**往下一层层看，**第一个**含我们三类零件之一的
 //   激活对话框就是它 —— 返回 {top:'party'/'setting'/'sort', comp, dlg, dlgName}。
 //   为什么必须"第一个命中即返回"：① 特别装备设定那层页在 ②③ 打开时**仍然 active**（叠在下面），
@@ -5305,25 +5332,34 @@ function _findExTopPart() {
     if (!Object.keys(kk).length) return null;
     const tt = {};
     for (const nm in kk) { const t = _typeOf(kk[nm]); if (t && !t.isNull()) tt[nm] = t; }
-    const root = _dialogAreaTr();
-    if (!root) return null;
-    let cc = 0;
-    try { const r = _inv(root, "get_childCount"); cc = r.isNull() ? 0 : r.add(0x10).readS32(); } catch (e) {}
-    for (let i = cc - 1; i >= 0; i--) {                 // 倒序：后加的在上层
-      const ch = _inv1i(root, "GetChild", i);
-      if (ch.isNull()) continue;
-      const go = _inv(ch, "get_gameObject");
-      if (go.isNull()) continue;
-      if (_goActive(go) !== true) continue;             // 只认这一层真的开着
-      for (const nm in tt) {
-        let c = null;
-        try { c = _inv2oi(go, "GetComponentInChildren", tt[nm], 1); } catch (e) {}
-        if (!c || c.isNull()) { try { c = _inv1o(go, "GetComponentInChildren", tt[nm]); } catch (e) {} }
-        if (c && !c.isNull()) {
-          return { top: nm, cls: cls[nm], comp: c, dlg: go, dlgName: _str(_inv(go, "get_name")) };
-        }
+    // ★★**只认最上层**（与 `_topDialogName` 完全同一套判定）——
+    //   最上层不是 EX 页 ⇒ 返回 null（"当前不在三连页"），**绝不往下一层回退**。
+    //   为什么不能回退：①特别装备设定那层页在 ②③ 打开时**仍然 active**（叠在下面），
+    //   回退就会永远读到 ①（旧页）⇒ 签名不变 ⇒ 误判"点击没生效" ⇒ 多点 ⇒ 点错按钮。
+    const top = _topDialogGo();
+    if (!top) return null;
+    const go = top.go;
+    const dlgName = top.name;
+    // 缓存（同一个对话框对象 ⇒ 直接复用；正缓存 2s TTL / 负缓存 1.5s TTL）
+    if (_exeqCache && _exeqCache.dlg.equals(go)) {
+      if (_exeqCache.top && Date.now() - (_exeqCache.at || 0) < 2000) {
+        return { top: _exeqCache.top, cls: cls[_exeqCache.top], comp: _exeqCache.comp, dlg: go, dlgName: dlgName };
+      }
+      if (!_exeqCache.top && Date.now() - (_exeqCache.at || 0) < 1500) return null;
+    }
+    // ★只在这一层里找 EX 组件
+    for (const nm in tt) {
+      let c = null;
+      try { c = _inv2oi(go, "GetComponentInChildren", tt[nm], 1); } catch (e) {}
+      if (!c || c.isNull()) { try { c = _inv1o(go, "GetComponentInChildren", tt[nm]); } catch (e) {} }
+      if (c && !c.isNull()) {
+        _exeqCache = { top: nm, comp: c, dlg: go, dlgName: dlgName, at: Date.now() };
+        return { top: nm, cls: cls[nm], comp: c, dlg: go, dlgName: dlgName };
       }
     }
+    // ★这一层没有 EX 组件 ⇒ 负缓存（编组页上反复问签名时省掉整棵大树遍历）
+    _exeqCache = { top: null, comp: null, dlg: go, dlgName: dlgName, at: Date.now() };
+    return null;
   } catch (e) {}
   return null;
 }
@@ -5343,14 +5379,97 @@ function _exeqButtons(rootTr) {
   }, false, rootTr);                                   // 先便宜地筛名字，再只给命中的算坐标
   for (const f of found) {
     const p = _ndXY({ tr: f.tr }, env);
-    if (p && p.onscreen) out.push({ name: f.name, x: p.x, y: p.y });
+    if (p && p.onscreen) {
+      // ★带上**按钮实例标识**（GameObject 指针）——同名按钮可能有多个（"第一个"不稳定，
+      //   实测重读整包时会在两个候选之间跳：TwoButtonRight (1179,960) ↔ (1150,904)）
+      //   ⇒ 调用方靠它把"多点"**锁定在同一个按钮实例**上 ⇒ 绝不会点到别的目标。
+      let id = "";
+      try { const g = _inv(f.tr, "get_gameObject"); if (g && !g.isNull()) id = String(g); } catch (e) {}
+      out.push({ name: f.name, x: p.x, y: p.y, id: id });
+    }
   }
+  return out;
+}
+// ★★坐标"在动"这件事**不在 agent 侧解决**（2026-11-08 教训）：
+//   切页动画期间按钮坐标在动（实测 setting「确认」动画中 (1182,965) vs 稳定 (1179,960)），
+//   曾在这里加"等一帧再读、取稳定值"（Thread.sleep）⇒ EX 页上匹配到的按钮有十几个，
+//   每个都睡 ⇒ 整包读变成几秒 ⇒ **agent 单通道被占满** ⇒ 整个助手卡死
+//   （labExEquip 飞了 8 秒没回包，viewId 跟着超时掉线）。
+//   ⇒ 正确做法在**调用方**：每次点击前**重读整包**（坐标会随动画推进而更新），
+//     没生效就在**同一次调用里接着点**（"多点是手段"），不追求一次点准。
+
+// ★★特别装备三连页的**签名**（页身份 + 页内关键状态）。
+//   整包快照（labExEquip）与轻量读（labExEquipSig）**共用这一个函数** ⇒ 两边口径永远一致。
+function _exeqSigOf(top, dlgName, change, row, checked, sel) {
+  // ★带**最上层容器名**：这样"页面切了"能被立刻看见（容器名变了就是换了一层），
+  //   而不必等页内状态变 —— 切页动画期间的"旧页读数"也就不会把状态机带偏。
+  const c = String(dlgName || "").replace(/\((Clone|Instance)\)$/, "");
+  if (top === "party") return "party@" + c + "|change=" + change;
+  if (top === "setting") return "setting@" + c + "|row=" + row + "|checked=" + checked;
+  if (top === "sort") return "sort@" + c + "|sel=" + sel;
+  return top;
+}
+
+// ★**极轻**：只读特别装备三连页的**签名**（就一个字符串）。
+//   不算坐标、不读按钮、不回传整包 JSON —— 状态机轮询专用。
+//   （labels 只读第 0 个、toggles 只读"选中那个"的文字 ⇒ 比整包快照轻得多）
+function labExEquipSig() {
+  const out = { sig: null, err: null };
+  try {
+    const f = _findExTopPart();
+    if (!f) { out.sig = ""; return out; }                 // 不在三连页里
+    const top = f.top;
+    if (top === "party") {
+      let ch = "null";
+      try {
+        const b = _invBool(f.comp, "isChangeExtraEquip");
+        ch = (b === true) ? "true" : ((b === false) ? "false" : "null");
+      } catch (e) {}
+      out.sig = _exeqSigOf(top, f.dlgName, ch, "?", "null", "?");
+    } else if (top === "setting") {
+      let row = "?";
+      try {
+        const arr = f.comp.add(0x90).readPointer();        // CustomUILabel[]
+        if (ptrOk(arr)) {
+          const n = arr.add(0x18).readS32();
+          if (n > 0) {
+            const l = arr.add(0x20).readPointer();          // ★只读第 0 个（签名只要第一行）
+            if (ptrOk(l)) row = _str1(_inv(l, "get_text"));
+          }
+        }
+      } catch (e) {}
+      let checked = "null";
+      try {
+        const cb = f.comp.add(0x98).readPointer();
+        if (ptrOk(cb)) {
+          const tg = cb.add(0x38).readPointer();
+          if (ptrOk(tg)) checked = (tg.add(0x81).readU8() !== 0) ? "true" : "false";
+        }
+      } catch (e) {}
+      out.sig = _exeqSigOf(top, f.dlgName, "null", row, checked, "?");
+    } else {
+      let sel = "?";
+      try {
+        const lst = f.comp.add(0xA0).readPointer();         // List<PartsUnitSortTypeToggle>
+        const n = ptrOk(lst) ? _listCount(lst) : -1;
+        for (let i = 0; i < (n > 0 ? Math.min(n, 24) : 0); i++) {
+          const it = _listItem(lst, i);
+          if (!ptrOk(it)) continue;
+          if (!_invBool(it, "get_IsSelected")) continue;     // ★只读选中那个的文字
+          const lb = it.add(0x30).readPointer();             // typeLabel
+          if (ptrOk(lb)) sel = _str1(_inv(lb, "get_text"));
+          break;
+        }
+      } catch (e) {}
+      out.sig = _exeqSigOf(top, f.dlgName, "null", "?", "null", sel);
+    }
+  } catch (e) { out.err = String(e); }
   return out;
 }
 
 // 只读快照：**只读"当前最上层"那一页**（wantBtns=false 时连按钮坐标都不算，省掉一次子树遍历）
 function labExEquipSnapshot(diag, wantBtns) {
-  const res = { jsBuild: JS_BUILD, top: null, page: null, err: null };
+  const res = { jsBuild: JS_BUILD, top: null, page: null, sig: null, err: null };
   const env = _camEnv();
   const xy = function (o) {
     if (!env || !o || o.isNull()) return { x: null, y: null };
@@ -5403,9 +5522,12 @@ function labExEquipSnapshot(diag, wantBtns) {
       try { const ar = f.comp.add(0x80).readPointer();
             o.plateSlots = ptrOk(ar) ? ar.add(0x18).readS32() : -1; } catch (e) {}
       if (diag) o.slots = _slotDump(f.comp, 0x10, 0x100);
+      res.sig = _exeqSigOf("party", f.dlgName,
+        o.change === true ? "true" : (o.change === false ? "false" : "null"), "?", "null", "?");
     } else if (f.top === "setting") {                    // ② 自动特别装备设定
       o.labels = labelTexts(f.comp.add(0x90).readPointer(), 8);   // ★4 行右侧当前值（文字）
-      o.prioBtn = ctrlCoords(f.comp.add(0x88).readPointer(), 8);  // 4 行右侧按钮坐标
+      // ★2026-11-08：**不要按钮坐标时就不投影**（状态机轮询只要"状态变了没"，坐标是纯浪费）
+      o.prioBtn = wantBtns ? ctrlCoords(f.comp.add(0x88).readPointer(), 8) : [];  // 4 行右侧按钮坐标
       o.terms = []; o.checked = null; o.checkBtn = null;
       try {
         const cb = f.comp.add(0x98).readPointer();
@@ -5413,12 +5535,15 @@ function labExEquipSnapshot(diag, wantBtns) {
           const tg = cb.add(0x38).readPointer();
           if (ptrOk(tg)) o.checked = (tg.add(0x81).readU8() !== 0);   // UIToggle.mIsActive @0x81
           const tb = cb.add(0x48).readPointer();
-          if (ptrOk(tb)) o.checkBtn = xy(tb);
+          if (ptrOk(tb) && wantBtns) o.checkBtn = xy(tb);
         }
       } catch (e) {}
       try { const pm = f.comp.add(0xA0).readPointer();
             if (ptrOk(pm)) o.terms = _intListOf(pm.add(0x150).readPointer()); } catch (e) {}
       if (diag) o.slots = _slotDump(f.comp, 0x10, 0xC0);
+      res.sig = _exeqSigOf("setting", f.dlgName, "null",
+        (o.labels && o.labels.length ? (o.labels[0] || "?") : "?"),
+        (o.checked === true ? "true" : (o.checked === false ? "false" : "null")), "?");
     } else {                                             // ③ 优先属性值
       o.cur = null; o.list = []; o.toggles = [];
       try {
@@ -5435,11 +5560,18 @@ function labExEquipSnapshot(diag, wantBtns) {
           let t = null;
           try { const lb = it.add(0x30).readPointer();               // typeLabel
                 if (ptrOk(lb)) t = _str1(_inv(lb, "get_text")); } catch (e) {}
-          const p = xy(it); p.i = i; p.label = t; p.sel = _invBool(it, "get_IsSelected");
+          // ★不要坐标时只带 label/sel（轮询读不需要投影坐标）
+          const p = wantBtns ? xy(it) : {};
+          p.i = i; p.label = t; p.sel = _invBool(it, "get_IsSelected");
           o.toggles.push(p);
         }
       } catch (e) {}
       if (diag) o.slots = _slotDump(f.comp, 0x10, 0xB0);
+      var selLbl = "?";
+      for (var si = 0; si < o.toggles.length; si++) {
+        if (o.toggles[si].sel) { selLbl = o.toggles[si].label || "?"; break; }
+      }
+      res.sig = _exeqSigOf("sort", f.dlgName, "null", "?", "null", selLbl);
     }
     res.page = o;
   } catch (e) { res.err = String(e); }
@@ -5461,7 +5593,8 @@ function labExEquipTop() {
 // ── 选角色页（SUMMON_UNIT=1 且 pageTop 是对话框）：初始编成 / 门票召唤（★只读）──
 // ★构建号：改过读逻辑就 +1。attach 时 pcr_auto 会打出来（rpc jsBuild）——用来确认
 //   "正在跑的到底是哪一版脚本"，免得拿旧输出讨论半天（2026-10-10 踩过）。
-const JS_BUILD = "cs62";     // ★cs62（2026-10-22）：新增 battleSettingsStart/Poll（战斗设定只读；getter 是 IFix 模板 ⇒ 投递游戏线程执行）
+const JS_BUILD = "cs68";     // ★cs68（2026-11-08）：**"当前最上层"统一成一个实现**（_topDialogGo）—— ①_exeqFind 只查**最上层那一层**、**绝不往回退**（回退会永远读到下面那层仍 active 的①页 ⇒ 签名不变 ⇒ 误判"没生效"⇒多点⇒点错按钮）；②签名里带**最上层容器名**（"页面切了"能立刻看见）。cs67：去掉 agent 侧坐标"稳定化"（Thread.sleep 堵死单通道）；cs64：_findExTopPart 组件查找缓存；cs63：labExEquipSig 轻量签名读
+// ★cs62（2026-10-22）：新增 battleSettingsStart/Poll（战斗设定只读；getter 是 IFix 模板 ⇒ 投递游戏线程执行）
 // ★JS 侧详细日志开关（2026-10-11 加）：默认关。
 //   关掉的是"每次调用都会打、但正常情况没信息量"的那几条（如 findMap 的"跳过堆扫描"、
 //   "有效活跃实例 数="）—— 换区途中 labStatus 读空时会连续调用，一秒钟刷好几行。
@@ -7269,6 +7402,9 @@ rpc.exports = {
   labExEquipDiag: _rpcSafe(function () { try { return labExEquipSnapshot(true, true); } catch (e) { return null; } }),
   // 最上层是不是这三页之一（给 Python 判断"这页由我们自己驱动、不要自动点通用弹窗"）
   labExEquipTop: _rpcSafe(function () { try { return labExEquipTop(); } catch (e) { return { top: null, err: String(e) }; } }),
+  // ★★**极轻**：只读三连页的**签名**（一个字符串）—— 状态机轮询专用
+  //   不算坐标、不读按钮、不回传整包 JSON（只要 labels[0] / checked / 选中的那一项）
+  labExEquipSig: _rpcSafe(function () { try { return labExEquipSig(); } catch (e) { return { sig: null, err: String(e) }; } }),
   // 诊断版：带"每个对象槽挂的是什么类"的现场 dump（★不再把内部 diag 覆盖成空对象）
   labPartyDiag: _rpcSafe(function () { try { return labPartySnapshot(true); } catch (e) { return null; } }),
   // 选角色页旧读法（PartsDialogLabyrinthSelectableChara + 堆扫描）已在 2026-10-11 退役：

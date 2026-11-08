@@ -365,7 +365,23 @@ object AgentApi {
     suspend fun labResetCaches(): JSONObject? = obj("labResetCaches", timeoutMs = T_SLOW)
 
     /** 特别装备三连页；`full=true` 连按钮坐标一起算 */
-    suspend fun labExEquip(full: Boolean = false): JSONObject? = obj("labExEquip", listOf(full), T_SLOW)
+    suspend fun labExEquip(full: Boolean = false, timeoutMs: Long = T_SLOW): JSONObject? =
+        obj("labExEquip", listOf(full), timeoutMs)
+
+    /**
+     * ★**极轻**：只读特别装备三连页的**签名**（一个字符串）—— 状态机轮询专用。
+     *
+     * 不算坐标、不读按钮、不回传整包 JSON（只要 `labels[0]` / `checked` / 选中的那一项），
+     * 比 [labExEquip] 轻一个量级。
+     * @return 签名；`""` = 当前不在三连页里；`null` = 读不到
+     */
+    suspend fun labExEquipSig(timeoutMs: Long = T_FAST): String? {
+        val o = obj("labExEquipSig", emptyList(), timeoutMs) ?: return null
+        val err = o.optString("err")
+        if (err.isNotEmpty() && err != "null") return null
+        if (o.isNull("sig")) return null
+        return o.optString("sig")
+    }
 
     /** 最上层是不是"特别装备三连页"之一 */
     suspend fun labExEquipTop(): JSONObject? = obj("labExEquipTop", timeoutMs = T_FAST)
@@ -481,6 +497,7 @@ object AgentApi {
         "labResetCaches" to emptyList(),
         "labExEquip" to listOf(false),
         "labExEquipTop" to emptyList(),
+        "labExEquipSig" to emptyList(),
         "labQuestDetail" to listOf("UIButton_Unit"),
         "labChallenging" to emptyList(),
         "labCharaPageQuick" to emptyList(),

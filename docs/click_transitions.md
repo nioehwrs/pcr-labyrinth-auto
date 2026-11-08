@@ -1,6 +1,6 @@
 # 点击 → 窗口转移表（状态机驱动点击）
 
-> **进度标记**：`[ ]` 待改造 ｜ `[~]` 已接入观察中 ｜ `[x]` 已完成（稳定） ｜ `[—]` 不适用
+> 标记：✅ 已做 ｜ ⏳ 待做 ｜ 🔍 待测
 
 ## 一、模型：`tapAndCheck` 两阶段
 
@@ -14,25 +14,40 @@ tapAndCheck(input, x, y, what,
 ```
 
 ```
-阶段 1（点击）：反复点 → 停 settleMs → 读 labTop
-               只要 top **不在 from 集合里** ⇒ 这一下生效，进入阶段 2
-               控制量：retries（次数）
-
-阶段 2（等待）：**完全不点击**，每 100ms 看一眼
-               直到 top ∈ expect ⇒ 状态机完成
-               控制量：expectTimeoutMs（时间）
+阶段 1（点击）：点 → 停 settleMs → 读 labTop；top 不在 from 里 ⇒ 生效，进入阶段 2
+阶段 2（等待）：完全不点击，每 100ms 看一次
+                 ① top ∈ expect ⇒ 完成
+                 ② expect 带 "@battle" ⇒ 再查 inBattle ⇒ 也算完成
 ```
 
-两个阶段控制量不同，互不穿透：
+- 阶段 1 回答「这一下点上了吗」（靠次数）；阶段 2 回答「目标页面到了吗」（靠超时）。
+- `@battle` 只用于「终点是战斗画面」；进编组页不能带。
+- 多点 ≠ 缺陷：多点是容错手段，只有点到别的目标导致状态错乱才算问题。
 
-- 阶段 1 回答“**这一下点上了吗**”（坐标会失效，所以要次数）；
-- 阶段 2 回答“**目标页面到了吗**”（页面慢，所以要超时）。
+### 两个扩展参数（2026-11-08，特别装备三连页要用）
 
-特殊目标 `@battle`：进战斗后没有对话框（`labTop` 为空），改用 `AgentApi.labInBattle()`。
+| 参数 | 作用 |
+|---|---|
+| `readTop` | 换"页面标识"读取器（默认 `labTop`）。特别装备三连页改成读**页面签名** |
+| `unknownTop` | 读取器返回这个值 = "读不到" ⇒ 视作**没离开**（不传则沿用旧语义：读失败会被当成"离开了"） |
+| `xyAt` | ★**每次点击时重新取坐标**（不传就用固定 x,y）。EX 三连页用：切页动画期间坐标在动 ⇒ 第一次读到的是中间值 ⇒ 点空；重读一次就接近稳定值 |
 
-### 为什么判据是“离开 from”而不是“到达 expect”作点击终止
+**页面签名**：状态机认的"当前页面标识"不一定是窗口名，也可以是更细的签名
+（页身份 + 页内关键状态）。签名变了 ⇒ 这一步生效 —— **换页**和**页内勾选/选项变了**
+一视同仁，不需要额外判据。
 
-进到下一屏就已经离开了 from，自然会停，不会多点；`expect` 只用于阶段 2 确认。
+> 特别装备三连页的签名：
+> `party|change=true` ｜ `setting|row=稀有度|checked=true` ｜ `sort|sel=稀有度` ｜ `""`（不在三连页）
+
+**阶段 1 = 在 from 页上一直点**：点 → 停 `settleMs` → 读一次标识；
+- 离开了 `from` ⇒ 生效，进入阶段 2；
+- 没离开 ⇒ **继续点下一次**（`retries` 次内）—— 「多点是手段」，点不准就多点几下，
+  别急着换策略；唯一底线是**别点到不该点的东西**（⇒ 每次点击前用 `xyAt` 重读当前页，
+  当前页是权威 ⇒ 只会点当前页该点的那个按钮）。
+
+> ⚠ 坐标"在动"**不在 agent 侧解决**（2026-11-08 教训）：曾用 `Thread.sleep` 等一帧取稳定值，
+> 而 EX 页上匹配到的按钮有十几个 ⇒ 整包读变成几秒 ⇒ **agent 单通道被占满** ⇒ 整个助手卡死。
+> ⇒ 改由调用方**每次点击前重读整包 + 多点几次**。
 
 ---
 
@@ -40,13 +55,17 @@ tapAndCheck(input, x, y, what,
 
 | RPC | 内容 | 实测耗时 |
 |---|---|---|
-| `labTop` | 只读 `DialogArea` 顶层子节点名（归一化去 `(Clone)`） | **中位 4ms / 最大 27ms** |
-| `labView` | 只读 ViewManager→当前 View 类名 + `inBattle` | ~5~20ms（比 labStatus 快一个数量级） |
-| `labPartyIdx` | `labTop` + 编组页 `nowSelectParty`（`+0x208 → +0x148`） | 待实测 |
-| `labBattleResult` | `inBattle` / `resultEnable`（`ViewBattle+0xF0`）/ `gameState`（`BattleManager+0x1DC`） | 待实测 |
-| `labStatus` | 全量快照（地图节点、顶框、编队、遗物…） | **150~300ms** |
+| `labTop` | 只读 `DialogArea` 顶层子节点名（归一化去 `(Clone)`） | 中位 4ms / 最大 27ms |
+| `labView` | 只读 ViewManager→当前 View 类名 + `inBattle` | ~5~20ms |
+| `labPartyIdx` | `labTop` + 编组页 `nowSelectParty` | 切队判据在用 |
+| `labPartyLite` | 三队人数 `partyDic` + 当前队 + 槽位（不带 40 个候选） | ~ms |
+| `labPartyTabs` | 编组页顶部页签按钮（切队用）的坐标 | direct：几 ms |
+| `labBattleResult` | `inBattle` / `resultEnable` / `gameState` | 🔍 待实测 |
+| `labExEquipTop` | 只读"特别装备三连页的**页身份**"（party/setting/sort），不遍历按钮子树 | 比 `labExEquip` 便宜 |
+| `labExEquipSig` | ★**极轻**：只回三连页的**页面签名**（一个字符串）—— 不算坐标 / 不读按钮 / 不回传整包 JSON | 状态机轮询专用 |
+| `labStatus` | 全量快照（地图节点、顶框、编组、遗物…） | 150~300ms |
 
-> 结论：只判某个字段时**不要用 `labStatus`**，用对应的轻量接口。
+> 只判某个字段时不要用 `labStatus`，用对应的轻量接口。
 
 ---
 
@@ -57,7 +76,7 @@ tapAndCheck(input, x, y, what,
  └─点节点→ DialogCommonSmall（通用确认小窗）
       └─点确认→ DialogQuestDetail（关卡预览，带 questId）
            └─点「开打」→ DialogCommonPartyEdit（编组页）
-                └─编好队点「战斗开始」→ 战斗中（无顶框，vịew=ViewBattle）
+                └─编好队点「战斗开始」→ 战斗中（无顶框，view=ViewBattle）
                      └─打完→ 结算页（QuestResultWin / LabyrinthExResult / BackKeyCapture）
                           └─点「下一步」→ DialogLabyrinthSelection（战后选人 / 选遗物）
 ```
@@ -68,146 +87,109 @@ tapAndCheck(input, x, y, what,
 
 ### A. 地图 / 导航
 
-| 进度 | 动作 | from | 说明 |
+| 状态 | 动作 | from | 说明 |
 |---|---|---|---|
-| [ ] | 前进到节点 XXX | `-`（地图） | 第一跳都是 `DialogCommonSmall`；**按节点类型收紧的是第二跳** |
-| [—] | 屏幕中心（推进动画） | 任意 | 不换窗口，不适用 |
-| [ ] | ButtonQuest / 出发 | `-` | 待观测 |
+| ⏳ | 前进到节点 XXX | `-`（地图） | 第一跳都是 `DialogCommonSmall`；第二跳按节点类型收紧 |
+| ⏳ | ButtonQuest / 出发 | `-` | 待观测 |
+| — | 屏幕中心（推进动画） | 任意 | 不换窗口，不适用 |
 
 ### B. 战斗 / 结算
 
-| 进度 | 动作 | from | expect（阶段2） | 参数 |
+| 状态 | 动作 | from | expect（阶段2） | 参数 |
 |---|---|---|---|---|
-| [~] | 预览·开打（进编组） | `DialogQuestDetail` | `DialogCommonPartyEdit` | 200ms × 8 |
-| [~] | 战斗开始（普通） | `DialogCommonPartyEdit` | **`@battle`** | 200ms × 6 |
-| [—] | 决定·跳过本队（Boss 空队） | `DialogCommonPartyEdit` | — | 只点一次 + delay(800)，见下“Boss 多队” |
-| [~] | 结算·下一步 | `{BackKeyCapture, LabyrinthExResult, QuestResultWin}` | `{DialogLabyrinthSelection, DialogLabyrinthResult}` | 200ms × 25 |
+| ✅ | 预览·开打（进编组） | `DialogQuestDetail` | `DialogCommonPartyEdit` | 600ms × 8，阶段2 超时 3s |
+| ✅ | 战斗开始（普通） | `DialogCommonPartyEdit` | `@battle` | 800ms × 6 |
+| ✅ | 决定·切队（Boss） | `DialogCommonPartyEdit` | 窗口不变、`nowSelectParty` 递增 | 只点 1 次 + 每 120ms 轮询，≤2s |
+| ✅ | 结算·下一步 | `{BackKeyCapture, LabyrinthExResult, QuestResultWin}` | `{DialogLabyrinthSelection, DialogLabyrinthResult}` | 200ms × 25 |
+| ⏳ | 结算·关闭 | 同上 | — | 低频 |
+| — | 结算后加速·点中心 | 任意 | — | 不换窗口 |
 
-> **终点分叉**（2026-11-07 实测）：
-> - 普通战 / 非最终 Boss → `DialogLabyrinthSelection`（战后选人 / 选遗物）；
-> - **50801 最终 Boss → `DialogLabyrinthResult`（迷宫结算页）**，之后是
->   `DialogAnimationViewer → DialogCommonFullSize → DialogCommonBig`（由结算 handler 负责点掉）。
->   两种都要放进 `expect`，否则最终 Boss 那场会白等 6 秒。
-| [ ] | 结算·关闭 | 同上 | — | 低频 |
-| [—] | 结算后加速·点中心 | 任意 | — | 不换窗口 |
+**Boss 三队（3 队）**：三队挤在同一个编组页，点「决定」多数是切到下一队（顶框不变）。
 
-**结算静置**：`RESULT_SETTLE_MS` 由 **3500 → 2000 → 200ms**（2026-11-07）。
-按钮落位时间不稳定，“等”不如“多试”：留 200ms 只给起始帧，容错全交给
-「下一步」的 `retries = 25`（≈5 秒），前几下落空无害。
+| 状态 | 事项 |
+|---|---|
+| ✅ | 切到队伍 2/3 且这一队要编 ⇒ 就地算 + 编（约 6s 编完三队） |
+| ✅ | 编组框消失 = 已经开打 ⇒ 残留的预览页空壳不再点「挑战」 |
+| ✅ | 日志打「Boss 决定前：队伍1/2/3 各多少人」 |
+| ✅ | 两个分支（`bossAdv` / `isBoss`）**已合并**成同一个"点决定 → 轮询等切队"循环 |
 
-**Boss 多队（3 队）**：三队挤在同一个 `DialogCommonPartyEdit` 里，点「决定/战斗开始」多数是**切到下一队**（顶框不变）⇒ 不能重试，否则 2/3 队被跳过。
-
-### 分支现状（2026-11-07 实测修正）
-
-```kotlin
-val bossAdv = isBoss && !fillOk
-```
-
-`fillOk` 来自 `PartyPlan.partyFillOk`，语义是“**这一队还该不该编**”：
-
-- 3 层 Boss 只编第 1 队 ⇒ 第 2/3 队 `fillOk=false`；
-- **第 1 队编满之后**也不再需要编 ⇒ `fillOk` 同样 `false`。
-
-所以 `bossAdv` 的真实含义是「**这一队不需要（再）编**」，同时覆盖“空队”和“已编满的第 1 队”。
-日志佐证：`点了 决定·跳过本队（5 人，允许空）` —— 5 人已满却走“跳过本队”。
-
-⇒ **`else if (isBoss)` 那个“编满单次点击”分支实际走不到，属于死分支，待删**。
-Boss 三队全流程都在 `bossAdv` 分支里：确认第 1 队 → 跳过第 2 队 → 跳过/开战。
-
-### 已具备的判据（尚未接入）
-
-```kotlin
-val (t0, n0) = AgentApi.labPartyIdx()      // (窗口, nowSelectParty)
-tap(...)
-delay(200)
-val (t1, n1) = AgentApi.labPartyIdx()
-when {
-    t1 !in setOf("DialogCommonPartyEdit") -> 开战 ✔
-    n1 != n0                              -> 切队 ✔（继续编下一队）
-    else                                  -> 没点上，重试
-}
-```
-
-两个分支（`bossAdv` / `isBoss`）目前都只打观测行：
-
-```
-◧ Boss 跳过：[$top idx=0] → [$top idx=1]
-◧ Boss 编组：[$top idx=0] → [$top idx=1]
-```
-
-待 `idx` 递增被实测确认后，再把判据接进 `bossAdv`。
+**结算页终点分叉**：普通战 / 非最终 Boss → `DialogLabyrinthSelection`；**50801 最终 Boss → `DialogLabyrinthResult`**，之后 `DialogAnimationViewer → DialogCommonFullSize → DialogCommonBig`。
 
 ### C. 三选一 / 遗物 / 门票（同一窗口名，三种用途）
 
-| 进度 | 动作 | from | expect | 参数 |
+| 状态 | 动作 | from | expect | 参数 |
 |---|---|---|---|---|
-| [~] | 战后选人 | `DialogLabyrinthSelection` | `DialogCommonMiddle` | 150ms × 1（外层 10 次重读重算） |
-| [~] | 选择遗物 | `DialogLabyrinthSelection` | `DialogCommonBig` | 同上 |
-| [~] | 门票：选 N | `DialogLabyrinthSelection` | `DialogCommonBig` | 同上 |
+| ✅ | 战后选人 | `DialogLabyrinthSelection` | `DialogCommonMiddle` | 150ms × 1 + 外层 10 次重读重算 |
+| ✅ | 选择遗物 | `DialogLabyrinthSelection` | `DialogCommonBig` | 同上 |
+| ✅ | 门票：选 N | `DialogLabyrinthSelection` | `DialogCommonBig` | 同上 |
 
-外层重试（`handleLabSelection`）：
-
-```
-tapAndCheck(..., retries = 1)        // 点一次，停 150ms
-  ├─ 离开 → 进入阶段 2 等 expect
-  └─ 没离开 → 清 lastSelSig → 120ms → **重新读卡片位置/属性** → 重新决策 → 再点（最多 10 次）
-```
-
-**Boss 两轮选人**：点完仍在 Selection 时，重读卡片算新 `sig`：
-
-- `sig` 变了 ⇒ 新一轮（Boss 第二轮），清计数、正常决策；
-- `sig` 不变 ⇒ 上次没点上，计入重试。
-
-日志：`… 战后选人 页：卡片已刷新（新一轮选人），按新卡片重新决策`
+外层重试：点一次停 150ms，没离开就清 `lastSelSig` → 120ms → 重读卡片位置/属性 → 重新决策 → 再点（最多 10 次）。
+Boss 两轮选人：卡片 `sig` 变了 = 新一轮，`sig` 没变 = 上次没点上。
 
 ### D. 商店
 
-| 进度 | 动作 | from | expect |
+| 状态 | 动作 | from | expect |
 |---|---|---|---|
-| [ ] | 商店·买#N | `DialogLabyrinthShop` | 离开 → `DialogCommonMiddle` |
-| [ ] | 商店·更新 / 关闭 | `DialogLabyrinthShop` | 离开 |
+| ⏳ | 商店·买#N | `DialogLabyrinthShop` | 离开 → `DialogCommonMiddle` |
+| ⏳ | 商店·更新 / 关闭 | `DialogLabyrinthShop` | 离开 |
 
-### E. 编队 / 特别装备
+### E. 编组 / 特别装备
 
-| 进度 | 动作 | from | 备注 |
+| 状态 | 动作 | from（页面标识） | 参数 |
 |---|---|---|---|
-| [—] | 编队 add/remove | `DialogCommonPartyEdit` | 不换窗口，不适用 |
-| [ ] | 打开特别装备 | `DialogCommonPartyEdit` | → `DialogCommonFullSize` |
-| [ ] | 特别装备·ThreeButtonCenter | `DialogCommonFullSize` | → `DialogCommonBig` |
-| [ ] | 特别装备·TwoButtonRight | `DialogCommonBig` | → `DialogCommonFullSize` |
-| [ ] | 特别装备·ThreeButtonRight | `DialogCommonFullSize` | → `DialogCommonPartyEdit` |
+| — | 编组 add/remove | `DialogCommonPartyEdit` | 不换窗口，不适用 |
+| ✅ | 编组页页签直读 | `DialogCommonPartyEdit` | `labPartyTabs` direct，0.75s → 几 ms |
+| ✅ | 编组页去掉固定等待 | — | 判据：读数连续两次相同；编一队 11s → 3s |
+| ✅ | 点「开打」前并行算队伍 | — | `preTeamJob`，省一次算法（~1s） |
+| ✅ | 打开特别装备 | `""`（不在三连页） | settle 0 × 1，读一次签名 |
+| ✅ | 特别装备·ThreeButtonCenter（自动装备） | `party\|change=false` | 同上 |
+| ✅ | 特别装备·TwoButtonRight（确认） | `sort\|sel=稀有度` | 同上 |
+| ✅ | 特别装备·TwoButtonRight（确认） | `setting\|row=稀有度\|checked=true` | 同上 |
+| ✅ | 特别装备·ThreeButtonRight（装备确定） | `party\|change=true` | 同上 |
+| ✅ | 特别装备·ThreeButtonLeft（取消·自动装备无改动） | `party\|change=false` | 同上 |
+| ✅ | 特别装备·复选框（补勾） | `setting\|row=稀有度\|checked=false` | 同上 |
+| ✅ | 特别装备·「稀有度」选项 | `sort\|sel=全部` | 同上 |
+
+**特别装备三连页（2026-11-08 改成"打包自己跑完"，不进主循环）**
+
+- 流程是**确定的线性序列**：编组页 →（点「特别装备」）→ ①特别装备设定 → ②自动特别装备设定
+  → ③优先属性值 → ② → ① →（点「装备确定」）→ 编组页。
+- ★**打包**（`handleExequipPacked`）：编组页点开「特别装备」后**当场**把三连页走完，
+  主循环**根本不会看到 EX 页** ⇒ 主循环也就**不会在 EX 页上读 `labStatus`**（全量 150~300ms，
+  EX 页上根本用不上）。内部循环 = 「读签名（状态检测）→ 决策 → 点一下 → 再读签名看变了没」。
+- 每一轮只做**一次状态检测**（读页面签名）→ 决定点哪个 → 点一下，**不轮询**。
+- 状态检测走 **`labExEquipSig`**（极轻：只回一个签名字符串，不算坐标/不回传整包 JSON）；
+  决策那一次才用 `labExEquip(true)`（要按钮坐标）。签名的算法**只在 agent 侧有一份**
+  （`_exeqSigOf`），两个 RPC 共用 ⇒ 口径永远一致。
+- "上一次点的还没生效"（签名没变）⇒ **在同一次调用里接着点**（重读整包拿最新坐标再点），
+  不空等、不跨轮；同一页面签名下最多点 `EXEQ_TAP_MAX` 下，超了才收手。
+- 页面标识用**签名**（页身份 + 页内关键状态），不用容器窗口名 ——
+  三个页可能都挂在 `DialogCommonFullSize/Big` 下，容器名分不开；
+  **页内**变化（勾选框、「稀有度」）也是"签名变了" ⇒ 同一套判据，不用额外判据。
+- **兜底**：打包流程异常收手（步数/预算用尽）⇒ 放弃这次装备（不卡流程）；
+  只有"EX 流程还没走完"（`ExeqSess.pending`）时，主循环才做一次轻量探测（`labTop` + `labExEquipSig`）
+  —— 平时（编组页正常编队）**一次轻量读都不用付**（不在 EX 页时签名读要在编组页大子树里找组件，很贵）。
 
 ### F. 通用弹窗（同壳不同内容，只能靠 `(窗口, 按钮名)` 区分）
 
-| 进度 | 动作 | from | to |
+| 状态 | 动作 | from | to |
 |---|---|---|---|
-| [ ] | TwoButtonRight | `DialogCommonSmall` | `-`（关闭）×43 |
-| [ ] | OneButtonWhite | `DialogCommonMiddle` | `-`×29 |
-| [ ] | OneButtonBlue | `DialogCommonSmall` | `DialogLabyrinthShop`×22 |
-| [ ] | TwoButtonRight | `DialogCommonMiddle` | `DialogCommonSmall`×22 |
-| [ ] | OneButtonWhite | `DialogCommonBig` | `DialogCommonMiddle`×10 |
+| ⏳ | TwoButtonRight | `DialogCommonSmall` | `-`（关闭）×43 |
+| ⏳ | OneButtonWhite | `DialogCommonMiddle` | `-`×29 |
+| ⏳ | OneButtonBlue | `DialogCommonSmall` | `DialogLabyrinthShop`×22 |
+| ⏳ | TwoButtonRight | `DialogCommonMiddle` | `DialogCommonSmall`×22 |
+| ⏳ | OneButtonWhite | `DialogCommonBig` | `DialogCommonMiddle`×10 |
 
 ---
 
-## 五、待标定
+## 五、待测
 
-### 战斗胜负枚举（`gameState`）
-
-`labBattleResult()` 已能读 `gameState`，但**语义未标定**。当前结算判断仍靠“等按钮出现 + 按钮名（重新挑战=失败）”。
-
-标定方法：跑一胜一负，对比日志里两行
-
-```
-◧ 战斗结果原始值：inBattle=true resultEnable=? gameState=?
-```
-
-值确定后可把“静置 + 等按钮”改成“轮询 `resultEnable`/`gameState`”，再省 2 秒。
-
-### 其他
-
-- **A-1**：前进到节点的第二跳期望（NORMAL/HARD→QuestDetail、TICKET/RELIC→Selection、EVENT→LabyrinthEvent、SHOP→LabyrinthShop、BOSS→QuestDetail）；
-- **Boss 三队**：把 `◧ Boss 编组` 观测升级为二元判据（窗口 + `nowSelectParty`）；
-- **D/E/F** 尚未接入。
+| 事项 | 怎么测 |
+|---|---|
+| `gameState` 胜负枚举 | 跑一胜一负，对比日志 `◧ 战斗结果原始值：inBattle=… resultEnable=… gameState=…` |
+| 地图节点第二跳期望 | NORMAL/HARD→QuestDetail、TICKET/RELIC→Selection、EVENT→LabyrinthEvent、SHOP→LabyrinthShop、BOSS→QuestDetail |
+| 特别装备的**签名**判得准不准 | 真机跑一次编组，看日志 `⤷ [party\|change=false] --特别装备·ThreeButtonCenter--> [setting\|…]`，以及"读 N 次共 Yms"里的 Y（读一次多贵） |
+| `labBattleResult` 耗时 | 接入时顺带采样 |
 
 ---
 
