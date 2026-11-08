@@ -1643,17 +1643,6 @@ object MazeLoop {
         else -> null
     }
 
-    /** ★从**签名**里取 `change`（只有①页有）：true / false / null（读不到） */
-    private fun exeqChangeOf(sig: String): Boolean? {
-        val i = sig.indexOf("|change=")
-        if (i < 0) return null
-        return when (sig.substring(i + 8)) {
-            "true" -> true
-            "false" -> false
-            else -> null
-        }
-    }
-
     /**
      * ★**轻量**读 EX 三连页的当前签名（agent 侧算好，只回一个字符串 —— 不带坐标、不带按钮）。
      *
@@ -4434,17 +4423,6 @@ object MazeLoop {
             // ── ② 页身份 / 阶段位（签名里就有，不用再读整包）──
             val page = exeqPageOf(sigNow)
             if (page == EXEQ_PAGE_SETTING) sess.sawSetting = true     // ★进过② ⇒ 之后 change=false 才是"真没改动"
-            if (page == EXEQ_PAGE_PARTY && sess.auto && !sess.sawSetting &&
-                exeqChangeOf(sigNow) == false
-            ) {
-                // ★★刚点完「自动装备」、页面正在切到② —— 这时 change=false 只是**中间态**，
-                //   **绝不能**据此判"自动装备后无改动"（那会跳到「取消」⇒ 点错按钮，2026-11-08 实测）。
-                //   等一小会儿；超过 [EXEQ_AUTO_WAIT_MS] 还没切过去 ⇒ 说明那次点击没生效 ⇒ 再点一次（多点）。
-                val el = System.currentTimeMillis() - sess.autoAt
-                if (el < EXEQ_AUTO_WAIT_MS) {
-                    delay(EXEQ_POLL_MS); continue
-                }
-            }
             if (sess.tapSig != sigNow) {
                 sess.tapSig = sigNow
                 sess.tapN = 0
@@ -4462,18 +4440,34 @@ object MazeLoop {
                 AppState.addLog("    [!] 特别装备流程点了 $EXEQ_MAX_STEPS 下仍未结束 → 停手")
                 break
             }
-            // ── ③ 决策 + 点：**在当前页上一直点到生效**（tapAndCheck 阶段 1 的语义）──
+            // ── ③ 查**转移表**：这一步做什么、去哪（★只用轻量签名 ⇒ 几十 ms）──
+            //   表的一条规则 = **（当前页, 条件）→（动作, 目标页）**；
+            //   签名里已经带了页内关键状态（change/row/checked/sel）⇒ 不用等整包就知道目标页。
+            val rule = exeqRuleOf(sigNow, sess)
+            if (rule == null) {
+                // ★没命中任何规则 ⇒ 页内状态读不全（change/checked/row/sel 拿不到）⇒ 本轮不点，等一下再读
+                if (sess.n < 2) {
+                    AppState.addLog("    [!] $page 页：读不到页内状态（change/checked/row/sel）→ 本轮不点")
+                }
+                delay(EXEQ_POLL_MS); continue
+            }
+            // ★"此刻该等"（刚点完「自动装备」、页面正在切到②）⇒ 不点，等一下再看（省一次整包读）
+            if (rule.waitWhile?.invoke(sess) == true) { delay(EXEQ_POLL_MS); continue }
+            // ── ④ 执行转移：**点一下，等到达目标页**（tapAndCheck 阶段 1 的语义）──
             //   · 每次点击前都**重读整包**：① 当前页是权威（不会点到别的目标）② 坐标是**最新**的
             //     （切页动画期间坐标在动 ⇒ 第一次可能点空 ⇒ 再点一次就中了 —— 多点是手段）。
             //   · ★整包读到的签名必须与外层的轻量签名**一致**（不一致 ⇒ 页面正在切 ⇒ 这一轮不点）。
-            //   · 没生效就在**同一次调用里**接着点（retries 次），不空等、不跨轮。
+            //   · ★★方案 B：判据是**"到达目标页了没"**（不是"签名变了没"）：
+            //     没到目标 ⇒ 这次没生效 ⇒ **重试同一个动作**（同一按钮实例），不重新决策点别的。
             val ok = tapAndCheck(
-                input, 0, 0, "特别装备",
+                input, 0, 0, rule.what,
                 from = setOf(sigNow),
                 settleMs = EXEQ_TAP_SETTLE_MS,
                 retries = EXEQ_TAP_TRIES,
                 readTop = { exeqSigNow() },
                 unknownTop = EXEQ_UNKNOWN,
+                // ★★这次转移的**落点**（转移表给的）⇒ 到达它才算这次转移完成
+                reached = { sig -> exeqReached(sig, sigNow, rule.target) },
                 // ★★点完**探**几次（不是"等一下就重试"）—— 页面动画没走完时签名不会变，
                 //   探到"变了"就停；探完还没变才判"真没生效"（那时按钮已静止，再点才点得准）。
                 probe = PROBE_N,
@@ -4490,7 +4484,14 @@ object MazeLoop {
                     val sr = xr.optString("sig")
                     // ★读数与外层不一致 ⇒ 页面正在切/状态在变 ⇒ 这一轮**不点**（避免点到别的按钮）
                     if (sr != sigNow) return@xyAt null
-                    val act = exeqDecide(xr, sess) ?: return@xyAt null
+                    // ★按**转移表**的动作取按钮（外层已用签名定好"这一步做什么、去哪"；
+                    //   这里只补上按钮实例 + 最新坐标）
+                    val act = exeqActOf(rule, xr, sess) ?: run {
+                        if (sess.n < 2) {
+                            AppState.addLog("    [!] ${rule.what}：按钮读不到（页面数据不全）→ 本轮不点")
+                        }
+                        return@xyAt null
+                    }
                     // ③ 多点按**同一个按钮实例**计数（换按钮/换实例就清零）
                     val bn = act.btn.optString("name")
                     val bid = act.btn.optString("id")
@@ -4562,8 +4563,10 @@ object MazeLoop {
                         }
                     }
                     // ★把**按钮实例 id**（指针尾 8 位）打进日志：多点重试时用它核对"点的是不是同一个按钮"
+                    //   ★顺带打出**目标页**（转移表给的落点）—— 日志里能直接看到"这一步要去哪"
                     AppState.addLog(
-                        "特别装备：${act.what}（按钮=${act.btn.optString("name")}" +
+                        "特别装备：${act.what} → ${act.target.ifEmpty { "编组页" }}" +
+                            "（按钮=${act.btn.optString("name")}" +
                             "@${act.btn.optString("id").takeLast(8)} 签名=$sr）",
                     )
                     act.btn.optInt("x") to act.btn.optInt("y")
@@ -4588,6 +4591,8 @@ object MazeLoop {
         val what: String,
         /** 要点的按钮（整包里的一项：x/y/name/id） */
         val btn: JSONObject,
+        /** ★**目标页**（这次转移的落点）：party / setting / sort / `""`=回到编组页 */
+        val target: String,
         /** ★点完这个按钮后，"已经点过自动装备"要置真 */
         val markAuto: Boolean = false,
         /** ★这一步是**收尾**（装备确定 / 取消）—— 点完整个流程就结束了 */
@@ -4595,87 +4600,214 @@ object MazeLoop {
     )
 
     /**
-     * 决策：当前三连页上，下一步该点哪个？（**纯读，不点**）
+     * ★★**EX 三连页的显式转移表**（2026-11-08 方案 B；用户口径：
+     * "靠当前页面和目标页面去控制点击"）。
      *
-     * 顺序：① 点「自动装备」→ ② 若「全部」≠稀有度 点那一行 →（③ 选「稀有度」+ 确认）
-     *       ② 若未勾 点复选框 → 点「确认」→ ① 按 isChangeExtraEquip() 点「装备确定」；
-     *       若从②回来、确实没改动 → 点「取消」退出。
-     * @return null = 现在点不了（页面数据没读全 / 找不到按钮 / **正在切页，不该点**）
+     * 一条规则 = **（当前页, 条件）→（动作, 目标页）**：
+     *   · 当前页 `page`   = 页身份（party / setting / sort）
+     *   · 条件   `cond`   = 用**轻量签名**判定（几十 ms ⇒ 不用等整包就知道"这一步要去哪"）
+     *   · 动作   `what`   = 人话描述
+     *   · 目标页 `target` = ★这次点击**要去哪一页**（转移的落点）
+     *   · 取按钮 `pick`   = 从**整包**里取要点的那个（按钮随页内状态变 ⇒ 由整包数据决定；
+     *                        带 GameObject 实例 id，坐标每次现取）
+     *
+     * ★"目标页"是这次显式化的**核心**：
+     *   以前点完只要"签名变了"就算生效（可能只是页内状态变了）⇒ 点歪了也当成功；
+     *   现在必须**到达目标页**（或同页但状态真的变了）才算这次转移完成
+     *   ⇒ 没到目标 ⇒ **重试同一个动作**（同一按钮实例），而不是重新决策去点别的按钮。
      */
-    private fun exeqDecide(x: JSONObject, sess: ExeqSess): ExeqAct? {
-        val page = jStr(x, "top")
-        if (page.isEmpty()) return null
-        val p = x.optJSONObject("page") ?: JSONObject()
-        var what: String? = null
-        var tapBtn: JSONObject? = null
-        var markAuto = false
-        var isFinal = false
-        when (page) {
-            EXEQ_PAGE_PARTY -> {
-                val ch = p.opt("change")
-                when {
-                    ch == true -> {
-                        what = "装备确定"; tapBtn = _exeqBtn(p.optJSONArray("buttons"), "ThreeButtonRight", sess.tapBtnId)
-                        isFinal = true
+    private data class ExeqRule(
+        val page: String,
+        val cond: (String, ExeqSess) -> Boolean,
+        val what: String,
+        val target: String,
+        val pick: (JSONObject, ExeqSess) -> JSONObject?,
+        val markAuto: Boolean = false,
+        val isFinal: Boolean = false,
+        /** ★"此刻该等"（如：刚点完「自动装备」、页面正在切）⇒ 不点，等一下再看（省一次整包读） */
+        val waitWhile: ((ExeqSess) -> Boolean)? = null,
+    )
+
+    /** ★**EX 三连页的转移表本体**（顺序 = 优先级，第一条 cond 成立的生效） */
+    private val EXEQ_RULES: List<ExeqRule> by lazy {
+        listOf(
+            // ── ① 特别装备设定（party）──
+            ExeqRule(
+                page = EXEQ_PAGE_PARTY,
+                cond = { sig, _ -> exeqTriOf(sig, "change") == true },
+                what = "装备确定",
+                target = EXEQ_OFF_PAGE,
+                pick = { p, s -> _exeqBtn(p.optJSONArray("buttons"), "ThreeButtonRight", s.tapBtnId) },
+                isFinal = true,
+            ),
+            ExeqRule(
+                page = EXEQ_PAGE_PARTY,
+                cond = { sig, s -> exeqTriOf(sig, "change") == false && s.auto && !s.sawSetting },
+                what = "自动装备（等切到②·超时重试）",
+                target = EXEQ_PAGE_SETTING,
+                pick = { p, s ->
+                    // ★刚点完「自动装备」，页面正在切到② ⇒ change=false 只是**中间态**，
+                    //   绝不能据此判"自动装备后无改动"（那会跳到「取消」⇒ 点错按钮，2026-11-08 实测）。
+                    //   超过 [EXEQ_AUTO_WAIT_MS] 还没切过去 ⇒ 那次点击没生效 ⇒ 再点一次。
+                    if (System.currentTimeMillis() - s.autoAt < EXEQ_AUTO_WAIT_MS) null
+                    else _exeqBtn(p.optJSONArray("buttons"), "ThreeButtonCenter", s.tapBtnId)
+                },
+                markAuto = true,
+                waitWhile = { s -> System.currentTimeMillis() - s.autoAt < EXEQ_AUTO_WAIT_MS },
+            ),
+            ExeqRule(
+                page = EXEQ_PAGE_PARTY,
+                cond = { sig, s -> exeqTriOf(sig, "change") == false && s.auto && s.sawSetting },
+                what = "取消（自动装备后无改动）",
+                target = EXEQ_OFF_PAGE,
+                pick = { p, s -> _exeqBtn(p.optJSONArray("buttons"), "ThreeButtonLeft", s.tapBtnId) },
+                isFinal = true,
+            ),
+            ExeqRule(
+                page = EXEQ_PAGE_PARTY,
+                cond = { sig, _ -> exeqTriOf(sig, "change") == false },
+                what = "自动装备",
+                target = EXEQ_PAGE_SETTING,
+                pick = { p, s -> _exeqBtn(p.optJSONArray("buttons"), "ThreeButtonCenter", s.tapBtnId) },
+                markAuto = true,
+            ),
+            // ── ② 自动特别装备设定（setting）──
+            ExeqRule(
+                page = EXEQ_PAGE_SETTING,
+                cond = { sig, _ ->
+                    val r = exeqFieldOf(sig, "row")
+                    r != null && r != "?" && r != "稀有度"
+                },
+                what = "「全部」行 进「优先属性值」",
+                target = EXEQ_PAGE_SORT,
+                pick = { p, _ -> p.optJSONArray("prioBtn")?.optJSONObject(0) },
+            ),
+            ExeqRule(
+                page = EXEQ_PAGE_SETTING,
+                cond = { sig, s ->
+                    exeqFieldOf(sig, "row") == "稀有度" &&
+                        exeqTriOf(sig, "checked") == false && s.exShare
+                },
+                what = "复选框(补勾)",
+                target = EXEQ_PAGE_SETTING,
+                pick = { p, _ -> p.optJSONObject("checkBtn") },
+            ),
+            ExeqRule(
+                page = EXEQ_PAGE_SETTING,
+                cond = { sig, s ->
+                    exeqFieldOf(sig, "row") == "稀有度" &&
+                        exeqTriOf(sig, "checked") == true && !s.exShare
+                },
+                what = "复选框(取消勾选·不抢别队装备)",
+                target = EXEQ_PAGE_SETTING,
+                pick = { p, _ -> p.optJSONObject("checkBtn") },
+            ),
+            ExeqRule(
+                page = EXEQ_PAGE_SETTING,
+                cond = { sig, _ ->
+                    // ★checked 必须是 **true/false**（"null" = 读不到 ⇒ 不点，等一下再读）
+                    exeqFieldOf(sig, "row") == "稀有度" && exeqTriOf(sig, "checked") != null
+                },
+                what = "确认",
+                target = EXEQ_PAGE_PARTY,
+                pick = { p, s -> _exeqBtn(p.optJSONArray("buttons"), "TwoButtonRight", s.tapBtnId) },
+            ),
+            // ── ③ 优先属性值（sort）──
+            ExeqRule(
+                page = EXEQ_PAGE_SORT,
+                cond = { sig, _ -> exeqFieldOf(sig, "sel") == "稀有度" },
+                what = "确认",
+                target = EXEQ_PAGE_SETTING,
+                pick = { p, s -> _exeqBtn(p.optJSONArray("buttons"), "TwoButtonRight", s.tapBtnId) },
+            ),
+            ExeqRule(
+                page = EXEQ_PAGE_SORT,
+                cond = { _, _ -> true },
+                what = "「稀有度」",
+                target = EXEQ_PAGE_SORT,
+                pick = { p, _ ->
+                    val tg = p.optJSONArray("toggles") ?: org.json.JSONArray()
+                    var hit: JSONObject? = null
+                    for (i in 0 until tg.length()) {
+                        val t = tg.optJSONObject(i) ?: continue
+                        if (hit == null && t.optString("label") == "稀有度") hit = t
                     }
-                    ch == false -> {
-                        if (sess.auto && !sess.sawSetting) {
-                            // ★★2026-11-08：**不能**在这里判"自动装备后无改动" ——
-                            //   刚点完「自动装备」，页面正在切到②（自动特别装备设定），
-                            //   这时读到的 change=false 只是"**还没装备完**"的中间态。
-                            //   ⇒ 等待期间**一律不点**；超过 [EXEQ_AUTO_WAIT_MS] 还没切过去
-                            //     ⇒ 说明那次点击没生效 ⇒ **再点一次**（多点是手段）。
-                            val el = System.currentTimeMillis() - sess.autoAt
-                            if (el < EXEQ_AUTO_WAIT_MS) return null
-                            what = "自动装备（重试）"; tapBtn = _exeqBtn(p.optJSONArray("buttons"), "ThreeButtonCenter", sess.tapBtnId)
-                            markAuto = true
-                        } else if (sess.auto) {
-                            // ★从②回来、确实没改动 ⇒ 取消退出（PC 同款）
-                            what = "取消（自动装备后无改动）"; tapBtn = _exeqBtn(p.optJSONArray("buttons"), "ThreeButtonLeft", sess.tapBtnId)
-                            isFinal = true
-                        } else {
-                            what = "自动装备"; tapBtn = _exeqBtn(p.optJSONArray("buttons"), "ThreeButtonCenter", sess.tapBtnId)
-                            markAuto = true
-                        }
-                    }
-                    else -> { if (sess.n < 2) AppState.addLog("    [!] ① 读不到 isChangeExtraEquip → 本轮不点"); return null }
-                }
-            }
-            EXEQ_PAGE_SETTING -> {
-                val labels = p.optJSONArray("labels")
-                if (labels == null || labels.length() == 0) return null
-                val share = sess.exShare
-                val checked = p.opt("checked")
-                when {
-                    labels.optString(0, "") != "稀有度" -> {
-                        what = "「全部」行(当前=${labels.optString(0, "?")}) 进「优先属性值」"
-                        tapBtn = p.optJSONArray("prioBtn")?.optJSONObject(0)
-                    }
-                    checked == false && share -> { what = "复选框(补勾)"; tapBtn = p.optJSONObject("checkBtn") }
-                    checked == true && !share -> { what = "复选框(取消勾选·不抢别队装备)"; tapBtn = p.optJSONObject("checkBtn") }
-                    checked != null -> { what = "确认"; tapBtn = _exeqBtn(p.optJSONArray("buttons"), "TwoButtonRight", sess.tapBtnId) }
-                    else -> { if (sess.n < 2) AppState.addLog("    [!] ② 读不到复选框状态 → 本轮不点"); return null }
-                }
-            }
-            EXEQ_PAGE_SORT -> {
-                val tg = p.optJSONArray("toggles") ?: org.json.JSONArray()
-                var hit: JSONObject? = null
-                var cur: JSONObject? = null
-                for (i in 0 until tg.length()) {
-                    val t = tg.optJSONObject(i) ?: continue
-                    if (hit == null && t.optString("label") == "稀有度") hit = t
-                    if (cur == null && t.optBoolean("sel")) cur = t
-                }
-                if (hit == null) { AppState.addLog("    [!] ③ 页里找不到「稀有度」选项 → 不点"); return null }
-                if (cur != null && cur.optString("label") == "稀有度") {
-                    what = "确认"; tapBtn = _exeqBtn(p.optJSONArray("buttons"), "TwoButtonRight", sess.tapBtnId)
-                } else {
-                    what = "「稀有度」"; tapBtn = hit
-                }
-            }
+                    hit
+                },
+            ),
+        )
+    }
+
+    /**
+     * ★按**轻量签名**查转移表（几十 ms）—— 决定"这一步做什么、去哪"。
+     *
+     * ★用签名而不是整包：签名里已经有页内关键状态（change / row / checked / sel），
+     *   所以**不用等整包读**就知道目标页 ⇒ 点击确认的判据可以当场定下来。
+     *
+     * @return null = 页内状态读不全（change/checked/row/sel 拿不到）⇒ 本轮不点
+     */
+    private fun exeqRuleOf(sig: String, sess: ExeqSess): ExeqRule? {
+        val page = exeqPageOf(sig) ?: return null
+        for (r in EXEQ_RULES) {
+            if (r.page != page) continue
+            if (r.cond(sig, sess)) return r
         }
-        if (what == null || tapBtn == null || tapBtn.opt("x") == null) return null
-        return ExeqAct(what, tapBtn, markAuto, isFinal)
+        return null
+    }
+
+    /** ★按转移表的动作，从**整包**里取要点的那个按钮（取不到 ⇒ 不点） */
+    private fun exeqActOf(r: ExeqRule, x: JSONObject, sess: ExeqSess): ExeqAct? {
+        val p = x.optJSONObject("page") ?: JSONObject()
+        val btn = r.pick(p, sess) ?: return null
+        if (btn.opt("x") == null) return null
+        return ExeqAct(r.what, btn, r.target, r.markAuto, r.isFinal)
+    }
+
+    /**
+     * ★**这次转移到达目标了没**（方案 B 的核心判据）。
+     *
+     * · 目标页 ≠ 当前页 ⇒ 必须**页身份**变成目标页
+     * · 目标页 == 当前页（如②页点复选框、③页点选项）⇒ 必须**页内状态**真的变了（签名变了）
+     *
+     * @param sig 刚读到的签名；[fromSig] 发起这次转移时的签名；[target] 转移表给的目标页
+     */
+    private fun exeqReached(sig: String, fromSig: String, target: String): Boolean {
+        if (sig == EXEQ_UNKNOWN) return false
+        val p = exeqPageIdOf(sig)
+        val fp = exeqPageIdOf(fromSig)
+        return if (p == fp) sig != fromSig else p == target
+    }
+
+    /**
+     * ★从**签名**里取 `|key=value` 的值（签名格式 `页身份@容器|状态…`）。
+     *
+     * 签名里已经带了页内关键状态（change / row / checked / sel）⇒
+     *   转移表的**条件**可以只用轻量签名判定（几十 ms），不用等整包读。
+     */
+    private fun exeqFieldOf(sig: String, key: String): String? {
+        val i = sig.indexOf("|$key=")
+        if (i < 0) return null
+        val rest = sig.substring(i + key.length + 2)
+        val j = rest.indexOf('|')
+        return if (j < 0) rest else rest.substring(0, j)
+    }
+
+    /**
+     * ★签名里的**三态**字段（true / false / null）。
+     *
+     * `null` = **读不到**（agent 侧读失败时写的 "null" 字符串）——
+     *   ★不能把它当成"false"或"已确定"，否则会误判成"没改动 ⇒ 点取消"这类**点错按钮**的事。
+     */
+    private fun exeqTriOf(sig: String, key: String): Boolean? = when (exeqFieldOf(sig, key)) {
+        "true" -> true
+        "false" -> false
+        else -> null
+    }
+
+    /** ★签名的**页身份**（party / setting / sort / `""`=不在三连页 / `"?"`=读不到） */
+    private fun exeqPageIdOf(sig: String): String = when {
+        sig == EXEQ_UNKNOWN -> EXEQ_UNKNOWN
+        else -> exeqPageOf(sig) ?: EXEQ_OFF_PAGE
     }
 
     /** 角色一览里"当前屏上"的 unitId（升序）—— 只用来判"滚完到底动没动"（PC `_vis` 同款：不过滤 vis） */
@@ -6526,6 +6658,16 @@ object MazeLoop {
         probe: Int = 0,
         /** 探针之间的间隔 */
         probeMs: Long = 150L,
+        /**
+         * ★阶段 1 的**目标达成判据**（可选，2026-11-08 方案 B）。
+         *
+         * 传了它 ⇒ 阶段 1 **只**认它：
+         *   · 读到的页面**到达目标** ⇒ 这次转移完成（进入阶段 2 / 返回 true）；
+         *   · "离开了 `from`，但没到目标" ⇒ 这次**没生效** ⇒ **重试同一个动作**
+         *     （由调用方保证 `xyAt` 重取同一按钮的坐标 ⇒ 多点也点在同一个按钮上）。
+         * 不传 ⇒ 老行为（离开 `from` 就算生效）。
+         */
+        reached: (suspend (String) -> Boolean)? = null,
     ): Boolean {
         // ── 阶段 1：反复点，直到**离开 from**（证明这一下生效了）──
         var attempt = 0
@@ -6564,7 +6706,10 @@ object MazeLoop {
                 // ★探针读失败（= unknownTop）⇒ **不算"离开"**（EX 流程里签名读不到时最上层的读数是陈旧的，
                 //   当成"点生效了"会让状态机直接跳到下一步 ⇒ 点错按钮）。
                 if (readTop != null && nowTop == unknownTop) continue
-                if (nowTop !in from) {
+                // ★★方案 B：判据优先用 [reached]（"到达目标页了没"）；
+                //   没传就退回老行为（离开 from 就算生效）。
+                val hit = if (reached != null) reached(nowTop) else (nowTop !in from)
+                if (hit) {
                     left = true
                     if (TRANS_VERBOSE) {
                         AppState.addLog(
