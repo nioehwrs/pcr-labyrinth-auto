@@ -1339,8 +1339,21 @@ class TeamBuild(private val tables: Tables) {
     /**
      * PC 版 `_aoe_score`(1072)：多目标 boss 评分。
      * ★不扣「单体效果低」（多目标里"对单弱"不是缺点）；★boss 档用场景评级 `tier_boss`。
+     *
+     * ★aoeW（2026-11-07 用户定）：**「多目标输出优先」**档（profile 的 `aoe_priority`，**只给冰狼**）——
+     *   多目标 boss 里"队里有个群攻就行"是错的：多目标输出**越多越好**，要占满队伍。
+     *     · 群攻加分量抬到 `aoe_priority`（默认 15，普通多目标 boss 是 7）⇒ 群攻优先占位；
+     *       数值由 `TeamTuning.aoePriority` 可临时覆盖（扫参数用，null = 用默认值）。
+     *     · ★破甲**不计分**，破甲手也**不免**单体核心的罚（用户 2026-11-07 明确）
      */
-    private fun aoeScore(uid: String, atk: String, w: Map<String, Double>, bing: Boolean, boss: Boolean): Double {
+    private fun aoeScore(
+        uid: String,
+        atk: String,
+        w: Map<String, Double>,
+        bing: Boolean,
+        boss: Boolean,
+        aoeW: Double?,
+    ): Double {
         val ts = rules.tagsOf(uid)
         val t = if (boss) rules.tierOf(uid, "boss") else rules.tierOf(uid)
         var s = (t ?: 0) * w["tier"]!!
@@ -1350,7 +1363,7 @@ class TeamBuild(private val tables: Tables) {
         ) {
             s -= TeamTuning.mixPenalty
         }
-        if (TagIds.T["aoe"] in ts) s += w["aoe"]!!
+        if (TagIds.T["aoe"] in ts) s += (aoeW ?: w["aoe"]!!)
         if (TagIds.T["dps"] in ts) s += w["core"]!!
         if (TagIds.T["burst"] in ts) s += w["single"]!!
         if ((TagIds.T["pbuff"] in ts && atk == "物理") || (TagIds.T["mbuff"] in ts && atk == "魔法")) {
@@ -1359,7 +1372,9 @@ class TeamBuild(private val tables: Tables) {
         if (TagIds.T["tp"] in ts) s += w["tp"]!!
         if (TagIds.T["heal"] in ts) s += w["heal"]!!
         if (TagIds.T["jiasu"] in ts) s += w["jiasu"]!!
-        // "非群攻的输出核心"扣分；但它若还干 群充/治疗/加速 的活 → 免扣
+        // "非群攻的输出核心"扣分（solo_core）：多目标 boss 里单体核心只打一个目标 = 浪费。
+        //   但它若还干 群充/治疗/加速 的活 → 免扣（用户 2026-10-12）。
+        //   ★多目标优先档也一样照扣：破甲**不计分**、破甲手也**不免**这个罚（用户 2026-11-07）。
         val teamFuncs = setOf(TagIds.T["tp"], TagIds.T["heal"], TagIds.T["jiasu"])
         if (TagIds.T["dps"] in ts && TagIds.T["aoe"] !in ts && (ts intersect teamFuncs).isEmpty()) {
             s += w["solo_core"]!!
@@ -1392,6 +1407,9 @@ class TeamBuild(private val tables: Tables) {
         val w = C.W["aoe"]!!
         val wt = C.W["burst_team"]!!
         val bing = truthy(pf["bing"])
+        // ★「多目标输出优先」档（2026-11-07 用户定：冰狼）：群攻加分量抬到 aoe_priority（默认 15），
+        //   TeamTuning.aoePriority 可临时覆盖以便扫参数；null = 普通多目标 boss 的群攻加分（7）。
+        val aoeW = if (truthy(pf["aoe_priority"])) (TeamTuning.aoePriority ?: w["aoe_priority"]!!) else null
         val boss = (pf["key"] as? String ?: "").startsWith("Boss_")
         val edge = (pf["edge"] as? String) ?: "魔法"        // aoe 默认魔法略优（profile 可覆盖）
         val edgeW = wt["edge"]!!
@@ -1405,7 +1423,7 @@ class TeamBuild(private val tables: Tables) {
         var bestWarns: List<String> = emptyList()
 
         for (atk in opts) {
-            fun sc(u: String): Double = aoeScore(u, atk, w, bing, boss)
+            fun sc(u: String): Double = aoeScore(u, atk, w, bing, boss, aoeW)
 
             val jsAll = cands.filter { TagIds.T["jiasu"] in rules.tagsOf(it) }
                 .sortedWith(descByDoubleVal { sc(it) })
@@ -1565,7 +1583,7 @@ class TeamBuild(private val tables: Tables) {
         res.log.addAll(bestNotes)
 
         val atkUse = res.atk ?: bestAtk
-        fun sc2(u: String): Double = aoeScore(u, atkUse, w, bing, boss)
+        fun sc2(u: String): Double = aoeScore(u, atkUse, w, bing, boss, aoeW)
         var tkRng2: Int? = null
         for (u in res.picked) {
             if (u in keep && (TagIds.T["tank"] in rules.tagsOf(u) || TagIds.T["mtank"] in rules.tagsOf(u))) {

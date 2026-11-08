@@ -31,6 +31,14 @@ class TeamPortProbeTest {
         File(root, "android/app/src/main/assets/$name").readText()
     }
 
+    /**
+     * ★2026-11-07 用户定："PC 版与 Android 版早就分叉了，别管 PC 版" ⇒ 这两条**与 PC 的对拍不再维护**。
+     *   分叉点举例：`C.ATTR_W` 5.0 → 7.5（Android 端同属性加成 +50%）、冰狼档多 `aoe_priority`、
+     *   `C.W["aoe"]` 多 `aoe_priority` 权重、美杜莎补 `u_aoe` 标签 —— 这些都是 Android 端**有意**改的。
+     *   Android 端自己的回归基准是 [TeamPortFullTest]（`tests/fixtures/team_fixtures.json`，
+     *   由 `TeamFixtureGenTest` 重算），那边才是绿的。
+     */
+    @Ignore("PC 版与 Android 端已分叉（2026-11-07 用户决定不再同步），该对拍不再维护")
     @Test
     fun 常量表与PC版一致() {
         val c = probes.getJSONObject("consts")
@@ -56,6 +64,7 @@ class TeamPortProbeTest {
         assertTrue("常量表与 PC 版不一致：\n" + bad.joinToString("\n"), bad.isEmpty())
     }
 
+    @Ignore("PC 版与 Android 端已分叉（2026-11-07 用户决定不再同步），该对拍不再维护")
     @Test
     fun 纯函数与关卡档逐项一致() {
         val rules = Rules(tables)

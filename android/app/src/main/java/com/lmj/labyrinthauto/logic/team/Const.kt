@@ -83,7 +83,9 @@ object C {
     const val SKILL_CUT = 300        // 遗物『开局获得技能值』≥此值 → 不用 首动群充（判据是 >=）
     const val ATTR_MIN = 4           // 属性限定 硬限制：同属性人数下限
     const val ATTR_TOL = 1           // 同属性优化允许的评级下降幅度
-    const val ATTR_W = 5.0           // 同属性加成折算：游戏给 500/1000/2500/5000 → /1000×ATTR_W
+    // 同属性加成折算：游戏给 500/1000/2500/5000 → /1000×ATTR_W
+    // ★2026-11-07 用户定：整体**提高 50%**（5.0 → 7.5）⇒ 2人=3.75 / 3人=7.5 / 4人=18.75 / 5人=37.5
+    const val ATTR_W = 7.5
     const val LOG = "team_runs.jsonl"
     const val BOSSWEAK = -12.0       // 「对boss弱」的扣分（只用于非速通档）
 
@@ -135,6 +137,11 @@ object C {
             "tier" to 10.0, "aoe" to 7.0, "core" to 6.0, "single" to 1.0, "same_type" to 8.0,
             "buff" to 3.0, "tp" to 3.0, "heal" to 1.0, "jiasu" to 2.0, "multi" to 2.0,
             "dot" to 3.0, "solo_core" to -7.0,
+            // ★「多目标输出优先」档专用（2026-11-07 用户定，**只给冰狼**）：多目标 boss 里"队里有个群攻就行"是错的
+            //   —— 多目标输出**越多越好**，要占满队伍。aoe_priority = 群攻加分量（普通多目标 boss 是 7，这里抬到 15，
+            //   让群攻在评级略低时也能压过单体核心 ⇒ 队伍里尽量多群攻）。
+            //   ★破甲**不计分**、破甲手也**不免**单体核心的罚（用户 2026-11-07）。
+            "aoe_priority" to 15.0,
         ),
     )
 }
@@ -217,7 +224,8 @@ object Profiles {
         ),
         // 多目标 boss
         "Boss_310103" to mapOf("algo" to "aoe"),                          // 愤怒巨龙
-        "Boss_319604" to mapOf("algo" to "aoe", "bing" to true),          // 冰霜魔狼
+        // 冰霜魔狼：dot 加分 + 黑姐（对策·冰狼）优先当坦克 + **多目标输出优先**（群攻越多越好）
+        "Boss_319604" to mapOf("algo" to "aoe", "bing" to true, "aoe_priority" to true),
         // 双敌 / 五敌 EX（遗物系）
         "EX_770120901" to mapOf("algo" to "sutong", "min_dot" to 1),      // 护盾·遗物+空花（五敌）
         // ★这两个**双敌**档按**怪物 id** 命中（2026-10-16 修，用户口径：EX 的区号只是"同一怪物在不同区的

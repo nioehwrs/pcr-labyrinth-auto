@@ -26,8 +26,18 @@ object TeamTuning {
     @Volatile
     var softRatio: Double = 0.5
 
+    /**
+     * ★「多目标输出优先」档（2026-11-07，**冰狼专档**）的**群攻加分量**。
+     *   普通多目标 boss 的群攻加分是 7（Const.W["aoe"]["aoe"]）；这个档位要"多目标输出越多越好"，
+     *   群攻加分量抬到 Const.W["aoe"]["aoe_priority"]（默认 15），这里可临时覆盖以便**扫参数**。
+     *   null = 用 Const 里的默认值（正式行为）。
+     */
+    @Volatile
+    var aoePriority: Double? = null
+
     fun reset() {
         mixPenalty = DEFAULT_MIX_PENALTY
         softRatio = 0.5
+        aoePriority = null
     }
 }
