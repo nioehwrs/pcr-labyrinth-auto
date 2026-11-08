@@ -1504,6 +1504,11 @@ object MazeLoop {
                                                        //   每一下还有"没生效重试"的余量）
     private const val EXEQ_TAP_TRIES = 3             // 同一次调用里最多点几下（tapAndCheck 的 retries）
     private const val EXEQ_TAP_MAX = 6               // 同一个按钮最多点几下（防止在一个按钮上狂点）
+    /** ★★连续"点不动/读不到"几次就**放弃这次装备**（2026-11-08 实测 11:44 那轮卡死 30 秒的教训）：
+     *  EX 装备只是锦上添花，卡住就该放过 ⇒ 放过它，编组页照常开打。 */
+    private const val EXEQ_STALL_MAX = 3
+    /** ★tapAndCheck 里"这一刻不该点"的连续上限（超了就返回 false，让外层换策略） */
+    private const val EXEQ_SKIP_MAX = 6
     private const val EXEQ_TAP_SETTLE_MS = 300L      // ★点完等一下再看"签名变了没"（等切页动画走一走）
     //   ★★2026-11-08 用户定的口径："对于容易点错出问题的页面，可以把 settleMs 稍稍调大" ——
     //     EX 三连页就是最容易点错的一页（②页的「确认」和①页的按钮挨着，点偏就点到别的），
@@ -1590,6 +1595,10 @@ object MazeLoop {
         var fullMs: Long = 0L,
         /** ★**最后一次点击**的时刻（用来算"这一步从点到生效"用了多久） */
         var lastTapAt: Long = 0L,
+        /** ★连续"点不动/读不到"的次数（≥[EXEQ_STALL_MAX] ⇒ 放弃这次装备，别卡住开打） */
+        var stall: Int = 0,
+        /** ★同一句诊断日志打了几次（防刷屏；成功一次就清零） */
+        var sayN: Int = 0,
     )
 
     /**
@@ -1654,6 +1663,19 @@ object MazeLoop {
      */
     private suspend fun exeqSigNow(): String =
         runCatching { AgentApi.labExEquipSig() }.getOrNull() ?: EXEQ_UNKNOWN
+
+    /**
+     * ★EX 流程的**诊断日志**（节流：同一轮失败只打前 3 句，免得刷屏）。
+     *
+     * ★2026-11-08：以前 EX 流程"点不动"是**完全静默**的 —— 整包读挂住时一声不吭地空转 30 秒，
+     *   日志上什么都看不出来 ⇒ 只能靠猜。现在每次"这一轮不点"都说清**为什么**。
+     */
+    private fun exeqSay(sess: ExeqSess, msg: String) {
+        if (sess.sayN < 3) {
+            sess.sayN++
+            AppState.addLog("    · $msg")
+        }
+    }
 
     // 编队页缓存（PC `party_ctx_cached`：本局持有角色池 + 加速遗物技能值，进迷宫读一次）
     @Volatile
@@ -4363,6 +4385,8 @@ object MazeLoop {
         sess.tapX = -1
         sess.tapY = -1
         sess.tapN = 0
+        sess.stall = 0                               // ★连续失败计数（新一轮清零）
+        sess.sayN = 0                                // ★诊断日志节流（新一轮清零）
         sess.pending = true                          // ★"流程进行中"（收尾处靠它判"异常收手"）
         OverlayStatus.setState("特别装备")
         while (System.currentTimeMillis() - t0 < EXEQ_TOTAL_BUDGET_MS) {
@@ -4454,11 +4478,12 @@ object MazeLoop {
             // ★"此刻该等"（刚点完「自动装备」、页面正在切到②）⇒ 不点，等一下再看（省一次整包读）
             if (rule.waitWhile?.invoke(sess) == true) { delay(EXEQ_POLL_MS); continue }
             // ── ④ 执行转移：**点一下，等到达目标页**（tapAndCheck 阶段 1 的语义）──
-            //   · 每次点击前都**重读整包**：① 当前页是权威（不会点到别的目标）② 坐标是**最新**的
-            //     （切页动画期间坐标在动 ⇒ 第一次可能点空 ⇒ 再点一次就中了 —— 多点是手段）。
+            //   · ★**整包读（~400ms）每轮只做一次**：拿动作 + 按钮坐标，之后**复用同一个坐标** ⇒
+            //     多点也点在**同一个位置**上（不会落到别的目标）；页面若在动 ⇒ 下一轮外层会重读拿新坐标。
             //   · ★整包读到的签名必须与外层的轻量签名**一致**（不一致 ⇒ 页面正在切 ⇒ 这一轮不点）。
             //   · ★★方案 B：判据是**"到达目标页了没"**（不是"签名变了没"）：
             //     没到目标 ⇒ 这次没生效 ⇒ **重试同一个动作**（同一按钮实例），不重新决策点别的。
+            var cachedAct: ExeqAct? = null          // ★本轮的动作缓存（整包读只做一次）
             val ok = tapAndCheck(
                 input, 0, 0, rule.what,
                 from = setOf(sigNow),
@@ -4475,83 +4500,49 @@ object MazeLoop {
                 xyAt = xyAt@{
                     // ① 页面已经切走？⇒ 这一次不点（外层循环会重新读页面状态）
                     if (exeqSigNow() != sigNow) return@xyAt null
-                    // ② 重读整包（当前页 + 最新坐标）
-                    val tFull = android.os.SystemClock.elapsedRealtime()
-                    val xr = AgentApi.labExEquip(true, timeoutMs = EXEQ_READ_FULL_MS)
-                    sess.fullMs += android.os.SystemClock.elapsedRealtime() - tFull
-                    if (xr == null) { fullFail++; return@xyAt null }
-                    fullFail = 0
-                    val sr = xr.optString("sig")
-                    // ★读数与外层不一致 ⇒ 页面正在切/状态在变 ⇒ 这一轮**不点**（避免点到别的按钮）
-                    if (sr != sigNow) return@xyAt null
-                    // ★按**转移表**的动作取按钮（外层已用签名定好"这一步做什么、去哪"；
-                    //   这里只补上按钮实例 + 最新坐标）
-                    val act = exeqActOf(rule, xr, sess) ?: run {
-                        if (sess.n < 2) {
-                            AppState.addLog("    [!] ${rule.what}：按钮读不到（页面数据不全）→ 本轮不点")
-                        }
-                        return@xyAt null
-                    }
-                    // ③ 多点按**同一个按钮实例**计数（换按钮/换实例就清零）
-                    val bn = act.btn.optString("name")
-                    val bid = act.btn.optString("id")
-                    if (sess.tapBtn != bn || (bid.isNotEmpty() && sess.tapBtnId != bid)) {
-                        sess.tapBtn = bn
-                        sess.tapBtnId = bid
-                        sess.tapN = 0
-                        sess.tapX = -1
-                        sess.tapY = -1
-                    }
-                    if (sess.tapN >= EXEQ_TAP_MAX) return@xyAt null
-                    // ★★"按钮在动" ⇒ 页面正在切 ⇒ **这一轮不点**（2026-11-08 实测 10:29:36）：
-                    //   同一个按钮实例（id 相同）两次读出的坐标能差很多 —— ②「确认」
-                    //   (1179,960) → (1026,666)：那是**页面切换动画**里它在位移，
-                    //   说明**上一下其实已经点中了**（只是签名还没更新，200ms 内没更新）。
-                    //   点那个"移动中的位置"会落在**别的控件**上 ⇒ 这才是真正的"多点落到不同目标"。
-                    //   ⇒ 判据做成**自洽**的（不依赖"上次点的坐标"作为结论）：
-                    //     **再读一次整包**，同一实例两次坐标一致 ⇒ 停稳了，才可以点。
-                    //   ★但**平时不做**这个双读 —— 整包读 ~700ms，白读一次就是白等 0.7s
-                    //     （实测这 1.4s 的双读就是"点完还在发呆"的大头）。
-                    //     ⇒ 只有**疑似在动**（与上次读到的不一致）才多读一次。
-                    val bx0 = act.btn.optInt("x")
-                    val by0 = act.btn.optInt("y")
-                    var bx = bx0
-                    var by = by0
-                    if (sess.tapX >= 0 &&
-                        (Math.abs(bx0 - sess.tapX) > EXEQ_BTN_MOVE_PX ||
-                            Math.abs(by0 - sess.tapY) > EXEQ_BTN_MOVE_PX)
-                    ) {
-                        // ★两次读之间**必须隔开一点**（2026-11-08 实测 10:39:41）：
-                        //   同一帧内连读两次 ⇒ 坐标当然一样 ⇒ 误判"已停稳" ⇒ 照样点在移动中的位置。
-                        delay(EXEQ_STILL_MS)
-                        val xr2 = AgentApi.labExEquip(true, timeoutMs = EXEQ_READ_FULL_MS)
+                    // ② 拿动作：★**本轮只读一次整包**（~400ms），之后复用同一个按钮/坐标
+                    val act = cachedAct ?: run {
+                        val tFull = android.os.SystemClock.elapsedRealtime()
+                        // ★只投影**要点的那个**按钮（agent 侧）—— ①页实测全投影要 380ms
+                        val xr = AgentApi.labExEquip(true, rule.btnKey, timeoutMs = EXEQ_READ_FULL_MS)
                         sess.fullMs += android.os.SystemClock.elapsedRealtime() - tFull
-                        if (xr2 == null) { fullFail++; return@xyAt null }
-                        val sr2 = xr2.optString("sig")
-                        if (sr2 != sigNow) return@xyAt null          // 页面在切 ⇒ 不点
-                        val b2 = _exeqBtn(
-                            xr2.optJSONObject("page")?.optJSONArray("buttons"), bn, sess.tapBtnId,
-                        ) ?: return@xyAt null
-                        val bx2 = b2.optInt("x")
-                        val by2 = b2.optInt("y")
-                        if (Math.abs(bx2 - bx0) > EXEQ_BTN_MOVE_PX ||
-                            Math.abs(by2 - by0) > EXEQ_BTN_MOVE_PX
-                        ) {
-                            // 还在动 ⇒ 记下新位置，等它**停稳**（下一轮再读，两次一致就点）
-                            sess.tapX = bx2
-                            sess.tapY = by2
-                            AppState.addLog(
-                                "    · 按钮还在动（$bn ${bx2},${by2} ⇄ ${bx0},${by0}）→ 这一轮不点，等它停稳",
-                            )
+                        if (xr == null) {
+                            fullFail++
+                            exeqSay(sess, "整包读失败（agent 没回包）→ 这一轮不点")
                             return@xyAt null
                         }
-                        bx = bx2
-                        by = by2
+                        fullFail = 0
+                        val sr = xr.optString("sig")
+                        // ★读数与外层不一致 ⇒ 页面正在切/状态在变 ⇒ 这一轮**不点**（避免点到别的按钮）
+                        if (sr != sigNow) {
+                            exeqSay(sess, "整包签名≠轻量签名（页面在切）→ 这一轮不点")
+                            return@xyAt null
+                        }
+                        // ★按**转移表**的动作取按钮（外层已用签名定好"这一步做什么、去哪"；
+                        //   这里只补上按钮实例 + 最新坐标）
+                        val a = exeqActOf(rule, xr, sess) ?: run {
+                            exeqSay(sess, "${rule.what}：按钮读不到（页面数据不全）→ 这一轮不点")
+                            return@xyAt null
+                        }
+                        // 多点按**同一个按钮实例**计数（换按钮/换实例就清零）
+                        val bn = a.btn.optString("name")
+                        val bid = a.btn.optString("id")
+                        if (sess.tapBtn != bn || (bid.isNotEmpty() && sess.tapBtnId != bid)) {
+                            sess.tapBtn = bn
+                            sess.tapBtnId = bid
+                            sess.tapN = 0
+                        }
+                        cachedAct = a
+                        a
+                    }
+                    if (sess.tapN >= EXEQ_TAP_MAX) {
+                        exeqSay(sess, "${rule.what}：同一个按钮已点 $EXEQ_TAP_MAX 下 → 不再点")
+                        return@xyAt null
                     }
                     sess.tapN++
                     sess.n++
-                    sess.tapX = bx
-                    sess.tapY = by
+                    sess.tapX = act.btn.optInt("x")
+                    sess.tapY = act.btn.optInt("y")
                     sess.lastTapAt = System.currentTimeMillis()
                     if (act.markAuto) { sess.auto = true; sess.autoAt = System.currentTimeMillis() }
                     if (act.isFinal) {
@@ -4567,13 +4558,30 @@ object MazeLoop {
                     AppState.addLog(
                         "特别装备：${act.what} → ${act.target.ifEmpty { "编组页" }}" +
                             "（按钮=${act.btn.optString("name")}" +
-                            "@${act.btn.optString("id").takeLast(8)} 签名=$sr）",
+                            "@${act.btn.optString("id").takeLast(8)} 签名=$sigNow）",
                     )
                     act.btn.optInt("x") to act.btn.optInt("y")
                 },
             )
             // ★生效了 ⇒ 立刻进下一步（不等）；没生效 ⇒ 等一下再来（别把 agent 读爆）
-            if (!ok) delay(EXEQ_RETRY_WAIT_MS)
+            if (ok) {
+                sess.stall = 0
+                sess.sayN = 0
+            } else {
+                // ★★2026-11-08 修（实测 11:44 那轮卡死）：**连续点不动就放弃这次装备**，
+                //   别再空转到 30 秒预算耗尽（那一轮整包读挂住 ⇒ 一声不吭地卡了 30 秒）。
+                sess.stall++
+                if (sess.stall >= EXEQ_STALL_MAX) {
+                    AppState.addLog(
+                        "    [!] 特别装备：连续 ${sess.stall} 次点不动/读不到 → 放弃这次装备" +
+                            "（不卡住开打）",
+                    )
+                    sess.pending = false
+                    sess.exDone = true
+                    break
+                }
+                delay(EXEQ_RETRY_WAIT_MS)
+            }
         }
         // ── 收尾：正常走完（回到编组页）已在循环里清了 pending；
         //   能走到这儿 = **异常收手**（步数/预算用尽）⇒ 放弃这次装备，
@@ -4622,6 +4630,9 @@ object MazeLoop {
         val what: String,
         val target: String,
         val pick: (JSONObject, ExeqSess) -> JSONObject?,
+        /** ★**要点的那个按钮**的键**（agent 侧"只投影这一个"，省掉几百 ms 的坐标投影）：
+         *  按钮名（ThreeButtonRight…）或 "prio0" / "check" / "rare" */
+        val btnKey: String,
         val markAuto: Boolean = false,
         val isFinal: Boolean = false,
         /** ★"此刻该等"（如：刚点完「自动装备」、页面正在切）⇒ 不点，等一下再看（省一次整包读） */
@@ -4638,6 +4649,7 @@ object MazeLoop {
                 what = "装备确定",
                 target = EXEQ_OFF_PAGE,
                 pick = { p, s -> _exeqBtn(p.optJSONArray("buttons"), "ThreeButtonRight", s.tapBtnId) },
+                btnKey = "ThreeButtonRight",
                 isFinal = true,
             ),
             ExeqRule(
@@ -4652,6 +4664,7 @@ object MazeLoop {
                     if (System.currentTimeMillis() - s.autoAt < EXEQ_AUTO_WAIT_MS) null
                     else _exeqBtn(p.optJSONArray("buttons"), "ThreeButtonCenter", s.tapBtnId)
                 },
+                btnKey = "ThreeButtonCenter",
                 markAuto = true,
                 waitWhile = { s -> System.currentTimeMillis() - s.autoAt < EXEQ_AUTO_WAIT_MS },
             ),
@@ -4661,6 +4674,7 @@ object MazeLoop {
                 what = "取消（自动装备后无改动）",
                 target = EXEQ_OFF_PAGE,
                 pick = { p, s -> _exeqBtn(p.optJSONArray("buttons"), "ThreeButtonLeft", s.tapBtnId) },
+                btnKey = "ThreeButtonLeft",
                 isFinal = true,
             ),
             ExeqRule(
@@ -4669,6 +4683,7 @@ object MazeLoop {
                 what = "自动装备",
                 target = EXEQ_PAGE_SETTING,
                 pick = { p, s -> _exeqBtn(p.optJSONArray("buttons"), "ThreeButtonCenter", s.tapBtnId) },
+                btnKey = "ThreeButtonCenter",
                 markAuto = true,
             ),
             // ── ② 自动特别装备设定（setting）──
@@ -4681,6 +4696,7 @@ object MazeLoop {
                 what = "「全部」行 进「优先属性值」",
                 target = EXEQ_PAGE_SORT,
                 pick = { p, _ -> p.optJSONArray("prioBtn")?.optJSONObject(0) },
+                btnKey = "prio0",
             ),
             ExeqRule(
                 page = EXEQ_PAGE_SETTING,
@@ -4691,6 +4707,7 @@ object MazeLoop {
                 what = "复选框(补勾)",
                 target = EXEQ_PAGE_SETTING,
                 pick = { p, _ -> p.optJSONObject("checkBtn") },
+                btnKey = "check",
             ),
             ExeqRule(
                 page = EXEQ_PAGE_SETTING,
@@ -4701,6 +4718,7 @@ object MazeLoop {
                 what = "复选框(取消勾选·不抢别队装备)",
                 target = EXEQ_PAGE_SETTING,
                 pick = { p, _ -> p.optJSONObject("checkBtn") },
+                btnKey = "check",
             ),
             ExeqRule(
                 page = EXEQ_PAGE_SETTING,
@@ -4711,6 +4729,7 @@ object MazeLoop {
                 what = "确认",
                 target = EXEQ_PAGE_PARTY,
                 pick = { p, s -> _exeqBtn(p.optJSONArray("buttons"), "TwoButtonRight", s.tapBtnId) },
+                btnKey = "TwoButtonRight",
             ),
             // ── ③ 优先属性值（sort）──
             ExeqRule(
@@ -4719,6 +4738,7 @@ object MazeLoop {
                 what = "确认",
                 target = EXEQ_PAGE_SETTING,
                 pick = { p, s -> _exeqBtn(p.optJSONArray("buttons"), "TwoButtonRight", s.tapBtnId) },
+                btnKey = "TwoButtonRight",
             ),
             ExeqRule(
                 page = EXEQ_PAGE_SORT,
@@ -4734,6 +4754,7 @@ object MazeLoop {
                     }
                     hit
                 },
+                btnKey = "rare",
             ),
         )
     }
@@ -6684,7 +6705,7 @@ object MazeLoop {
                 val p = runCatching { xyAt() }.getOrNull()
                 if (p == null) {
                     skip++
-                    if (skip > EXEQ_TAP_MAX * 2) return false
+                    if (skip > EXEQ_SKIP_MAX) return false
                     kotlinx.coroutines.delay(EXEQ_POLL_MS)
                     continue
                 }

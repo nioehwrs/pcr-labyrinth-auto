@@ -364,9 +364,14 @@ object AgentApi {
      *  页面读不到时的**中间档**——比重启游戏便宜 30~40s，且能判断"是不是缓存问题"。 */
     suspend fun labResetCaches(): JSONObject? = obj("labResetCaches", timeoutMs = T_SLOW)
 
-    /** 特别装备三连页；`full=true` 连按钮坐标一起算 */
-    suspend fun labExEquip(full: Boolean = false, timeoutMs: Long = T_SLOW): JSONObject? =
-        obj("labExEquip", listOf(full), timeoutMs)
+    /**
+     * 特别装备三连页；`full=true` 连按钮坐标一起算。
+     *
+     * ★`only` = **只投影这一个按钮**（按钮名 / "prio0" / "check" / "rare"）；
+     *   null = 老行为（把整棵子树里的按钮全投影一遍，①页实测 380ms）。
+     */
+    suspend fun labExEquip(full: Boolean = false, only: String? = null, timeoutMs: Long = T_SLOW): JSONObject? =
+        obj("labExEquip", listOf(full, only ?: ""), timeoutMs)
 
     /**
      * ★**极轻**：只读特别装备三连页的**签名**（一个字符串）—— 状态机轮询专用。

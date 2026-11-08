@@ -2,9 +2,11 @@ package com.lmj.labyrinthauto.frida
 
 import com.lmj.labyrinthauto.core.AppState
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
@@ -15,6 +17,9 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -54,6 +59,14 @@ object AgentBridge {
      * 再杀游戏重来（13:19 那局白跑）。20s 内有过成功回包就说明连接是活的，不该判死。
      */
     private const val BUSY_GRACE_MS = 20_000L
+
+    /** ★写请求超时（2026-11-08）：agent 卡住不读 socket ⇒ `out.write` 阻塞 ⇒ 必须有上限。 */
+    private const val WRITE_TIMEOUT_MS = 3_000L
+
+    /** ★写请求用的**单线程**执行器（保证请求顺序 + 不阻塞调用方）。 */
+    private val writePool = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "agent-write").apply { isDaemon = true }
+    }
 
     /** 在飞调用（id → "fn@发出时刻"）：超时时用它报出**真正还卡着的那次调用**（见 [call]）。
      *  ⚠为什么需要：先超时的往往是**便宜调用**（`viewId` T_FAST=3s），而真正卡住 agent 的常是
@@ -179,12 +192,24 @@ object AgentBridge {
             put("args", JSONArray(args))
         }
         try {
-            synchronized(this) {
-                out.write((req.toString() + "\n").toByteArray(Charsets.UTF_8))
-                out.flush()
+            // ★★写请求也**必须有超时**（2026-11-08 实测 11:44 那轮卡死 30s 的教训）：
+            //   agent 卡住不读 socket ⇒ 发送缓冲区填满 ⇒ `out.write` **阻塞在锁里**；
+            //   而它原来在 `withTimeoutOrNull` **之外** ⇒ 整个流程永久挂死（一声不吭）。
+            //   ⇒ 写放进独立线程 + 超时；超时就**断连**（agent 侧会自己重连）⇒ 返回 null，流程还能自愈。
+            withContext(Dispatchers.IO) {
+                writePool.submit {
+                    synchronized(this) {
+                        out.write((req.toString() + "\n").toByteArray(Charsets.UTF_8))
+                        out.flush()
+                    }
+                }.get(WRITE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
             }
         } catch (t: Throwable) {
             pending.remove(id)
+            if (t is TimeoutException || t is InterruptedException) {
+                AppState.addLog("[agent] 写请求超时（$fn）→ 断开连接，让 agent 重连")
+                noteStale("写请求超时（$fn）")
+            }
             return null
         }
         val res = withTimeoutOrNull(timeoutMs) { deferred.await() }

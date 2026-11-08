@@ -5366,7 +5366,7 @@ function _findExTopPart() {
 
 // 某层对话框**子树内**的按钮（按名字）→ 坐标。
 // ★必须限定在该子树里：Two/ThreeButton* 在别的弹窗里也有同名的，全树找会串坐标
-function _exeqButtons(rootTr) {
+function _exeqButtons(rootTr, only) {
   const out = [];
   if (!rootTr || rootTr.isNull()) return out;
   const env = _camEnv();
@@ -5375,7 +5375,12 @@ function _exeqButtons(rootTr) {
   const found = [];
   _rawWalk(function (nd) {
     if (nd.active !== true) return;
-    if (re.test(nd.name)) found.push({ name: nd.name, tr: nd.tr });
+    if (!re.test(nd.name)) return;
+    // ★★2026-11-08：**只要指定的那一个按钮**（only）—— 别把整棵子树里的
+    //   One/Two/ThreeButton 全投影一遍坐标（实测①页有 ~90 个 ⇒ 投影 380ms，
+    //   这就是"点一下要等半秒"的大头）。only=null 时保持老行为（全部投影）。
+    if (only && nd.name !== only) return;
+    found.push({ name: nd.name, tr: nd.tr });
   }, false, rootTr);                                   // 先便宜地筛名字，再只给命中的算坐标
   for (const f of found) {
     const p = _ndXY({ tr: f.tr }, env);
@@ -5468,7 +5473,8 @@ function labExEquipSig() {
 }
 
 // 只读快照：**只读"当前最上层"那一页**（wantBtns=false 时连按钮坐标都不算，省掉一次子树遍历）
-function labExEquipSnapshot(diag, wantBtns) {
+//   ★`only` = **只要投影这一个**（按钮名 / "prio0" / "check" / "rare"）；null = 老的全量行为。
+function labExEquipSnapshot(diag, wantBtns, only) {
   const res = { jsBuild: JS_BUILD, top: null, page: null, sig: null, err: null };
   const env = _camEnv();
   const xy = function (o) {
@@ -5491,11 +5497,13 @@ function labExEquipSnapshot(diag, wantBtns) {
     }
     return out;
   };
-  const ctrlCoords = function (arrPtr, maxN) {          // 组件数组 → 坐标
+  const ctrlCoords = function (arrPtr, maxN, onlyIdx) {  // 组件数组 → 坐标
     const out = [];
     let n = 0;
     try { n = ptrOk(arrPtr) ? Math.min(arrPtr.add(0x18).readS32(), maxN || 8) : 0; } catch (e) { n = 0; }
     for (let i = 0; i < n; i++) {
+      // ★只投影指定的那一个（onlyIdx）—— 4 个 prioBtn 全投影也就 ~16ms，但顺手省掉
+      if (onlyIdx != null && i !== onlyIdx) continue;
       let p = ptr(0);
       try { p = arrPtr.add(0x20 + i * 8).readPointer(); } catch (e) {}
       const c = xy(p); c.i = i; out.push(c);
@@ -5506,8 +5514,14 @@ function labExEquipSnapshot(diag, wantBtns) {
     const f = _findExTopPart();
     if (!f) return res;                                  // 当前最上层不是这三页
     res.top = f.top;
+    // ★★2026-11-08 实测：整包读的耗时**大头不是坐标投影，而是 `_rawWalk` 遍历整棵子树**
+    //   （①页 DialogCommonFullSize = 编组页的大容器 ⇒ 遍历要 350ms+）。
+    //   ⇒ 只要的不是**对话框按钮**（prio0 / check / rare 都能从组件的字段直接拿到）时，
+    //     **别去遍历找按钮** —— 这一步省掉就是几十 ms。
+    const needDlgBtns = (wantBtns || diag) &&
+      !(only === "prio0" || only === "check" || only === "rare");
     const o = { cls: f.cls, ptr: String(f.comp), dlg: String(f.dlg), dlgName: f.dlgName,
-                buttons: (wantBtns || diag) ? _exeqButtons(_inv(f.dlg, "get_transform")) : [],
+                buttons: needDlgBtns ? _exeqButtons(_inv(f.dlg, "get_transform"), only) : [],
                 slots: null };
     if (f.top === "party") {                             // ① 特别装备设定
       o.change = _invBool(f.comp, "isChangeExtraEquip"); // ★有没有改动
@@ -5527,7 +5541,9 @@ function labExEquipSnapshot(diag, wantBtns) {
     } else if (f.top === "setting") {                    // ② 自动特别装备设定
       o.labels = labelTexts(f.comp.add(0x90).readPointer(), 8);   // ★4 行右侧当前值（文字）
       // ★2026-11-08：**不要按钮坐标时就不投影**（状态机轮询只要"状态变了没"，坐标是纯浪费）
-      o.prioBtn = wantBtns ? ctrlCoords(f.comp.add(0x88).readPointer(), 8) : [];  // 4 行右侧按钮坐标
+      //   ★★只投影**要点的那个**（only="prio0" ⇒ 只投影第 0 行；其它 ⇒ 全投影）
+      const prioOnly = (only === "prio0") ? 0 : null;
+      o.prioBtn = wantBtns ? ctrlCoords(f.comp.add(0x88).readPointer(), 8, prioOnly) : [];  // 4 行右侧按钮坐标
       o.terms = []; o.checked = null; o.checkBtn = null;
       try {
         const cb = f.comp.add(0x98).readPointer();
@@ -5535,7 +5551,7 @@ function labExEquipSnapshot(diag, wantBtns) {
           const tg = cb.add(0x38).readPointer();
           if (ptrOk(tg)) o.checked = (tg.add(0x81).readU8() !== 0);   // UIToggle.mIsActive @0x81
           const tb = cb.add(0x48).readPointer();
-          if (ptrOk(tb) && wantBtns) o.checkBtn = xy(tb);
+          if (ptrOk(tb) && wantBtns && (!only || only === "check")) o.checkBtn = xy(tb);
         }
       } catch (e) {}
       try { const pm = f.comp.add(0xA0).readPointer();
@@ -5561,7 +5577,8 @@ function labExEquipSnapshot(diag, wantBtns) {
           try { const lb = it.add(0x30).readPointer();               // typeLabel
                 if (ptrOk(lb)) t = _str1(_inv(lb, "get_text")); } catch (e) {}
           // ★不要坐标时只带 label/sel（轮询读不需要投影坐标）
-          const p = wantBtns ? xy(it) : {};
+          // ★★2026-11-08：**只投影「稀有度」那一个**（only="rare"）—— 11 个全投影 ≈ 44ms，纯浪费
+          const p = (wantBtns && (!only || only === "rare") && t === "稀有度") ? xy(it) : {};
           p.i = i; p.label = t; p.sel = _invBool(it, "get_IsSelected");
           o.toggles.push(p);
         }
@@ -5593,7 +5610,7 @@ function labExEquipTop() {
 // ── 选角色页（SUMMON_UNIT=1 且 pageTop 是对话框）：初始编成 / 门票召唤（★只读）──
 // ★构建号：改过读逻辑就 +1。attach 时 pcr_auto 会打出来（rpc jsBuild）——用来确认
 //   "正在跑的到底是哪一版脚本"，免得拿旧输出讨论半天（2026-10-10 踩过）。
-const JS_BUILD = "cs68";     // ★cs68（2026-11-08）：**"当前最上层"统一成一个实现**（_topDialogGo）—— ①_exeqFind 只查**最上层那一层**、**绝不往回退**（回退会永远读到下面那层仍 active 的①页 ⇒ 签名不变 ⇒ 误判"没生效"⇒多点⇒点错按钮）；②签名里带**最上层容器名**（"页面切了"能立刻看见）。cs67：去掉 agent 侧坐标"稳定化"（Thread.sleep 堵死单通道）；cs64：_findExTopPart 组件查找缓存；cs63：labExEquipSig 轻量签名读
+const JS_BUILD = "cs69";     // ★cs69（2026-11-08）：**EX 整包读改成"只投影要点的那个"**（labExEquip(full, only)）—— ①页实测有 ~90 个 One/Two/ThreeButton，全投影坐标要 380ms（"点一下等半秒"的大头）⇒ now 只投影 1 个（~12ms）。cs68：**"当前最上层"统一成一个实现**（_topDialogGo）—— ①_exeqFind 只查**最上层那一层**、**绝不往回退**（回退会永远读到下面那层仍 active 的①页 ⇒ 签名不变 ⇒ 误判"没生效"⇒多点⇒点错按钮）；②签名里带**最上层容器名**（"页面切了"能立刻看见）。cs67：去掉 agent 侧坐标"稳定化"（Thread.sleep 堵死单通道）；cs64：_findExTopPart 组件查找缓存；cs63：labExEquipSig 轻量签名读
 // ★cs62（2026-10-22）：新增 battleSettingsStart/Poll（战斗设定只读；getter 是 IFix 模板 ⇒ 投递游戏线程执行）
 // ★JS 侧详细日志开关（2026-10-11 加）：默认关。
 //   关掉的是"每次调用都会打、但正常情况没信息量"的那几条（如 findMap 的"跳过堆扫描"、
@@ -7398,7 +7415,7 @@ rpc.exports = {
   }),
   // 特别装备三连页（只读快照）：① 特别装备设定 ② 自动特别装备设定 ③ 优先属性值
   //   full=true 时连"该层对话框子树内的按钮坐标"一起算（要点的时候才需要，平时省掉一次子树遍历）
-  labExEquip: _rpcSafe(function (full) { try { return labExEquipSnapshot(false, !!full); } catch (e) { return null; } }),
+  labExEquip: _rpcSafe(function (full, only) { try { return labExEquipSnapshot(false, !!full, only || null); } catch (e) { return null; } }),
   labExEquipDiag: _rpcSafe(function () { try { return labExEquipSnapshot(true, true); } catch (e) { return null; } }),
   // 最上层是不是这三页之一（给 Python 判断"这页由我们自己驱动、不要自动点通用弹窗"）
   labExEquipTop: _rpcSafe(function () { try { return labExEquipTop(); } catch (e) { return { top: null, err: String(e) }; } }),
