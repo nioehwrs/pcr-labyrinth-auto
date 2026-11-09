@@ -447,6 +447,50 @@ object AgentApi {
             else -> obj("dialog", listOf(topCls, knownChains), T_DIALOG)
         }
 
+    /**
+     * ★★通用弹窗「按钮轻读」（2026-11-09）：按 `DialogCommonAbstract` 的按钮字段**直取** +
+     * 名字/active 校验 + 只投影命中的按钮，**零遍历**（与 `labExBtn` 同一范式，几十 ms）。
+     * 对比 [dialog]：走 `DialogArea` 子树遍历，设备日志实测冷 0.5~0.6s、大结算页 3~3.9s
+     * ⇒ [T_DIALOG] 才给到 6s；这里用 [T_FAST] 就够。
+     *
+     * [topCls] = 调用方看到的当前顶框名；对不上或一颗按钮都没激活 ⇒ `ok=false`，
+     * 调用方应退回 [dialog] 兜底，**绝不硬点**。
+     * 返回 `{ok, top, buttons:[{name,x,y,id}], ms, err}`。
+     */
+    suspend fun labDlgBtn(topCls: String, timeoutMs: Long = T_FAST): JSONObject? =
+        obj("labDlgBtn", listOf(topCls), timeoutMs)
+
+    /**
+     * ★★「关闭已启动」轻读（2026-11-09 定案）—— `tapAndCheck` 阶段 1 的"这一下生效了"判据。
+     *
+     * 返回 `{top, raw, path, proc, started, factor, closing, ms, err}`：
+     *   · `top` = 当前最上层对话框规范名（与 [labTop] 同源）
+     *   · `closing` = 退出动画正在跑（`started=1 && factor<0.95`）或整页已消失
+     *   · `proc` = `DialogBase.isProcess`；`started`/`factor` = `outMainTweenAlpha` 的
+     *     `UITweener.mStarted` / `mFactor`
+     *
+     * 实测（2026-11-09，7 段关闭）：退出 tween 在点击后 **+200~300ms** 启动，整页到 +800ms
+     * 才消失；按钮层 `mState/IsPressed` 全程不变（游戏关弹窗不走"禁用按钮"）。
+     * 所以用它判"点生效了"比等窗口消失早 500~600ms。
+     * ⚠基线 `factor` 可能是 1、`proc` 可能是 1（打开过程残留）⇒ 只能认 `started` 由 0 变 1
+     * 且 `factor` 从小往上涨，**不能只看 `proc==1`**。
+     * 零 hook、只读字段，实测 3~6ms。
+     */
+    suspend fun labDlgClosing(timeoutMs: Long = T_FAST): JSONObject? =
+        obj("labDlgClosing", timeoutMs = timeoutMs)
+
+    /**
+     * ★三选一页的**阶段 1 探针**（2026-11-09）：一次读取同时给「顶框名 + 关闭判据 + 诊断」。
+     *
+     * 三选一（`DialogLabyrinthSelection`）也是 `DialogBase` 子类 ⇒ 退出 tween 与确认框同源，
+     * 所以可以用和 [labDlgClosing] 一样的判据（`started==1 && factor<0.95`）。
+     * 返回 `{path, top, closing, proc, tw, selNum, listN, remainText, remainActive, cardIdx[], ms, err}`：
+     *   · `closing` 就是判据；`tw`/`proc`/`selNum`/`listN`/`remain` 只是**顺带**诊断（进 probe 轨迹日志）
+     * 零 hook、只读字段（含一次 `get_text`），实测 8~18ms。
+     */
+    suspend fun labSelState(timeoutMs: Long = T_FAST): JSONObject? =
+        obj("labSelState", timeoutMs = timeoutMs)
+
     /** 第一个"屏内+激活+名字匹配"的节点：`{name,x,y}`；找不到 null */
     suspend fun find(nameRe: String): JSONObject? = obj("find", listOf(nameRe), T_SLOW)
 

@@ -836,7 +836,7 @@ object MazeLoop {
                 if (top.isNotEmpty() && dlgOpenMiss == top) {
                     // ★同一顶框上一轮已 dialog(top) open=false ⇒ 顶框不变结果不会变，
                     //   不再重复走那 0.5~2.2s 的遍历（2026-10-19 优化，低配机器一局 86 次 slow）
-                } else if (tapDialogConfirm(input, top)) {
+                } else if (tapDialogConfirm(input, top, tag)) {
                     idle = 0
                     delay(900)
                     continue
@@ -1874,7 +1874,7 @@ object MazeLoop {
             //（ownPage 让主循环的白名单在这被跳过，所以这里必须自己兜；按钮是白名单里的"确定/下一步"类）
             // 阈值取 10 轮（≈15s）：先给页面切换留足时间（换页瞬间读失败是正常的），确认真卡住才降级
             if (n >= 10) {
-                if (tapDialogConfirm(input, top)) {
+                if (tapDialogConfirm(input, top, tag)) {
                     AppState.addLog("选角色页读不到且已停 $n 轮 → 退化为通用弹窗确认（顶框=$top）")
                     delay(900)
                     return
@@ -3413,7 +3413,10 @@ object MazeLoop {
                     from = setOf("DialogLabyrinthSelection"),
                     expect = selExpect(kind),
                     // ★不猜设备速度（见下面 xyAt 分支的说明）
+                    // ★probe=2：实测三选一页没有退出 tween 可读（tw 全程 0/0），真正切换在 ~1s 后
+                    //   ⇒ 多探只是把"判没点到"往后推，没有收益；探 2 次就重试，多点无害。
                     retries = 8, settleMs = 200L, probe = 2, probeMs = 150L,
+                    probeState = { selProbe("DialogLabyrinthSelection") },
                 )
             } else {
                 left = tapAndCheck(
@@ -3428,6 +3431,9 @@ object MazeLoop {
                     //     · `retries` 大**不会**让快设备多点（探到就 break），只是给慢设备留余量。
                     //   ★**点击间隔 = 200 + 150 = 350ms**（一秒最多 3 下）。用户 2026-11-08：
                     //     "350~500ms 这个范围挺好，200ms 一秒五次就太快了" ⇒ 别再往密里调。
+                    //   ★probe=2（+350/500ms）：实测三选一页**没有**退出 tween（tw 全程 0/0），
+                    //     真正切换在 ~1s 后（选卡动画）⇒ 多探几次只是把"判没点到"推迟 1s，没有收益
+                    //     （"时间太长的 probe 就失去即时性价值"）⇒ 探 2 次就重试，多点无害。
                     retries = 8, settleMs = 200L, probe = 2, probeMs = 150L,
                     // ★每一下**现取坐标**（按钮还在滑入 ⇒ 旧坐标会点空；屏外则这一下不点）
                     // ★★兜底（2026-11-08 事故）：重读失败就退回**决策时那个坐标**（外层刚判过它在屏内）。
@@ -3446,7 +3452,23 @@ object MazeLoop {
                         if (xy != null) xyOk++ else xyNull++
                         xy
                     },
+                    probeState = { selProbe("DialogLabyrinthSelection") },
                 )
+            }
+            // ★★印记节点三选一专用：选完卡之后会**连弹两次**（收到印记 → 收到角色），
+            //   就地用 tapAndCheck 两段点掉，不让主循环再按固定 900ms 慢慢摸（2026-11-09）。
+            //   遗物三选一走 handleRelicChoice、角色三选一 kind≠"门票" ⇒ 都不进这里。
+            if (left && kind == "门票") {
+                closeTicketRewardChain(input)
+            }
+            // ★★角色三选一（战后选人）：选完卡之后的**单弹** Middle → 地图（2026-11-09）。
+            //   只发生在战斗节点；普通战斗战后不给遗物，直接从角色三选一开始。
+            // ★**不串链**：只在 left=true 时触发 —— left 来自上面 tapAndCheck 的阶段 2，
+            //   战后选人的 expect = selExpect(kind) = DialogCommonMiddle ⇒ 已经**等到** Middle 出现。
+            //   Boss 节点两轮选人的第一轮之后仍在 Selection ⇒ 阶段 2 超时 ⇒ left=false ⇒
+            //   走下面的递归重选，不会把第二轮误当成确认框（用户 2026-11-09 提醒）。
+            if (left && kind != "门票") {
+                closeMiddleRewardDialog(input, "战后选人：关闭收到角色(Middle)")
             }
             // ★★"一次都没点出去"要说出来（2026-11-08 事故：取不到坐标 ⇒ 静默空转 20 秒，
             //   日志里只有一屏幕 `⏸ 3 选 1`，完全看不出为什么）。节流：本轮第一次 + 每 10 次。
@@ -3954,6 +3976,15 @@ object MazeLoop {
             AppState.addLog(
                 "[遗物] 选 ${c.opt("rewardId")}（${cards.size} 张里认表 $known 张）：候选=[${cards.map { it.opt("rewardId") }}] " +
                     "理由=${relicPick.relicPickNote(c, ctx)} ｜LTD候选=${ltdChoicesBrief()}",
+            )
+            // ★★选完卡**就地**把「收到遗物」单弹点掉（轻读 + tapAndCheck，2026-11-09）。
+            //   落点按节点类型分叉：遗物节点(RELIC)→地图；战斗节点(NORMAL/HARD/BOSS/EX…)→角色三选一页，
+            //   后者必须等到 DialogLabyrinthSelection 出现才算走完，再由角色三选一流程继续推进。
+            //   panelTypeName 读不到/是 NONE ⇒ 不预判落点，离开 Big 即完成（保守降级）。
+            val panel = st.optString("panelTypeName", "")
+            closeRelicRewardDialog(
+                input,
+                fromBattleNode = panel.isNotEmpty() && panel != "RELIC" && panel != "NONE",
             )
             return true
         }
@@ -7026,6 +7057,8 @@ object MazeLoop {
         probe: Int = 0,
         probeMs: Long = 150L,
         reached: (suspend (String) -> Boolean)? = null,
+        /** 一次快照探针（top + 判据 + 诊断同源）；给了它就不再读 readTop / reached。 */
+        probeState: (suspend () -> TapCheck.Probe)? = null,
     ): Boolean = TapCheck.run(
         tapFn = { tx, ty, tw -> tap(input, tx, ty, tw) },
         x = x, y = y, what = what, from = from,
@@ -7033,6 +7066,7 @@ object MazeLoop {
         expect = expect, expectTimeoutMs = expectTimeoutMs,
         readTop = readTop, unknownTop = unknownTop,
         xyAt = xyAt, probe = probe, probeMs = probeMs, reached = reached,
+        probeState = probeState,
         // ★下面三个就是原来写死在本文件里的常量，值完全一致（别在这里改行为）
         skipMax = EXEQ_SKIP_MAX,
         skipDelayMs = EXEQ_POLL_MS,
@@ -7110,6 +7144,15 @@ object MazeLoop {
      */
     private val SEL_TICK_MS = 150L
 
+    /** 遗物选卡 → 顶框变成 `DialogCommonBig` 的最长等待：实测最长 3.9s（15:41:47→15:41:52）。
+     *  探针是 3ms 的 [AgentApi.labTop]，100ms 一探 ⇒ 弹窗一出现就点，不是固定死等。 */
+    private const val RELIC_REWARD_WAIT_MS = 4_500L
+
+    /** 确认按钮「落位」探测：弹窗打开动画里按钮会漂，连读这么多次、两次差 ≤8px 才用。
+     *  不是加大等待换准确，是用 30ms 的轻读**更快知道现在能不能点**（2026-11-09 事故）。 */
+    private const val DLG_XY_TRIES = 4
+    private const val DLG_XY_GAP_MS = 60L
+
     /** 选人页最多点几次（每次都重新读卡片位置/属性；2026-11-07 用户定为 10） */
     private val SEL_RETRY_MAX = 10
 
@@ -7130,6 +7173,265 @@ object MazeLoop {
         } else {
             setOf("DialogCommonBig")
         }
+
+    /**
+     * ★★印记节点三选一（kind="门票"）之后的**两连弹**（2026-11-09 现场抓证）：
+     * ```
+     * DialogCommonBig(收到印记) --关闭--> DialogCommonMiddle(收到角色) --关闭--> 地图(无弹窗)
+     * ```
+     * 遗物三选一（statusType=9，走 handleRelicChoice）与角色三选一（kind=战后选人/选择角色）
+     * **都不是**这个响应方式 ⇒ 只在 handleLabSelection 里 `kind == "门票" && left` 时调用。
+     *
+     * 两段都走 [tapAndCheck]：点完立刻探 labTop，变了就走，不睡固定 900ms。
+     * ★★2026-11-09 读法定案（与 EX 三连页 `labExBtn` / 编队 `labExEquipSig` 同一范式）：
+     *   **专门拆一个轻读取** [AgentApi.labDlgBtn] —— 按 `DialogCommonAbstract +0x118` 字段直取按钮，
+     *   零遍历、几十 ms；替换掉 `dialog()` 的 `DialogArea` 子树全量遍历（冷 0.5~0.6s / 大页 3~3.9s）。
+     * ★★2026-11-09 事故修正：**「每下现取坐标」对弹窗按钮是反的**。
+     *   [TapCheck] 的注释说"切页动画期间坐标在动 ⇒ 旧坐标会点空"，那是三选一卡片；
+     *   弹窗关闭按钮出现时静止，点击后却随**收起动画上移** ⇒ 每下重读拿到的是漂到地图节点带
+     *   （实测 Big 959,958→959,890；Middle 958,875→959,789；地图节点在 x≈960,y=563~825）
+     *   ⇒ 多点误触下个节点，弹出「移动目标确认」DialogCommonSmall，状态机却以为已回地图。
+     *   ⇒ 改为 **段入口读一次「已落位」坐标，段内固定**；每下只用 3ms 的 labTop 校验壳还在。
+     * 失败只打日志，主循环的 tapDialogConfirm 仍会兜底 ⇒ 不会比旧逻辑更容易卡住。
+     */
+    // ═══════════ ★★「关闭已启动」判据（2026-11-09 定案，替代"等窗口消失"） ═══════════
+    //  实测 7 段关闭（门票 Big/Middle、遗物 Big、战后选人 Middle，2026-11-09）：
+    //    · 按钮层 mState / initEnable / IsPressed / curBoxCollider **全程不变**
+    //      （游戏关弹窗不经"禁用按钮"，回调里直接 Close() ⇒ 按钮上没有"已点击"标记）
+    //    · 退出 tween（mStarted=1、mFactor 0→1）在点击后 **+200~300ms** 启动
+    //    · 整页（顶层 Dialog → DialogCommonAbstract）到 **+800ms** 才消失
+    //  ⇒ 阶段 1 用「关闭已启动」判"这一下生效了"：点到了 +200~300ms 就停手、不补第二下；
+    //    没启动就继续重试 ⇒ 不会"点了没反应就放弃"。
+    //  ⇒ 判据与点击都只用一次 3~6ms 轻读；[dlgReadyToTap] 在**紧邻 tap 之前**再确认一次
+    //    "壳还在 + 没在关"，把"判断时还在、点下去已消失"的窗口压到最小。
+    /** 阶段 1 的**单次快照**探针：`top` 与"是否已离开"来自同一次读取。
+     *  ★省掉原来"先 labTop 再判关闭态"的第二次 RPC —— 不只是快，更重要的是两次读之间
+     *    状态可能已经变化（top 说还在、closing 说已关），判据就不自洽了。
+     *  ★读失败（RPC 超时 / agent 内部异常）⇒ `left=false`，**绝不把"读不到"当成"已离开"**。 */
+    private suspend fun dlgProbe(shell: String): TapCheck.Probe {
+        val r = runCatching { AgentApi.labDlgClosing() }.getOrNull()
+        if (r == null || r.optString("path") == "err") return TapCheck.Probe("", false)
+        val top = r.optString("top")
+        return TapCheck.Probe(
+            top = top,
+            left = top != shell || r.optBoolean("closing", false),
+        )
+    }
+
+    /** 紧邻 tap 之前的最后确认：**一次轻读同时判「壳还在」和「没在关」**。
+     *  任一不成立就不给坐标（不消耗 retries，[TapCheck] 会稍后再试）。
+     *  ★比原来只看 labTop 更严：关闭动画已启动时，即便窗口对象还在，也不再点第二下。 */
+    private suspend fun dlgReadyToTap(shell: String, xy: Pair<Int, Int>): Pair<Int, Int>? {
+        val r = runCatching { AgentApi.labDlgClosing() }.getOrNull() ?: return null
+        if (r.optString("top") != shell) return null
+        if (r.optBoolean("closing", false)) return null
+        return xy
+    }
+    // ═══════════ 结束 ═══════════
+
+    /** ★三选一页的阶段 1 探针：**一次读取**同时给 top / 关闭判据 / 诊断串。
+     *
+     * 三选一（`DialogLabyrinthSelection`）也是 `DialogBase` 子类 ⇒ 退出 tween 与确认框同源
+     * （`labDlgClosing` 已按 DialogBase 兜底），所以用同一条判据：
+     *   「顶框已不是这个壳」或「退出动画已启动」= 这一下生效了。
+     * 诊断串（`tw` / `proc` / `selNum` / `listN` / `remain`）跟同一次读取返回，
+     * **不额外发 RPC、不阻塞 probe** —— probe 仍按 settle/probeMs 的节奏跑。
+     */
+    private suspend fun selProbe(shell: String): TapCheck.Probe {
+        val r = runCatching { AgentApi.labSelState() }.getOrNull()
+        if (r == null || r.optString("path") == "err") return TapCheck.Probe("", false)
+        val top = r.optString("top")
+        val diag = "tw=${r.optString("tw")} proc=${r.optString("proc")}" +
+            " selNum=${r.optString("selNum")} listN=${r.optString("listN")}" +
+            " remain=${r.optString("remainText")}"
+        return TapCheck.Probe(
+            top = top,
+            left = top != shell || r.optBoolean("closing", false),
+            diag = diag,
+        )
+    }
+
+    private suspend fun closeTicketRewardChain(input: InputBackend) {
+        val bigXY = stableDlgConfirmXY("DialogCommonBig")
+        if (bigXY == null) {
+            AppState.addLog("[!] 门票两连弹：Big 按钮没落位 → 交给主循环通用弹窗兜底")
+            return
+        }
+        val first = tapAndCheck(
+            input, bigXY.first, bigXY.second, "门票：关闭收到印记(Big)",
+            from = setOf("DialogCommonBig"),
+            expect = setOf("DialogCommonMiddle"),
+            settleMs = SEL_TICK_MS, probe = 5, probeMs = 70L, retries = 3,
+            xyAt = { dlgReadyToTap("DialogCommonBig", bigXY) },
+            probeState = { dlgProbe("DialogCommonBig") },
+        )
+        if (!first) {
+            AppState.addLog("[!] 门票两连弹：Big → Middle 未确认 → 交给主循环通用弹窗兜底")
+            return
+        }
+        closeMiddleRewardDialog(input, "门票：关闭收到角色(Middle)")
+    }
+
+    /** 段入口取一次「落位」的确认按钮坐标：弹窗打开动画里按钮 y 会漂（实测 876↔960），
+     *  连读最多 [DLG_XY_TRIES] 次（每次 ~30ms 轻读 + [DLG_XY_GAP_MS] 间隔），
+     *  两次差 ≤8px 才算落位。等不到就返回 null ⇒ 主循环兜底，**不拿漂着的坐标去点**。 */
+    private suspend fun stableDlgConfirmXY(shell: String): Pair<Int, Int>? {
+        var last: Pair<Int, Int>? = null
+        repeat(DLG_XY_TRIES) { i ->
+            val p = dlgConfirmBtnXY(shell)
+            if (p != null) {
+                val l = last
+                if (l != null && kotlin.math.abs(p.first - l.first) <= 8 &&
+                    kotlin.math.abs(p.second - l.second) <= 8
+                ) return p
+                last = p
+            }
+            if (i < DLG_XY_TRIES - 1) delay(DLG_XY_GAP_MS)
+        }
+        return null
+    }
+
+    /**
+     * ★★「收到角色」`DialogCommonMiddle` 单弹 → 地图（2026-11-09 抽出来给两处共用）：
+     *   · 印记三选一两连弹的**第二弹**（Big 收到印记 → Middle 收到角色 → 地图）
+     *   · 角色三选一（战后选人）之后的**唯一一弹**（Middle → 地图）
+     *
+     * 两处都是 `DialogCommonMiddle` + `OneButtonWhite`(958,870)：历史日志多次出现
+     * `顶框=DialogCommonMiddle(Clone)` → `点了 对话框「OneButtonWhite」(958,870)` → `顶框=无`；
+     * 现场抓证时这个壳是「角色加入」(`PartsDialogLabyrinthGetUnitResult`)。
+     * ★[expect] = 空串（无对话框）：**不能**只判「离开 Middle 就算成功」，否则误触出来的
+     *   `DialogCommonSmall`（移动目标确认）会被当成已回地图 ⇒ 状态转换认为自己不在这个地方。
+     * @return 是否确认到了地图；false 只打日志，主循环 `tapDialogConfirm` 仍会兜底。
+     */
+    private suspend fun closeMiddleRewardDialog(input: InputBackend, what: String): Boolean {
+        val xy = stableDlgConfirmXY("DialogCommonMiddle")
+        if (xy == null) {
+            AppState.addLog("[!] $what 按钮没落位 → 交给主循环通用弹窗兜底")
+            return false
+        }
+        val ok = tapAndCheck(
+            input, xy.first, xy.second, what,
+            from = setOf("DialogCommonMiddle"),
+            expect = setOf(""),
+            expectTimeoutMs = 2_000L,
+            settleMs = SEL_TICK_MS, probe = 5, probeMs = 70L, retries = 3,
+            xyAt = { dlgReadyToTap("DialogCommonMiddle", xy) },
+            probeState = { dlgProbe("DialogCommonMiddle") },
+        )
+        if (!ok) {
+            AppState.addLog("[!] $what 未确认 → 交给主循环通用弹窗兜底")
+        }
+        return ok
+    }
+
+    /**
+     * ★★遗物三选一之后的**单弹**（2026-11-09 现场截图 + 历史日志取证；用户 11-09 补充两条分叉）：
+     * ```
+     * ① 遗物节点(panelTypeName=RELIC)：
+     *    三选一 --statusType 立刻变--> DialogCommonBig(获得道具/收到遗物)
+     *           --OneButtonWhite(958,960)--> 顶框=无（地图）         ← 结束状态：地图
+     * ② 战斗节点（NORMAL/HARD/BOSS/EX… 一切非 RELIC）：
+     *    三选一 --statusType 立刻变--> DialogCommonBig
+     *           --OneButtonWhite(958,960)--> DialogLabyrinthSelection  ← 结束状态：角色三选一
+     *           再由角色三选一流程继续推进
+     * ```
+     * 两类节点的 Big **都是** `DialogCommonBig`（日志 `顶框=DialogCommonBig(Clone)` 印证）；
+     * 与印记三选一不同：印记是 Big→Middle→地图 **两连弹**，遗物只有这一弹。
+     *
+     * ★顶框名有最长 3.9s 的延迟（实测 15:41:47→15:41:52），所以先用便宜的 [AgentApi.labTop]
+     *   （3ms，100ms 一探）等 Big 出现；一出现就用 [dlgConfirmBtnXY]（[AgentApi.labDlgBtn]
+     *   字段直取、零遍历）现取坐标 + [tapAndCheck] 点掉。
+     * ★[fromBattleNode] 决定阶段 2 的落点判据：战斗节点必须**等到** `DialogLabyrinthSelection`
+     *   才算这次转移完成（否则状态机会以为还在奖励链里）；遗物节点离开 Big 就算完成。
+     * ★本来就没弹窗 / 等不到 / 换成别的通用壳 ⇒ 静默交回主循环兜底，不阻塞流程。
+     */
+    private suspend fun closeRelicRewardDialog(input: InputBackend, fromBattleNode: Boolean) {
+        val t0 = SystemClock.elapsedRealtime()
+        var emptyN = 0
+        var seen = false
+        while (SystemClock.elapsedRealtime() - t0 < RELIC_REWARD_WAIT_MS) {
+            val t = runCatching { AgentApi.labTop() }.getOrNull() ?: ""
+            if (t == "DialogCommonBig") { seen = true; break }
+            if (t in DLG_GENERIC_SHELLS) return   // 不是预期的那个壳 ⇒ 别白等，交给主循环
+            // 连续两次"没有对话框"才认定本来就没弹窗（单次读失败不误判）
+            if (t.isEmpty()) {
+                if (++emptyN >= 2 && SystemClock.elapsedRealtime() - t0 > 400L) return
+            } else {
+                emptyN = 0
+            }
+            delay(100L)
+        }
+        if (!seen) return   // 没等到 ⇒ 交给主循环通用弹窗兜底
+        val xy = stableDlgConfirmXY("DialogCommonBig")
+        if (xy == null) {
+            AppState.addLog("[!] 遗物确认框：Big 按钮没落位 → 交给主循环通用弹窗兜底")
+            return
+        }
+        val ok = tapAndCheck(
+            input, xy.first, xy.second, "遗物：关闭收到遗物(Big)",
+            from = setOf("DialogCommonBig"),
+            // ★分叉：战斗节点必须等到角色三选一页；遗物节点必须等到「无对话框」，
+            //   不能只判"离开 Big" ⇒ 否则误触出来的 DialogCommonSmall 会被当成已回地图。
+            expect = if (fromBattleNode) setOf("DialogLabyrinthSelection") else setOf(""),
+            expectTimeoutMs = 3_000L,
+            settleMs = SEL_TICK_MS, probe = 5, probeMs = 70L, retries = 3,
+            xyAt = { dlgReadyToTap("DialogCommonBig", xy) },
+            probeState = { dlgProbe("DialogCommonBig") },
+        )
+        if (!ok) {
+            AppState.addLog(
+                "[!] 遗物确认框：Big → ${if (fromBattleNode) "角色三选一" else "地图"} 未确认 → 交给主循环兜底",
+            )
+        }
+    }
+
+    /** 轻读失败回退的节流日志（按壳 + 10s 间隔，避免每次点击前刷屏） */
+    private var dlgLiteFallbackShell = ""
+    private var dlgLiteFallbackAt = 0L
+
+    /** 现取当前顶框里那颗「确认/关闭」按钮坐标：**顶框名对不上就不给坐标**（不越框点）。
+     *  ★主路 = [AgentApi.labDlgBtn] 字段直取（零遍历，几十 ms）；agent 已校验顶框名 +
+     *    按钮 GameObject 名字 + activeInHierarchy，命中的才给。
+     *  ★兜底 = 轻读失败（壳结构变了 / 不是通用弹窗）才退回 [AgentApi.dialog] 子树遍历，
+     *    并回喂按钮链给 [LabBtnStore]（与主循环 tapDialogConfirm 共用缓存），绝不硬点。
+     *    ★失败必须留日志：真机验证时靠"没有这行"来证明轻读全程生效。
+     *  ★★2026-11-09：先用 3ms 的 labTop 确认壳还在 / 已经在了。**顶框不对就直接不给坐标**，
+     *    否则 [stableDlgConfirmXY] 连读时若撞上弹窗正在创建，会把"还没出现"误判成轻读故障
+     *    ⇒ 退回 dialog() 子树遍历（0.5s+，且可能读到别的弹窗按钮坐标）。 */
+    private suspend fun dlgConfirmBtnXY(shell: String): Pair<Int, Int>? {
+        val cur = runCatching { AgentApi.labTop() }.getOrNull()
+        if (cur != shell) return null
+        val fast = runCatching { AgentApi.labDlgBtn(shell) }.getOrNull()
+        val d = if (fast?.optBoolean("ok", false) == true && fast.optString("top") == shell) {
+            fast
+        } else {
+            val why = fast?.optString("err").takeUnless { it.isNullOrEmpty() } ?: "无回包/超时"
+            val now = SystemClock.elapsedRealtime()
+            if (dlgLiteFallbackShell != shell || now - dlgLiteFallbackAt > 10_000L) {
+                dlgLiteFallbackShell = shell
+                dlgLiteFallbackAt = now
+                AppState.addLog("[!] 通用弹窗轻读失败（$shell，$why）→ 本次退回 dialog 遍历")
+            }
+            val topKey = "dlg|" + shell
+            val known = appCtx?.let { LabBtnStore.getChains(it, topKey) }
+            val slow = runCatching {
+                AgentApi.dialog(shell, if (known != null && known.length() > 0) known else null)
+            }.getOrNull() ?: return null
+            val fresh = slow.optJSONArray("learnedList")
+            if (fresh != null && fresh.length() > 0) {
+                appCtx?.let { LabBtnStore.putChains(it, topKey, fresh) }
+            }
+            slow
+        }
+        val bts = d.optJSONArray("buttons") ?: return null
+        for (want in DIALOG_CONFIRM) {
+            for (i in 0 until bts.length()) {
+                val b = bts.optJSONObject(i) ?: continue
+                if (b.optString("name") == want && hasXY(b)) return b.optInt("x") to b.optInt("y")
+            }
+        }
+        return null
+    }
 
     private fun markTransition(what: String) {
         if (transCount > 400) return
@@ -7155,7 +7457,7 @@ object MazeLoop {
      * 抽出来是为了给"handler 读不到页面"时当**降级路径**（见 [handleSummonUnit]）—— 否则那种页会永久卡死。
      * @return true = 点了
      */
-    private suspend fun tapDialogConfirm(input: InputBackend, top: String): Boolean {
+    private suspend fun tapDialogConfirm(input: InputBackend, top: String, tag: String = ""): Boolean {
         // ★2026-10-20：弹窗按钮链接 [LabBtnStore] 跨局回喂（结算页那种大弹窗的 DialogArea 子树
         //   要 3s+，2026-10-20 00:40 实测局末连 4 次 dialog 3.2~3.8s 只为点一颗 OneButtonWhite）。
         //   第一次遍历顺带学链落盘，之后（含跨局）直达零遍历。key = "dlg|<弹窗规范名>"。
@@ -7188,7 +7490,11 @@ object MazeLoop {
         // ★防"幽灵弹窗"无限连点（2026-10-17 事故，同一类坑在 Navigator 也出现过）：
         //   同一颗按钮（名字+坐标）连点 [DLG_TAP_MAX] 次仍没换页 ⇒ 判"点它没用"，返回 false
         //   让主循环继续往下走（比每轮回来再点它安全）。
-        val sig = "${hit.optString("name")}@${hit.optInt("x")},${hit.optInt("y")}"
+        // ★★2026-11-09 事故修正：签名必须带**节点现场** [tag]。
+        //   原来只有「按钮名@坐标」，同一个 `TwoButtonRight@1179,744` 在不同节点的移动确认框
+        //   坐标一模一样 ⇒ 前两次明明**成功移动了**，计数却一直累加 ⇒ 第 3 次把正常弹窗
+        //   误判成幽灵弹窗熔断，卡在「移动目标确认」18s（与 [labResultSig] 同款修法）。
+        val sig = "$tag|${hit.optString("name")}@${hit.optInt("x")},${hit.optInt("y")}"
         if (sig == dlgTapSig) dlgTapN++ else { dlgTapSig = sig; dlgTapN = 1 }
         if (dlgTapN > DLG_TAP_MAX) {
             if (dlgTapN == DLG_TAP_MAX + 1) {

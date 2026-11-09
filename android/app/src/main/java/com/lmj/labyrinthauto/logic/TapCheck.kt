@@ -40,6 +40,20 @@ import kotlinx.coroutines.delay
  */
 object TapCheck {
 
+    /**
+     * 一次 probe 的结果。
+     *
+     * ★`top` 和 `left` **必须来自同一次内存快照**：先读 labTop、再另读一次关闭态，
+     *   两次之间状态可能已经变化（top 说"还在"、closing 说"已关"）⇒ 判据不自洽。
+     *   调用方通过 [run] 的 `probeState` 一次返回，阶段 1 就只做一次 RPC。
+     *
+     * @param top 当前窗口规范名（仅用于日志）
+     * @param left 这一下是否已生效（已离开 from / 关闭已启动）
+     * @param diag **顺便**带回的诊断串（如退出 tween 的 `started/factor`），只进 probe 轨迹日志；
+     *        它和 `top`/`left` 来自同一次读取，不额外发 RPC、也不拖慢 probe 节奏。
+     */
+    data class Probe(val top: String, val left: Boolean, val diag: String = "")
+
     suspend fun run(
         tapFn: suspend (Int, Int, String) -> Boolean,
         x: Int,
@@ -56,6 +70,8 @@ object TapCheck {
         probe: Int = 0,
         probeMs: Long = 150L,
         reached: (suspend (String) -> Boolean)? = null,
+        /** ★给了它就**只调它一次**（同一次快照同时给 top + 判据），不再读 readTop / reached。 */
+        probeState: (suspend () -> Probe)? = null,
         skipMax: Int = 6,
         skipDelayMs: Long = 60L,
         verbose: Boolean = true,
@@ -83,22 +99,47 @@ object TapCheck {
             }
             attempt++
             if (!tapFn(px, py, what)) return false
+            // ★探针轨迹（只在给了 `probeState` 时开）：每次 probe 记「相对点击的时刻 / RPC 耗时 / 诊断串」。
+            //   ★probe 仍按 settleMs / probeMs 的节奏跑 —— 诊断是读取时**顺便**带回来的，
+            //     不额外发 RPC、也不阻塞 ⇒ 2s 内自然是十几次探测，而不是"一次读取占住 2s"。
+            val pt0 = android.os.SystemClock.elapsedRealtime()
+            val pTrace = if (probeState != null) ArrayList<String>() else null
             // ── 点完**探**一下"页面变没变" ──
             var probed = 0
             while (probed < maxProbe) {
                 delay(if (probed == 0) settleMs else probeMs)
                 probed++
-                nowTop = if (readTop != null) {
-                    runCatching { readTop() }.getOrDefault(unknownTop)
+                val tRead0 = android.os.SystemClock.elapsedRealtime()
+                var ps: Probe? = null
+                val hit: Boolean
+                if (probeState != null) {
+                    // ★一次快照：top / 判据 / 诊断同源；读失败 ⇒ top 空、left=false（不算离开）
+                    ps = runCatching { probeState() }.getOrNull()
+                    nowTop = ps?.top ?: ""
+                    hit = ps?.left == true
                 } else {
-                    runCatching { AgentApi.labTop() }.getOrNull() ?: ""
+                    nowTop = if (readTop != null) {
+                        runCatching { readTop() }.getOrDefault(unknownTop)
+                    } else {
+                        runCatching { AgentApi.labTop() }.getOrNull() ?: ""
+                    }
+                    // 探针读失败 ⇒ **不算"离开"**
+                    if (readTop != null && nowTop == unknownTop) continue
+                    // 判据优先用 reached（"到达目标页了没"）；没传就退回老行为（离开 from 就算生效）
+                    hit = if (reached != null) reached(nowTop) else (nowTop !in from)
                 }
-                // 探针读失败 ⇒ **不算"离开"**
-                if (readTop != null && nowTop == unknownTop) continue
-                // 判据优先用 reached（"到达目标页了没"）；没传就退回老行为（离开 from 就算生效）
-                val hit = if (reached != null) reached(nowTop) else (nowTop !in from)
+                if (pTrace != null) {
+                    val tNow = android.os.SystemClock.elapsedRealtime()
+                    val d = ps?.diag
+                    pTrace.add(
+                        "+${tNow - pt0}ms/${tNow - tRead0}ms" + (if (d.isNullOrEmpty()) "" else " $d"),
+                    )
+                }
                 if (hit) {
                     left = true
+                    if (pTrace != null && pTrace.isNotEmpty()) {
+                        AppState.addLog("⏱ probe $what：${pTrace.joinToString(" ｜ ")} ⇒ 命中")
+                    }
                     if (verbose) {
                         AppState.addLog(
                             "⤷ [${from.joinToString("/")}] --$what--> [$nowTop] " +

@@ -5414,6 +5414,33 @@ function _dlgBtnByField(dlgComp, name, env) {
   } catch (e) { return null; }
 }
 
+/**
+ * ★拿最上层对话框的 **`DialogBase`** 组件（不是 `DialogCommonAbstract`）。
+ *
+ * 为什么要它：`DialogCommonAbstract` 只是 `DialogBase` 的一个子类（通用确认框），
+ *   而**三选一页 `DialogLabyrinthSelection` 是 `DialogBase` 的直接子类** ⇒ 只按
+ *   `DialogCommonAbstract` 找会拿不到它，把这个页面的退出 tween / isProcess 全漏掉。
+ *   `isProcess@0xB4`、`outMainTweenAlpha@0xE0` 都是 `DialogBase` 的字段，对两类页面通用。
+ */
+let _dlgBaseType = null;
+function _dlgBaseComp(go) {
+  try {
+    if (!_dlgBaseType) {
+      const k = findClass("DialogBase");
+      if (!k || k.isNull()) return null;
+      const t = _typeOf(k);
+      if (!t || t.isNull()) return null;
+      _dlgBaseType = t;
+    }
+    let c = null;
+    try { c = _inv1o(go, "GetComponent", _dlgBaseType); } catch (e) {}
+    if (!c || c.isNull()) {
+      try { c = _inv2oi(go, "GetComponentInChildren", _dlgBaseType, 1); } catch (e) {}
+    }
+    return (c && !c.isNull()) ? c : null;
+  } catch (e) { return null; }
+}
+
 /** ★拿最上层对话框的 `DialogCommonAbstract` 组件（按钮地基在它里面） */
 function _dlgCommonComp(go) {
   try {
@@ -5431,6 +5458,172 @@ function _dlgCommonComp(go) {
     }
     return (c && !c.isNull()) ? c : null;
   } catch (e) { return null; }
+}
+
+/**
+ * ★★通用弹窗「按钮轻读」（2026-11-09）—— 与 [dialogButtonsSnapshot] 的"子树遍历"相对。
+ *
+ * 动机：dialog() 走 `_rawWalk(DialogArea)`，设备日志实测冷遍历 0.5~0.6s、大结算页 3~3.9s，
+ *   且点击间隔 270ms > 180ms 快照 TTL ⇒ 每下点击都要重付一次。EX 三连页早就把这套读法
+ *   换成了"按字段直取"（labExBtn，30ms）⇒ 通用弹窗照搬：
+ *   `DialogCommonAbstract +0x118 fundationObject → One/Two/ThreeButton*`（dump.cs 核对），
+ *   `DialogCommonBig / Middle / FullSize` 都是它的**直接子类、无自有字段** ⇒ 偏移通用。
+ *
+ * ★零遍历、零扫堆、零索引路径学习，只做：
+ *   `_topDialogGo()`（与 labTop 同一个"最上层"权威判定）→ `GetComponent(DialogCommonAbstract)`
+ *   → 7 个字段读 + 名字/activeInHierarchy 校验 → **只投影命中的那几颗**。
+ * ★[topCls] 对不上不给按钮（不越框点）；一颗都没命中 ⇒ ok=false，
+ *   调用方退回 `dialog()` 兜底（壳结构变了/不是通用弹窗），绝不硬点。
+ */
+function labDlgBtnSnapshot(topCls) {
+  const out = { ok: false, top: "", buttons: [], ms: 0, err: null, src: "field" };
+  const t0 = Date.now();
+  const norm = function (s) { return String(s || "").replace(/\(Clone\)$/, ""); };
+  try {
+    const t = _topDialogGo();
+    const top = t ? norm(t.name) : "";
+    out.top = top;
+    if (topCls && top !== norm(topCls)) { out.err = "top-mismatch"; out.ms = Date.now() - t0; return out; }
+    if (!t || !top) { out.err = "no-dialog"; out.ms = Date.now() - t0; return out; }
+    const comp = _dlgCommonComp(t.go);
+    if (!comp) { out.err = "no-DialogCommonAbstract"; out.ms = Date.now() - t0; return out; }
+    const env = _camEnv();
+    if (!env) { out.err = "no-cam"; out.ms = Date.now() - t0; return out; }
+    const names = ["OneButtonWhite", "OneButtonBlue", "TwoButtonLeft", "TwoButtonRight",
+                   "ThreeButtonLeft", "ThreeButtonCenter", "ThreeButtonRight"];
+    for (let i = 0; i < names.length; i++) {
+      const b = _dlgBtnByField(comp, names[i], env);
+      if (b) out.buttons.push(b);
+    }
+    out.ok = out.buttons.length > 0;
+    if (!out.ok) out.err = "no-active-button";
+  } catch (e) { out.err = String(e); }
+  out.ms = Date.now() - t0;
+  return out;
+}
+
+/**
+ * ★★通用弹窗「关闭已启动」轻读（2026-11-09 定案）—— 替代"等窗口消失"当"这一下点生效了"。
+ *
+ * 为什么不能用 labTop 当判据：窗口关闭动画固定 200ms、退出 tween 跑完还要 ~300ms，
+ *   对象到 **+800ms** 才整体消失 ⇒ 150ms / 270ms 的 probe 必然读到残留窗口
+ *   ⇒ 判"没生效" ⇒ 补点第二下（第二下可能落在已经出现的地图节点上）。
+ *
+ * 实测 7 段关闭（门票 Big/Middle、遗物 Big、战后选人 Middle，2026-11-09）：
+ *   · 按钮层 mState / initEnable / IsPressed / curBoxCollider **全程不变**
+ *     （游戏关弹窗不经"禁用按钮"，回调里直接 Close() ⇒ 按钮上没有"已点击"标记）
+ *   · `DialogBase.isProcess`(0xB4) 0→1 与退出 tween（mStarted=1、mFactor 0→1）
+ *     在 **+200~300ms** 启动
+ *   · 整条页（顶层 Dialog → DialogCommonAbstract）到 +800ms 才消失
+ * ⇒ 用「退出动画已启动」当"点生效了"，比等窗口消失早 500~600ms；
+ *   没启动就继续重试 ⇒ 不会"点了没反应就放弃"。
+ *
+ * ★零 hook、只读字段（不 invoke），实测 3~6ms。返回：
+ *   {top, raw, path, proc, started, factor, closing, ms, err}
+ *   closing = 退出动画正在跑（started=1 且 factor<0.95），或整条页已消失。
+ *   ⚠基线 factor 可能是 1（上一次 out tween 跑完的残留）、proc 可能是 1（打开过程中），
+ *     所以只能认「started 变 1 且 factor 从小往上涨」，**不能只看 proc==1**。
+ */
+function labDlgClosingSnapshot() {
+  const out = { top: "", raw: "", path: "", proc: null, started: null, factor: null,
+                closing: false, ms: 0, err: null };
+  const t0 = Date.now();
+  try {
+    const t = _topDialogGo();
+    out.raw = t ? String(t.name || "") : "";
+    out.top = _normWindowName(out.raw);
+    if (!t || !t.go || t.go.isNull()) {
+      out.path = "no-top-dialog"; out.closing = true; out.ms = Date.now() - t0; return out;
+    }
+    // ★先按 DialogCommonAbstract 找（有类型缓存、快），拿不到再按 DialogBase 找 ——
+    //   三选一（DialogLabyrinthSelection）是 DialogBase 直接子类，只按前者会整个漏掉。
+    const dc = _dlgCommonComp(t.go) || _dlgBaseComp(t.go);
+    if (!dc || dc.isNull()) {
+      out.path = "no-DialogBase"; out.closing = true; out.ms = Date.now() - t0; return out;
+    }
+    out.path = "ok";
+    out.proc = dc.add(0xB4).readU8();              // DialogBase.isProcess
+    try {
+      const oa = dc.add(0xE0).readPointer();       // outMainTweenAlpha（退出动画）
+      if (!oa.isNull()) {
+        out.started = oa.add(0x68).readU8();       // UITweener.mStarted
+        out.factor = Math.round(oa.add(0x78).readFloat() * 1000) / 1000;
+        out.closing = (out.started === 1 && out.factor < 0.95);
+      }
+    } catch (e) { out.err = String(e); }
+  } catch (e) { out.err = String(e); out.path = "err"; }
+  out.ms = Date.now() - t0;
+  return out;
+}
+
+/**
+ * ★三选一页的**阶段 1 探针**（2026-11-09）：顶框名 + 关闭判据 + 顺带诊断。
+ *
+ * 三选一（`DialogLabyrinthSelection`）也是 `DialogBase` 子类 ⇒ 退出 tween / isProcess 与
+ *   确认框同源（`labDlgClosing` 已按 DialogBase 兜底），所以判据也相同：
+ *   顶框已不是这个壳，或退出动画已启动（`started=1 && factor<0.95`）。
+ * ★实测结论（2026-11-09，多局）：三选一页**没有**可读的退出 tween（`tw` 全程 0/0），
+ *   真正的换页在点击后 ~1s（选卡动画）⇒ 判据实际落在「顶框变了」；`closing` 字段
+ *   保留给"将来能读到 tween"的情况。
+ *
+ * 诊断字段（**只进 probe 轨迹日志，不参与判据** —— 已实测证伪）：
+ *   · selNum       = `PartsLabyrinthSelectionItemView.selectionNum@0x38`（实测恒为 3，不是已选数量）
+ *   · listN        = view+0x28 列表长度（实测选入前后不变）
+ *   · remainText   = `DialogLabyrinthSelection+0x138` 文本（"还剩N次"，只跨页变化）
+ *   · remainActive = `+0x130` GameObject 是否显示
+ *   · cardIdx[]    = 每卡 `PartsSelectionItemInfo+0x98 unitChoiceIndex`
+ *
+ * 零 hook；只读字段 + 一次 `get_text`（UILabel 常规 getter），实测 11~18ms。
+ * `_selDialogList(true)` = 不扫堆，拿不到就报 no-sel-instance（避免把游戏拖慢）。
+ */
+function labSelStateSnapshot() {
+  const out = { ms: 0, path: "", top: "", inst: "", selNum: null, listN: null,
+                remainText: null, remainActive: null, cardIdx: [], proc: null,
+                started: null, factor: null, closing: false, tw: null, err: null };
+  const t0 = Date.now();
+  try {
+    const t = _topDialogGo();
+    out.top = _normWindowName(t ? String(t.name || "") : "");
+    // ① 先读 DialogBase 通用状态：**不依赖三选一实例**，顶框是任意 DialogBase 子类就能读。
+    //    这两项（isProcess / 退出 tween）才是"这个页面何时开始消失"的直接证据。
+    if (t && t.go && !t.go.isNull()) {
+      const db = _dlgCommonComp(t.go) || _dlgBaseComp(t.go);
+      if (db && !db.isNull()) {
+        try { out.proc = db.add(0xB4).readU8(); } catch (e) {}
+        try {
+          const oa = db.add(0xE0).readPointer();     // outMainTweenAlpha
+          if (!oa.isNull()) {
+            out.started = oa.add(0x68).readU8();
+            out.factor = Math.round(oa.add(0x78).readFloat() * 1000) / 1000;
+            out.tw = out.started + "/" + out.factor;
+            // 与确认框同一个判据：退出动画在跑（started=1 且 factor 还没到 1）
+            out.closing = (out.started === 1 && out.factor < 0.95);
+          }
+        } catch (e) { out.tw = "err"; }
+      }
+    }
+    // ② 再读三选一特有字段（拿不到实例也不影响上面的通用状态）
+    const sl = _selDialogList(true);
+    if (!sl) { out.path = "no-sel-instance"; out.ms = Date.now() - t0; return out; }
+    out.inst = "" + sl.d;
+    out.listN = sl.n;
+    const view = sl.d.add(0x140).readPointer();      // partsItemView
+    if (!ptrOk(view)) { out.path = "no-parts-view"; out.ms = Date.now() - t0; return out; }
+    out.path = "ok";
+    out.selNum = view.add(0x38).readS32();           // ← 待定语义
+    const rl = sl.d.add(0x138).readPointer();        // remainSelectionNumLabel
+    if (ptrOk(rl)) { try { out.remainText = _str1(_inv(rl, "get_text")); } catch (e) { out.remainText = "err"; } }
+    const ro = sl.d.add(0x130).readPointer();        // remainSelectionNumObject
+    if (ptrOk(ro)) { try { out.remainActive = (_goActive(ro) === true); } catch (e) {} }
+    for (let i = 0; i < sl.n && i < 8; i++) {
+      try {
+        const it = _listItem(sl.list, i);
+        out.cardIdx.push(ptrOk(it) ? it.add(0x98).readS32() : null);
+      } catch (e) { out.cardIdx.push(null); }
+    }
+  } catch (e) { out.err = String(e); out.path = "err"; }
+  out.ms = Date.now() - t0;
+  return out;
 }
 
 function _exeqButtons(rootTr, only) {
@@ -5762,7 +5955,7 @@ function labExEquipTop() {
 // ── 选角色页（SUMMON_UNIT=1 且 pageTop 是对话框）：初始编成 / 门票召唤（★只读）──
 // ★构建号：改过读逻辑就 +1。attach 时 pcr_auto 会打出来（rpc jsBuild）——用来确认
 //   "正在跑的到底是哪一版脚本"，免得拿旧输出讨论半天（2026-10-10 踩过）。
-const JS_BUILD = "cs73";     // ★cs73（2026-11-08）：`labStatusLite` / `labSnapshot` 补 `guildId`（`LabyrinthTempData+0x1C`）—— 局内刷"已在迷宫里要不要沿用"要核对公会，否则手动开着 A 公会的局、配置是 B 公会时会直接沿用、跑完当成 B 公会的成绩。cs72（2026-11-08）：**"最上层"只剩一个实现 + 根没了不再扫全树** —— ①`_topDialogTr`（`findList(...,"top")` 的根）改为复用 `_topDialogGo`，不再自己写一遍判据（原来有 3 份实现，正是 EX 三连页多点/点错的根源）；②`_rootWalkNodes` 的遍历缓存**加校验"根是不是同一个"**（原来只看 key ⇒ `"top"` 这个根会变，1.5s 内会把上一个对话框的子树当成当前的返回）；③新增 `_walkForRoot`：**显式给了根却取不到（如当前没有对话框）⇒ 返回空，不再退化成全树**（`findList(…,"top")` 实测 2633ms → 3ms；而且全树会捞到别处的同名节点）。cs71：**读取全面"按需"** —— ①新增 `labExBtn(key)`：EX 三连页只读**要点的那个按钮** + 当前签名（不再读整包：整包会把 setting 的 4 行文字/复选框、sort 的 11 个 toggle 文字都过一遍，纯浪费）；②新增 `labExtra()`：非分派字段（eventId/questId/eventResultId/effectNum/curChoice/remainChoice + LTD choices）拆成独立读，handler 要时才调；③`labStatusLite` 补 `next`（移动分支用，一次内存读）。cs70：**EX 整包读的按钮改按字段取**（DialogFundationObject：twoLeft 0x48 / twoRight 0x58 / threeLeft 0x70 / threeCenter 0x80 / threeRight 0x98，经对话框组件 +0x118 foundationObject），**不再遍历整棵子树**（①页遍历要 350ms+）。cs69：labExEquip(full, only) 只投影要点的那个；cs68：**"当前最上层"统一成一个实现**（_topDialogGo）—— ①_exeqFind 只查**最上层那一层**、**绝不往回退**（回退会永远读到下面那层仍 active 的①页 ⇒ 签名不变 ⇒ 误判"没生效"⇒多点⇒点错按钮）；②签名里带**最上层容器名**（"页面切了"能立刻看见）。cs67：去掉 agent 侧坐标"稳定化"（Thread.sleep 堵死单通道）；cs64：_findExTopPart 组件查找缓存；cs63：labExEquipSig 轻量签名读
+const JS_BUILD = "cs81";     // ★cs81（2026-11-09）：三选一探针改为**并进 probeState**（probe 按 150ms 节奏跑、每次读取顺带带回 proc/tween/selNum，不再同步阻塞采样）；三选一探针 RPC 由 `debugSelTrace` 转正为 `labSelState`（含 started/factor/closing）。★cs80（2026-11-09）：`labDlgClosing` 取组件改为 **DialogCommonAbstract 优先、DialogBase 兜底** —— `DialogLabyrinthSelection`（三选一页）是 DialogBase 直接子类，原先只按 DialogCommonAbstract 找会整个漏掉，读不到它的退出 tween/isProcess。配套 `debugSelTrace` 补 proc/tw。★cs79（2026-11-09）【已于 cs81 转正为 labSelState】：新增三选一页采样 `PartsLabyrinthSelectionItemView.selectionNum@0x38`、卡片列表长度、游戏显示的剩余数文本(+0x138)、剩余数 UI 是否显示(+0x130)、每卡 unitChoiceIndex(+0x98)，用来确定 selectionNum 是"已选数量"还是"选中下标"及其响应速度。★cs78（2026-11-09）：`labDlgClosing` 失败时标 `path=err`（调用方据此区分"读失败"与"窗口没了"，读失败绝不当成"已离开"）；`tapAndCheck` 阶段 1 改为**单次快照探针** `probeState`（top 与判据同源，少一次 RPC，也避免两次读之间的状态错位）。★cs77（2026-11-09）：新增 `labDlgClosing` —— 通用弹窗「关闭已启动」轻读（退出 tween 的 mStarted/factor，零 hook、3~6ms），替代"等窗口消失"当"这一下点生效了"；实测整页到 +800ms 才消失、退出 tween +200~300ms 就启动。★cs74（2026-11-09）：新增 `labDlgBtn` —— 通用弹窗按钮按 `DialogCommonAbstract +0x118` **字段直取**（零遍历，30ms 级），替代 `dialog()` 的 DialogArea 子树遍历（冷 0.5~0.6s / 大页 3~3.9s）；门票三选一两连弹改用它现取坐标。★cs73（2026-11-08）：`labStatusLite` / `labSnapshot` 补 `guildId`（`LabyrinthTempData+0x1C`）—— 局内刷"已在迷宫里要不要沿用"要核对公会，否则手动开着 A 公会的局、配置是 B 公会时会直接沿用、跑完当成 B 公会的成绩。cs72（2026-11-08）：**"最上层"只剩一个实现 + 根没了不再扫全树** —— ①`_topDialogTr`（`findList(...,"top")` 的根）改为复用 `_topDialogGo`，不再自己写一遍判据（原来有 3 份实现，正是 EX 三连页多点/点错的根源）；②`_rootWalkNodes` 的遍历缓存**加校验"根是不是同一个"**（原来只看 key ⇒ `"top"` 这个根会变，1.5s 内会把上一个对话框的子树当成当前的返回）；③新增 `_walkForRoot`：**显式给了根却取不到（如当前没有对话框）⇒ 返回空，不再退化成全树**（`findList(…,"top")` 实测 2633ms → 3ms；而且全树会捞到别处的同名节点）。cs71：**读取全面"按需"** —— ①新增 `labExBtn(key)`：EX 三连页只读**要点的那个按钮** + 当前签名（不再读整包：整包会把 setting 的 4 行文字/复选框、sort 的 11 个 toggle 文字都过一遍，纯浪费）；②新增 `labExtra()`：非分派字段（eventId/questId/eventResultId/effectNum/curChoice/remainChoice + LTD choices）拆成独立读，handler 要时才调；③`labStatusLite` 补 `next`（移动分支用，一次内存读）。cs70：**EX 整包读的按钮改按字段取**（DialogFundationObject：twoLeft 0x48 / twoRight 0x58 / threeLeft 0x70 / threeCenter 0x80 / threeRight 0x98，经对话框组件 +0x118 foundationObject），**不再遍历整棵子树**（①页遍历要 350ms+）。cs69：labExEquip(full, only) 只投影要点的那个；cs68：**"当前最上层"统一成一个实现**（_topDialogGo）—— ①_exeqFind 只查**最上层那一层**、**绝不往回退**（回退会永远读到下面那层仍 active 的①页 ⇒ 签名不变 ⇒ 误判"没生效"⇒多点⇒点错按钮）；②签名里带**最上层容器名**（"页面切了"能立刻看见）。cs67：去掉 agent 侧坐标"稳定化"（Thread.sleep 堵死单通道）；cs64：_findExTopPart 组件查找缓存；cs63：labExEquipSig 轻量签名读
 // ★cs62（2026-10-22）：新增 battleSettingsStart/Poll（战斗设定只读；getter 是 IFix 模板 ⇒ 投递游戏线程执行）
 // ★JS 侧详细日志开关（2026-10-11 加）：默认关。
 //   关掉的是"每次调用都会打、但正常情况没信息量"的那几条（如 findMap 的"跳过堆扫描"、
@@ -7499,6 +7692,24 @@ rpc.exports = {
   //   `learned=true` 表示这次是**走学习路径**（零遍历）得出的结果。
   dialog: _rpcSafe(function (topCls, knownChains) {
     try { return dialogButtonsSnapshot(topCls || null, knownChains || null); } catch (e) { return null; }
+  }),
+  // ★★通用弹窗「按钮轻读」（2026-11-09）：字段直取，**零遍历**。
+  //   返回 {ok, top, buttons:[{name,x,y,id}], ms, src, err}；topCls 对不上 / 按钮一颗都没激活 ⇒ ok=false
+  //   ⇒ 调用方退回 `dialog()` 兜底。与 `labExBtn` 同款按需读（30ms 级 vs dialog 冷遍历 0.5~0.6s）。
+  labDlgBtn: _rpcSafe(function (topCls) {
+    try { return labDlgBtnSnapshot(topCls || null); }
+    catch (e) { return { ok: false, top: "", buttons: [], ms: 0, err: String(e), src: "field" }; }
+  }),
+  // ★★「关闭已启动」轻读（2026-11-09 定案）：退出 tween（mStarted/factor）或整页已消失。
+  //   给 tapAndCheck 阶段 1 用 —— 点一下后 +200~300ms 就能确认"生效了"，不必等窗口 800ms 消失。
+  labDlgClosing: _rpcSafe(function () {
+    try { return labDlgClosingSnapshot(); }
+    catch (e) { return { top: "", path: "err", closing: false, ms: 0, err: String(e) }; }
+  }),
+  // ★三选一页的阶段 1 探针：顶框名 + 退出 tween 判据 + 顺带诊断（零 hook，8~18ms）。
+  labSelState: _rpcSafe(function () {
+    try { return labSelStateSnapshot(); }
+    catch (e) { return { path: "err", closing: false, ms: 0, err: String(e) }; }
   }),
   // ★战斗结算页"对象字段"抓取（2026-10-16）：为"从字段读按钮、彻底不扫树"备料，见 battleResultDump
   battleResultDump: _rpcSafe(function () {

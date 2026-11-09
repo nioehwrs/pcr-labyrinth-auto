@@ -924,7 +924,12 @@ object FridaInjector {
                     continue
                 }
                 toldConnected = true
-                AppState.addLog("agent 已回连（il2cpp 就绪），开始读页面名")
+                // ★打脚本构建号：验证「轻读」改动时，开局就能确认注入的是哪一版 agent
+                //  （改过读逻辑时 JS_BUILD 会递增；PROBE 之外的常规日志原本看不到它）。
+                val jsb = runCatching {
+                    AgentBridge.call("jsBuild", timeoutMs = 3_000L)?.optString("data")
+                }.getOrNull()
+                AppState.addLog("agent 已回连（il2cpp 就绪），脚本构建号=${jsb ?: "读不到"}，开始读页面名")
                 // ★★"再晚点挂"（2026-10-17 用户："再晚点挂就行了吧"）：il2cpp 就绪 ≠ **游戏加载完**。
                 //   实测（09:04）注入后 2s、页面还是 `NONE(0)` 时那一拍最危险 —— 我们在那儿做过 UI 遍历
                 //   ⇒ 把游戏卡死。虽然调用侧已加"加载/瞬态页不做遍历"，这里再**静置 [POST_INJECT_SETTLE_MS]**
