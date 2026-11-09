@@ -705,8 +705,24 @@ class AutoForegroundService : Service() {
             //   （PC keep_opening(sync=False) 注释：调用方自己的"杀进程→启动→attach"就是同步）。
             AppState.addLog("刷开局完成 → 杀进程重启游戏以同步开局（PC 同款 step_kill→step_launch）")
             GameProcess.kill()
-            delay(1_000)                     // PC step_kill 也 sleep 1.0，确保进程真的没
+            // ★★2026-11-09 用户报障（"还没跑完三局，自己就停下了"）：
+            //   原来只 sleep 1s 就 `am start`。但 `am force-stop` 是**异步**的，旧进程往往没退干净，
+            //   于是注入循环又自己 launch 一次 ⇒ **两个启动意图打架**，游戏起来 1s 就崩：
+            //     已调起游戏 → 已调起游戏（重复） → 游戏已起来 pid=7355 → 静置 6s
+            //     → 注入失败 No such process → 崩溃线索 `has died: fg TOP` → 连撞 3 次 → 暂停自愈 → 停手
+            //   改成：先等 pid 真的消失（最多 4s），再启动；启动后再等 pid 出来，
+            //   以免注入循环误判"没在跑"又 launch 一次。
+            val goneAt = android.os.SystemClock.elapsedRealtime()
+            while (android.os.SystemClock.elapsedRealtime() - goneAt < 4_000L) {
+                if (FridaInjector.gamePid() <= 0) break
+                delay(300)
+            }
             GameProcess.launch(applicationContext)
+            val upAt = android.os.SystemClock.elapsedRealtime()
+            while (android.os.SystemClock.elapsedRealtime() - upAt < 10_000L) {
+                if (FridaInjector.gamePid() > 0) break
+                delay(300)
+            }
 
             // ②-b 等注入循环把新进程的 agent 起来：先等**旧 agent 掉线**（确认重启生效，
             //   否则可能拿着重启前的旧连接往下跑），再等**新 agent 连上**（冷启动+就绪+注入）。
