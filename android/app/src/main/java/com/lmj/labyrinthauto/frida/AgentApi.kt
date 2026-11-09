@@ -379,7 +379,8 @@ object AgentApi {
     /**
      * 特别装备三连页；`full=true` 连按钮坐标一起算。
      *
-     * ★`only` = **只投影这一个按钮**（按钮名 / "prio0" / "check" / "rare"）；
+     * ★`only` = **只投影这一个按钮**（按钮名 / "prio0" / "check" / "rare" /
+     *   `"sort:<选项名>"`，如 `sort:物理防御贯穿`）；
      *   null = 老行为（把整棵子树里的按钮全投影一遍，①页实测 380ms）。
      */
     suspend fun labExEquip(full: Boolean = false, only: String? = null, timeoutMs: Long = T_SLOW): JSONObject? =

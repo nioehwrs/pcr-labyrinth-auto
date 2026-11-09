@@ -16,6 +16,7 @@ import com.lmj.labyrinthauto.logic.relic.RelicPick
 import com.lmj.labyrinthauto.logic.shop.ShopPlan
 import com.lmj.labyrinthauto.logic.shop.ShopSampleLog
 import com.lmj.labyrinthauto.logic.team.Rules
+import com.lmj.labyrinthauto.logic.team.TagIds
 import com.lmj.labyrinthauto.logic.team.TeamRunLog
 import com.lmj.labyrinthauto.frida.AgentApi
 import com.lmj.labyrinthauto.frida.AgentBridge
@@ -718,7 +719,16 @@ object MazeLoop {
             //    战斗中我们只等、只在结算时点「下一步」/「重新挑战」，从不点通用弹窗。
             //    ★战斗视图会**滞后**于实际页面切换（实测战斗后遗物页已出现而 inBattle 仍 true）
             //      ⇒ 战斗之上若已压着"我们认识的选取页/失败页"，就不走进战斗分支（PC 6113）。
-            if (st.optBoolean("inBattle", false) && BATTLE_INTERRUPT_PAGES.none { it in top }) {
+            val inBattleBranch = st.optBoolean("inBattle", false) &&
+                BATTLE_INTERRUPT_PAGES.none { it in top }
+            if (inBattleBranch) {
+                // ★★「等待接手」的解除点（2026-11-09 用户）："检测到战斗中才继续自动操作"。
+                //   用户自己组队开战后把「手动节点」标记清掉 ⇒ 后续流程恢复自动。
+                if (manualTeamNodes.isNotEmpty()) {
+                    AppState.addLog("[手动] 检测到战斗中 → 解除「等待接手」，恢复自动")
+                    manualTeamNodes.clear()
+                    manualSaid.remove(WAIT_GATE_TAG)
+                }
                 if (battleTick(input, st)) {
                     if (retreatRequested) {
                         AppState.addLog("[✗] 按策略「撤退重跑」→ 结束本局（服务层会调撤退 API 并继续下一局）")
@@ -731,6 +741,19 @@ object MazeLoop {
             }
             // 能走到这里 ⇒ 已不在战斗视图（或失败结算已落回）→ 计时/档位复位（PC 6196~6201）
             resetBattleTimers()
+
+            // ★★「等待接手」全局闸门（2026-11-09 用户）：等待期间用户可能自己打开 EX 三连页
+            //   调整特别装备，而原来只有编组页/预览页两个 handler 会停手 —— 页面一离开编组页，
+            //   下面的 EX 兜底(1.5)、通用弹窗白名单(0)、点屏幕中心就会把用户开的页**自动点掉**。
+            //   ⇒ 这里一刀切：等待接手期间只要还没进战斗，就只观察、不点任何东西。
+            if (manualTeamNodes.isNotEmpty() && !inBattleBranch) {
+                if (manualSaid.add(WAIT_GATE_TAG)) {
+                    AppState.addLog("[手动] 等待接手期间不自动操作（含特别装备页），进战斗后自动恢复")
+                }
+                idle = 0
+                delay(POLL_MS)
+                continue
+            }
 
             // 1.5) ★特别装备三连页（叠在编队页之上、独立 DialogCommonBig/FullSize）。
             //     ★★2026-11-08 改法：三连页改成**由编组页 handler 打包跑完**（[handleExequipPacked]：
@@ -1462,6 +1485,9 @@ object MazeLoop {
     /** 手动节点提示只打一次 */
     private val manualSaid = HashSet<String>()
 
+    /** ★「等待接手」全局闸门那行提示的去重键（解除时移除 ⇒ 下次等待还能再提示） */
+    private const val WAIT_GATE_TAG = "__wait_gate__"
+
     /** PC `_LAST_FIGHT_TEAM`(6123) 的简化：我们**点过「挑战」**的节点（用来区分"这局不是脚本开的"） */
     private val weStartedFight = HashSet<String>()
 
@@ -1507,12 +1533,16 @@ object MazeLoop {
     //   ② 自动特别装备设定 PartsDialogRecommendSettingExtraEquip（labels 4 行 + checkBtn + TwoButton）
     //   ③ 优先属性值     PartsDialogExtraEquipSort（toggles + TwoButton）
     //   只读由 agent 的 labExEquip / labExEquipTop 提供（字段与 PC 探针一致）。
+    // ★2026-11-09：③ 页不再选「稀有度」（会穿不上村好剑），改按目标队的输出系别选下面两项之一。
+    //   真机探针抓到 ③ 页共 11 项，末两项即这两个名字：…物理暴击 / 魔法暴击 / 物理防御贯穿 / 魔法防御贯穿。
+    private const val EXEQ_SORT_PHYS = "物理防御贯穿"
+    private const val EXEQ_SORT_MAGIC = "魔法防御贯穿"
     private const val LAB_EXEQUIP_AUTO = true        // 是否自动走这套流程（PC LAB_EXEQUIP_AUTO）
     private const val LAB_EXEQUIP_SKIP_SAME = true   // 与上场同一套队才跳过（PC LAB_EXEQUIP_SKIP_SAME）
     private const val EXEQ_POLL_MS = 60L             // 打包流程内部的轮询间隔（签名读很轻，60ms 一探）
     private const val EXEQ_WAIT_MAX_MS = 3000L       // 等"三连页开出来"的上限（超了 ⇒ 放弃这次装备）
     private const val EXEQ_MAX_STEPS = 18            // 一次流程最多点几下（PC EXEQ_MAX_STEPS=8；
-                                                       //   ★这里要多留：整条链最少 6 下（自动装备→优先→稀有度→确认→确认→装备确定），
+                                                       //   ★这里要多留：整条链最少 6 下（自动装备→优先→系别贯穿→确认→确认→装备确定），
                                                        //   每一下还有"没生效重试"的余量）
     private const val EXEQ_TAP_TRIES = 3             // 同一次调用里最多点几下（tapAndCheck 的 retries）
     private const val EXEQ_TAP_MAX = 6               // 同一个按钮最多点几下（防止在一个按钮上狂点）
@@ -1611,7 +1641,31 @@ object MazeLoop {
         var stall: Int = 0,
         /** ★同一句诊断日志打了几次（防刷屏；成功一次就清零） */
         var sayN: Int = 0,
+        /** ★本次特别装备要选的排序项（[exeqSortTarget] 按目标队算出；默认物理） */
+        var sortTarget: String = EXEQ_SORT_PHYS,
     )
+
+    /**
+     * ★★选好最优队后**额外跑一次**（2026-11-09 用户口径）：算这队输出成员里物理多还是魔法多，
+     *   不从组队算法里硬拉物理/魔法值。平局（含一个输出成员都没有）默认物理。
+     *
+     * · 输出成员 = 带「输出核心 u_dps」「单体输出 u_burst」「群体输出 u_aoe」之一的角色；
+     * · 系别 = [Rules.effAtk]（已处理「类型反转」标签，物理↔魔法对调）；
+     * · 返回值直接就是 ③ 排序页要选的那个选项名。
+     */
+    private fun exeqSortTarget(team: List<Int>): String {
+        val c = appCtx ?: return EXEQ_SORT_PHYS
+        val rules = Rules(GameData.tables(c))
+        val dpsTags = setOf(TagIds.T["dps"], TagIds.T["burst"], TagIds.T["aoe"])
+        var phys = 0
+        var magic = 0
+        for (u in team) {
+            val id = u.toString()
+            if (rules.tagsOf(id).none { it in dpsTags }) continue
+            if (rules.effAtk(id) == "魔法") magic++ else phys++
+        }
+        return if (magic > phys) EXEQ_SORT_MAGIC else EXEQ_SORT_PHYS
+    }
 
     /**
      * ★当前的特别装备会话（**单例**，2026-11-08）。
@@ -4572,6 +4626,10 @@ object MazeLoop {
                     val bt = pt.optJSONObject("buttons") ?: JSONObject()
                     val eq = bt.optJSONObject("exequip")
                     if (eq != null && eq.opt("x") != null) {
+                        // ★选好最优队后**额外跑一次**：按输出成员的系别决定 ③ 页选哪个排序项
+                        //  （物理多 ⇒ 物理防御贯穿；魔法多 ⇒ 魔法防御贯穿；平局默认物理）。
+                        sess.sortTarget = exeqSortTarget(plan.target)
+                        AppState.addLog("特别装备：目标队输出系别 → 排序选「${sess.sortTarget}」")
                         // 第 1 队（nowSelectParty<=0）才允许「使用其他角色已装备」；第 2/3 队取消勾选防抢装备
                         val nsp = pt.opt("nowSelectParty")
                         sess.exShare = !(nsp is Int) || nsp <= 0
@@ -5058,9 +5116,11 @@ object MazeLoop {
         val cond: (String, ExeqSess) -> Boolean,
         val what: String,
         val target: String,
-        /** ★**要点的那个按钮**的键**（agent 侧"按需读"这一个：按钮名 / "prio0" / "check" / "rare"）
-         *  —— 读法见 [AgentApi.labExBtn]（只读这一个按钮 + 当前签名，不读整包）。 */
+        /** ★**要点的那个按钮**的键**（agent 侧"按需读"这一个：按钮名 / "prio0" / "check" /
+         *  `"sort:<选项名>"`）—— 读法见 [AgentApi.labExBtn]（只读这一个按钮 + 当前签名，不读整包）。 */
         val btnKey: String,
+        /** ★按钮名要**按会话状态**现算时用（③ 页的排序项随目标队系别变；命中时 [exeqRuleOf] 会 copy 覆盖） */
+        val btnKeyOf: ((ExeqSess) -> String)? = null,
         val markAuto: Boolean = false,
         val isFinal: Boolean = false,
         /** ★"此刻该等"（如：刚点完「自动装备」、页面正在切）⇒ 不点，等一下再看（省一次读） */
@@ -5108,11 +5168,12 @@ object MazeLoop {
                 markAuto = true,
             ),
             // ── ② 自动特别装备设定（setting）──
+            //   ★"设好了"的判据 = 第 ① 行当前值 == 本次要选的排序项（不再是写死的「稀有度」）。
             ExeqRule(
                 page = EXEQ_PAGE_SETTING,
-                cond = { sig, _ ->
+                cond = { sig, s ->
                     val r = exeqFieldOf(sig, "row")
-                    r != null && r != "?" && r != "稀有度"
+                    r != null && r != "?" && r != s.sortTarget
                 },
                 what = "「全部」行 进「优先属性值」",
                 target = EXEQ_PAGE_SORT,
@@ -5121,7 +5182,7 @@ object MazeLoop {
             ExeqRule(
                 page = EXEQ_PAGE_SETTING,
                 cond = { sig, s ->
-                    exeqFieldOf(sig, "row") == "稀有度" &&
+                    exeqFieldOf(sig, "row") == s.sortTarget &&
                         exeqTriOf(sig, "checked") == false && s.exShare
                 },
                 what = "复选框(补勾)",
@@ -5131,7 +5192,7 @@ object MazeLoop {
             ExeqRule(
                 page = EXEQ_PAGE_SETTING,
                 cond = { sig, s ->
-                    exeqFieldOf(sig, "row") == "稀有度" &&
+                    exeqFieldOf(sig, "row") == s.sortTarget &&
                         exeqTriOf(sig, "checked") == true && !s.exShare
                 },
                 what = "复选框(取消勾选·不抢别队装备)",
@@ -5140,9 +5201,9 @@ object MazeLoop {
             ),
             ExeqRule(
                 page = EXEQ_PAGE_SETTING,
-                cond = { sig, _ ->
+                cond = { sig, s ->
                     // ★checked 必须是 **true/false**（"null" = 读不到 ⇒ 不点，等一下再读）
-                    exeqFieldOf(sig, "row") == "稀有度" && exeqTriOf(sig, "checked") != null
+                    exeqFieldOf(sig, "row") == s.sortTarget && exeqTriOf(sig, "checked") != null
                 },
                 what = "确认",
                 target = EXEQ_PAGE_PARTY,
@@ -5151,17 +5212,19 @@ object MazeLoop {
             // ── ③ 优先属性值（sort）──
             ExeqRule(
                 page = EXEQ_PAGE_SORT,
-                cond = { sig, _ -> exeqFieldOf(sig, "sel") == "稀有度" },
+                cond = { sig, s -> exeqFieldOf(sig, "sel") == s.sortTarget },
                 what = "确认",
                 target = EXEQ_PAGE_SETTING,
                 btnKey = "TwoButtonRight",
             ),
+            // ★选中目标项（物理/魔法防御贯穿）：btnKey 按会话状态现算，见 [exeqRuleOf]。
             ExeqRule(
                 page = EXEQ_PAGE_SORT,
                 cond = { _, _ -> true },
-                what = "「稀有度」",
+                what = "选系别防御贯穿",
                 target = EXEQ_PAGE_SORT,
-                btnKey = "rare",
+                btnKey = "",
+                btnKeyOf = { "sort:" + it.sortTarget },
             ),
         )
     }
@@ -5178,7 +5241,11 @@ object MazeLoop {
         val page = exeqPageOf(sig) ?: return null
         for (r in EXEQ_RULES) {
             if (r.page != page) continue
-            if (r.cond(sig, sess)) return r
+            if (!r.cond(sig, sess)) continue
+            // ★③ 页「选排序项」的动作随队伍系别变 ⇒ 命中时现算按钮名与日志文案
+            return r.btnKeyOf?.let { f ->
+                r.copy(what = "「${sess.sortTarget}」", btnKey = f(sess))
+            } ?: r
         }
         return null
     }

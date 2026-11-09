@@ -5861,7 +5861,7 @@ function labExEquipSig() {
 //     · 对话框自带按钮（ThreeButtonRight…）→ **按字段**取（DialogFundationObject），
 //       快路径取不到才回退遍历（见 [_dlgBtnByField] / [_exeqButtons]）。
 //     · prio0（setting 页 4 行右侧按钮的第 0 个）/ check（复选框）/ rare（sort 页「稀有度」）
-//       → 各自的字段直取。
+//       / `sort:<选项名>`（sort 页任一选项，2026-11-09 起按名字找）→ 各自的字段直取。
 function _exeqXY(compPtr, env, name) {
   try {
     if (!ptrOk(compPtr) || !env) return null;
@@ -5910,7 +5910,10 @@ function labExBtn(key, preferId) {
     } else if (key === "check" && f.top === "setting") {
       const cb = f.comp.add(0x98).readPointer();
       if (ptrOk(cb)) btn = _exeqXY(cb.add(0x48).readPointer(), env, "check");
-    } else if (key === "rare" && f.top === "sort") {
+    } else if (f.top === "sort" && (key === "rare" || key.indexOf("sort:") === 0)) {
+      // ★2026-11-09：按**选项名**投影（不再写死「稀有度」）。真机抓到 ③ 页共 11 项，
+      //   末两项是「物理防御贯穿」/「魔法防御贯穿」⇒ key = "sort:<选项名>"；"rare" 保留兼容。
+      const want = (key === "rare") ? "稀有度" : key.slice(5);
       const lst = f.comp.add(0xA0).readPointer();           // List<PartsUnitSortTypeToggle>
       const n = ptrOk(lst) ? _listCount(lst) : -1;
       for (let i = 0; i < (n > 0 ? Math.min(n, 24) : 0); i++) {
@@ -5918,7 +5921,7 @@ function labExBtn(key, preferId) {
         if (!ptrOk(it)) continue;
         let t = null;
         try { const lb = it.add(0x30).readPointer(); if (ptrOk(lb)) t = _str1(_inv(lb, "get_text")); } catch (e) {}
-        if (t === "稀有度") { btn = _exeqXY(it, env, "rare"); break; }
+        if (t === want) { btn = _exeqXY(it, env, key); break; }
       }
     }
     res.btn = btn;
@@ -5927,7 +5930,8 @@ function labExBtn(key, preferId) {
 }
 
 // 只读快照：**只读"当前最上层"那一页**（wantBtns=false 时连按钮坐标都不算，省掉一次子树遍历）
-//   ★`only` = **只要投影这一个**（按钮名 / "prio0" / "check" / "rare"）；null = 老的全量行为。
+//   ★`only` = **只要投影这一个**（按钮名 / "prio0" / "check" / "rare" /
+//     `"sort:<选项名>"`，如 `sort:物理防御贯穿`）；null = 老的全量行为。
 function labExEquipSnapshot(diag, wantBtns, only) {
   const res = { jsBuild: JS_BUILD, top: null, page: null, sig: null, err: null };
   const env = _camEnv();
@@ -5971,8 +5975,9 @@ function labExEquipSnapshot(diag, wantBtns, only) {
     // ★★2026-11-08 实测：整包读的耗时**大头不是坐标投影，而是 `_rawWalk` 遍历整棵子树**
     //   （①页 DialogCommonFullSize = 编组页的大容器 ⇒ 遍历要 350ms+）。
     //   ⇒ **按需**：知道要哪个按钮时，按**字段**直接取（几 ms），绝不遍历。
+    const isSortOnly = !!only && only.indexOf("sort:") === 0;
     const needDlgBtns = (wantBtns || diag) &&
-      !(only === "prio0" || only === "check" || only === "rare");
+      !(only === "prio0" || only === "check" || only === "rare" || isSortOnly);
     const o = { cls: f.cls, ptr: String(f.comp), dlg: String(f.dlg), dlgName: f.dlgName,
                 buttons: [], slots: null };
     if (needDlgBtns) {
@@ -5982,7 +5987,7 @@ function labExEquipSnapshot(diag, wantBtns, only) {
         const dc = _dlgCommonComp(f.dlg);
         if (dc) got = _dlgBtnByField(dc, only, env);
       }
-      o.buttons = got ? [got] : _exeqButtons(_inv(f.dlg, "get_transform"), only);
+      o.buttons = got ? [got] : _exeqButtons(_inv(f.dlg, "get_transform"), isSortOnly ? null : only);
     }
     if (f.top === "party") {                             // ① 特别装备设定
       o.change = _invBool(f.comp, "isChangeExtraEquip"); // ★有没有改动
@@ -6028,6 +6033,12 @@ function labExEquipSnapshot(diag, wantBtns, only) {
         if (ptrOk(pm)) { o.cur = pm.add(0x150).readS32();
                          o.list = _intListOf(pm.add(0x158).readPointer()); }
       } catch (e) {}
+      // ★2026-11-09：③ 页要投影哪个选项（`only = "sort:<选项名>"`；`"rare"` 等价于稀有度）。
+      //   真机抓到的 11 项：稀有度 / 有技能 / 物理攻击力 / 魔法攻击力 / 物理防御力 / 魔法防御力 /
+      //   生命值 / 物理暴击 / 魔法暴击 / **物理防御贯穿** / **魔法防御贯穿**
+      let wantSort = null;
+      if (only === "rare") wantSort = "稀有度";
+      else if (only && only.indexOf("sort:") === 0) wantSort = only.slice(5);
       try {
         const lst = f.comp.add(0xA0).readPointer();                 // List<PartsUnitSortTypeToggle>
         const n = ptrOk(lst) ? _listCount(lst) : -1;
@@ -6038,8 +6049,8 @@ function labExEquipSnapshot(diag, wantBtns, only) {
           try { const lb = it.add(0x30).readPointer();               // typeLabel
                 if (ptrOk(lb)) t = _str1(_inv(lb, "get_text")); } catch (e) {}
           // ★不要坐标时只带 label/sel（轮询读不需要投影坐标）
-          // ★★2026-11-08：**只投影「稀有度」那一个**（only="rare"）—— 11 个全投影 ≈ 44ms，纯浪费
-          const p = (wantBtns && (!only || only === "rare") && t === "稀有度") ? xy(it) : {};
+          // ★★只投影**要点的那一个**（only="sort:<选项名>" / "rare"）—— 11 个全投影 ≈ 44ms，纯浪费
+          const p = (wantBtns && (!only || t === wantSort)) ? xy(it) : {};
           p.i = i; p.label = t; p.sel = _invBool(it, "get_IsSelected");
           o.toggles.push(p);
         }
