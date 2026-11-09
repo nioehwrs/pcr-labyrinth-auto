@@ -50,19 +50,28 @@ import com.lmj.labyrinthauto.frida.RootShell
 object Foreground {
 
     /** TTL 缓存：没缓存等于每轮起一个 `su dumpsys`（≈0.1~0.5s）。
-     *  ⚠TTL 别太大：这是"点错 App"的安全闸门，宁可多查一次。 */
+     *
+     *  ★2026-11-09：500ms → 2000ms。原因：编组页连点间隔约 300ms，500ms 的 TTL 意味着
+     *    **每 2 次点击就有 1 次缓存过期**，那一下要多跑一遍 `su dumpsys input`
+     *    ⇒ 表现成"每两个点卡一下"的鼓点节奏（去掉固定 delay 后才暴露出来）。
+     *    放宽到 2s 后，一个连点批次（5 个约 1.5s）最多只查一次。
+     *  ★安全性不靠这个 TTL：[MazeLoop] 主循环每轮用 `packageName(force = true)` **强制刷新**，
+     *    所以"前台被切走"仍然在下一轮（约 1s）就能发现。 */
     @Volatile private var cachedPkg: String? = null
     @Volatile private var cachedAt = 0L
-    private const val TTL_MS = 500L
+    private const val TTL_MS = 2_000L
 
     /** 一次读不到就刷屏；同一句话最多每 [LOG_EVERY_MS] 说一次（换源后要能看出"哪个界面读不到"）。 */
     @Volatile private var lastMissLogAt = 0L
     private const val LOG_EVERY_MS = 60_000L
 
-    /** 当前前台包名；null = 没读出来（没有焦点窗口 / 焦点窗口名不含组件名 / 命令失败） */
-    suspend fun packageName(): String? {
+    /** 当前前台包名；null = 没读出来（没有焦点窗口 / 焦点窗口名不含组件名 / 命令失败）。
+     *
+     *  @param force `true` = 忽略 TTL 立刻重查。**主循环每轮、导航闸门**用这个；
+     *               高频连点（[MazeLoop.tap]）用默认值走缓存，否则每 2 下就要多花 0.1~0.5s。 */
+    suspend fun packageName(force: Boolean = false): String? {
         val now = SystemClock.elapsedRealtime()
-        if (now - cachedAt < TTL_MS) return cachedPkg
+        if (!force && now - cachedAt < TTL_MS) return cachedPkg
         val pkg = readFocusPkg()
         cachedPkg = pkg
         cachedAt = now

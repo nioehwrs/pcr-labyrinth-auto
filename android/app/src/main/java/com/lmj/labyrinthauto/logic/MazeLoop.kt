@@ -489,7 +489,8 @@ object MazeLoop {
             // ★安全闸门（同 Navigator，2026-11-02 对齐）：**读到别的包** ⇒ 立刻停手；
             //   **读不到**只说明"这一刻没有焦点窗口"（进战斗/场景切换时窗口重建，实测 21:27:35）
             //   ⇒ 本轮不点、等下一轮，连挂 [FRONT_NULL_MAX] 轮才停手。
-            val frontPkg = Foreground.packageName()
+            // ★force：主循环每轮必须"现查"，切走检测不能依赖 tap 里那个 2s 缓存
+            val frontPkg = Foreground.packageName(force = true)
             if (frontPkg != null && frontPkg != GameProcess.pkg()) {
                 AppState.addLog("停手：前台已切到 $frontPkg（不再碰游戏）")
                 return
@@ -4381,10 +4382,15 @@ object MazeLoop {
                     )
                     for ((op, c) in todo) {
                         tap(input, c.first, c.second, "编队：remove ${op.unit}")
-                        // ★2026-11-07：不再死等 350ms ⇒ **等这个人真的出队**就立刻点下一个
-                        //   （等不到就按原上限 350ms 继续，最坏不比原来差）。
-                        if (!awaitUnitInTeam(op.unit, want = false)) {
-                            delay(PartyPlan.LAB_PARTY_TAP_MS)
+                        // ★2026-11-07：不再死等 350ms ⇒ **等这个人真的出队**就立刻点下一个。
+                        // ★★2026-11-09 修正：`awaitUnitInTeam` 内部就会**轮询到 350ms 上限**，
+                        //   超时后再 `delay(350)` ⇒ 最坏 700ms/人（原注释"最坏不比原来差"是错的）。
+                        //   实测"换人时每两个顿一下"就是它 ⇒ 现在只补到**最小间隔 350ms**。
+                        val t0 = SystemClock.elapsedRealtime()
+                        if (!awaitUnitInTeam(op.unit, want = false, label = "rm")) {
+                            val spent = SystemClock.elapsedRealtime() - t0
+                            AppState.addLog("编队：等 remove ${op.unit} 出队超时 ${spent}ms（只补到最小间隔）")
+                            if (spent < PartyPlan.LAB_PARTY_TAP_MS) delay(PartyPlan.LAB_PARTY_TAP_MS - spent)
                         }
                     }
                     // ★2026-11-07：不再固定等 1 秒 ⇒ 轮询队伍名单，撤掉了就立刻走。
@@ -4441,10 +4447,15 @@ object MazeLoop {
                 AppState.addLog("编队：加入 ${addTodo.size} 个（坐标一次算好，整批点完中途不读）")
                 for ((op, c) in addTodo) {
                     tap(input, c.first, c.second, "编队：add ${op.unit}")
-                    // ★2026-11-07：不再死等 350ms ⇒ **等这个人真的进队**就立刻点下一个
-                    //   （等不到就按原上限 350ms 继续，最坏不比原来差）。
-                    if (!awaitUnitInTeam(op.unit, want = true)) {
-                        delay(PartyPlan.LAB_PARTY_TAP_MS)
+                    // ★2026-11-07：不再死等 350ms ⇒ **等这个人真的进队**就立刻点下一个。
+                    // ★★2026-11-09 修正：`awaitUnitInTeam` 内部就会**轮询到 350ms 上限**，
+                    //   超时后再 `delay(350)` ⇒ 最坏 700ms/人 ⇒ 换人时"每两个顿一下"。
+                    //   现在只补到**最小间隔 350ms**（命中即走，最坏不比固定等待差）。
+                    val t0 = SystemClock.elapsedRealtime()
+                    if (!awaitUnitInTeam(op.unit, want = true, label = "add")) {
+                        val spent = SystemClock.elapsedRealtime() - t0
+                        AppState.addLog("编队：等 add ${op.unit} 进队超时 ${spent}ms（只补到最小间隔）")
+                        if (spent < PartyPlan.LAB_PARTY_TAP_MS) delay(PartyPlan.LAB_PARTY_TAP_MS - spent)
                     }
                 }
             }
@@ -5512,14 +5523,38 @@ object MazeLoop {
         unit: Int,
         want: Boolean,
         timeoutMs: Long = PartyPlan.LAB_PARTY_TAP_MS,
+        label: String = "",
     ): Boolean {
         val t0 = SystemClock.elapsedRealtime()
+        var n = 0
+        var first = -1
+        var last = -1
         while (SystemClock.elapsedRealtime() - t0 < timeoutMs) {
-            val plan = runCatching { AgentApi.labPartyPlan(timeoutMs = 700L) }.getOrNull() ?: return false
-            if (plan.top != "DialogCommonPartyEdit") return false
-            if ((unit in plan.members) == want) return true
+            n++
+            val plan = runCatching { AgentApi.labPartyPlan(timeoutMs = 700L) }.getOrNull()
+            if (plan == null || plan.top != "DialogCommonPartyEdit") {
+                AppState.addLog(
+                    "编队[$label] 等 $unit ${if (want) "进队" else "出队"}：读不到编组页（第${n}轮）→ 放弃",
+                )
+                return false
+            }
+            val cnt = plan.members.count { it != 0 }
+            if (first < 0) first = cnt
+            last = cnt
+            if ((unit in plan.members) == want) {
+                AppState.addLog(
+                    "编队[$label] $unit ${if (want) "进队" else "出队"} 命中 第${n}轮 " +
+                        "${SystemClock.elapsedRealtime() - t0}ms（人数 $first→$last）",
+                )
+                return true
+            }
             kotlinx.coroutines.delay(50)
         }
+        AppState.addLog(
+            "编队[$label] $unit ${if (want) "进队" else "出队"} **超时** 第${n}轮 " +
+                "${SystemClock.elapsedRealtime() - t0}ms（人数 $first→$last）" +
+                (if (first == last) "｜同队人数没变 ⇒ 这一下可能没点进去" else "｜人数变了但没读到它"),
+        )
         return false
     }
 
@@ -6940,7 +6975,8 @@ object MazeLoop {
         //   主循环开头本来也有这道闸门，但 handler 在**同一次主循环迭代里**连点很多下
         //   （编组页一次点 6 个角色、EX 页连点），等它回到循环开头已经晚了好几秒。
         //   ⇒ 放到 [tap] 里：**每次点击前**都查一次。
-        //     · [Foreground.packageName] 有 500ms TTL 缓存 ⇒ 命中时几乎零成本；
+        //     · [Foreground.packageName] 有 2s TTL 缓存 ⇒ **一个连点批次内几乎零成本**；
+        //       主循环每轮用 `force = true` 现查 ⇒ 切走照样下一轮就发现（见 [Foreground.TTL_MS] 注释）；
         //     · **读不到(null) ≠ 切走** ⇒ 照点（与主循环口径一致，宁可不误停也别漏点）。
         val fp = Foreground.packageName()
         if (fp != null && fp != GameProcess.pkg()) {
@@ -6957,9 +6993,16 @@ object MazeLoop {
             }
             return false
         }
-        return when (val r = input.tap(x, y)) {
+        // ★2026-11-09：量一下输入本身的耗时（`input tap` 要 fork 进程，正常 0.2~0.4s）。
+        //   只在 >=200ms 时附在日志里，便于验证"点击节奏"是否均匀，平时不刷屏。
+        val tIn = SystemClock.elapsedRealtime()
+        val r = input.tap(x, y)
+        val inCost = SystemClock.elapsedRealtime() - tIn
+        return when (r) {
             is com.lmj.labyrinthauto.input.InputResult.Ok -> {
-                AppState.addLog("点了 $what ($x,$y)［${input.name}］")
+                AppState.addLog(
+                    "点了 $what ($x,$y)［${input.name}］" + if (inCost >= 200) " 输入 ${inCost}ms" else "",
+                )
                 PlanProbe.act(what)          // ★观测：挂到当前页的动作列表（不落盘、不判定）
                 markTransition(what)         // ★观测：等主循环下一轮看窗口有没有变（不改行为）
                 // ★2026-10-27：参与自学习的按钮，挂个探针 —— 下一轮用"现场 tag 变没变"判它点早了没有
