@@ -114,12 +114,18 @@ object Foreground {
             if (name != null) {
                 COMPONENT.find(name)?.groupValues?.getOrNull(1)?.let { return it }
             }
-            if (Build.VERSION.SDK_INT <= 32) {
-                // Android 12 及以下：input 这条路结构不同，换 WMS 焦点（见方法注释）
+            // ★2026-11-09 用户报障（伊丽莎白 / Android 14 / REDMI 25060RK16C）：
+            //   那台 SDK 34 的 `dumpsys input` **也没有 FocusedWindows 段** ⇒ 前台永远读不到
+            //   ⇒ 主循环"本轮不点" → 20s 超时 → 连撞 3 次停手
+            //   （用户："点击一键黎明界，只打开游戏，没有点击动作"）。
+            //   所以回退条件从 `<= 32` 放宽到 `<= 34`（Android 14 及以下）。
+            //   **SDK 35+ 仍然不回退** —— Android 15 的 `dumpsys window displays` 会踩
+            //   `TaskUtils.shouldIgnoreDesktopHomeOcclusion` 把 system_server 打崩（见方法注释）。
+            if (Build.VERSION.SDK_INT <= 34) {
                 useWindowSource = true
                 AppState.addLog(
                     "前台判定：本机 dumpsys input 取不到焦点窗口（Android ${Build.VERSION.SDK_INT}）" +
-                        "→ 改用 dumpsys window displays 的 mCurrentFocus（仅 12 及以下可走，15 会崩系统）",
+                        "→ 改用 dumpsys window displays 的 mCurrentFocus（15 及以上不走这条）",
                 )
             } else {
                 val now = System.currentTimeMillis()
@@ -150,8 +156,10 @@ object Foreground {
     /** 只取焦点窗口那几行：`FocusedWindows:` 之后 3 行内就有 name（全量 dump 没必要，也省时间）。 */
     private const val CMD_INPUT = "dumpsys input | grep -A3 -m1 FocusedWindows"
 
-    /** Android 12 及以下的备用源：`mCurrentFocus=Window{… u0 包名/Activity}`（只取第一行） */
-    private const val CMD_WINDOW = "dumpsys window displays | grep -m1 mCurrentFocus"
+    /** 备用源（Android 14 及以下）：`mCurrentFocus=Window{… u0 包名/Activity}`。
+     *  ★2026-11-09：有些 ROM/版本用 `mFocusedWindow`，两个都匹配（只取第一行）。 */
+    private const val CMD_WINDOW =
+        "dumpsys window displays | grep -m1 -E 'mCurrentFocus|mFocusedWindow'"
 
     /** `displayId=0, name='71d0adf com.bilibili.priconne/com.bilibili.priconne.MainActivity'` */
     private val FOCUS_NAME = Regex("name='([^']*)'")
