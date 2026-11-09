@@ -5626,6 +5626,122 @@ function labSelStateSnapshot() {
   return out;
 }
 
+/**
+ * ★公会选择页（263）「卡列表」**轻读**（2026-11-09 定型）：字段直取，实测 **9ms**
+ *   —— 替代 `findList("DepartureButton")`（全树遍历，实测 500~916ms/次）。
+ *
+ * 结构（dump.cs 核对 + 真机验证）：
+ *   ViewManager+0x110 → ViewLabyrinthGuildSetting
+ *     +0xD0 settingPlateController (PartsLabyrinthGuildSettingPlateController)
+ *       +0x20 curUIScrollContent (CustomUIScrollContent)
+ *         +0x30 curUIWrapContent (UIWrapContent) → +0x58 mChildren (List<Transform>)
+ *   每张卡：PartsLabyrinthGuildSettingPlate
+ *     +0x40 guildNameLabel(text) / +0x50 departureButton(投影坐标) / +0x20 clearedDifficultyObject
+ *   +0xF0 labyrinthTempData → +0x1C GuildId / +0x5C Difficulty / +0x60 SelectDifficulty
+ *
+ * 拿不到 wrap 列表时退回「遍历 scrollContent 的 GameObject children」。
+ * 零 hook、只读字段 + 少量 invoke（get_text / get_transform），不点任何东西。
+ */
+function labGuildCardsSnapshot() {
+  const out = { ms: 0, ok: false, view: null, hasCtrl: null, hasScroll: null, hasWrap: null,
+                childCount: null, wrapCount: null, ltd: null, cards: [],
+                W: null, H: null, cardKlassFound: null, err: null };
+  const t0 = Date.now();
+  try {
+    const vm = _viewManagerInst();
+    const cv = vm.isNull() ? ptr(0) : vm.add(0x110).readPointer();
+    out.view = cv.isNull() ? null : klassNameOf(cv);
+    if (ptrOk(cv) && out.view === "ViewLabyrinthGuildSetting") {
+      const ctrl = cv.add(0xD0).readPointer();
+      out.hasCtrl = ptrOk(ctrl);
+      const ltd = cv.add(0xF0).readPointer();
+      if (ptrOk(ltd)) {
+        out.ltd = {
+          guildId: ltd.add(0x1C).readS32(),
+          difficulty: ltd.add(0x5C).readS32(),
+          selectDifficulty: ltd.add(0x60).readS32(),
+          difficultyMax: ltd.add(0x64).readS32(),
+        };
+      }
+      if (ptrOk(ctrl)) {
+        const scroll = ctrl.add(0x20).readPointer();
+        out.hasScroll = ptrOk(scroll);
+        if (ptrOk(scroll)) {
+          const wrap = scroll.add(0x30).readPointer();
+          out.hasWrap = ptrOk(wrap);
+          const trs = [];
+          if (ptrOk(wrap)) {
+            const mc = wrap.add(0x58).readPointer();          // UIWrapContent.mChildren
+            if (ptrOk(mc)) {
+              out.wrapCount = _listCount(mc);
+              for (let i = 0; i < out.wrapCount && i < 20; i++) {
+                try { const tr = _listItem(mc, i); if (ptrOk(tr)) trs.push(tr); } catch (e) {}
+              }
+            }
+          }
+          if (trs.length === 0) {
+            try {
+              const sgo = _inv(scroll, "get_gameObject");
+              if (ptrOk(sgo)) {
+                out.childCount = _inv1i(sgo, "get_childCount") | 0;
+                for (let i = 0; i < out.childCount && i < 20; i++) {
+                  try { const tr = _inv1o(sgo, "GetChild", i); if (ptrOk(tr)) trs.push(tr); } catch (e) {}
+                }
+              }
+            } catch (e) {}
+          }
+          const env = _camEnv();
+          if (env) { out.W = env.W; out.H = env.H; }
+          let cardKlass = null;
+          try { cardKlass = findClass("PartsLabyrinthGuildSettingPlate"); } catch (e) {}
+          out.cardKlassFound = !!(cardKlass && !cardKlass.isNull());
+          for (const tr of trs) {
+            const one = { cls: null, name: null, x: null, y: null, on: null, clearedOn: null };
+            try {
+              const g = _inv(tr, "get_gameObject");
+              if (!ptrOk(g)) { out.cards.push(one); continue; }
+              // ★节点名（不是类名）：klassNameOf(GameObject) 只会给 "GameObject"
+              try { one.cls = _str1(_inv(g, "get_name")); } catch (e) { one.cls = klassNameOf(g); }
+              let card = null;
+              if (cardKlass && !cardKlass.isNull()) {
+                try { card = _compSelf(g, cardKlass); } catch (e) {}
+                if (!ptrOk(card)) { try { card = _compInChildren(g, cardKlass); } catch (e) {} }
+              }
+              if (ptrOk(card)) {
+                one.cls = "CARD:" + (one.cls || "");
+                try {
+                  const lbl = card.add(0x40).readPointer();     // guildNameLabel
+                  if (ptrOk(lbl)) one.name = _str1(_inv(lbl, "get_text"));
+                } catch (e) {}
+                try {
+                  const co = card.add(0x20).readPointer();      // clearedDifficultyObject
+                  if (ptrOk(co)) one.clearedOn = _invBool(co, "get_activeSelf");
+                } catch (e) {}
+                try {
+                  const btn = card.add(0x50).readPointer();     // departureButton
+                  if (ptrOk(btn) && env) {
+                    const btr = _inv(btn, "get_transform");
+                    const p = ptrOk(btr) ? _ndXY({ tr: btr }, env) : null;
+                    // ★2026-11-09：**不再用 onscreen 过滤** —— 半露卡（最左边那张）的
+                    //   departureButton 投影点会落到 x<0，判 offscreen 就把坐标丢了，
+                    //   上层误以为"不在可见区"⇒ 白拖一屏再拖回来（用户实测"拉比林斯明明在页面上"）。
+                    //   这里坐标照给，只带 `on` 标记，让 Kotlin 侧决定要不要点。
+                    if (p) { one.x = p.x; one.y = p.y; one.on = !!p.onscreen; }
+                  }
+                } catch (e) {}
+              }
+              out.cards.push(one);
+            } catch (e) { out.cards.push(one); }
+          }
+        }
+      }
+    }
+    out.ok = out.cards.length > 0;
+  } catch (e) { out.err = String(e); }
+  out.ms = Date.now() - t0;
+  return out;
+}
+
 function _exeqButtons(rootTr, only) {
   const out = [];
   if (!rootTr || rootTr.isNull()) return out;
@@ -5955,7 +6071,7 @@ function labExEquipTop() {
 // ── 选角色页（SUMMON_UNIT=1 且 pageTop 是对话框）：初始编成 / 门票召唤（★只读）──
 // ★构建号：改过读逻辑就 +1。attach 时 pcr_auto 会打出来（rpc jsBuild）——用来确认
 //   "正在跑的到底是哪一版脚本"，免得拿旧输出讨论半天（2026-10-10 踩过）。
-const JS_BUILD = "cs81";     // ★cs81（2026-11-09）：三选一探针改为**并进 probeState**（probe 按 150ms 节奏跑、每次读取顺带带回 proc/tween/selNum，不再同步阻塞采样）；三选一探针 RPC 由 `debugSelTrace` 转正为 `labSelState`（含 started/factor/closing）。★cs80（2026-11-09）：`labDlgClosing` 取组件改为 **DialogCommonAbstract 优先、DialogBase 兜底** —— `DialogLabyrinthSelection`（三选一页）是 DialogBase 直接子类，原先只按 DialogCommonAbstract 找会整个漏掉，读不到它的退出 tween/isProcess。配套 `debugSelTrace` 补 proc/tw。★cs79（2026-11-09）【已于 cs81 转正为 labSelState】：新增三选一页采样 `PartsLabyrinthSelectionItemView.selectionNum@0x38`、卡片列表长度、游戏显示的剩余数文本(+0x138)、剩余数 UI 是否显示(+0x130)、每卡 unitChoiceIndex(+0x98)，用来确定 selectionNum 是"已选数量"还是"选中下标"及其响应速度。★cs78（2026-11-09）：`labDlgClosing` 失败时标 `path=err`（调用方据此区分"读失败"与"窗口没了"，读失败绝不当成"已离开"）；`tapAndCheck` 阶段 1 改为**单次快照探针** `probeState`（top 与判据同源，少一次 RPC，也避免两次读之间的状态错位）。★cs77（2026-11-09）：新增 `labDlgClosing` —— 通用弹窗「关闭已启动」轻读（退出 tween 的 mStarted/factor，零 hook、3~6ms），替代"等窗口消失"当"这一下点生效了"；实测整页到 +800ms 才消失、退出 tween +200~300ms 就启动。★cs74（2026-11-09）：新增 `labDlgBtn` —— 通用弹窗按钮按 `DialogCommonAbstract +0x118` **字段直取**（零遍历，30ms 级），替代 `dialog()` 的 DialogArea 子树遍历（冷 0.5~0.6s / 大页 3~3.9s）；门票三选一两连弹改用它现取坐标。★cs73（2026-11-08）：`labStatusLite` / `labSnapshot` 补 `guildId`（`LabyrinthTempData+0x1C`）—— 局内刷"已在迷宫里要不要沿用"要核对公会，否则手动开着 A 公会的局、配置是 B 公会时会直接沿用、跑完当成 B 公会的成绩。cs72（2026-11-08）：**"最上层"只剩一个实现 + 根没了不再扫全树** —— ①`_topDialogTr`（`findList(...,"top")` 的根）改为复用 `_topDialogGo`，不再自己写一遍判据（原来有 3 份实现，正是 EX 三连页多点/点错的根源）；②`_rootWalkNodes` 的遍历缓存**加校验"根是不是同一个"**（原来只看 key ⇒ `"top"` 这个根会变，1.5s 内会把上一个对话框的子树当成当前的返回）；③新增 `_walkForRoot`：**显式给了根却取不到（如当前没有对话框）⇒ 返回空，不再退化成全树**（`findList(…,"top")` 实测 2633ms → 3ms；而且全树会捞到别处的同名节点）。cs71：**读取全面"按需"** —— ①新增 `labExBtn(key)`：EX 三连页只读**要点的那个按钮** + 当前签名（不再读整包：整包会把 setting 的 4 行文字/复选框、sort 的 11 个 toggle 文字都过一遍，纯浪费）；②新增 `labExtra()`：非分派字段（eventId/questId/eventResultId/effectNum/curChoice/remainChoice + LTD choices）拆成独立读，handler 要时才调；③`labStatusLite` 补 `next`（移动分支用，一次内存读）。cs70：**EX 整包读的按钮改按字段取**（DialogFundationObject：twoLeft 0x48 / twoRight 0x58 / threeLeft 0x70 / threeCenter 0x80 / threeRight 0x98，经对话框组件 +0x118 foundationObject），**不再遍历整棵子树**（①页遍历要 350ms+）。cs69：labExEquip(full, only) 只投影要点的那个；cs68：**"当前最上层"统一成一个实现**（_topDialogGo）—— ①_exeqFind 只查**最上层那一层**、**绝不往回退**（回退会永远读到下面那层仍 active 的①页 ⇒ 签名不变 ⇒ 误判"没生效"⇒多点⇒点错按钮）；②签名里带**最上层容器名**（"页面切了"能立刻看见）。cs67：去掉 agent 侧坐标"稳定化"（Thread.sleep 堵死单通道）；cs64：_findExTopPart 组件查找缓存；cs63：labExEquipSig 轻量签名读
+const JS_BUILD = "cs86";     // ★cs86（2026-11-09）：`labGuildCards` 增加 `W`/`H`（屏幕宽高）—— 上层据此过滤**右越界**的卡（实测拉比林斯 x=2447 > 1920 被当成可见 ⇒ 点出去白等 1.8s）。★cs85（2026-11-09）：`labGuildCards` 不再用 `_ndXY.onscreen` 丢坐标 —— 半露卡（最左那张）的 departureButton 会投影到 x<0，之前被当成"不在可见区"⇒ 白拖一屏再拖回来；现在照给坐标 + `on` 标记，由 Kotlin 侧决定。★cs84（2026-11-09）：`dbgGuildCards` 转正为 **`labGuildCards`** —— 公会选择页卡列表字段直取（ViewManager→ViewLabyrinthGuildSetting+0xD0→scroll+0x20→wrap+0x30→mChildren+0x58），真机实测 **9ms**（原 findList 500~916ms），并带每卡 guildNameLabel 文本，可按名字选公会而不是"第 N 张"。★cs83（2026-11-09）【调试用·测试完请删除】：`dbgGuildCards` 修正 —— 上一版 `klassNameOf(GameObject)` 恒为 "GameObject"，改成读**节点名**；卡组件先 `_compSelf` 再 `_compInChildren`；新增 `cardKlassFound` 便于判断是不是类名找错了。★cs82（2026-11-09）【调试用·测试完请删除】：新增 `dbgGuildCards` —— 公会选择页（263）卡列表结构探针：ViewManager→ViewLabyrinthGuildSetting(+0xD0 controller→+0x20 scroll→+0x30 wrap→+0x58 mChildren)，每卡读 guildNameLabel(+0x40)/departureButton(+0x50)/clearedDifficultyObject(+0x20)，外加 LabyrinthTempData(+0xF0) 的 GuildId/Difficulty/SelectDifficulty。为了把 `findList("DepartureButton")`（~800ms 全树遍历）换成字段直取。★cs81（2026-11-09）：三选一探针改为**并进 probeState**（probe 按 150ms 节奏跑、每次读取顺带带回 proc/tween/selNum，不再同步阻塞采样）；三选一探针 RPC 由 `debugSelTrace` 转正为 `labSelState`（含 started/factor/closing）。★cs80（2026-11-09）：`labDlgClosing` 取组件改为 **DialogCommonAbstract 优先、DialogBase 兜底** —— `DialogLabyrinthSelection`（三选一页）是 DialogBase 直接子类，原先只按 DialogCommonAbstract 找会整个漏掉，读不到它的退出 tween/isProcess。配套 `debugSelTrace` 补 proc/tw。★cs79（2026-11-09）【已于 cs81 转正为 labSelState】：新增三选一页采样 `PartsLabyrinthSelectionItemView.selectionNum@0x38`、卡片列表长度、游戏显示的剩余数文本(+0x138)、剩余数 UI 是否显示(+0x130)、每卡 unitChoiceIndex(+0x98)，用来确定 selectionNum 是"已选数量"还是"选中下标"及其响应速度。★cs78（2026-11-09）：`labDlgClosing` 失败时标 `path=err`（调用方据此区分"读失败"与"窗口没了"，读失败绝不当成"已离开"）；`tapAndCheck` 阶段 1 改为**单次快照探针** `probeState`（top 与判据同源，少一次 RPC，也避免两次读之间的状态错位）。★cs77（2026-11-09）：新增 `labDlgClosing` —— 通用弹窗「关闭已启动」轻读（退出 tween 的 mStarted/factor，零 hook、3~6ms），替代"等窗口消失"当"这一下点生效了"；实测整页到 +800ms 才消失、退出 tween +200~300ms 就启动。★cs74（2026-11-09）：新增 `labDlgBtn` —— 通用弹窗按钮按 `DialogCommonAbstract +0x118` **字段直取**（零遍历，30ms 级），替代 `dialog()` 的 DialogArea 子树遍历（冷 0.5~0.6s / 大页 3~3.9s）；门票三选一两连弹改用它现取坐标。★cs73（2026-11-08）：`labStatusLite` / `labSnapshot` 补 `guildId`（`LabyrinthTempData+0x1C`）—— 局内刷"已在迷宫里要不要沿用"要核对公会，否则手动开着 A 公会的局、配置是 B 公会时会直接沿用、跑完当成 B 公会的成绩。cs72（2026-11-08）：**"最上层"只剩一个实现 + 根没了不再扫全树** —— ①`_topDialogTr`（`findList(...,"top")` 的根）改为复用 `_topDialogGo`，不再自己写一遍判据（原来有 3 份实现，正是 EX 三连页多点/点错的根源）；②`_rootWalkNodes` 的遍历缓存**加校验"根是不是同一个"**（原来只看 key ⇒ `"top"` 这个根会变，1.5s 内会把上一个对话框的子树当成当前的返回）；③新增 `_walkForRoot`：**显式给了根却取不到（如当前没有对话框）⇒ 返回空，不再退化成全树**（`findList(…,"top")` 实测 2633ms → 3ms；而且全树会捞到别处的同名节点）。cs71：**读取全面"按需"** —— ①新增 `labExBtn(key)`：EX 三连页只读**要点的那个按钮** + 当前签名（不再读整包：整包会把 setting 的 4 行文字/复选框、sort 的 11 个 toggle 文字都过一遍，纯浪费）；②新增 `labExtra()`：非分派字段（eventId/questId/eventResultId/effectNum/curChoice/remainChoice + LTD choices）拆成独立读，handler 要时才调；③`labStatusLite` 补 `next`（移动分支用，一次内存读）。cs70：**EX 整包读的按钮改按字段取**（DialogFundationObject：twoLeft 0x48 / twoRight 0x58 / threeLeft 0x70 / threeCenter 0x80 / threeRight 0x98，经对话框组件 +0x118 foundationObject），**不再遍历整棵子树**（①页遍历要 350ms+）。cs69：labExEquip(full, only) 只投影要点的那个；cs68：**"当前最上层"统一成一个实现**（_topDialogGo）—— ①_exeqFind 只查**最上层那一层**、**绝不往回退**（回退会永远读到下面那层仍 active 的①页 ⇒ 签名不变 ⇒ 误判"没生效"⇒多点⇒点错按钮）；②签名里带**最上层容器名**（"页面切了"能立刻看见）。cs67：去掉 agent 侧坐标"稳定化"（Thread.sleep 堵死单通道）；cs64：_findExTopPart 组件查找缓存；cs63：labExEquipSig 轻量签名读
 // ★cs62（2026-10-22）：新增 battleSettingsStart/Poll（战斗设定只读；getter 是 IFix 模板 ⇒ 投递游戏线程执行）
 // ★JS 侧详细日志开关（2026-10-11 加）：默认关。
 //   关掉的是"每次调用都会打、但正常情况没信息量"的那几条（如 findMap 的"跳过堆扫描"、
@@ -7710,6 +7826,11 @@ rpc.exports = {
   labSelState: _rpcSafe(function () {
     try { return labSelStateSnapshot(); }
     catch (e) { return { path: "err", closing: false, ms: 0, err: String(e) }; }
+  }),
+  // ★公会选择页（263）卡列表轻读（字段直取，~9ms）：给 readCards 用，替代 findList。
+  labGuildCards: _rpcSafe(function () {
+    try { return labGuildCardsSnapshot(); }
+    catch (e) { return { ok: false, cards: [], ms: 0, err: String(e) }; }
   }),
   // ★战斗结算页"对象字段"抓取（2026-10-16）：为"从字段读按钮、彻底不扫树"备料，见 battleResultDump
   battleResultDump: _rpcSafe(function () {

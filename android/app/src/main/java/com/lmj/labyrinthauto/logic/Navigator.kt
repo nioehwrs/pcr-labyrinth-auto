@@ -407,10 +407,13 @@ object Navigator {
         return d.optInt("x") to d.optInt("y")
     }
 
-    /** 通用弹窗的"确定/关闭"按钮：名字必须在白名单里，认不出来就不点（PC 版同款） */
+    /** 通用弹窗的"确定/关闭"按钮：名字必须在白名单里，认不出来就不点（PC 版同款）。
+     *
+     *  ★2026-11-09：`dialog()` 是全量遍历（同一页 0.7s，选人面板上可达 5s），这里只需要
+     *    通用按钮白名单 ⇒ 换成字段直取的 [AgentApi.labDlgBtn]（~50ms），按钮名完全一致。 */
     private suspend fun dialogConfirmButton(): Triple<String, Int, Int>? {
-        val d = AgentApi.dialog() ?: return null
-        if (!d.optBoolean("open", false)) return null
+        val d = AgentApi.labDlgBtn("") ?: return null
+        if (d.optString("top").isBlank()) return null
         val arr = d.optJSONArray("buttons") ?: return null
         for (i in 0 until arr.length()) {
             val b = arr.optJSONObject(i) ?: continue

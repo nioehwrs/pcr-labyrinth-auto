@@ -13,6 +13,7 @@ import com.lmj.labyrinthauto.frida.RootShell
 import com.lmj.labyrinthauto.input.Foreground
 import com.lmj.labyrinthauto.input.InputBackend
 import com.lmj.labyrinthauto.logic.Navigator
+import com.lmj.labyrinthauto.logic.TapCheck
 import com.lmj.labyrinthauto.logic.party.PartyPlan
 import com.lmj.labyrinthauto.net.labyrinth.LabyrinthMapNode
 import kotlinx.coroutines.delay
@@ -142,7 +143,17 @@ object InGameReroll {
      *
      * @return true = 刷到合格开局
      */
-    suspend fun run(input: InputBackend, ctx: Context): Boolean {
+    /** 前台被切走时的中止信号（用户 2026-11-09："切应用自动中止"）。 */
+    private class AbortedException(msg: String) : Exception(msg)
+
+    suspend fun run(input: InputBackend, ctx: Context): Boolean = try {
+        runBody(input, ctx)
+    } catch (e: AbortedException) {
+        AppState.addLog("局内刷开局：${e.message} → **已中止**（不再点游戏）")
+        false
+    }
+
+    private suspend fun runBody(input: InputBackend, ctx: Context): Boolean {
         // ★局内刷初始前也关"屏幕中心加速"（2026-10-22 用户）：刷完停在选人页，不能带上一局的开关。
         CenterTapGate.reset("局内刷初始前")
         val cfg = RerollSettings.loadConfig(ctx)
@@ -190,7 +201,10 @@ object InGameReroll {
             return false
         }
 
+        aborted = false
         for (i in 1..nMax) {
+            // ★2026-11-09（用户要求）：**切应用自动中止** —— 前台不是游戏就整条链停手。
+            if (!frontOk()) return false
             lastAttempt = i                    // ★结束提示"跑了 N 轮"用（service 的 finally 读）
             AppState.addLog("局内刷开局·第 $i/$nMax 次")
             // ★悬浮窗第二格（2026-10-19 用户）：刷开局阶段写"正在刷第几轮"
@@ -237,7 +251,8 @@ object InGameReroll {
                 AppState.addLog("局内刷开局：撤退失败 → 停手")
                 return false
             }
-            delay(600)
+            // ★2026-11-09：600 → SETTLE_MS(200)。下一轮 [enterOnce] 开头还会等页面，不需要在这里多睡。
+            delay(SETTLE_MS)
         }
         AppState.addLog("局内刷开局：$nMax 次都不合格 → 停手")
         return false
@@ -365,18 +380,29 @@ object InGameReroll {
      * 点空了（没换页）就再点，最多 3 次。
      */
     private suspend fun chainStart(input: InputBackend): Int? {
-        var tries = 0
-        while (tries < 3) {
-            tries++
-            if (!tapNode(input, "labyrinth_thumb_start", "出发")) return null
-            val vid = waitView(setOf(263, 264), 4_000L)
-            if (vid == 263 || vid == 264) {
-                AppState.addLog("局内刷开局：链A（出发）完成 → 出口 viewId=$vid")
-                return vid
-            }
-            AppState.addLog("局内刷开局：链A：点了出发没换页（viewId=$vid）→ 再点一次（第 $tries/3 次）")
+        val b = findBtn("labyrinth_thumb_start", FIND_MS)
+        if (b == null) {
+            AppState.addLog("局内刷开局：${FIND_MS / 1000}s 内没找到「出发」")
+            return null
         }
-        AppState.addLog("[✗] 链A：连点 3 次「出发」都没离开 259")
+        // ★2026-11-09：统一走 [tapToView]（= TapCheck）—— 点完只认"页面真的变了"，
+        //   点空立刻重试（原来 `tapNode` + `waitView(4s)` 点空要白等 4 秒）。
+        val ok = tapToView(
+            input,
+            b.optInt("x"),
+            b.optInt("y"),
+            "出发",
+            from = Navigator.TARGET_VIEW,
+            expect = setOf(263, 264),
+            expectTimeoutMs = 4_000L,
+            retries = 3,
+        )
+        val vid = Navigator.currentViewId()
+        if (ok) {
+            AppState.addLog("局内刷开局：链A（出发）完成 → 出口 viewId=$vid")
+            return vid
+        }
+        AppState.addLog("[✗] 链A：连点 3 次「出发」都没离开 ${Navigator.TARGET_VIEW}（viewId=$vid）")
         return null
     }
 
@@ -422,6 +448,7 @@ object InGameReroll {
         var unknownSaid = false
         var looseHits = 0
         while (SystemClock.elapsedRealtime() - t0 < timeoutMs) {
+            if (!frontOk()) return false
             val q = AgentApi.labCharaPageQuick()
             val mx = q?.optJSONObject("buttons")?.optJSONObject("map")?.optInt("x", -1) ?: -1
             if (q?.optBoolean("ok") == true && mx > 0) {
@@ -445,9 +472,14 @@ object InGameReroll {
             } else {
                 looseHits = 0
             }
-            val d = AgentApi.dialog()
-            if (d?.optBoolean("open") == true) {
-                val a = d.optJSONArray("buttons")
+            // ★2026-11-09：`dialog()` 在选人面板（DialogCommonFullSize）上实测 **5004ms**，
+            //   而这里是 200ms 一拍 ⇒ 直接把 agent 单通道堵死（viewId 3s 超时 → 判掉线 →
+            //   反复原地重注入，最后一局都没跑起来）。这里只需要「顶框 + 白名单按钮坐标」，
+            //   用字段直取的 labDlgBtn（~50ms）完全等价。
+            val d = AgentApi.labDlgBtn("")
+            val dlgTop = d?.optString("top").orEmpty()
+            if (dlgTop.isNotEmpty()) {
+                val a = d?.optJSONArray("buttons")
                 var hit: JSONObject? = null
                 if (a != null) {
                     for (i in 0 until a.length()) {
@@ -455,14 +487,22 @@ object InGameReroll {
                         if (whitelist.contains(b.optString("name"))) { hit = b; break }
                     }
                 }
-                if (hit != null && taps < 10) {
+                if (hit != null && taps < 16) {
                     taps++
+                    // ★★2026-11-09（和"三选一"同一思路）：**每次都点，坐标用这一拍现读的**。
+                    //   弹窗展开动画里读到的坐标会漂（实测 y 944→960）⇒ 第一下会点空；
+                    //   但**下一拍重读就是新坐标**，直接补点即可 —— 不需要"先等坐标稳定"（白等 200ms）。
+                    //   点完只探 450ms：**检测到"开始关闭"就停**，没关就下一拍重取坐标再点。
                     AppState.addLog(
-                        "局内刷开局：链C·关掉一层「${hit.optString("name")}」" +
+                        "局内刷开局：链C·点掉一层「${hit.optString("name")}」" +
                             "(${hit.optInt("x")},${hit.optInt("y")})",
                     )
                     input.tap(hit.optInt("x"), hit.optInt("y"))
-                    delay(400)
+                    awaitUntil(450L) {
+                        val c = AgentApi.labDlgClosing()
+                        c == null || c.optBoolean("closing", false) ||
+                            c.optString("top").orEmpty() != dlgTop
+                    }
                     continue
                 }
                 if (hit == null && !unknownSaid) {
@@ -480,7 +520,7 @@ object InGameReroll {
                 AppState.addLog(
                     "[!] 链C：顶框=$top 但读不出面板（labCharaPageQuick.ok=${q?.optBoolean("ok")}" +
                         " err=${q?.optString("err")} node=${q?.optString("node")}" +
-                        " dialog.open=${d?.optBoolean("open")}）→ 只等不点",
+                        " dialog.top=$dlgTop）→ 只等不点",
                 )
             }
             delay(POLL_MS)
@@ -501,13 +541,105 @@ object InGameReroll {
      */
     private suspend fun tapStartConfirm(input: InputBackend): Boolean {
         waitStable("StartButton")
-        for (t in 1..3) {
-            if (!tapNode(input, "StartButton", "确认出发")) return false
-            val v = waitView(setOf(264), 4_000L)
-            if (v == 264) return true
-            AppState.addLog("局内刷开局：点了确认出发还在公会页（viewId=$v）→ 再点一次（第 $t/3 次）")
+        val b = findBtn("StartButton", 2_000L) ?: return false
+        // ★2026-11-09：统一走 [tapToView]，并用「确认框开始消失」判这一下生效
+        //   （弹窗是本地的先关，比 viewId 变早）⇒ 点空立刻重试，不再死等 4s。
+        return tapToView(
+            input,
+            b.optInt("x"),
+            b.optInt("y"),
+            "确认出发",
+            from = 263,
+            expect = setOf(264),
+            dialogClosing = true,
+            expectTimeoutMs = 5_000L,
+            retries = 3,
+        )
+    }
+
+    /**
+     * ★2026-11-09：通用"等状态成立"——每 [POLL_MS] 试一次 [cond]，成立就立刻返回。
+     *
+     * 专门用来替代"点完固定睡 400ms"这类无用等待：能轮询的一律轮询（见文件头注释的口径），
+     * 状态早就成立时是 **0 等待**，没成立时最多等到 [timeoutMs]（不比原来差）。
+     */
+    private suspend fun awaitUntil(timeoutMs: Long, cond: suspend () -> Boolean): Boolean {
+        val t0 = SystemClock.elapsedRealtime()
+        while (true) {
+            if (cond()) return true
+            if (SystemClock.elapsedRealtime() - t0 >= timeoutMs) return false
+            delay(POLL_MS)
         }
-        return false
+    }
+
+    /**
+     * ★2026-11-09：刷开局的「点一下 → 等页面转移」统一走 [TapCheck]（和迷宫主循环同一套语义），
+     * 不再手写 `tapNode` + `waitView(4~6s)` —— 那样点空也要死等超时。
+     *
+     *  · **阶段 1**：点完按 probe 节奏探"页面变了没"；[dialogClosing] = true 时改看
+     *    「弹窗开始消失」（`labDlgClosing`，本地的，比 viewId 变还早）
+     *    ⇒ 点空会**立刻重试**（retries），点到了立刻停手。
+     *  · **阶段 2**：只等目标页出现（`expectTimeoutMs`）。
+     *
+     * @param from 点击前的 viewId
+     * @param expect 期望到达的 viewId 集合
+     * @param dialogClosing 这次点击是"关一个弹窗" ⇒ 用「窗口开始消失」判生效
+     */
+    private suspend fun tapToView(
+        input: InputBackend,
+        x: Int,
+        y: Int,
+        what: String,
+        from: Int,
+        expect: Set<Int>,
+        dialogClosing: Boolean = false,
+        expectTimeoutMs: Long = 5_000L,
+        retries: Int = 3,
+    ): Boolean {
+        val fromS = from.toString()
+        val expectS = expect.map { it.toString() }.toSet()
+        return TapCheck.run(
+            tapFn = { tx, ty, _ ->
+                // ★2026-11-09：切应用就停手（返回 false ⇒ TapCheck 不会再补点）
+                if (!frontOk()) {
+                    false
+                } else {
+                    AppState.addLog("局内刷开局：点「$what」($tx,$ty)")
+                    input.tap(tx, ty) is com.lmj.labyrinthauto.input.InputResult.Ok
+                }
+            },
+            x = x,
+            y = y,
+            what = what,
+            from = setOf(fromS),
+            expect = expectS,
+            // ★2026-11-09：重试节奏收紧 —— 原来 200×4=0.8s 才补点，用户实测"第二次点击明显慢"。
+            //   现在 150/300/450ms 三拍没反应就补点（≈0.45s，用户要的 0.5s 量级）；
+            //   命中路径不受影响（第 1~2 拍就停手）。
+            settleMs = 150L,
+            probe = 3,
+            probeMs = 150L,
+            retries = retries,
+            expectTimeoutMs = expectTimeoutMs,
+            readTop = { Navigator.currentViewId().toString() },
+            probeState = {
+                val v = Navigator.currentViewId().toString()
+                var closed = false
+                var diag = ""
+                if (dialogClosing) {
+                    val c = AgentApi.labDlgClosing()
+                    if (c != null) {
+                        closed = c.optBoolean("closing", false) || c.optString("top").isEmpty()
+                        // ★2026-11-09（诊断）：`Probe.diag` 会进 `⏱ probe` 轨迹日志 ——
+                        //   用来确认「选人面板 DialogCommonFullSize」关闭时有没有比"顶框变空"
+                        //   更早的可读信号（`proc`=isProcess / `st`=tween.mStarted / `f`=mFactor）。
+                        diag = "proc=${c.optInt("proc")} st=${c.optInt("started")} " +
+                            "f=${c.optDouble("factor")} top=${c.optString("top")}"
+                    }
+                }
+                TapCheck.Probe(v, v != fromS || closed, diag)
+            },
+        )
     }
 
     /** 等 viewId 变成 [want] 里的任意一个（超时返回当前值）。 */
@@ -532,77 +664,157 @@ object InGameReroll {
      */
     private suspend fun selectGuild(input: InputBackend, guildId: Int): Boolean {
         val want = GUILD_CN[guildId] ?: return false
-        // 上一局为选靠后的公会拖过列表 ⇒ 先拖回最左，保证"第 N 张 = 第 N 个公会"
-        if (guildListScrolled) {
-            input.swipe(450, 605, 1_450, 605, 500)
-            guildListScrolled = false
-            delay(400)                                   // 等列表惯性停住（拖完立刻读会读到旧位置）
+
+        // ① 先看**当前位置**有没有（列表会保持上次选公会的大致位置，常常一读就中）
+        var btns = readCards()
+        findGuildCard(btns, want)?.let { return tapGuildCard(input, it, want) }
+
+        // ② 不在可见区 ⇒ 先**往右拖到最左**（左边可能还有被推出的卡）。
+        //    ★2026-11-09 用户："没有左划可能是个漏洞" —— 以前只会往左翻，
+        //    列表停在右边、目标在左边时永远找不到。这里先回最左，再统一往左翻。
+        var backSteps = 0
+        while (backSteps++ < 12) {
+            if (!frontOk()) return false
+            val leftmost = btns.minOfOrNull { it.optInt("x", 9999) } ?: 9999
+            if (leftmost <= 350) break                    // 已经到最左（第一张 x≈287）
+            AppState.addLog(
+                "局内刷开局：「$want」不在可见区 → 往右拖回左边" +
+                    "（最左 x=$leftmost，可见=${namesBrief(btns)}）",
+            )
+            input.swipe(450, 605, 1_450, 605, 500)        // 内容右移 = 露出左边
+            delay(300)
+            btns = readCards()
+            findGuildCard(btns, want)?.let { return tapGuildCard(input, it, want) }
         }
-        var scrolled = 0
-        for (round in 1..12) {
-            // ★必须**按屏幕横坐标排序**再取第 guildId 张（2026-10-19 修）：
-            //   `findList` 返回的是 DFS 顺序，实测是**从右往左**（1907→1367→827→286），
-            //   直接按下标取会选错公会（要第 3 个「咲恋救济院」，结果点了第 2 张卡 = 827）。
-            val btns = readCards()
-            val idx = guildId - 1 - scrolled
-            if (idx in btns.indices) {
-                val b = btns[idx]
-                AppState.addLog("局内刷开局：选公会「$want」第 ${idx + 1} 张 (${b.optInt("x")},${b.optInt("y")})")
-                // ★点了要**看有没有弹确认框**：拖动后"第 N 张"可能取到只露一半的卡，
-                //   点了没反应（2026-10-19 实测 x=10 那张）⇒ 换旁边一张再试，别一路拖到底。
-                if (tapCard(input, b)) return true
-                val alt = btns.getOrNull(idx + 1) ?: btns.getOrNull(idx - 1)
-                if (alt != null) {
-                    AppState.addLog("局内刷开局：第 ${idx + 1} 张点了没反应 → 换相邻一张 (${alt.optInt("x")},${alt.optInt("y")})")
-                    if (tapCard(input, alt)) return true
-                }
-            }
-            // 顺序对不上（拖过/卡片没铺好）→ 用文字确认一次，仍不行就拖
-            if (round >= 2) {
-                val labels = AgentApi.findTextList("GuildNameLabel", max = 10)
-                val hit = firstMatch(labels) { it.optString("text").replace("\n", "").contains(want) }
-                if (hit != null) {
-                    val b = btns.minByOrNull { abs(it.optInt("x") - hit.optInt("x")) }
-                    if (b != null) {
-                        AppState.addLog("局内刷开局：选公会「$want」(${b.optInt("x")},${b.optInt("y")})")
-                        if (tapCard(input, b)) return true
-                    }
-                }
-                if (round == 2) {
-                    AppState.addLog("局内刷开局：顺序没命中（可见行=${labelsBrief(labels)}）→ 拖动公会列表")
-                }
-            }
-            // 目标卡不在屏上 → 列表往左拖一屏再找
-            input.swipe(1_450, 605, 450, 605, 500)
-            guildListScrolled = true
-            scrolled++
-            delay(400)
+
+        // ③ 从最左开始**往左翻**，逐屏找
+        var fwdSteps = 0
+        while (fwdSteps++ < 12) {
+            if (!frontOk()) return false
+            AppState.addLog("局内刷开局：「$want」不在可见区 → 往左翻（可见=${namesBrief(btns)}）")
+            input.swipe(1_450, 605, 450, 605, 500)        // 内容左移 = 露出右边
+            delay(300)
+            btns = readCards()
+            findGuildCard(btns, want)?.let { return tapGuildCard(input, it, want) }
         }
-        AppState.addLog("局内刷开局：找不到公会「$want」→ 失败")
+
+        AppState.addLog("局内刷开局：找不到公会「$want」（回拖 ${backSteps - 1} 屏 / 左翻 ${fwdSteps - 1} 屏）→ 失败")
+        return false
+    }
+
+    /** 公会名归一化：卡上实测会读成「破晓 之星」「王宫骑士团 （NIGHTMARE）」，去掉空白再比。 */
+    private fun normGuildName(s: String): String =
+        s.replace("\n", "").replace(" ", "").replace("　", "")
+
+    private fun findGuildCard(btns: List<JSONObject>, want: String): JSONObject? {
+        val w = normGuildName(want)
+        if (w.isEmpty()) return null
+        return btns.firstOrNull { normGuildName(it.optString("name")).contains(w) }
+    }
+
+    private fun namesBrief(btns: List<JSONObject>): String =
+        btns.joinToString(" ") { it.optString("name") }.take(120)
+
+    /** 点目标卡；点了没弹确认框就**重读、同一张再试**（绝不换卡 —— 相邻那张是别的公会）。 */
+    private suspend fun tapGuildCard(input: InputBackend, b: JSONObject, want: String): Boolean {
+        AppState.addLog("局内刷开局：选公会「$want」（按名字）(${b.optInt("x")},${b.optInt("y")})")
+        if (tapCard(input, b)) return true
+        AppState.addLog("局内刷开局：点了没反应 → 重读列表再试同一张（不换卡）")
+        delay(POLL_MS)
+        val b2 = findGuildCard(readCards(), want)
+        if (b2 != null) {
+            AppState.addLog("局内刷开局：重试 (${b2.optInt("x")},${b2.optInt("y")})")
+            if (tapCard(input, b2)) return true
+        }
         return false
     }
 
     /**
-     * 读公会卡片（按屏幕横坐标排好）。
+     * ★一次**原始**读取（字段直取 → 兜底 findList），**不等位置稳定**。
      *
-     * ★先等它**铺好**（2026-10-19 实测：刚进公会页那一下常只读到 0~1 张卡 ⇒
-     *   "顺序没命中（可见行=(空)）"，其实根本没读到卡，白拖一屏）。
+     * 字段直取：`labGuildCards`（实测 9ms，替代 `findList` 的 500~916ms）。
+     * 按 `W`/`H` 过滤越界卡（允许 ±60 半露）：之前只过滤左边，右边屏外的卡
+     * （实测拉比林斯 x=2447 > 1920）会被当成"可见" ⇒ 点出去白等 1.8s。
      */
-    private suspend fun readCards(): List<JSONObject> {
+    private suspend fun readCardsRaw(): List<JSONObject> {
+        val r = runCatching { AgentApi.labGuildCards() }.getOrNull()
+        val arr = r?.optJSONArray("cards")
+        if (r != null && r.optBoolean("ok") && arr != null) {
+            val w = r.optInt("W", 1920)
+            val h = r.optInt("H", 1080)
+            val out = ArrayList<JSONObject>()
+            for (i in 0 until arr.length()) {
+                val c = arr.optJSONObject(i) ?: continue
+                val cx = c.optInt("x", -9999)
+                val cy = c.optInt("y", -9999)
+                if (cx < -60 || cy < -60 || cx > w + 60 || cy > h + 60) continue
+                out.add(c)
+            }
+            if (out.size >= 2) {
+                out.sortBy { it.optInt("x") }
+                return out
+            }
+        }
+        // 兜底：全树遍历（字段直取拿不到时）
         var list = sortedByX(AgentApi.findList("DepartureButton"))
         var waited = 0L
         while (list.size < 2 && waited < 1_500L) {
-            delay(300)
-            waited += 300
+            delay(POLL_MS)
+            waited += POLL_MS
             list = sortedByX(AgentApi.findList("DepartureButton"))
         }
         return list
     }
 
+    /**
+     * ★读公会卡并**等位置稳定**（连续两次 x 差 ≤2 才返回）。
+     *
+     * ★2026-11-09 用户指出：**列表会保持上次选公会时的滚动位置**。
+     *   但刚进 263 / 拖完列表时卡池还在动画，读到的 x 是**默认值**（表现为"总是最左"）
+     *   ⇒ 和实际显示不一致，于是误判"目标不在可见区"、白拖一屏。
+     *   所以必须等两拍一致（通常多花 200ms）。
+     */
+    private suspend fun readCards(): List<JSONObject> {
+        var prev = readCardsRaw()
+        var last = prev
+        repeat(4) {
+            if (prev.size >= 2) {
+                delay(POLL_MS)
+                val cur = readCardsRaw()
+                last = cur
+                val stable = cur.size == prev.size &&
+                    cur.indices.all { abs(cur[it].optInt("x") - prev[it].optInt("x")) <= 2 }
+                prev = cur
+                if (stable) {
+                    logCards(cur)
+                    return cur
+                }
+            } else {
+                delay(POLL_MS)
+                prev = readCardsRaw()
+                last = prev
+            }
+        }
+        logCards(last)
+        return last
+    }
+
+    private fun logCards(list: List<JSONObject>) {
+        AppState.addLog(
+            "[guildCards] ${list.size} 张 " +
+                list.joinToString(" ") { "${it.optString("name")}(${it.optInt("x")})" }.take(160),
+        )
+    }
+
     /** 点一张公会卡，并等确认弹窗出来（半露的卡点了没反应 ⇒ 返回 false，让上层换一张）。 */
     private suspend fun tapCard(input: InputBackend, b: JSONObject): Boolean {
-        input.tap(b.optInt("x"), b.optInt("y"))
-        delay(400)                                   // 弹窗有展开动画，立刻读会读不到
+        // ★2026-11-09：切应用就让整条链停手，不在助手窗口上乱点
+        if (!frontOk()) return false
+        // ★2026-11-09：半露卡的按钮中心可能 x<0，`input tap` 不接受负坐标 ⇒ clamp 到 >=4
+        input.tap(b.optInt("x").coerceAtLeast(4), b.optInt("y").coerceAtLeast(4))
+        // ★2026-11-09：原来这里固定睡 400ms 等弹窗展开，但 [findBtn] **本身就是轮询**的
+        //   （按钮一出现就返回）⇒ 这 400ms 是纯浪费，去掉。它只用来判断"弹窗有没有出来"，
+        //   不点它，所以坐标还没站稳也无所谓。
         return findBtn("StartButton", 2_000L) != null
     }
 
@@ -981,10 +1193,33 @@ object InGameReroll {
 
     // ────────────────────────── 读图 / 撤退 ──────────────────────────
 
+    // ────────────────────────── 中止（前台被切走）──────────────────────────
+
+    /** 前台被切走时置位（用户 2026-11-09："局内刷开局没有切应用自动中止"）。 */
+    @Volatile private var aborted = false
+
+    /**
+     * 前台还是游戏吗？不是 ⇒ 置位 [aborted] 并返回 false（调用方立刻 return）。
+     * **读不到（null）不算切走** —— 和主循环/`tap()` 的口径一致，宁可不误停。
+     */
+    private suspend fun frontOk(): Boolean {
+        // ★2026-11-09：命中后**抛异常**穿透，而不是让每层自己 `return false`。
+        //   之前只 return false，`dismissCharaPanel`/`retreat` 这类没写检查的循环会一直空转
+        //   （实测"日志里有一条中止，之后还在继续检测点地图"）。
+        if (aborted) throw AbortedException("已中止")
+        val fp = runCatching { Foreground.packageName() }.getOrNull()
+        if (fp != null && fp != GameProcess.pkg()) {
+            aborted = true
+            throw AbortedException("前台已切到 $fp")
+        }
+        return true
+    }
+
     /** 等 `labMap()` 出面板（进图后几千 ms 内就会有；最多 [timeoutMs]）。 */
     private suspend fun waitMap(timeoutMs: Long = 20_000L): List<LabyrinthMapNode>? {
         val t0 = SystemClock.elapsedRealtime()
         while (SystemClock.elapsedRealtime() - t0 < timeoutMs) {
+            if (!frontOk()) return null
             val m = AgentApi.labMap()
             val arr = m?.optJSONArray("panels")
             if (arr != null && arr.length() > 0) return parsePanels(arr)
@@ -1128,8 +1363,20 @@ object InGameReroll {
             val by = b.optInt("y", -1)
             if (bx <= 0 || by <= 0) break
             AppState.addLog("局内刷开局：点「确认撤退」($bx,$by)（dialog 报的坐标）")
-            input.tap(bx, by)
-            if (waitView(setOf(Navigator.TARGET_VIEW), 6_000L) == Navigator.TARGET_VIEW) {
+            // ★2026-11-09：走 [tapToView]，「确认框开始消失」= 这一下生效（本地，比 viewId 变早）；
+            //   retries=1 —— 外层循环会重读坐标再点（弹窗可能挪位置）。
+            val ok = tapToView(
+                input,
+                bx,
+                by,
+                "确认撤退",
+                from = Navigator.currentViewId(),
+                expect = setOf(Navigator.TARGET_VIEW),
+                dialogClosing = true,
+                expectTimeoutMs = 4_000L,
+                retries = 1,
+            )
+            if (ok) {
                 AppState.addLog("局内刷开局：已撤退回到黎明界 top")
                 return true
             }
@@ -1183,7 +1430,8 @@ object InGameReroll {
      */
     private suspend fun leaveBattlePanel(input: InputBackend): Boolean {
         // ① 取消（战斗/关卡详情里的 TwoButtonLeft = 取消）
-        val d = AgentApi.dialog()
+        // ★2026-11-09：`dialog()` 全量遍历太慢 ⇒ 用字段直取（只读 7 个通用按钮字段）。
+        val d = AgentApi.labDlgBtn("")
         val a = d?.optJSONArray("buttons")
         var cancel: JSONObject? = null
         if (a != null) {
@@ -1194,13 +1442,32 @@ object InGameReroll {
         }
         if (cancel != null) {
             AppState.addLog("局内刷开局：战斗面板 → 点「取消」(${cancel.optInt("x")},${cancel.optInt("y")})")
-            input.tap(cancel.optInt("x"), cancel.optInt("y"))
-            delay(SETTLE_MS)
+            // ★2026-11-09：走 [tapToView]，判「面板开始消失」；点空立刻补点（不再固定睡）。
+            tapToView(
+                input,
+                cancel.optInt("x"),
+                cancel.optInt("y"),
+                "取消（战斗面板）",
+                from = Navigator.currentViewId(),
+                expect = emptySet(),
+                dialogClosing = true,
+                retries = 1,
+            )
         }
         // ② 查看地图（回到 264 地图页）
-        if (tapNode(input, "MapViewModeButton", "查看地图", FIND_MS)) {
-            delay(SETTLE_MS)
-            if (waitView(setOf(264), 4_000L) == 264) return true
+        val mapBtn = findBtn("MapViewModeButton", FIND_MS)
+        if (mapBtn != null) {
+            val ok = tapToView(
+                input,
+                mapBtn.optInt("x"),
+                mapBtn.optInt("y"),
+                "查看地图",
+                from = Navigator.currentViewId(),
+                expect = setOf(264),
+                expectTimeoutMs = 4_000L,
+                retries = 2,
+            )
+            if (ok) return true
         }
         AppState.addLog("[!] 撤退⑥：战斗面板没能回到地图（${pageSig()}）→ 交回主循环重判")
         return false
@@ -1209,20 +1476,31 @@ object InGameReroll {
     /** 其他未知弹窗：只点白名单里的通用确认按钮（点掉一层就交给主循环重判）。 */
     private suspend fun clearOtherDialog(input: InputBackend): Boolean {
         val whitelist = setOf("OneButtonWhite", "TwoButtonRight", "ThreeButtonCenter", "OneButtonBlue")
-        val d = AgentApi.dialog()
+        // ★2026-11-09：同 [findConfirmButton] —— `dialog()` 全量遍历太慢（0.7~5s），换字段直取。
+        val d = AgentApi.labDlgBtn("")
         val a = d?.optJSONArray("buttons")
         if (a != null) {
             // ★一次最多连点 3 个（2026-11-4）：奖励弹窗是一串，一次只点一个会把轮次白白耗光
             for (pass in 1..3) {
-                val dd = if (pass == 1) d else AgentApi.dialog()
+                val dd = if (pass == 1) d else AgentApi.labDlgBtn("")
                 val aa = dd?.optJSONArray("buttons") ?: break
                 var hit = false
                 for (i in 0 until aa.length()) {
                     val b = aa.optJSONObject(i) ?: continue
                     if (whitelist.contains(b.optString("name"))) {
                         AppState.addLog("局内刷开局：未知面板 → 点掉「${b.optString("name")}」(${b.optInt("x")},${b.optInt("y")})")
-                        input.tap(b.optInt("x"), b.optInt("y"))
-                        delay(SETTLE_MS)
+                        // ★2026-11-09：走 [tapToView] —— 判据是「这层弹窗开始消失」（labDlgClosing），
+                        //   不再固定睡 SETTLE_MS；点空（弹窗没动）就立刻补点。
+                        tapToView(
+                            input,
+                            b.optInt("x"),
+                            b.optInt("y"),
+                            "点掉「${b.optString("name")}」",
+                            from = Navigator.currentViewId(),
+                            expect = emptySet(),
+                            dialogClosing = true,
+                            retries = 1,
+                        )
                         hit = true
                         break
                     }
@@ -1262,8 +1540,22 @@ object InGameReroll {
             val my = mp?.optInt("y", -1) ?: -1
             if (mx > 0 && my > 0) {
                 AppState.addLog("局内刷开局：选人页（顶框=$top）→ 点面板上的「地图」($mx,$my) 退回地图")
-                input.tap(mx, my)
-                if (stableTopGone(5_000L)) {
+                // ★2026-11-09：用 [tapToView] 判「面板开始消失」（本地 200~400ms）。
+                //   原来直接 `stableTopGone(5s)` 要等"完全消失 + 连续两拍"，实测多花 ~1s
+                //   —— 这就是"点地图到点撤退之间间隔较长"的来源。
+                val gone = tapToView(
+                    input,
+                    mx,
+                    my,
+                    "地图（收起选人面板）",
+                    from = Navigator.currentViewId(),
+                    expect = emptySet(),
+                    dialogClosing = true,
+                    retries = 1,
+                )
+                // ★2026-11-09：`tapToView` 命中（3 拍轮询出来的，不是单帧）就说明顶框已空，
+                //   不用再 `stableTopGone` 等"连续两拍"多花 200ms。
+                if (gone || stableTopGone(2_000L)) {
                     AppState.addLog("局内刷开局：面板已收起")
                     return true
                 }
@@ -1314,15 +1606,28 @@ object InGameReroll {
      */
     private suspend fun findConfirmButton(timeoutMs: Long = 3_000L): JSONObject? {
         val t0 = SystemClock.elapsedRealtime()
+        var lastX = -1
+        var lastY = -1
         while (SystemClock.elapsedRealtime() - t0 < timeoutMs) {
-            val d = AgentApi.dialog()
-            if (d?.optBoolean("open") == true) {
-                val a = d.optJSONArray("buttons")
-                if (a != null) {
-                    for (i in 0 until a.length()) {
-                        val b = a.optJSONObject(i) ?: continue
-                        if (b.optString("name") == "TwoButtonRight") return b
-                    }
+            // ★2026-11-09：`dialog()` 是全量遍历（同一页实测 747ms，**选人面板上 5004ms**），
+            //   放在 200ms 的轮询里会把 agent 单通道堵死 ⇒ 换字段直取的 labDlgBtn（~50ms）。
+            //   它覆盖的正是这几个通用按钮字段（TwoButtonRight / TwoButtonLeft / OneButtonWhite…）。
+            val d = AgentApi.labDlgBtn("")
+            val a = d?.optJSONArray("buttons")
+            if (a != null) {
+                for (i in 0 until a.length()) {
+                    val b = a.optJSONObject(i) ?: continue
+                    if (b.optString("name") != "TwoButtonRight") continue
+                    val x = b.optInt("x", -1)
+                    val y = b.optInt("y", -1)
+                    // ★★2026-11-09：确认框有**展开动画**，刚出现那一下投影出的坐标还在漂
+                    //   （实测 1075,647 → 稳定值 1179,744，差 ~100px）⇒ 点空，然后白等
+                    //   `waitView(259, 6000)` 六秒才重试。这里要求**连续两拍坐标一致**再返回
+                    //   （多花一拍 ~200ms，换掉那 6 秒）。
+                    if (x == lastX && y == lastY) return b
+                    lastX = x
+                    lastY = y
+                    break
                 }
             }
             delay(POLL_MS)

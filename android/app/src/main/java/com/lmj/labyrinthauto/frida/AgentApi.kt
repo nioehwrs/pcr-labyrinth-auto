@@ -491,6 +491,18 @@ object AgentApi {
     suspend fun labSelState(timeoutMs: Long = T_FAST): JSONObject? =
         obj("labSelState", timeoutMs = timeoutMs)
 
+    /**
+     * ★公会选择页（263）卡列表**轻读**（2026-11-09 定型）：字段直取，真机实测 **9ms**。
+     *
+     * 返回 `{ok, view, ltd, wrapCount, cards[], ms, err}`：
+     *   · `ltd` = `LabyrinthTempData+0xF0` 的 GuildId/Difficulty/SelectDifficulty/DifficultyMax
+     *   · `cards[]` = 每张 `PartsLabyrinthGuildSettingPlate` 的 `name`（guildNameLabel 文本）
+     *     和 `x`/`y`（departureButton 投影坐标）；**离屏卡 `x`/`y` 为 -1**
+     * 有了 `name` 就能**按名字**选公会，不用再假设"第 N 张 = 第 N 个公会"。
+     */
+    suspend fun labGuildCards(timeoutMs: Long = T_FAST): JSONObject? =
+        obj("labGuildCards", timeoutMs = timeoutMs)
+
     /** 第一个"屏内+激活+名字匹配"的节点：`{name,x,y}`；找不到 null */
     suspend fun find(nameRe: String): JSONObject? = obj("find", listOf(nameRe), T_SLOW)
 

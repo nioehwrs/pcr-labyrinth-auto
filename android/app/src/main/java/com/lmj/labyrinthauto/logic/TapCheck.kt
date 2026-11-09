@@ -170,8 +170,14 @@ object TapCheck {
         //   "离开前一个页面就结束点击，但要等到后一个页面出现，才算状态机完成"（2026-11-07 用户）
         val t0 = android.os.SystemClock.elapsedRealtime()
         while (android.os.SystemClock.elapsedRealtime() - t0 < expectTimeoutMs) {
-            // ① 窗口名（便宜、准）
-            val t = runCatching { AgentApi.labTop() }.getOrNull() ?: ""
+            // ① 目标页（便宜、准）。★2026-11-09：调用方给了 `readTop` 就用它 ——
+            //   刷开局那套用的是 **viewId**（`259/263/264`），和窗口名是两套口径；
+            //   没给就还是原来的窗口名。
+            val t = if (readTop != null) {
+                runCatching { readTop() }.getOrDefault(unknownTop)
+            } else {
+                runCatching { AgentApi.labTop() }.getOrNull() ?: ""
+            }
             if (t in expect) {
                 if (verbose) {
                     AppState.addLog(
