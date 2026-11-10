@@ -861,7 +861,10 @@ class AutoForegroundService : Service() {
         var lastPkg: String? = null
         while (true) {                       // 取消靠 delay() 抛 CancellationException（scope.cancel()）
             delay(WATCH_INTERVAL_MS)
-            val pkg = Foreground.packageName()
+            // ★2026-11-10：心跳必须**现查**（不走 2s TTL 缓存）—— 它是"切屏锁存"最稳的
+            //   实时来源。局内刷开局期间点击不走 MazeLoop.tap，光靠 frontOk() 的缓存读法，
+            //   切走后又恰好被自愈顶回游戏就会漏判（雷电 9 实测）。
+            val pkg = Foreground.packageName(force = true)
             if (pkg != lastPkg) {
                 lastPkg = pkg
                 AppState.addLog("前台切换 → ${pkg ?: "?"}")

@@ -22,12 +22,16 @@ import com.lmj.labyrinthauto.frida.AgentApi
 import com.lmj.labyrinthauto.frida.AgentBridge
 import com.lmj.labyrinthauto.frida.FridaInjector
 import com.lmj.labyrinthauto.frida.GameProcess
+import com.lmj.labyrinthauto.frida.RootShell
 import com.lmj.labyrinthauto.input.Foreground
 import com.lmj.labyrinthauto.input.InputBackend
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.async
 import org.json.JSONArray
 import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
  * **迷宫内状态机（P5 骨架）** —— 形状逐条对应 PC 版 `pcr_auto.py` 的 `maze_loop`(5900)：
@@ -6322,10 +6326,43 @@ object MazeLoop {
         //   实测问题：奖励页出来了、分数却是空的 —— 因为 ②屏的 UI 文本没赶上（CountUp 滚动/换屏太快），
         //   而奖励走的是 LTD 内存。这里在离开这页之前把 LTD.ResultInfo 的总分落下来，避免整局白跑。
         if (label == "关闭") maybeFillScoreFromLtd("关闭前")
+        // ★2026-11-10（用户要求）：**按钮已经定位、即将按下**的这一刻，先把分数屏截一张图留证，
+        //   然后再按按钮进下一步（不是刚进页面就截：那时 CountUp 可能还在滚、按钮也还没落位）。
+        //   只截 ②屏（CLEAR + 总分，按钮是「关闭」）；①屏「加入的角色」没有分数，不截。
+        if (label == "关闭") captureScoreShot(score)
         tries["$tag|rtaps"] = taps0 + 1
         AppState.addLog("迷宫结算：点了「$label」(${p.first},${p.second})")
         tap(input, p.first, p.second, "结算·$label", learnKey = "settle|result")
         delay(1_200)
+    }
+
+    /**
+     * ★2026-11-10（用户要求）：结算**分数屏**留证截图。
+     *
+     * 时机：**按钮已定位、即将按下**的那一刻（调用点在 [handleLabResult] 的 tap 之前）——
+     * 不是刚进页面：那时 CountUp 可能还在滚、按钮也还没落位。
+     * 范围：只对 ②屏（CLEAR + 总分，按钮是「关闭」）；①屏「加入的角色」没有分数，不截。
+     * 存放：**模拟器的系统截图目录** `/sdcard/Pictures/Screenshots/` —— 雷电等模拟器会把它映射到
+     *   电脑的共享文件夹（和系统截图摆在一起），不用再从 App 私有目录 `adb pull`。
+     *   文件名 `score_<总分>_<时间>.png`；用 root 写 + `stat` 校验，绕开 App 在公共存储上的权限差异。
+     * 失败只记一行，**不影响点按流程**。
+     */
+    private suspend fun captureScoreShot(score: String) {
+        val safeScore = score.filter { it.isDigit() }.ifEmpty { "x" }
+        val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val dir = "/sdcard/Pictures/Screenshots"
+        val path = "$dir/score_${safeScore}_$ts.png"
+        val t0 = SystemClock.elapsedRealtime()
+        // 一条命令做完：建目录 → 截 PNG → 用 stat 报大小（screencap 本身不输出）
+        val r = RootShell.exec("mkdir -p $dir; screencap -p $path; stat -c %s $path", 8_000L)
+        val ms = SystemClock.elapsedRealtime() - t0
+        val size = r.out.lineSequence().map { it.trim() }.lastOrNull { it.isNotEmpty() }
+            ?.toLongOrNull() ?: 0L
+        if (r.exit == 0 && size > 0L) {
+            AppState.addLog("迷宫结算：分数截图已存 $path（${size / 1024}KB，${ms}ms）")
+        } else {
+            AppState.addLog("[!] 分数截图失败（exit=${r.exit}，${ms}ms）${r.text.take(80)}")
+        }
     }
 
     /**

@@ -3,6 +3,7 @@ package com.lmj.labyrinthauto.input
 import android.os.Build
 import android.os.SystemClock
 import com.lmj.labyrinthauto.core.AppState
+import com.lmj.labyrinthauto.frida.FridaInjector
 import com.lmj.labyrinthauto.frida.RootShell
 
 /**
@@ -49,6 +50,42 @@ import com.lmj.labyrinthauto.frida.RootShell
  */
 object Foreground {
 
+    /**
+     * ★2026-11-10 雷电 9 实测：切屏自动停失效的两个原因
+     *  ① 服务自愈在用户切到助手约 2s 后把游戏**重新顶回前台** ⇒ `frontOk()` 再查又是游戏，
+     *     "切走过"这件事被洗掉了（日志：前台切换→助手 → 已调起游戏 → 前台切换→游戏）；
+     *  ② 撤退链那个 30s 长循环里没有前台检查点，一直在"未知面板点不掉"空转。
+     * ⇒ 这里做**锁存**：本次运行只要明确读到一次"前台不是游戏"就记住，直到运行结束；
+     *   同时立刻关掉自愈总闸，别再把游戏拉回来。读不到(null) 仍按老口径不算切走。
+     *   `armSwitchWatch` 只在"游戏已在前台、启动/导航都完成"之后调用，避免把启动阶段
+     *   （前台本来就是助手，脚本还要自己把游戏顶起来）误判成用户切屏。
+     */
+    @Volatile private var armedGamePkg: String? = null
+    @Volatile private var switchedAwayPkg: String? = null
+
+    /** 开闸：从现在起前台必须是游戏（调用点保证此刻游戏已在前台）。 */
+    fun armSwitchWatch(gamePkg: String) {
+        armedGamePkg = gamePkg
+        switchedAwayPkg = null
+    }
+
+    /** 收闸：一次运行结束（正常/中止都调），之后随便切应用都不再记账。 */
+    fun disarmSwitchWatch() {
+        armedGamePkg = null
+        switchedAwayPkg = null
+    }
+
+    /** 本次运行是否曾切走；非 null = 切到的那个包名。 */
+    fun switchedAway(): String? = switchedAwayPkg
+
+    private fun noteFocus(pkg: String?) {
+        val game = armedGamePkg ?: return
+        if (pkg == null || pkg == game || switchedAwayPkg != null) return
+        switchedAwayPkg = pkg
+        FridaInjector.autoRecover = false
+        AppState.addLog("停手：前台已切到 $pkg → 本次运行中止（不再把游戏拉回前台）")
+    }
+
     /** TTL 缓存：没缓存等于每轮起一个 `su dumpsys`（≈0.1~0.5s）。
      *
      *  ★2026-11-09：500ms → 2000ms。原因：编组页连点间隔约 300ms，500ms 的 TTL 意味着
@@ -71,8 +108,12 @@ object Foreground {
      *               高频连点（[MazeLoop.tap]）用默认值走缓存，否则每 2 下就要多花 0.1~0.5s。 */
     suspend fun packageName(force: Boolean = false): String? {
         val now = SystemClock.elapsedRealtime()
-        if (!force && now - cachedAt < TTL_MS) return cachedPkg
+        if (!force && now - cachedAt < TTL_MS) {
+            noteFocus(cachedPkg)          // 缓存命中也过一遍锁存（零成本，只是几个判断）
+            return cachedPkg
+        }
         val pkg = readFocusPkg()
+        noteFocus(pkg)
         cachedPkg = pkg
         cachedAt = now
         return pkg
@@ -104,57 +145,66 @@ object Foreground {
      *    `TaskUtils.shouldIgnoreDesktopHomeOcclusion`（desktop windowing 的 15 新代码）把 system_server
      *    打崩；**Android 12 没有这段代码**，实测安全。所以这里严格按 SDK 分流，绝不在 15 上回退。
      *
-     *  ⚠两条都失败时**只返回 null**（不点），绝不回退到 `dumpsys activity`。
+     *  · ★2026-11-10 雷电 Android 9（SDK 28）：连 `FocusedWindows:` 段都没有，
+     *    `dumpsys window displays` 里也**没有** `mCurrentFocus`（那字段只在 `dumpsys window`
+     *    顶层输出里），但 `dumpsys input` 有 `FocusedWindow: name='Window{… pkg/Activity}'`。
+     *    ⇒ 在 WMS 回退之前先补这一条（同样来自 InputManagerService、不碰任务树，实测 ~40ms），
+     *    否则前台永远读不到 ⇒ 局内刷开局「20s 内没切到游戏前台」直接停手。
+     *
+     *  ⚠全部读不到时**只返回 null**（不点），绝不回退到 `dumpsys activity`。
+     *  ⚠SDK 35+ 只跑 `dumpsys input`，绝不碰 window/任务树（见文件头崩溃栈）。
      */
     private suspend fun readFocusPkg(): String? {
-        // 本机已经确定用哪条源之后，就只跑那一条（少起一次 su）
-        if (!useWindowSource) {
-            val out = RootShell.exec(CMD_INPUT, 8_000L).out
-            val name = FOCUS_NAME.find(out)?.groupValues?.getOrNull(1)
-            if (name != null) {
-                COMPONENT.find(name)?.groupValues?.getOrNull(1)?.let { return it }
-            }
-            // ★2026-11-09 用户报障（伊丽莎白 / Android 14 / REDMI 25060RK16C）：
-            //   那台 SDK 34 的 `dumpsys input` **也没有 FocusedWindows 段** ⇒ 前台永远读不到
-            //   ⇒ 主循环"本轮不点" → 20s 超时 → 连撞 3 次停手
-            //   （用户："点击一键黎明界，只打开游戏，没有点击动作"）。
-            //   所以回退条件从 `<= 32` 放宽到 `<= 34`（Android 14 及以下）。
-            //   **SDK 35+ 仍然不回退** —— Android 15 的 `dumpsys window displays` 会踩
-            //   `TaskUtils.shouldIgnoreDesktopHomeOcclusion` 把 system_server 打崩（见方法注释）。
+        // 命中过一次就只跑那一条（少起一次 su）；没命中就按优先级依次试
+        val candidates: List<String> = chosenCmd?.let { listOf(it) } ?: buildList {
+            add(CMD_INPUT)
             if (Build.VERSION.SDK_INT <= 34) {
-                useWindowSource = true
-                AppState.addLog(
-                    "前台判定：本机 dumpsys input 取不到焦点窗口（Android ${Build.VERSION.SDK_INT}）" +
-                        "→ 改用 dumpsys window displays 的 mCurrentFocus（15 及以上不走这条）",
-                )
-            } else {
-                val now = System.currentTimeMillis()
-                if (now - lastMissLogAt > LOG_EVERY_MS) {
-                    lastMissLogAt = now
-                    AppState.addLog(
-                        "前台读不到（dumpsys input" +
-                            (if (name != null) "：焦点窗口名「$name」不含组件名" else "：没有 FocusedWindows") +
-                            "）→ 本轮不点",
-                    )
-                }
-                return null
+                add(CMD_INPUT_FOCUSED)
+                add(CMD_WINDOW)
             }
         }
-        val w = RootShell.exec(CMD_WINDOW, 8_000L).out
-        COMPONENT.find(w)?.groupValues?.getOrNull(1)?.let { return it }
+        for (cmd in candidates) {
+            val out = RootShell.exec(cmd, 8_000L).out
+            // dumpsys input 的焦点行是 name='Window{… pkg/Activity}'；
+            // dumpsys window displays 那行没有 name=，直接整行找组件名。
+            val name = FOCUS_NAME.find(out)?.groupValues?.getOrNull(1)
+            val pkg = COMPONENT.find(name ?: out)?.groupValues?.getOrNull(1)
+            if (pkg != null) {
+                if (chosenCmd != cmd) {
+                    chosenCmd = cmd
+                    AppState.addLog(
+                        "前台判定：本机命中 ${srcLabel(cmd)}（Android ${Build.VERSION.SDK_INT}）",
+                    )
+                }
+                return pkg
+            }
+        }
         val now = System.currentTimeMillis()
         if (now - lastMissLogAt > LOG_EVERY_MS) {
             lastMissLogAt = now
-            AppState.addLog("前台读不到（dumpsys window displays：没有 mCurrentFocus）→ 本轮不点")
+            AppState.addLog("前台读不到（焦点窗口/组件名都没读到）→ 本轮不点")
         }
         return null
     }
 
-    /** 本机是否改用 WMS 焦点源（Android 12 及以下；试出来一次就记住） */
-    @Volatile private var useWindowSource = false
+    private fun srcLabel(cmd: String): String = when (cmd) {
+        CMD_INPUT -> "dumpsys input 的 FocusedWindows"
+        CMD_INPUT_FOCUSED -> "dumpsys input 的 FocusedWindow"
+        else -> "dumpsys window displays 的 mCurrentFocus"
+    }
+
+    /** 本机命中的焦点命令（试出来一次就记住，之后只跑这一条） */
+    @Volatile private var chosenCmd: String? = null
 
     /** 只取焦点窗口那几行：`FocusedWindows:` 之后 3 行内就有 name（全量 dump 没必要，也省时间）。 */
     private const val CMD_INPUT = "dumpsys input | grep -A3 -m1 FocusedWindows"
+
+    /**
+     * ★2026-11-10 雷电 Android 9：`FocusedWindows:` 段不存在、`dumpsys window displays`
+     * 里也没有 `mCurrentFocus`，但这一行有组件名。同样来自 InputManagerService，
+     * 不碰任务树，比不带参数的 `dumpsys window` 安全也快（实测 ~40ms）。
+     */
+    private const val CMD_INPUT_FOCUSED = "dumpsys input | grep -m1 'FocusedWindow:'"
 
     /** 备用源（Android 14 及以下）：`mCurrentFocus=Window{… u0 包名/Activity}`。
      *  ★2026-11-09：有些 ROM/版本用 `mFocusedWindow`，两个都匹配（只取第一行）。 */

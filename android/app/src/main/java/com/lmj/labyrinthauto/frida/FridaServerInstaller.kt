@@ -235,7 +235,10 @@ object FridaServerInstaller {
     private suspend fun launch(port: Int): Boolean {
         RootShell.exec("chmod 755 $DEVICE_PATH", 8_000L)
         AppState.addLog("启动运行组件（root）：-l 0.0.0.0:$port -D")
-        RootShell.exec("$DEVICE_PATH -l 0.0.0.0:$port -D", 20_000L)
+        val start = RootShell.exec("$DEVICE_PATH -l 0.0.0.0:$port -D", 20_000L)
+        AppState.addLog(
+            "启动命令 exit=${start.exit} 输出：${redact(start.text.take(300)).ifBlank { "（空）" }}",
+        )
         repeat(25) {
             delay(400)
             if (portOpen(port)) {
@@ -243,7 +246,16 @@ object FridaServerInstaller {
                 return true
             }
         }
-        AppState.addLog("等不到运行组件端口（看是不是 root 被拒了）")
+        // ★诊断（2026-11-10）：雷电 Android 9 上设备侧端口明明在 LISTEN，portOpen 却一直 false。
+        //   portOpen 内部把异常吞了，这里在失败时单独连一次并把真实原因写进日志，便于定位
+        //   「连不上」到底是超时、拒绝还是权限，以及区分「启动慢于 10s 窗口」。
+        val why = withContext(Dispatchers.IO) {
+            runCatching {
+                Socket().use { it.connect(InetSocketAddress("127.0.0.1", port), 2_000) }
+                "复核时其实通了（只是启动慢于 10s 窗口）"
+            }.getOrElse { t -> "${t.javaClass.simpleName}: ${t.message}" }
+        }
+        AppState.addLog("等不到运行组件端口：$why")
         return false
     }
 
@@ -445,10 +457,18 @@ object FridaServerInstaller {
         return text.contains(local.length().toString())
     }
 
-    private fun portOpen(port: Int): Boolean = runCatching {
-        Socket().use { it.connect(InetSocketAddress("127.0.0.1", port), 800) }
-        true
-    }.getOrDefault(false)
+    /**
+     * ★2026-11-10：必须在 [Dispatchers.IO] 上跑。抓凭证是从 Compose 的
+     * `rememberCoroutineScope()`（主线程）一路调进来的，原来直接在主线程 `Socket.connect()`
+     * ⇒ StrictMode 抛 `NetworkOnMainThreadException`，又被 `runCatching` 吞成 false
+     * ⇒ 设备侧端口明明在 LISTEN，App 却永远判"没通"，抓凭证在 ensureServer 就中止。
+     */
+    private suspend fun portOpen(port: Int): Boolean = withContext(Dispatchers.IO) {
+        runCatching {
+            Socket().use { it.connect(InetSocketAddress("127.0.0.1", port), 800) }
+            true
+        }.getOrDefault(false)
+    }
 
     /**
      * 能不能"顺手"下载（WiFi / 有线 / 系统标注的不计费网络；移动流量留给"真正开跑时"）。

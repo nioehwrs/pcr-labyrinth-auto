@@ -151,6 +151,9 @@ object InGameReroll {
     } catch (e: AbortedException) {
         AppState.addLog("局内刷开局：${e.message} → **已中止**（不再点游戏）")
         false
+    } finally {
+        // 一次运行结束就收闸，别把"切屏"记到下一局去
+        Foreground.disarmSwitchWatch()
     }
 
     private suspend fun runBody(input: InputBackend, ctx: Context): Boolean {
@@ -202,6 +205,10 @@ object InGameReroll {
         }
 
         aborted = false
+        // ★2026-11-10：启动/导航都结束、游戏确实在前台了才开切屏闸门 ——
+        //   从这一刻起，任何一次前台读取只要明确读到"不是游戏"就锁存，直到本次运行结束；
+        //   放这么晚是为了不把启动阶段（前台本来是助手、脚本自己还要把游戏顶起来）误判成切屏。
+        Foreground.armSwitchWatch(GameProcess.pkg())
         for (i in 1..nMax) {
             // ★2026-11-09（用户要求）：**切应用自动中止** —— 前台不是游戏就整条链停手。
             if (!frontOk()) return false
@@ -733,29 +740,31 @@ object InGameReroll {
      * ★一次**原始**读取（字段直取 → 兜底 findList），**不等位置稳定**。
      *
      * 字段直取：`labGuildCards`（实测 9ms，替代 `findList` 的 500~916ms）。
-     * 按 `W`/`H` 过滤越界卡（允许 ±60 半露）：之前只过滤左边，右边屏外的卡
-     * （实测拉比林斯 x=2447 > 1920）会被当成"可见" ⇒ 点出去白等 1.8s。
+     * ★2026-11-10 恢复旧判据：**半个按钮不算在屏幕内**。
+     *   36ea6f0 那次把 `W`/`H` 放宽了 ±60，还把 `onscreen=false` 的半露卡坐标照收，
+     *   ⇒「王宫骑士团」只露半张（中心 x=1907 / W=1920）也被按名字选中去点，
+     *   点在裁掉的那半边没反应，重读重试还是同一张 ⇒ 整轮刷开局失败。
+     *   现在只认 `on=true` 且**整个按钮在屏内**的卡；半露卡照旧走拖动流程等它完整露出。
      */
     private suspend fun readCardsRaw(): List<JSONObject> {
         val r = runCatching { AgentApi.labGuildCards() }.getOrNull()
+        val w = r?.optInt("W", 1920) ?: 1920
+        val h = r?.optInt("H", 1080) ?: 1080
         val arr = r?.optJSONArray("cards")
         if (r != null && r.optBoolean("ok") && arr != null) {
-            val w = r.optInt("W", 1920)
-            val h = r.optInt("H", 1080)
-            val out = ArrayList<JSONObject>()
+            val raw = ArrayList<JSONObject>()
             for (i in 0 until arr.length()) {
                 val c = arr.optJSONObject(i) ?: continue
-                val cx = c.optInt("x", -9999)
-                val cy = c.optInt("y", -9999)
-                if (cx < -60 || cy < -60 || cx > w + 60 || cy > h + 60) continue
-                out.add(c)
+                // `on` = agent 算出的「按钮中心在屏内」；中心都不在 ⇒ 半露/屏外，本来就不算
+                if (c.has("on") && !c.optBoolean("on")) continue
+                if (c.optInt("x", -9999) == -9999) continue
+                raw.add(c)
             }
-            if (out.size >= 2) {
-                out.sortBy { it.optInt("x") }
-                return out
-            }
+            val out = fullyOnScreen(raw, w, h)
+            if (out.size >= 2) return out
         }
-        // 兜底：全树遍历（字段直取拿不到时）
+        // 兜底：全树遍历（字段直取拿不到时）。findList 已按中心 onscreen 过滤，
+        // 但仍要剔掉「只露半个按钮」的卡，否则和上面那次错改一样会点空。
         var list = sortedByX(AgentApi.findList("DepartureButton"))
         var waited = 0L
         while (list.size < 2 && waited < 1_500L) {
@@ -763,7 +772,33 @@ object InGameReroll {
             waited += POLL_MS
             list = sortedByX(AgentApi.findList("DepartureButton"))
         }
-        return list
+        return fullyOnScreen(list, w, h)
+    }
+
+    /**
+     * ★「整个按钮在屏幕内」才算可见。
+     * 卡宽由相邻卡中心距推得（实测 4 张为 287/827/1367/1907 ⇒ 间距 540、半宽 270）；
+     * 中心离屏幕左右缘不足半宽 ⇒ 按钮有一半被裁掉，不算在屏幕内。
+     * 算不出间距（只剩一张卡）时退化为只看中心，与旧 `findList` 的 onscreen 判据一致。
+     */
+    private fun fullyOnScreen(list: List<JSONObject>, w: Int, h: Int): List<JSONObject> {
+        val xs = list.map { it.optInt("x", -9999) }.sorted()
+        var gap = 0
+        for (i in 1 until xs.size) {
+            val d = xs[i] - xs[i - 1]
+            if (d in 120..900 && (gap == 0 || d < gap)) gap = d
+        }
+        val half = gap / 2
+        val out = ArrayList<JSONObject>()
+        for (c in list) {
+            val cx = c.optInt("x", -9999)
+            val cy = c.optInt("y", -9999)
+            if (cx < 0 || cx > w || cy < 0 || cy > h) continue
+            if (half > 0 && (cx - half < 0 || cx + half > w)) continue
+            out.add(c)
+        }
+        out.sortBy { it.optInt("x") }
+        return out
     }
 
     /**
@@ -806,12 +841,13 @@ object InGameReroll {
         )
     }
 
-    /** 点一张公会卡，并等确认弹窗出来（半露的卡点了没反应 ⇒ 返回 false，让上层换一张）。 */
+    /** 点一张公会卡，并等确认弹窗出来（没弹 ⇒ 返回 false，让上层重读再试）。 */
     private suspend fun tapCard(input: InputBackend, b: JSONObject): Boolean {
         // ★2026-11-09：切应用就让整条链停手，不在助手窗口上乱点
         if (!frontOk()) return false
-        // ★2026-11-09：半露卡的按钮中心可能 x<0，`input tap` 不接受负坐标 ⇒ clamp 到 >=4
-        input.tap(b.optInt("x").coerceAtLeast(4), b.optInt("y").coerceAtLeast(4))
+        // ★2026-11-10：卡已经过 [fullyOnScreen] 过滤，坐标必然是屏幕内的真实按钮中心，
+        //   不再需要把负坐标 clamp 到 4（那是给半露卡擦屁股的，会把点击挪到屏幕边缘白点）。
+        input.tap(b.optInt("x"), b.optInt("y"))
         // ★2026-11-09：原来这里固定睡 400ms 等弹窗展开，但 [findBtn] **本身就是轮询**的
         //   （按钮一出现就返回）⇒ 这 400ms 是纯浪费，去掉。它只用来判断"弹窗有没有出来"，
         //   不点它，所以坐标还没站稳也无所谓。
@@ -1207,6 +1243,12 @@ object InGameReroll {
         //   之前只 return false，`dismissCharaPanel`/`retreat` 这类没写检查的循环会一直空转
         //   （实测"日志里有一条中止，之后还在继续检测点地图"）。
         if (aborted) throw AbortedException("已中止")
+        // ★2026-11-10：先看**锁存**。切屏那一瞬间可能正好卡在撤退循环里没查前台，
+        //   而服务自愈随后又把游戏顶回前台 ⇒ 只靠"现在读到谁"永远判不出切走过。
+        Foreground.switchedAway()?.let {
+            aborted = true
+            throw AbortedException("前台已切到 $it")
+        }
         val fp = runCatching { Foreground.packageName() }.getOrNull()
         if (fp != null && fp != GameProcess.pkg()) {
             aborted = true
@@ -1293,6 +1335,10 @@ object InGameReroll {
         val deadline = SystemClock.elapsedRealtime() + 30_000L
         var round = 0
         while (SystemClock.elapsedRealtime() < deadline) {
+            // ★2026-11-10：切屏闸门要放在长循环**每轮开头**。这个循环最长空转 30s，
+            //   里面全是"等 800ms 重判"，没有它的话切了屏也会一直转到超时（雷电 9 实测）。
+            //   `frontOk()` 命中锁存时抛 [AbortedException] 直接穿透到 [run]。
+            if (!frontOk()) return false
             round++
             val sc = classifyScene()
             AppState.addLog("局内刷开局：撤退前现场 = ${sceneName(sc)}（${pageSig()}）")

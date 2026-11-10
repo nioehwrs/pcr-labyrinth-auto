@@ -6,6 +6,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
 /**
@@ -146,7 +147,125 @@ object RootShell {
     /** 跑一条短命令（id / pidof / pkill 这类）。 */
     suspend fun exec(cmd: String, timeoutMs: Long = 20_000L): Exec {
         val f = cached ?: detect() ?: return Exec(-1, "", "没有可用的 su 写法（授权被拒或超时）")
-        return runWith(f, cmd, timeoutMs)
+        // ★2026-11-10：优先走**常驻 root shell**（见 [ShellSession]）。
+        //   `pm install` 那种几十秒的长命令不占 shell 通道，仍走独立 su。
+        if (shellBroken || cmd.startsWith("pm install")) return runWith(f, cmd, timeoutMs)
+        return withContext(Dispatchers.IO) {
+            shellLock.withLock {
+                val s = ensureShell(f)
+                if (s != null) {
+                    val r = runInShell(s, cmd, timeoutMs)
+                    if (r != null) return@withLock r
+                    // 超时 / 通道被污染：杀掉，下次重建（会再 su 一次），本条命令回退独立进程
+                    s.kill()
+                    shell = null
+                    AppState.addLog("常驻 root shell 没回应（${cmd.take(40)}…）→ 本条改走独立 su")
+                }
+                runWith(f, cmd, timeoutMs)
+            }
+        }
+    }
+
+    /**
+     * ★2026-11-10 雷电 9：常驻 root shell。
+     *
+     * 雷电的 su 是 **Koush Superuser**（`com.koushikdutta.superuser`）：**每执行一次 `su`**
+     * 就 broadcast 给 `SuReceiver` 并弹一条「已授予"…"超级用户权限」toast（logcat 实测
+     * `SuReceiver.onReceive → Toast.show`，运行中每 2s 一条）。MuMu 的 su 只在首次授权时
+     * 提示，所以那边正常。
+     *
+     * 这里第一次 su 就起一个**常驻 sh**，之后所有短命令写它的 stdin（用结束标记 + `$?`
+     * 拿退出码）⇒ 授权提示只弹一次；顺带省掉每条命令 fork su 的 30~80ms。
+     * 起不来（有的 su 不支持交互 sh）就**永久回退**到每次 su 的 [runWith]，功能优先。
+     * `spawn()`（frida-inject）仍走独立 su —— 它要独占 stdout 做长驻管道。
+     */
+    private class ShellSession(val p: Process) {
+        val writer = p.outputStream.bufferedWriter()
+        val lines = LinkedBlockingQueue<String>()
+        @Volatile var dead = false
+
+        init {
+            Thread {
+                runCatching { p.inputStream.bufferedReader().forEachLine { lines.put(it) } }
+                dead = true
+            }.apply { isDaemon = true }.start()
+            // shell 自己的 stderr（每条命令的 stderr 已在命令里 `2>&1` 并进 stdout）
+            Thread {
+                runCatching { p.errorStream.bufferedReader().forEachLine { lines.put(it) } }
+            }.apply { isDaemon = true }.start()
+        }
+
+        fun kill() {
+            dead = true
+            runCatching { p.destroy() }
+        }
+    }
+
+    private val shellLock = Mutex()
+    @Volatile private var shell: ShellSession? = null
+
+    /** 交互 sh 起不来/握手失败后永久置位，别再每条命令都弹一次授权框。 */
+    @Volatile private var shellBroken = false
+    private var shellSeq = 0
+
+    /** 起（或复用）常驻 sh；握手失败 ⇒ [shellBroken] 永久回退。调用前须持 [shellLock]、在 IO 线程。 */
+    private fun ensureShell(f: Form): ShellSession? {
+        shell?.takeIf { !it.dead }?.let { return it }
+        if (shellBroken) return null
+        val s = try {
+            ShellSession(ProcessBuilder(*(f.prefix + listOf("sh")).toTypedArray()).start())
+        } catch (t: Throwable) {
+            shellBroken = true
+            AppState.addLog("常驻 root shell 起不来（${t.message}）→ 回退到每条命令单独 su")
+            return null
+        }
+        return try {
+            s.writer.write("echo __LMJ_READY__\n")
+            s.writer.flush()
+            val first = s.lines.poll(3, TimeUnit.SECONDS)
+            if (first != null && first.contains("__LMJ_READY__")) {
+                shell = s
+                AppState.addLog("常驻 root shell 已建立（root 授权只提示这一次）")
+                s
+            } else {
+                s.kill()
+                shellBroken = true
+                AppState.addLog("常驻 root shell 握手失败 → 回退到每条命令单独 su（会重新弹 root 提示）")
+                null
+            }
+        } catch (t: Throwable) {
+            s.kill()
+            shellBroken = true
+            null
+        }
+    }
+
+    /** 在常驻 shell 里跑一条命令；超时/通道异常返回 null（调用方回退）。 */
+    private fun runInShell(s: ShellSession, cmd: String, timeoutMs: Long): Exec? {
+        if (s.dead) return null
+        val seq = ++shellSeq
+        val marker = "__LMJ_END_${seq}__"
+        val out = StringBuilder()
+        return try {
+            s.writer.write("{ $cmd ; } 2>&1; echo \"$marker \$?\"\n")
+            s.writer.flush()
+            val deadline = System.currentTimeMillis() + timeoutMs
+            var done: Exec? = null
+            while (true) {
+                val left = deadline - System.currentTimeMillis()
+                if (left <= 0) break
+                val line = s.lines.poll(left, TimeUnit.MILLISECONDS) ?: break
+                if (line.startsWith("$marker ")) {
+                    val code = line.removePrefix("$marker ").trim().toIntOrNull() ?: -1
+                    done = Exec(code, out.toString(), "")
+                    break
+                }
+                out.appendLine(line)
+            }
+            done
+        } catch (t: Throwable) {
+            null
+        }
     }
 
     /**

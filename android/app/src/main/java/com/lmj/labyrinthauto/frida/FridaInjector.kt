@@ -12,6 +12,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.net.InetSocketAddress
@@ -740,10 +741,13 @@ object FridaInjector {
         return FridaServerInstaller.ensure(ctx, FRIDA_SERVER_PORT)
     }
 
-    private fun portOpen(): Boolean = runCatching {
-        Socket().use { it.connect(InetSocketAddress("127.0.0.1", FRIDA_SERVER_PORT), 800) }
-        true
-    }.getOrDefault(false)
+    /** ★2026-11-10：端口探测必须走 IO 线程，主线程会被 StrictMode 拦（NetworkOnMainThreadException）。 */
+    private suspend fun portOpen(): Boolean = withContext(Dispatchers.IO) {
+        runCatching {
+            Socket().use { it.connect(InetSocketAddress("127.0.0.1", FRIDA_SERVER_PORT), 800) }
+            true
+        }.getOrDefault(false)
+    }
 
     /**
      * ★安全杀注入器（2026-10-26）：原来是裸的 `kill -9 $(cat inject.pid)`。
