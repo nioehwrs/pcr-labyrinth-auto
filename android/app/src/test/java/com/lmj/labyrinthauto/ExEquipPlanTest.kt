@@ -31,12 +31,24 @@ class ExEquipPlanTest {
     }
 
     @Test
-    fun 快照里角色当前没有该槽_不处理() {
-        // 快照有 1001/slot1，但当前完全没这个角色（角色池变了）
+    fun 快照里的角色当前一件都没装_要装回() {
+        // ★2026-11-10 用户反馈「根本没有还原」：脚本换装把 1001 的 EX 全拆光后，
+        //   `parseSnapshot` 只收非空槽 ⇒ `current` 里没有 1001。
+        //   旧代码把这种情况和"角色池变了"一起 `return@forEach` ⇒ 计划为空 ⇒ 报"已经一致"。
         val target = mapOf(1001 to mapOf(1 to 11))
         val current = mapOf(2002 to mapOf(0 to 5))
         val p = ExEquipPlan.build(target, current, alive = setOf(11, 5))
-        assertTrue(p.isEmpty)
+        assertEquals(listOf(ExEquipPlan.Change(1001, 1, 11)), p.apply)
+        assertTrue(p.remove.isEmpty())
+    }
+
+    @Test
+    fun 目标槽当前为空_也要装回() {
+        // 角色还在、只是这个槽空着（`current` 只收非空槽 ⇒ curSlots 里没有 slot1）
+        val target = mapOf(1001 to mapOf(1 to 11))
+        val current = mapOf(1001 to mapOf(0 to 5))
+        val p = ExEquipPlan.build(target, current, alive = setOf(11, 5))
+        assertEquals(listOf(ExEquipPlan.Change(1001, 1, 11)), p.apply)
     }
 
     @Test

@@ -51,19 +51,22 @@ object ExEquipPlan {
         var unchanged = 0
 
         target.toSortedMap().forEach { (uid, slots) ->
-            // ★快照里没有的角色不碰（autopcr 同款：只动快照覆盖到的角色）
-            val curSlots = current[uid] ?: return@forEach
-            slots.toSortedMap().forEach { (slot, rawTarget) ->
-                if (slot !in curSlots) return@forEach
+            // ★快照里没有的角色不碰（autopcr 同款：只动快照覆盖到的角色）。
+            // ⚠2026-11-10 修「根本没有还原」：不能因为**当前这个角色一件 EX 都没装**就跳过 ——
+            //   `parseSnapshot` 只收非空槽，脚本换装把装备拆光后 `current[uid]` 就是 null，
+            //   旧代码直接 `return@forEach` ⇒ 整个角色被跳过 ⇒ `plan` 为空 ⇒ 报"已经和记录一致"。
+            val curSlots = current[uid] ?: emptyMap()
+            slots.toSortedMap().forEach slotLoop@{ (slot, rawTarget) ->
+                // ⚠同理：**目标槽当前为空（不在 curSlots 里）正是要装回的情况**，不能跳过。
                 val targetSerial = rawTarget.coerceAtLeast(0)
                 val currentSerial = (curSlots[slot] ?: 0).coerceAtLeast(0)
                 if (targetSerial == currentSerial) {
                     unchanged++
-                    return@forEach
+                    return@slotLoop
                 }
                 if (targetSerial > 0 && targetSerial !in alive) {
                     missing.add(targetSerial)          // 装备已经不存在了
-                    return@forEach
+                    return@slotLoop
                 }
                 if (targetSerial > 0) {
                     val occupy = position[targetSerial]
