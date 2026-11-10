@@ -27,8 +27,8 @@ android {
         minSdk = 26
         targetSdk = 35
         // 0.4.0：渠道服支持 + 多账号 + 凭证加密 + 架构自检/修复
-        versionCode = 33
-        versionName = "0.6.7"
+        versionCode = 35
+        versionName = "0.6.9"
 
         // 本阶段只保证 MuMu（x86_64）。P0 没有 native 库；
         // 等 PLAN.md §4 方案 B（内嵌 libfrida-core.so）时这条才会真正生效。
@@ -61,6 +61,12 @@ android {
                 keyAlias = keystoreProps["keyAlias"] as String
                 keyPassword = keystoreProps["keyPassword"] as String
             }
+            // ★2026-11-10：补 v1 签名。minSdk=26 时 AGP 默认**只签 v2**，而 Android 9（API 28）
+            //   的 getPackageArchiveInfo 对未安装 APK 取不到 v2-only 包的签名 ⇒ 应用内更新被
+            //   UpdateChecker.verifySignature 挡住、老用户永远卡在旧版本。v1+v2 双签让老系统
+            //   也能读到证书，新系统仍走 v2（签名证书不变 ⇒ 可以覆盖升级）。
+            enableV1Signing = true
+            enableV2Signing = true
         }
     }
 

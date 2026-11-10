@@ -37,6 +37,9 @@ import java.util.concurrent.TimeUnit
  * ## 安全
  * 三道校验：① HTTPS；② `sha256`（清单里给，防传输损坏/篡改）；③ **签名摘要与本机一致**
  * （防"别人拿个同包名的恶意 APK 塞进更新源"）。
+ * ★2026-11-10：③ 在少数老系统上会「读不到」而不是「不一致」——这时只要 ② 已经把这个 APK
+ *   和官方清单逐字节对上（凭证见 hasVerifiedReceipt）就放行，免得老设备永远升不了级；
+ *   **明确读到签名且对不上仍然拒绝**。
  */
 object UpdateChecker {
 
@@ -173,11 +176,13 @@ object UpdateChecker {
             sha256Of(out).equals(info.sha256, ignoreCase = true)
         ) {
             onProgress(100, out.length(), out.length())
+            markVerified(out, info.sha256)      // 复用缓存也要留下 sha256 凭证
             return@withContext out
         }
 
         val part = File(dir, out.name + ".part")
         part.delete()
+        receiptOf(out).delete()                // 旧凭证不能跟着新下载留着
         AppState.addLog("开始下载 ${info.versionName}（约 ${info.size / 1048576}MB）…")
         try {
             val req = Request.Builder().url(info.apkUrl).header("User-Agent", "lmj-auto").build()
@@ -215,6 +220,7 @@ object UpdateChecker {
                 part.delete()
             }
             AppState.addLog("下载完成：${out.name}（${out.length() / 1048576}MB）")
+            markVerified(out, info.sha256)      // ★sha256 已与官方清单比对通过 ⇒ 留下凭证
             out
         } catch (t: Throwable) {
             part.delete()
@@ -260,11 +266,21 @@ object UpdateChecker {
     /**
      * 校验下载到的 APK 是不是**我们自己签的包**：包名一致 + 签名摘要有交集。
      * 返回 null = 通过；否则是给人看的原因。
+     *
+     * ★2026-11-10（雷电 Android 9 / API 28 实测复刻）：
+     *   这版系统上 `getPackageArchiveInfo` 对**未安装 APK** 取不到 v2-only 包的签名
+     *   （日志「本机 1 个 / 包里 0 个」），老代码一律当成"校验失败"拒绝 ⇒ 0.6.2 用户
+     *   永远升不了级。现在分三层：
+     *     ① 增加验证方式：v1/v2 两种 flag 一起要 + 多来源读签名（治本）；
+     *     ② 仍然读不到：若这个 APK 带着「与官方清单 sha256 一致」的凭证就**放行**
+     *        —— 字节级证据比签名更强，且清单来自 HTTPS 官方源；
+     *     ③ 明确读到签名且不一致 / 没有 sha256 凭证：**照样拒绝**（防投毒不放宽）。
      */
+    @Suppress("DEPRECATION")
     fun verifySignature(ctx: Context, apk: File): String? {
         val pm = ctx.packageManager
-        val flags = if (Build.VERSION.SDK_INT >= 28) PackageManager.GET_SIGNING_CERTIFICATES
-        else @Suppress("DEPRECATION") PackageManager.GET_SIGNATURES
+        val flags = PackageManager.GET_SIGNATURES or
+            (if (Build.VERSION.SDK_INT >= 28) PackageManager.GET_SIGNING_CERTIFICATES else 0)
         val theirs = runCatching { pm.getPackageArchiveInfo(apk.absolutePath, flags) }.getOrNull()
             ?: return "安装包已损坏，请重新下载"
         // ★以下失败原因都**写进日志**（排查用），界面上只给用户能看懂的一句话（2026-10-26 用户）
@@ -272,27 +288,76 @@ object UpdateChecker {
             AppState.addLog("安装包校验：包名不符（${theirs.packageName}）→ 拒绝安装")
             return "安装包不正确，已取消安装"
         }
-        val mine = runCatching { signaturesOf(pm.getPackageInfo(ctx.packageName, flags)) }.getOrDefault(emptySet())
-        val other = runCatching { signaturesOf(theirs) }.getOrDefault(emptySet())
-        if (mine.isEmpty() || other.isEmpty()) {
-            AppState.addLog("安装包校验：读不到签名（本机 ${mine.size} 个 / 包里 ${other.size} 个）→ 拒绝安装")
-            return "安装包校验没通过，已取消安装"
+        var other = runCatching { signaturesOf(theirs) }.getOrDefault(emptySet())
+        if (other.isEmpty()) {
+            // 部分 ROM 对组合 flag 不填签名 ⇒ 再单独走一次 v1 通道（v1+v2 双签包能读到）
+            other = runCatching {
+                pm.getPackageArchiveInfo(apk.absolutePath, PackageManager.GET_SIGNATURES)
+                    ?.let { signaturesOf(it) }
+            }.getOrNull().orEmpty()
         }
-        if (mine.intersect(other).isEmpty()) {
+        val mine = runCatching { signaturesOf(pm.getPackageInfo(ctx.packageName, flags)) }.getOrDefault(emptySet())
+
+        // ① 双方都读到了且没有交集 ⇒ 明确是被换了签名，拒绝（这道闸门不放宽）
+        if (mine.isNotEmpty() && other.isNotEmpty() && mine.intersect(other).isEmpty()) {
             AppState.addLog("安装包校验：签名与本机不一致（可能被改过）→ 拒绝安装")
             return "安装包校验没通过，已取消安装（请从官方渠道重新下载）"
+        }
+        // ② 读不到 ≠ 不一致：有 sha256 凭证就放行，避免老设备永远卡在旧版本
+        if (mine.isEmpty() || other.isEmpty()) {
+            if (hasVerifiedReceipt(apk)) {
+                AppState.addLog(
+                    "安装包校验：读不到签名（本机 ${mine.size} 个 / 包里 ${other.size} 个），" +
+                        "但 sha256 与官方清单一致 → 放行安装",
+                )
+                return null
+            }
+            AppState.addLog(
+                "安装包校验：读不到签名（本机 ${mine.size} 个 / 包里 ${other.size} 个），" +
+                    "且没有 sha256 凭证 → 拒绝安装",
+            )
+            return "安装包校验没通过，已取消安装"
         }
         return null
     }
 
+    /** 把 PackageInfo 里能拿到的签名摘要**全收进来**（哪个通道有就用哪个）。 */
+    @Suppress("DEPRECATION")
     private fun signaturesOf(pi: PackageInfo): Set<String> {
+        val out = LinkedHashSet<String>()
         if (Build.VERSION.SDK_INT >= 28) {
-            val si = pi.signingInfo ?: return emptySet()
-            val signers = if (si.hasMultipleSigners()) si.apkContentsSigners else si.signingCertificateHistory
-            return signers.map { sha256Of(it.toByteArray()) }.toSet()
+            runCatching {
+                pi.signingInfo?.let { si ->
+                    // ★优先「当前签名者」；signingCertificateHistory 是签名轮换历史，
+                    //   部分 ROM（含 Android 9）在单签名者时返回 null/空 ⇒ 不能只靠它。
+                    si.apkContentsSigners?.forEach { out.add(sha256Of(it.toByteArray())) }
+                    if (!si.hasMultipleSigners()) {
+                        si.signingCertificateHistory?.forEach { out.add(sha256Of(it.toByteArray())) }
+                    }
+                }
+            }
         }
-        @Suppress("DEPRECATION")
-        return (pi.signatures ?: emptyArray()).map { sha256Of(it.toByteArray()) }.toSet()
+        runCatching { pi.signatures?.forEach { out.add(sha256Of(it.toByteArray())) } }
+        return out
+    }
+
+    /** 下载时校验通过写下的 sha256 凭证（与 APK 同目录，同名 + ".sha256"）。 */
+    private fun receiptOf(apk: File): File = File(apk.parentFile, apk.name + ".sha256")
+
+    private fun markVerified(apk: File, sha256: String) {
+        val r = receiptOf(apk)
+        if (sha256.length != 64) {
+            r.delete()
+            return
+        }
+        runCatching { r.writeText(sha256.trim()) }
+    }
+
+    /** 这个 APK 是否带着「与官方清单一致」的凭证，且文件本身没被换掉。 */
+    private fun hasVerifiedReceipt(apk: File): Boolean {
+        val expected = runCatching { receiptOf(apk).readText().trim() }.getOrNull()
+            ?.takeIf { it.length == 64 } ?: return false
+        return runCatching { sha256Of(apk).equals(expected, ignoreCase = true) }.getOrDefault(false)
     }
 
     fun sha256Of(file: File): String {
