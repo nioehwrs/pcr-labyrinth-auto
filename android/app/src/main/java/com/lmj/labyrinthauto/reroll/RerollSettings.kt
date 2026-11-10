@@ -175,10 +175,13 @@ object RerollSettings {
 
     /**
      * ★状态悬浮窗开关（2026-10-17 用户）：只显示"第几局 ｜ 第几层 ｜ 当前状态"一行，不可点不交互。
-     *  默认**关**（要用户自己开；开了之后每次启动助手都会自动显示）。
+     *  ★2026-11-10（用户："授权完成后还要自己手动打开"）：默认改为**开**。
+     *    没授权时首页只显示「去授权」按钮；授权回来后 MainActivity 的 onResume / 首页的
+     *    LaunchedEffect 会自动把悬浮窗显示出来、开关也直接是开着的，不用再拨一次。
+     *    用户手动关过（写过 overlayOn=false）就一直尊重那个选择，不会被自动重开。
      */
     fun loadOverlayOn(context: Context): Boolean =
-        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getBoolean("overlayOn", false)
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getBoolean("overlayOn", true)
 
     fun saveOverlayOn(context: Context, on: Boolean) {
         context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
