@@ -110,6 +110,39 @@ class ShopPlan(
     private fun kindOf(it: JSONObject): String = shopItemKind(it.opt("rewardId")).first
 
     /**
+     * ★2026-11-10（用户反馈："清单里有一个 3★，可货架上是 3 个 1★ + 印记"）：
+     * 清单（[Quota]）是进店/刷新时算的，key 只含 `blockId|area|已刷次数` —— **不含货架内容**。
+     * 货架可能在脚本察觉之外变化（游戏自己刷新、跨局残留、刷新那一帧读到旧货架），
+     * 于是清单会指向货架上根本不存在的品类 ⇒ [pickByQuota] 一件都挑不出来、整店空手。
+     * ⇒ 只要某品类的清单数 > 货架上**可买**件数，就判"清单对不上货架"，调用方丢弃重算。
+     */
+    fun quotaFitsShelf(sh: JSONObject, q: Quota): Boolean {
+        val c = shelfKindCounts(sh)
+        return q.n1 <= (c["1★遗物"] ?: 0) && q.n2 <= (c["2★遗物"] ?: 0) &&
+            q.n3 <= (c["3★遗物"] ?: 0) && q.nb <= (c["随机印记"] ?: 0)
+    }
+
+    /** 当前货架"可买"件的品类计数（不含已售/不在货架；不排序、不跑 DP，很轻） */
+    fun shelfKindCounts(sh: JSONObject): Map<String, Int> {
+        val arr = sh.optJSONArray("items") ?: return emptyMap()
+        val m = HashMap<String, Int>()
+        for (i in 0 until arr.length()) {
+            val it = arr.optJSONObject(i) ?: continue
+            if (Py.truthy(it.opt("isSold"))) continue
+            if ((Py.num(it, "availability")?.toInt() ?: -1) != 1) continue
+            val k = kindOf(it)
+            m[k] = (m[k] ?: 0) + 1
+        }
+        return m
+    }
+
+    /** 日志用：`1★遗物×3 随机印记×2` */
+    fun shelfKindsBrief(sh: JSONObject): String {
+        val c = shelfKindCounts(sh)
+        return if (c.isEmpty()) "（无）" else c.entries.joinToString(" ") { "${it.key}×${it.value}" }
+    }
+
+    /**
      * 按清单从候选里挑件（同品类取前 N 件，且**累计不超预算**）。
      *
      * ★同品类内的先后**就是三选一那套**：`cand` 由 [dpCandidates] 用 [sortShopBucket] 排好，而

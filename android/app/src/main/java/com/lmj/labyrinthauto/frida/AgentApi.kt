@@ -481,6 +481,16 @@ object AgentApi {
         obj("labDlgClosing", timeoutMs = timeoutMs)
 
     /**
+     * ★★通用确认框「**出现**」轻读（2026-11-10）：顶层对话框指针 + `top` + `TwoButtonLeft/Right`。
+     *
+     * `ok=true` ⇒ 两颗按钮都在（结构上就是「取消/确认」），`right` 是可直接点的确认坐标；
+     * `ptr` 用来区分**同名窗口重开**（名字判据做不到）。零遍历、只读字段，实测 2~4ms。
+     * 读不到时 `path` 说明断在哪一步（`no-top-dialog` / `no-DialogCommonAbstract` / `no-cam`）。
+     */
+    suspend fun labDlgPair(timeoutMs: Long = T_FAST): JSONObject? =
+        obj("labDlgPair", timeoutMs = timeoutMs)
+
+    /**
      * ★三选一页的**阶段 1 探针**（2026-11-09）：一次读取同时给「顶框名 + 关闭判据 + 诊断」。
      *
      * 三选一（`DialogLabyrinthSelection`）也是 `DialogBase` 子类 ⇒ 退出 tween 与确认框同源，

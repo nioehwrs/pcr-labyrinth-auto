@@ -210,6 +210,9 @@ object MazeLoop {
      */
     private const val SHOP_COIN_WAIT_MS = 10_000L
 
+    /** ★2026-11-10：刷新后"新货架还没铺好"的宽限（这期间 `avail==0` 当未就绪，重读而不是关店） */
+    private const val SHOP_REFRESH_SETTLE_MS = 1_200L
+
     /** 金币重读间隔（配合 [SHOP_COIN_WAIT_MS]） */
     private const val SHOP_COIN_GAP_MS = 800L
 
@@ -368,6 +371,18 @@ object MazeLoop {
         dlgTapN = 0
         labResultSig = ""                       // 结算页"落位闸门"（连续两轮同坐标才点）
         seenKills = GameProcess.kills           // 本局开始时的"游戏被杀次数"基线（见主循环 0.35）
+        // ★2026-11-10（用户反馈：新局商店里出现了"上一局的 3★ 清单"）：
+        //   `shopQuota` 等是**单例字段**，跨局必须清 —— 否则新局进同一家店（blockId/area 相同）
+        //   会沿用上一局的清单，按一个货架上根本不存在的品类挑件 ⇒ 一件不买。
+        shopQuota = null; shopQuotaKey = null; shopQuotaRejectN = 0
+        shopRefreshKey = null; shopRefreshCount = 0; shopRefreshAt = 0L
+        shopBought = false
+        shopPendKind = null; shopPendGi = -1; shopPendRetry = 0
+        shopPendRid = ""; shopPendPrice = 0; shopPendCoinBefore = 0; shopPendCntBefore = 0
+        shopBuyStep = 0; shopBuyAt = 0L
+        shopDragCount = 0; shopDragTarget = null
+        shopCoinBadKey = null; shopCoinBadAt = 0L
+        shopRelicCtx = null
         // 刷开局产物（reroll）注入：开局前就已知 3/5 区 Boss 与每区最优路线，
         // 消除"开局读不到 3 区 Boss / 完整地图"的差异（PLAN §0.6 原定不碰，本次已实现）。
         val reroll = RerollState.result
@@ -1026,6 +1041,33 @@ object MazeLoop {
     /** PC `MAZE_NODE_TAP_GAP`(5418) / `MAZE_NODE_TAP_BACKOFF`(5419)：同一地图节点的点击间隔（1s 起、逐步退避到 3s） */
     private const val NODE_TAP_GAP_MS = 1_000L
     private const val NODE_TAP_BACKOFF_MS = 3_000L
+
+    /**
+     * ★2026-11-10（用户方案）：点地图节点后「抓出现 + 抓消失」两步确认。
+     *   · [MOVE_CONFIRM_WAIT_MS]：等「是否前往」确认框出现的上限（出现即点，不等满）；
+     *   · [MOVE_CONFIRM_NO_PTR_MS]：连顶层对话框都没有时的宽限 —— 超过就当"直接移动/进战斗"，
+     *     不为了等框白耗满 500ms；
+     *   · [MOVE_CONFIRM_POLL_MS]：探针间隔（`labDlgPair` 2~4ms、`labDlgClosing` 3~6ms，60ms 足够）；
+     *   · [MOVE_CONFIRM_GONE_MS]：点确认后等「开始消失」的上限；
+     *   · [MOVE_NO_DIALOG_SETTLE_MS]：没有确认框时给游戏推进画面的短静置（原来固定 800ms）。
+     */
+    private const val MOVE_CONFIRM_WAIT_MS = 500L
+    private const val MOVE_CONFIRM_NO_PTR_MS = 260L
+    private const val MOVE_CONFIRM_POLL_MS = 60L
+    private const val MOVE_CONFIRM_GONE_MS = 450L
+    private const val MOVE_NO_DIALOG_SETTLE_MS = 300L
+
+    /** ★出现后最多点几次（点空就用下一拍的新坐标再点；**多点当手段**，不等按钮落位） */
+    private const val MOVE_CONFIRM_TAP_MAX = 5
+
+    /** ★每次点完只探这么久有没有"开始消失"（入场动画期点空是正常代价） */
+    private const val MOVE_CONFIRM_PROBE_MS = 180L
+
+    /** 探测"是否开始消失"时的轮询间隔 */
+    private const val MOVE_CONFIRM_PROBE_POLL_MS = 60L
+
+    /** ★出现后的总预算（最多 5 次点击 + 各自探测），超时交回主循环 */
+    private const val MOVE_CONFIRM_TOTAL_MS = 1_200L
 
     /** PC `MAZE_DRAG_LIMIT`(339) / `MAZE_DRAG_MS_MIN,MAX`(340) / `MAZE_DRAG_SETTLE`(341)：屏外节点 → 横向拖动地图 */
     private const val DRAG_LIMIT = 6
@@ -2573,6 +2615,13 @@ object MazeLoop {
     private var shopRefreshCount = 0
     private var shopRefreshKey: String? = null
 
+    /**
+     * ★2026-11-10（用户反馈"刷新之后也有可能读取为空"）：本店**最近一次点「更新」**的时刻。
+     * 刷新后货架的 `availability` 会先清零再重新填 ⇒ 这期间 `avail==0` 是"未就绪"，不是"买空了"。
+     * 原来只有 `neverTouched`（进店第一帧）一道闸，**刷新后**没有任何保护。
+     */
+    private var shopRefreshAt = 0L
+
     /** ★「金币读到 0/空」的起始时刻 + 所属门店（换店或读到 >0 就清）；见 [SHOP_COIN_WAIT_MS] */
     private var shopCoinBadKey: String? = null
     private var shopCoinBadAt = 0L
@@ -2742,10 +2791,11 @@ object MazeLoop {
             }
             return
         }
-        // ★读取来源/耗时（2026-10-17 用户："商店还是在扫描"）：`src` = cache / dlg / scan。
-        //   `scan` = 全堆扫描（实测数秒 ✗）—— 出现就说明"DialogArea 优先"没命中，日志里同时给出
+        // ★读取来源/耗时（2026-10-17 用户："商店还是在扫描"）：`src` = top / dlg / scan。
+        //   ★2026-11-10：`top` = 从**当前最上层对话框**现取（不再用跨轮实例缓存 —— 刷新后会读到旧货架）；
+        //   `scan` = 全堆扫描（实测数秒 ✗）—— 出现就说明前两路都没命中，日志里同时给出
         //   DialogArea 的子节点名 + 有没有目标组件（agent 的 `dlgMiss`），不用再靠猜。
-        //   每种来源每页只报一次（正常应只出现 `cache` 或 `dlg` 一行）。
+        //   每种来源每页只报一次（正常应只出现 `top` 或 `dlg` 一行）。
         val src = sh.optString("src").ifEmpty { "?" }
         if (tries.getOrPut("$tag|rsrc_$src", { 0 }) == 0) {
             tries["$tag|rsrc_$src"] = 1
@@ -2772,6 +2822,7 @@ object MazeLoop {
         if (rkey != shopRefreshKey) {
             // 换店 ⇒ 买过标记也清；★购买清单/待确认件同样作废（不同店的货架/金币无关）
             shopRefreshCount = 0; shopRefreshKey = rkey; shopBought = false; shopQuota = null
+            shopRefreshAt = 0L
             shopQuotaRejectN = 0
             shopPendKind = null; shopPendGi = -1; shopPendRetry = 0
             shopBuyStep = 0; shopBuyAt = 0L          // 换店 ⇒ 购买子链作废（新店的交易与上家无关）
@@ -2893,9 +2944,15 @@ object MazeLoop {
             //   买空之后（或已刷过）`avail==0` 是**正常状态**（该刷新/该关店）——
             //   那种情况必须往下走，否则会卡在商店页出不去。
             val neverTouched = !shopBought && shopRefreshCount == 0
+            // ★2026-11-10（用户反馈"刷新之后也有可能读取为空"）：**刷新后的短窗口**也算未就绪 ——
+            //   刷新会整批换货架，新货的 availability 先清零再填；原来这道闸只覆盖"进店第一帧"，
+            //   刷新后那几帧被当成"买空了"⇒ 不买也不刷，直接关店。
+            //   只在本店**还没买过**时才这么判（买空之后 avail==0 仍是正常的"该关店"）。
+            val justRefreshed = shopRefreshAt > 0 && !shopBought &&
+                SystemClock.elapsedRealtime() - shopRefreshAt < SHOP_REFRESH_SETTLE_MS
             if (slots0 == null || slots0.length() == 0 ||
                 items0 == null || items0.length() == 0 ||
-                (avail == 0 && neverTouched)
+                (avail == 0 && (neverTouched || justRefreshed))
             ) {
                 if (n == 1 || n % 20 == 0) {
                     AppState.addLog(
@@ -2912,9 +2969,38 @@ object MazeLoop {
         //   清单存在时 [ShopPlan.shopPlan] 不跑 DP，只按清单从当前货架挑件（具体哪个遗物照旧现排序现取）。
         val qkey = "$rkey|$shopRefreshCount"
         if (shopQuotaKey != qkey) { shopQuotaKey = qkey; shopQuota = null }
-        val (picked, desc) = shopPlan.shopPlan(
+        // ★2026-11-10（用户反馈："清单里 3★、货架上只有 3 个 1★ + 印记"）：清单 key **不含货架内容**，
+        //   货架在脚本察觉之外变了（游戏自己刷新 / 跨局残留 / 刷新那一帧读到旧货架）时，
+        //   清单会指向货架上不存在的品类 ⇒ 按清单挑件必然 0 件（本次截图就是这个）。
+        //   先做一次**清单↔货架一致性**校验，不符就丢弃重算。
+        val qFit = shopQuota
+        if (qFit != null && !shopPlan.quotaFitsShelf(sh, qFit)) {
+            AppState.addLog(
+                "商店：清单 $qFit 与当前货架不符（货架=${shopPlan.shelfKindsBrief(sh)}）→ 丢弃清单，重新决策",
+            )
+            shopQuota = null
+        }
+        val plan0 = shopPlan.shopPlan(
             area, sh, done = shopRefreshCount, relicCtx = relicCtx, quota = shopQuota,
         )
+        var picked = plan0.first
+        var desc = plan0.second
+        // ★2026-11-10（用户反馈：清单只要 3★、金币差一点 ⇒ 一件不买）：
+        //   清单是**进店/刷新时**按当时金币算的；之后买别的/刷新扣钱，金币只会变少。
+        //   若清单里的件到这一轮**一件都买不起**（`pickByQuota` 全跳过），就地丢弃清单、
+        //   按**当前金币**重算一次（DP 有预算约束，会改买 1★/印记/2★）。
+        //   原来没有这道兜底：清单非空 ⇒ 不走"空清单中毒"那段 ⇒ 直接关店（日志 `1★0 2★0 3★1` + `0/0 件`）。
+        val q0 = shopQuota
+        if (picked.isEmpty() && q0 != null && q0.total() > 0) {
+            val c0 = (sh.opt("coin") as? Number)?.toInt() ?: 0
+            AppState.addLog("商店：清单 $q0 一件都买不起（金币=$c0）→ 丢弃清单，按当前金币重算")
+            shopQuota = null
+            val p2 = shopPlan.shopPlan(
+                area, sh, done = shopRefreshCount, relicCtx = relicCtx, quota = null,
+            )
+            picked = p2.first
+            desc = p2.second
+        }
         // ★★2026-11-08 排障（用户反馈 0.6.6："3 层商店 1.2 万金币却没买遗物/印记"）：
         //   把"决定买不买"的**输入**全打出来 —— 以后这类"钱够却不买"能一眼定位是
         //   ① 商品没识别出品类（kind=?）② 不在货架 ③ DP 没启用 ④ 清单是空的。
@@ -3082,6 +3168,7 @@ object MazeLoop {
             if (rb != null && hasXY(rb)) {
                 tap(input, rb.optInt("x"), rb.optInt("y"), "商店·更新")
                 shopRefreshCount++
+                shopRefreshAt = SystemClock.elapsedRealtime()   // ★刷新后空货架宽限（见 [SHOP_REFRESH_SETTLE_MS]）
                 // 刷新后货架全新 ⇒ 待确认件/清单都作废（清单 key 里带 shopRefreshCount，下轮会重算）
                 shopPendKind = null; shopPendGi = -1; shopPendRetry = 0
                 shopBuyStep = 0; shopBuyAt = 0L      // 刷新即换货架 ⇒ 购买子链作废
@@ -3799,9 +3886,14 @@ object MazeLoop {
             val bt = (t.opt("blockType") as? Number)?.toInt()
             val what = "前进到节点$nk[${Route.LAB_BLOCK_TYPE[bt] ?: Py.str(bt)}]$rt"
             OverlayStatus.setState("前往节点$nk")      // ★悬浮窗（细于 overlayTick 的默认描述）
+            // ★2026-11-10（用户方案）：点前先记顶层指针基线 —— 只认"点完之后**新出现**的框"，
+            //   避免把上一页残留的对话框当成"是否前往"点掉。
+            val basePtr = runCatching { AgentApi.labDlgPair() }.getOrNull()?.optString("ptr").orEmpty()
             tap(input, t.optInt("x"), t.optInt("y"), what)
             nodeSaidAt[nk] = now                                         // 同一节点 30s 内只"重点"一次（PC 6425）
-            delay(800)
+            // ★不再盲等 800ms：先**抓确认框出现**（2~4ms/拍），出现即点确认，再**抓它开始消失**；
+            //   没有框（直接移动/进战斗）就短等回主循环。
+            if (!awaitMoveConfirm(input, basePtr)) delay(MOVE_NO_DIALOG_SETTLE_MS)
             return true
         }
         // ③ 目标在屏外 → 横向拖动地图，把它拉进视野
@@ -3835,6 +3927,100 @@ object MazeLoop {
                 } +
                 if (nodes.size > 12) "…（共 ${nodes.size} 个）" else "",
         )
+        return false
+    }
+
+    /**
+     * ★2026-11-10（用户方案）：点地图节点后的「**抓出现** + **抓消失**」两步。
+     *
+     * 第一步「出现」：`labDlgPair` 轻读（2~4ms/拍）——
+     *   · 顶层对话框指针**变了**（≠点前基线）+ `top` 是 `DialogCommon*` + `TwoButtonLeft/Right` 都在
+     *     ⇒ 就是「取消/确认」框，直接取 `right` 点确认，不再等主循环下一轮；
+     *   · 只认 `DialogCommon*`：别的框（遗物/选人/事件）出现不算，交给主循环对应 handler，避免误点；
+     *   · 窗口/按钮一出现就点（**多点是一种手段**）；入场动画期坐标会变、点空是正常代价，
+     *     点完只探 [MOVE_CONFIRM_PROBE_MS]，没开始消失就**用下一拍的新坐标再点**（最多 3 次），
+     *     不为了"点得准"去等按钮落位 —— 那等于拿等待换准确。
+     * 第二步「消失」：`labDlgClosing`（outMainTweenAlpha，3~6ms）—— 框**开始收起**就继续，不等它真没了。
+     *
+     * @param basePtr 点节点**之前**的顶层对话框指针；空串 = 点前没有对话框（正常情况）。
+     * @return true = 处理了确认框（已点确认）；false = 这段时间没出现新确认框（直接移动/进战斗）
+     */
+    private suspend fun awaitMoveConfirm(input: InputBackend, basePtr: String): Boolean {
+        val t0 = SystemClock.elapsedRealtime()
+        var noPtrAt = 0L
+        var seenAt = 0L
+        var taps = 0
+        var lastDiag = "未读到"
+        while (true) {
+            val now = SystemClock.elapsedRealtime()
+            if (seenAt == 0L) {
+                if (now - t0 >= MOVE_CONFIRM_WAIT_MS) break             // 一直没出现
+            } else if (taps >= MOVE_CONFIRM_TAP_MAX) {
+                AppState.addLog("确认框：点了 $taps 次仍没开始消失 → 回主循环再看")
+                return false
+            } else if (now - seenAt >= MOVE_CONFIRM_TOTAL_MS) {
+                AppState.addLog("确认框：出现后 ${MOVE_CONFIRM_TOTAL_MS}ms 还没关掉 → 回主循环再看")
+                return false
+            }
+            val r = runCatching { AgentApi.labDlgPair() }.getOrNull()
+            val top = r?.optString("top").orEmpty()
+            val ptr = r?.optString("ptr").orEmpty()
+            lastDiag = if (r == null) "RPC 超时/空"
+            else "path=${r.optString("path")} ms=${r.optLong("ms")} comp=${r.optString("compCls")}"
+            if (ptr.isEmpty() || top.isEmpty() || ptr == basePtr) {
+                // 还没有**新**对话框：给 [MOVE_CONFIRM_NO_PTR_MS] 宽限，多数"直接移动"到这就够了
+                if (noPtrAt == 0L) noPtrAt = SystemClock.elapsedRealtime()
+                if (SystemClock.elapsedRealtime() - noPtrAt >= MOVE_CONFIRM_NO_PTR_MS) break
+                delay(MOVE_CONFIRM_POLL_MS)
+                continue
+            }
+            noPtrAt = 0L
+            if (!top.startsWith("DialogCommon")) {
+                AppState.addLog("确认框：点节点后出现了「$top」→ 不是前往确认框，交给主循环")
+                return false
+            }
+            if (r?.optBoolean("ok") == true) {
+                val right = r.optJSONObject("right")
+                val x = (right?.opt("x") as? Number)?.toInt()
+                val y = (right?.opt("y") as? Number)?.toInt()
+                if (x != null && y != null) {
+                    if (seenAt == 0L) {
+                        seenAt = now
+                        AppState.addLog(
+                            "确认框：出现 +${now - t0}ms（$top / comp=${r.optString("compCls")} / " +
+                                "读 ${r.optLong("ms")}ms）",
+                        )
+                    }
+                    // ★★2026-11-10（用户口径：**多点是一种手段**，不要等完全出现才点）：
+                    //   出现就点。入场动画期间坐标会变、点空是正常代价 —— 点完只探
+                    //   [MOVE_CONFIRM_PROBE_MS]；没开始消失就**用下一拍的新坐标再点**，
+                    //   而不是等按钮落位（那等于拿等待换准确）。
+                    taps++
+                    AppState.addLog("确认框：点「确认」#$taps ($x,$y)")
+                    input.tap(x, y)
+                    if (awaitDialogGone(t0, MOVE_CONFIRM_PROBE_MS)) return true
+                    continue
+                }
+            }
+            delay(MOVE_CONFIRM_POLL_MS)
+        }
+        AppState.addLog(
+            "确认框：点节点后 ${MOVE_CONFIRM_WAIT_MS}ms 内没等到「是否前往」（直接移动/进战斗）｜最后：$lastDiag",
+        )
+        return false
+    }
+
+    /** 第二步：等确认框**开始消失**（`labDlgClosing`）；[timeoutMs] 内没动静返回 false（调用方重试）。 */
+    private suspend fun awaitDialogGone(t0: Long, timeoutMs: Long = MOVE_CONFIRM_GONE_MS): Boolean {
+        val g0 = SystemClock.elapsedRealtime()
+        while (SystemClock.elapsedRealtime() - g0 < timeoutMs) {
+            delay(MOVE_CONFIRM_PROBE_POLL_MS)
+            val c = runCatching { AgentApi.labDlgClosing() }.getOrNull()
+            if (c == null || c.optBoolean("closing", false) || c.optString("top").isEmpty()) {
+                AppState.addLog("确认框：开始消失 +${SystemClock.elapsedRealtime() - t0}ms")
+                return true
+            }
+        }
         return false
     }
 
