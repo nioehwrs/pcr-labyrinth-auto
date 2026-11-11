@@ -286,9 +286,14 @@ class ShopPlan(
      */
     fun remainingRefresh(area: Int?, sh: JSONObject, done: Int): Int {
         val cfg = SHOP_CFG[area] ?: SHOP_DEFAULT_CFG
-        val byDone = (cfgInt(cfg, "max_refresh", 0) - done).coerceAtLeast(0)
-        val left = Py.num(sh, "resettable")?.toInt()
-        return if (left != null) minOf(byDone, left.coerceAtLeast(0)) else byDone
+        val mx = cfgInt(cfg, "max_refresh", 0)
+        // ★2026-11-11（用户）：`get_resettableNum` 实测**刷新后不递减**（更像本店"可刷新上限"）；
+        //   真正的"已刷几次"是 `resetCount`（LabyrinthTempData.ShopResetCount，agent cs90 起）：
+        //   剩余 = min(策略上限, 游戏上限) - max(本地 done, 游戏已刷)
+        val gameDone = Py.num(sh, "resetCount")?.toInt() ?: 0
+        val upper = minOf(mx, Py.num(sh, "resettable")?.toInt() ?: mx)
+        val doneReal = maxOf(done, gameDone).coerceAtLeast(0)
+        return (upper - doneReal).coerceAtLeast(0)
     }
 
     /**

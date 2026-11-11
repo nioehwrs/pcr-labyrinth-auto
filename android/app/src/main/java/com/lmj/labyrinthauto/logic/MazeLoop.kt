@@ -213,6 +213,47 @@ object MazeLoop {
     /** ★2026-11-10：刷新后"新货架还没铺好"的宽限（这期间 `avail==0` 当未就绪，重读而不是关店） */
     private const val SHOP_REFRESH_SETTLE_MS = 1_200L
 
+    /** ★2026-11-11（用户）：点「更新」没弹确认框 = 点早了/点空，**不是"本店不能刷"** ⇒ 重试上限 */
+    private const val SHOP_REFRESH_TRY_MAX = 2
+
+    /** ★连续多少轮都点不到「更新」才怀疑界面异常 → 停手留人工（不关店） */
+    private const val SHOP_REFRESH_FAIL_MAX = 6
+
+    // ── 商店「动画链」时间参数（2026-11-10 用户方案：买/刷新/关闭都按 弹窗出现→消失 推进） ──
+
+    /** 首下点击后，等"确认框出现"的上限（新框以顶层指针变化识别） */
+    private const val SHOP_ANIM_BOX_WAIT_MS = 1_000L
+
+    /**
+     * 点确认后，等"框开始消失"的探测窗口；没开始消失就用新坐标补点。
+     * ★2026-11-10 实测 220ms 太短（tween 在 +200~300ms 才启动）⇒ 每次都判"没生效"、多补一下，
+     *   日志里每件都出现 `#3` 的白点；改成 400ms。
+     */
+    private const val SHOP_ANIM_CLOSE_PROBE_MS = 400L
+
+    /** 每个框最多补点几次（动画期点空是正常代价，多点当手段） */
+    private const val SHOP_ANIM_TAP_MAX = 3
+
+    /** 到账确认链的最长时长（遗物 1 个框；印记 1+1；角色 1 个） */
+    private const val SHOP_ANIM_RECEIPT_MS = 4_000L
+
+    /**
+     * ★A 方案：回到商店页后，等「刚买的那件标成已售」的上限。
+     * 注意弹窗还盖着时下面的货架**不会变**（P5 截图），所以必须等 `drainShopReceipts` 回到商店后再读；
+     * 用 [AgentApi.labShopItems]（3~5ms/次）每 120ms 一次。
+     */
+    private const val SHOP_ANIM_SOLD_WAIT_MS = 1_200L
+
+    /** 刷新确认后，等"货架签名真的变了"的上限 */
+    private const val SHOP_ANIM_REFRESH_MS = 2_500L
+
+    /** 关闭确认后，等"离开商店页"的上限 */
+    private const val SHOP_ANIM_CLOSE_BOX_MS = 2_000L
+
+    /** 动画链探针间隔（`labDlgBox` ~5~8ms，60ms 足够快又不刷 RPC） */
+    private const val SHOP_ANIM_POLL_MS = 60L
+
+
     /** 金币重读间隔（配合 [SHOP_COIN_WAIT_MS]） */
     private const val SHOP_COIN_GAP_MS = 800L
 
@@ -376,6 +417,7 @@ object MazeLoop {
         //   会沿用上一局的清单，按一个货架上根本不存在的品类挑件 ⇒ 一件不买。
         shopQuota = null; shopQuotaKey = null; shopQuotaRejectN = 0
         shopRefreshKey = null; shopRefreshCount = 0; shopRefreshAt = 0L
+        shopRefreshFailN = 0
         shopBought = false
         shopPendKind = null; shopPendGi = -1; shopPendRetry = 0
         shopPendRid = ""; shopPendPrice = 0; shopPendCoinBefore = 0; shopPendCntBefore = 0
@@ -2622,6 +2664,15 @@ object MazeLoop {
      */
     private var shopRefreshAt = 0L
 
+    /**
+     * ★2026-11-10：本店「刷新点了但没生效」的**连续次数**（跨轮累计）。
+     *
+     * 用户口径（2026-11-11）：点早/点空只是执行问题，**不该反过来改变"该不该刷"的决策**，
+     * 更不该因此提前关店 —— 失败就重试 / 下轮再试；次数只作"界面真出问题"的保护：
+     * 连续 [SHOP_REFRESH_FAIL_MAX] 次都点不到才 `stopRequested`（停手留人工，**不关店**）。
+     */
+    private var shopRefreshFailN = 0
+
     /** ★「金币读到 0/空」的起始时刻 + 所属门店（换店或读到 >0 就清）；见 [SHOP_COIN_WAIT_MS] */
     private var shopCoinBadKey: String? = null
     private var shopCoinBadAt = 0L
@@ -2823,9 +2874,17 @@ object MazeLoop {
             // 换店 ⇒ 买过标记也清；★购买清单/待确认件同样作废（不同店的货架/金币无关）
             shopRefreshCount = 0; shopRefreshKey = rkey; shopBought = false; shopQuota = null
             shopRefreshAt = 0L
+            shopRefreshFailN = 0
             shopQuotaRejectN = 0
             shopPendKind = null; shopPendGi = -1; shopPendRetry = 0
             shopBuyStep = 0; shopBuyAt = 0L          // 换店 ⇒ 购买子链作废（新店的交易与上家无关）
+        }
+        // ★2026-11-11：用游戏 `resetCount` 对齐"本店已刷几次" —— 半路接手/闪退重进都能对上。
+        //   本地 done 只会追加（max），不会把游戏已刷次数抹掉。
+        val resetCnt = Py.num(sh, "resetCount")?.toInt()
+        if (resetCnt != null && resetCnt > shopRefreshCount) {
+            AppState.addLog("商店：对齐已刷新次数 $shopRefreshCount → $resetCnt（游戏 ShopResetCount）")
+            shopRefreshCount = resetCnt
         }
         // ★金币读不到/读到 0 → **先别决策**（2026-10-18 用户："不会是没读取到金币数，误以为没操作直接退出吧"）：
         //   coin=0 时商品全被判"买不起"、刷新也"刷不起" ⇒ 立刻点「关闭」退出 —— 正好是"5 层 2w 什么都没买"。
@@ -3014,7 +3073,11 @@ object MazeLoop {
             AppState.addLog(
                 "商店：进店快照 dp=${shopPlan.dpEnabled(area)} 清单=${if (shopQuota == null) "无(将重算)" else "有"}" +
                     " 金币=${coinRead ?: -1} items=${items.size}" +
-                    " slots=${sh.optJSONArray("slots")?.length() ?: -1}｜$brief",
+                    " slots=${sh.optJSONArray("slots")?.length() ?: -1}" +
+                    " 本地done=$shopRefreshCount 游戏resetCount=${sh.opt("resetCount")}" +
+                    " 游戏resettable=${sh.opt("resettable")}" +
+                    " 剩余刷=${shopPlan.remainingRefresh(area, sh, shopRefreshCount)}" +
+                    "｜$brief",
             )
         }
         // ★商店抽样（2026-11-4 用户）：记录"进店 / 每次刷新后"这一屏的星级构成 + 当前持有遗物，
@@ -3156,22 +3219,79 @@ object MazeLoop {
             // 开启购买子链：从现在起进入"交易锁"，回到商店页且走完确认+到账才计数（见 [SHOP_BUY_TIMEOUT_MS]）
             shopBuyStep = 1
             shopBuyAt = SystemClock.elapsedRealtime()
-            tap(input, s.optInt("x"), s.optInt("y"), "商店·买#$vi($tgtTag)")
+            // ★2026-11-10（用户方案）：不再"点一下回主循环等" —— 一次调用走完
+            //   购买确认框出现 → 点确认 → 框开始消失 → 收到确认（遗物/印记/角色）→ 回商店。
+            // ★2026-11-11（用户）：购买链固定三段（购买确认 → 购买完毕 →【仅印记】角色加入），
+            //   窗口一定依次出现且形态不同 ⇒ 按框类型推进、**不计数**；这里只告诉链"是不是印记"。
+            val isMark = buyKind.endsWith("印记")
+            val ok = shopTapThenConfirm(
+                input, s.optInt("x"), s.optInt("y"), "买#$vi($tgtTag)",
+                listOf("TwoButtonRight", "ThreeButtonCenter", "OneButtonWhite"),
+                expectReceipts = true,
+                isMark = isMark,
+            )
+            if (ok) {
+                // 动画链已走完（确认框→到账→回商店）⇒ **立即结算**，不等下一轮
+                shopBuyStep = 3
+                settlePurchaseNow("动画链完成")
+            }
             return
         }
         // ② 没可买的了 → 刷新或关闭（换店归零已提到 shopPlan 之前，这里不再重复）
         // q1（刷出≥1个1★概率）Kotlin 暂无 shop_pool_stats 探针 → 传 null（=不拦，与 PC q1 未知同款）
+        // ★「该不该刷」只看读数（DP 结论 + 游戏剩余次数 + 金币）—— **点击成败不影响这个决策**
         val rd = shopPlan.refreshDecision(area, sh, shopRefreshCount, null)
         if (n == 1 || n % 20 == 0) AppState.addLog("商店：${if (rd.refresh) "决定刷新" else "不刷新：${rd.why}"}")
         if (rd.refresh) {
             val rb = sh.optJSONObject("rerollBtn")
             if (rb != null && hasXY(rb)) {
-                tap(input, rb.optInt("x"), rb.optInt("y"), "商店·更新")
-                shopRefreshCount++
-                shopRefreshAt = SystemClock.elapsedRealtime()   // ★刷新后空货架宽限（见 [SHOP_REFRESH_SETTLE_MS]）
-                // 刷新后货架全新 ⇒ 待确认件/清单都作废（清单 key 里带 shopRefreshCount，下轮会重算）
-                shopPendKind = null; shopPendGi = -1; shopPendRetry = 0
-                shopBuyStep = 0; shopBuyAt = 0L      // 刷新即换货架 ⇒ 购买子链作废
+                // ★2026-11-11（用户）：点「更新」没弹确认框 = **这一下点早了/点空**，不等于"本店不能刷"。
+                //   ⇒ 允许重试（每次重读货架拿最新按钮坐标），只有连续失败才判定"不可刷"。
+                //   计数只在 [shopRefreshChain] 真的确认（确认框走完 + 货架签名变了）之后才 +1。
+                var refreshed = false
+                var tx = rb.optInt("x")
+                var ty = rb.optInt("y")
+                var sig = shopShelfSig(sh)
+                var attempt = 0
+                while (attempt < SHOP_REFRESH_TRY_MAX && !refreshed) {
+                    attempt++
+                    refreshed = shopRefreshChain(input, tx, ty, sig)
+                    if (!refreshed && attempt < SHOP_REFRESH_TRY_MAX) {
+                        AppState.addLog("[!] 商店：更新第 $attempt 次没等到确认框（点早了？）→ 重读按钮坐标再试")
+                        delay(120)
+                        val sh2 = AgentApi.labShop()
+                        val rb2 = sh2?.optJSONObject("rerollBtn")
+                        if (sh2 != null && rb2 != null && hasXY(rb2)) {
+                            tx = rb2.optInt("x"); ty = rb2.optInt("y")
+                            sig = shopShelfSig(sh2)
+                        }
+                    }
+                }
+                if (refreshed) {
+                    shopRefreshFailN = 0
+                    shopRefreshCount++
+                    shopRefreshAt = SystemClock.elapsedRealtime()   // ★刷新后空货架宽限（见 [SHOP_REFRESH_SETTLE_MS]）
+                    // 刷新后货架全新 ⇒ 待确认件/清单都作废（清单 key 里带 shopRefreshCount，下轮会重算）
+                    shopPendKind = null; shopPendGi = -1; shopPendRetry = 0
+                    shopBuyStep = 0; shopBuyAt = 0L      // 刷新即换货架 ⇒ 购买子链作废
+                } else {
+                    // ★点不到 ≠ 不能刷（用户 2026-11-11）：不计次、不关店，下一轮重新读货架再试；
+                    //   只有连续很多轮都点不到才怀疑界面异常 → 停手留人工（**不主动关店**）。
+                    shopRefreshFailN++
+                    if (shopRefreshFailN >= SHOP_REFRESH_FAIL_MAX) {
+                        AppState.addLog(
+                            "[✗] 商店：更新连续 $shopRefreshFailN 轮点不到" +
+                                "（游戏 resettable=${sh.opt("resettable")}、本地 done=$shopRefreshCount）" +
+                                " → 停手留人工（不关店）",
+                        )
+                        stopRequested = true
+                    } else {
+                        AppState.addLog(
+                            "[!] 商店：更新没生效（第 $shopRefreshFailN 轮，resettable=${sh.opt("resettable")}）" +
+                                "→ 下一轮重读再试",
+                        )
+                    }
+                }
                 return
             }
             if (n == 1) AppState.addLog("[!] 想刷新但没读到「更新」按钮坐标 → 不点（留人工）")
@@ -3180,10 +3300,331 @@ object MazeLoop {
         // ③ 刷不动/不划算 → 关闭退出
         val cb = sh.optJSONObject("closeBtn")
         if (cb != null && hasXY(cb)) {
-            tap(input, cb.optInt("x"), cb.optInt("y"), "商店·关闭")
+            // ★2026-11-10（用户方案）：点关闭 → 关闭确认框出现 → 点确认 → 框开始消失 → 离开商店页
+            shopCloseChain(input, cb.optInt("x"), cb.optInt("y"))
             return
         }
         if (n == 1) AppState.addLog("[!] 没可买的、也读不到「关闭」按钮坐标 → 停手（留人工）")
+    }
+
+    // ────────────── 商店：基于弹窗「出现/消失动画」的链（2026-11-10 用户方案） ──────────────
+
+    /**
+     * ★2026-11-10：「买到」**当场结算**（清单扣减 + 成交对账），不等下一轮主循环。
+     * 日志实测：动画链 2.3s 走完，但 `✔ 买到` 要再等 ~2s（跨回主循环那一轮）—— 那 2s 就是用户说的"间隔长"。
+     */
+    private fun settlePurchaseNow(reason: String) {
+        if (shopBuyStep < 3) return
+        val cost = if (shopBuyAt > 0) SystemClock.elapsedRealtime() - shopBuyAt else 0L
+        val kind = shopPendKind ?: "?"
+        shopQuota?.consume(kind)
+        AppState.addLog(
+            "商店：✔ 买到 $kind（#${shopPendGi} ${shopPendRid}）$reason，${cost}ms" +
+                (shopQuota?.let { "；清单剩 $it" } ?: ""),
+        )
+        shopChkKind = kind; shopChkPrice = shopPendPrice; shopChkCoin = shopPendCoinBefore
+        shopBuyStep = 0; shopPendKind = null; shopPendGi = -1; shopPendRetry = 0
+    }
+
+    /** 读一次「当前弹窗箱体」（~5~8ms）；读不到/没有对话框返回 null。 */
+    private suspend fun dlgBoxNow(): JSONObject? =
+        runCatching { AgentApi.labDlgBox() }.getOrNull()?.takeIf { it.optBoolean("ok") }
+
+    /** `labDlgBox.buttons[]` → { 槽位名 → (x,y) } */
+    private fun boxButtonMap(box: JSONObject?): Map<String, Pair<Int, Int>> {
+        val m = HashMap<String, Pair<Int, Int>>()
+        val arr = box?.optJSONArray("buttons") ?: return m
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val n = o.optString("name")
+            if (n.isEmpty()) continue
+            val x = (o.opt("x") as? Number)?.toInt() ?: continue
+            val y = (o.opt("y") as? Number)?.toInt() ?: continue
+            m[n] = x to y
+        }
+        return m
+    }
+
+    /**
+     * 按**框的结构**选要点的按钮（不是死顺序）：
+     *   · 有 `TwoButtonLeft`/`ThreeButtonLeft` ⇒ 这是「取消/确认」双按钮框 ⇒ 点 Right（确认）；
+     *   · 没有左键 ⇒ 单按钮框（收到道具/提示）⇒ 走调用方给的顺序（OneButtonWhite / OneButtonBlue …）。
+     * ★2026-11-10 实测：收到确认框上 `TwoButtonRight` 槽位也在（但没显示），死顺序会先点它 ⇒
+     *   白点一下（`到账确认 → TwoButtonRight #1` 不生效）。改为先看有没有左键。
+     */
+    private fun pickBoxBtn(box: JSONObject?, keys: List<String>): Triple<String, Int, Int>? {
+        val m = boxButtonMap(box)
+        val hasLeft = m.containsKey("TwoButtonLeft") || m.containsKey("ThreeButtonLeft")
+        // 单按钮框：**只认 OneButton***（TwoButtonRight 槽位可能还在、但没显示，点它等于白点）
+        val order = if (hasLeft) listOf("TwoButtonRight", "ThreeButtonRight", "ThreeButtonCenter")
+        else listOf("OneButtonWhite", "OneButtonBlue")
+        for (k in order) {
+            val xy = m[k] ?: continue
+            return Triple(k, xy.first, xy.second)
+        }
+        for (k in keys) {
+            val xy = m[k] ?: continue
+            return Triple(k, xy.first, xy.second)
+        }
+        return null
+    }
+
+    /** 等「新框出现」：顶层指针从 [prevPtr] 变走，且 `top` 是 `Dialog*`。 */
+    private suspend fun awaitNewBox(prevPtr: String, timeoutMs: Long): JSONObject? {
+        val t0 = SystemClock.elapsedRealtime()
+        while (SystemClock.elapsedRealtime() - t0 < timeoutMs) {
+            val b = dlgBoxNow()
+            val ptr = b?.optString("ptr").orEmpty()
+            val top = b?.optString("top").orEmpty()
+            if (ptr.isNotEmpty() && ptr != prevPtr && top.startsWith("Dialog")) return b
+            delay(SHOP_ANIM_POLL_MS)
+        }
+        return null
+    }
+
+    /** 等 [ptr] 这个框**开始消失**（out tween 启动）或已换框/消失。 */
+    private suspend fun awaitBoxClosing(ptr: String, timeoutMs: Long): Boolean {
+        val t0 = SystemClock.elapsedRealtime()
+        while (SystemClock.elapsedRealtime() - t0 < timeoutMs) {
+            val b = dlgBoxNow()
+            if (b == null) { delay(SHOP_ANIM_POLL_MS); continue }
+            if (b.optString("ptr") != ptr) return true
+            if (b.optBoolean("closing")) return true
+            delay(SHOP_ANIM_POLL_MS)
+        }
+        return false
+    }
+
+    /**
+     * 点当前框的某个按钮；没点中就**用下一拍的新坐标补点**（多点当手段），
+     * 点完只探 [SHOP_ANIM_CLOSE_PROBE_MS] 有没有"开始消失"。
+     * @return true = 框已开始消失/换掉
+     */
+    private suspend fun tapBoxButton(
+        input: InputBackend,
+        keys: List<String>,
+        what: String,
+        skipHits: Int = 1,
+    ): Boolean {
+        var taps = 0
+        var skipLeft = skipHits
+        while (taps < SHOP_ANIM_TAP_MAX) {
+            val b = dlgBoxNow()
+            if (b == null) { delay(SHOP_ANIM_POLL_MS); continue }
+            val hit = pickBoxBtn(b, keys)
+            if (hit == null) { delay(SHOP_ANIM_POLL_MS); continue }
+            // ★2026-11-11（用户）：新框刚弹出的前几拍按钮还在入场动画里，点必空 ⇒
+            //   按 [skipHits] 先"只读不点"若干拍（探测频率不变，还是 60ms 一拍，只放宽首次点击时机）。
+            //   购买确认框 skip=1；到账框（购买完毕 / 角色加入）按钮落位更晚，用 skip=2。
+            if (skipLeft > 0) {
+                skipLeft--
+                delay(SHOP_ANIM_POLL_MS)
+                continue
+            }
+            val ptr = b.optString("ptr")
+            taps++
+            AppState.addLog("商店：$what → 点「${hit.first}」#$taps (${hit.second},${hit.third})")
+            input.tap(hit.second, hit.third)
+            if (awaitBoxClosing(ptr, SHOP_ANIM_CLOSE_PROBE_MS)) return true
+        }
+        return false
+    }
+
+    /**
+     * 点掉「到账确认」框，直到**回到商店页**。
+     *
+     * ★2026-11-11（用户）：按**买的东西**区分，不看时间 ——
+     *   · 遗物：收到遗物 → 直接回商店（[needReceipts] = 1）；
+     *   · 印记：收到印记 → 还要确认一次「收到角色」（[needReceipts] = 2）。
+     * 点够了 [needReceipts] 个框、且当前在商店页就返回；不够就继续等（最多 4s）。
+     */
+    private suspend fun drainShopReceipts(input: InputBackend, isMark: Boolean, skipPtr: String): Boolean {
+        val keys = listOf("OneButtonWhite", "OneButtonBlue", "TwoButtonRight", "ThreeButtonCenter")
+        val t0 = SystemClock.elapsedRealtime()
+        var lastPtr = skipPtr          // 购买确认框不算"到账框"
+        var lastTop = ""
+        var sawReceipt = false         // 见过并点掉「购买完毕」
+        var sawRole = false            // 见过并点掉「角色加入」
+        while (SystemClock.elapsedRealtime() - t0 < SHOP_ANIM_RECEIPT_MS) {
+            val b = dlgBoxNow()
+            if (b == null) { delay(SHOP_ANIM_POLL_MS); continue }
+            val top = b.optString("top")
+            val ptr = b.optString("ptr")
+            val btns = boxButtonMap(b)
+            if (top != lastTop) {
+                lastTop = top
+                AppState.addLog(
+                    "商店：到账链看到顶层「${top.ifEmpty { "无" }}」" +
+                        "（comp=${b.optString("compCls").ifEmpty { "?" }}，" +
+                        "按钮=${btns.keys.joinToString(",").ifEmpty { "无" }}）",
+                )
+            }
+            if (top.startsWith("DialogLabyrinthShop")) {
+                // ★按"见过哪个框"判定，**不计数**（用户 2026-11-11）：
+                //   遗物：购买完毕点掉即可；印记：购买完毕 + 角色加入 都要点掉。
+                if (sawReceipt && (!isMark || sawRole)) return true
+                delay(SHOP_ANIM_POLL_MS)
+                continue
+            }
+            if (!top.startsWith("Dialog")) { delay(SHOP_ANIM_POLL_MS); continue }
+            if (ptr == lastPtr) { delay(SHOP_ANIM_POLL_MS); continue }
+            // ★三个框靠**按钮结构**区分（2026-11-11 日志实测）：
+            //   购买确认 = TwoButtonLeft + TwoButtonRight（已在 shopTapThenConfirm 点掉，作为 skipPtr 跳过）
+            //   购买完毕 = OneButtonBlue
+            //   角色加入 = OneButtonWhite
+            val isReceipt = btns.containsKey("OneButtonBlue")
+            val isRole = btns.containsKey("OneButtonWhite")
+            if (!isReceipt && !isRole) { delay(SHOP_ANIM_POLL_MS); continue }
+            val step = if (isReceipt) "购买完毕" else "角色加入"
+            lastPtr = ptr
+            if (tapBoxButton(input, keys, step, skipHits = 2)) {
+                if (isReceipt) sawReceipt = true else sawRole = true
+            }
+        }
+        return false
+    }
+
+    /**
+     * ★A 方案（2026-11-11 用户）：买完在**链内**确认"这件真的标成已售"。
+     *
+     * 关键时序（用户 P5 截图）：购买完毕/角色加入弹窗还盖着时，**下面的商店货架不会变**；
+     *   只有所有弹窗关闭、真正回到商店页后才重绘 ⇒ 必须在 `drainShopReceipts` 返回后调用。
+     * 只读 `labShopItems`（3~5ms/次），每 120ms 一次，最多 [SHOP_ANIM_SOLD_WAIT_MS]。
+     * @return true = 该 rewardId 已 `isSold`（买到且货架已更新）；false = 超时没变（交回主循环核对）
+     */
+    private suspend fun confirmSold(rid: String): Boolean {
+        if (rid.isEmpty()) return true
+        val t0 = SystemClock.elapsedRealtime()
+        while (SystemClock.elapsedRealtime() - t0 < SHOP_ANIM_SOLD_WAIT_MS) {
+            val arr = runCatching { AgentApi.labShopItems() }.getOrNull()?.optJSONArray("items")
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    if (o.optString("rewardId") != rid) continue
+                    if (Py.truthy(o.opt("isSold"))) {
+                        AppState.addLog("商店：确认已售 $rid（+${SystemClock.elapsedRealtime() - t0}ms）")
+                        return true
+                    }
+                }
+            }
+            delay(120)
+        }
+        AppState.addLog("[!] 商店：${SHOP_ANIM_SOLD_WAIT_MS}ms 内没等到 $rid 标成已售 → 交回主循环核对")
+        return false
+    }
+
+    /**
+     * 商店动作的「动画链」：点首下 → 等确认框**出现** → 点确认（点空补点）→ 等它**开始消失**。
+     * @param expectReceipts true = 购买（之后有「购买完毕」；印记还多一个「角色加入」）
+     * @param isMark        true = 印记（多等一个「角色加入」框）
+     */
+    private suspend fun shopTapThenConfirm(
+        input: InputBackend,
+        tx: Int, ty: Int, what: String,
+        confirmKeys: List<String>,
+        expectReceipts: Boolean,
+        isMark: Boolean = false,
+    ): Boolean {
+        val baseBox = dlgBoxNow()
+        val basePtr = baseBox?.optString("ptr").orEmpty()
+        val baseTop = baseBox?.optString("top").orEmpty()
+        // ★2026-11-10 用户反馈"这次点错了"：上一件的角色确认框还没关时，`labShop` 仍能从底下读到商店，
+        //   于是这里直接点了商品 —— 那一下其实打在确认框上。顶层不是商店页就**先不点**（撤销购买意图）。
+        if (baseTop.isNotEmpty() && !baseTop.startsWith("DialogLabyrinthShop")) {
+            AppState.addLog("[!] 商店：$what 前顶层「$baseTop」不是商店页 → 先不点（等它关掉）")
+            shopBuyStep = 0; shopPendKind = null; shopPendGi = -1; shopPendRetry = 0
+            return false
+        }
+        input.tap(tx, ty)
+        val b = awaitNewBox(basePtr, SHOP_ANIM_BOX_WAIT_MS) ?: run {
+            AppState.addLog("[!] 商店：$what 后 ${SHOP_ANIM_BOX_WAIT_MS}ms 没等到确认框（可能点空/无确认）")
+            return false
+        }
+        AppState.addLog("商店：$what → 确认框出现（${b.optString("top")}）")
+        val confirmPtr = b.optString("ptr")
+        // ★购买确认框也放宽一拍（用户 2026-11-11）：之前 skip=1 时每件都会 #1 点空、#2 才中
+        if (!tapBoxButton(input, confirmKeys, "$what 确认", skipHits = 2)) {
+            AppState.addLog("[!] 商店：$what 确认框点了 ${SHOP_ANIM_TAP_MAX} 次仍没开始消失")
+            return false
+        }
+        // ★把**购买确认框**的指针带过去：它 out tween 期间仍会是最上层，不能算进"到账框"里
+        //   （否则遗物 need=1 会把同一个框数两次、真正的「收到角色」又被跳过）。
+        if (expectReceipts) {
+            // ★到账链按框类型推进（购买完毕 / 角色加入），不计数；
+            //   最后仍以 `isSold` 为硬证据，避免"看到商店就认为完成"。
+            val drained = drainShopReceipts(input, isMark, confirmPtr)
+            val sold = confirmSold(shopPendRid ?: "")
+            if (!sold) {
+                AppState.addLog("[!] 商店：到账链没走完（框全点=$drained）且货架没标已售 → 交回主循环核对")
+                return false
+            }
+            return true
+        }
+        return true
+    }
+
+    /** 货架签名（刷新前/后对比用）：rewardId|价格|已售 逐件拼接。 */
+    private fun shopShelfSig(sh: JSONObject): String {
+        val arr = sh.optJSONArray("items") ?: return ""
+        val sb = StringBuilder()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            sb.append(o.optString("rewardId")).append('|')
+                .append((o.opt("price") as? Number)?.toInt() ?: -1).append('|')
+                .append(if (Py.truthy(o.opt("isSold"))) 1 else 0).append(';')
+        }
+        return sb.toString()
+    }
+
+    /** 刷新：点更新 → 确认框 → 等货架签名真的变了。 */
+    private suspend fun shopRefreshChain(
+        input: InputBackend, tx: Int, ty: Int, beforeSig: String,
+    ): Boolean {
+        if (!shopTapThenConfirm(
+                input, tx, ty, "更新",
+                listOf("TwoButtonRight", "ThreeButtonRight", "OneButtonWhite"),
+                expectReceipts = false,
+            )
+        ) return false
+        val t0 = SystemClock.elapsedRealtime()
+        while (SystemClock.elapsedRealtime() - t0 < SHOP_ANIM_REFRESH_MS) {
+            val sh = AgentApi.labShop()
+            if (sh == null) { delay(SHOP_ANIM_POLL_MS); continue }
+            val e = sh.optString("err")
+            if (e.isNotEmpty() && e != "null") { delay(SHOP_ANIM_POLL_MS); continue }
+            val sig = shopShelfSig(sh)
+            if (sig.isNotEmpty() && sig != beforeSig) {
+                AppState.addLog("商店：刷新确认 → 货架已更新（${SystemClock.elapsedRealtime() - t0}ms）")
+                return true
+            }
+            delay(SHOP_ANIM_POLL_MS)
+        }
+        AppState.addLog("[!] 商店：刷新确认框关掉后 ${SHOP_ANIM_REFRESH_MS}ms 货架签名没变（刷新可能没生效）")
+        return false
+    }
+
+    /** 关闭：点关闭 → 确认框 → 等离开商店页。 */
+    private suspend fun shopCloseChain(input: InputBackend, tx: Int, ty: Int): Boolean {
+        if (!shopTapThenConfirm(
+                input, tx, ty, "关闭",
+                listOf("TwoButtonRight", "OneButtonWhite", "ThreeButtonCenter"),
+                expectReceipts = false,
+            )
+        ) return false
+        val t0 = SystemClock.elapsedRealtime()
+        while (SystemClock.elapsedRealtime() - t0 < SHOP_ANIM_CLOSE_BOX_MS) {
+            val b = dlgBoxNow()
+            if (b == null) { delay(SHOP_ANIM_POLL_MS); continue }
+            val top = b.optString("top")
+            // ★实测：关闭确认框还在 out tween 时 top 已是 `DialogCommonSmall`（不是商店）⇒
+            //   旧判据立刻返回"已离开"，下一轮又读到商店。要等**一个 Dialog 都没有**（地图/View）。
+            if (!top.startsWith("Dialog")) {
+                AppState.addLog("商店：关闭确认 → 已离开商店页（${top.ifEmpty { "无顶框" }}）")
+                return true
+            }
+            delay(SHOP_ANIM_POLL_MS)
+        }
+        return false
     }
 
     /**

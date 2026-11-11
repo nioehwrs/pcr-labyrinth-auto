@@ -491,6 +491,34 @@ object AgentApi {
         obj("labDlgPair", timeoutMs = timeoutMs)
 
     /**
+     * ★★弹窗「箱体」轻读（2026-11-10）：**一次**拿全 顶层指针 + `top` + 关闭/出现 tween + 7 个按钮槽位。
+     *
+     * 给商店动画链用：新框出现（`ptr` 变）→ 点确认 → 框**开始消失**（`closing`）→ 下一个框出现。
+     * 一次 ~5~8ms（字段直取 + 只投影 active 的按钮），比分开调 3 个 RPC 更一致。
+     * `buttons` 每项 `{name,x,y,id}`（`name` = `OneButtonWhite` / `TwoButtonRight` / …）。
+     */
+    suspend fun labDlgBox(timeoutMs: Long = T_FAST): JSONObject? =
+        obj("labDlgBox", timeoutMs = timeoutMs)
+
+    /**
+     * ★★DialogArea **全部直接子节点**（名字 + active），只用于排查。
+     *
+     * 买印记后「角色加入」框（按钮 `OneButtonWhite`）存在，但 `labDlgBox.top` 一直读到商店页 ⇒
+     * 说明它的 GameObject 名字不是 `Dialog` 开头，被 `_topDialogGo` 跳过。这里一次列出全名。
+     */
+    suspend fun labDlgKids(timeoutMs: Long = T_FAST): JSONObject? =
+        obj("labDlgKids", timeoutMs = timeoutMs)
+
+    /**
+     * ★★货架**字段轻读**（2026-11-11）：只读 lineup 的 `rewardId/price/isSold/availability`。
+     *
+     * 不找 PurchaseButton 槽位、不算裁剪/投影、不读金币 —— 实测 3~5ms（`labShop` 全量是 150ms，
+     * 其中 113ms 来自槽位 walk）。给「买完在链内确认已售」用。
+     */
+    suspend fun labShopItems(timeoutMs: Long = T_FAST): JSONObject? =
+        obj("labShopItems", timeoutMs = timeoutMs)
+
+    /**
      * ★三选一页的**阶段 1 探针**（2026-11-09）：一次读取同时给「顶框名 + 关闭判据 + 诊断」。
      *
      * 三选一（`DialogLabyrinthSelection`）也是 `DialogBase` 子类 ⇒ 退出 tween 与确认框同源，
