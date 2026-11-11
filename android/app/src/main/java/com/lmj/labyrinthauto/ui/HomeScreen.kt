@@ -2741,6 +2741,8 @@ private fun GuideDialog(
     val sections = listOf(
         "一、准备" to listOf(
             "设备需要有 Root 权限（模拟器里打开 Root 开关，或 Magisk 授权）。",
+            "MuMu 模拟器 Android 15：打开 Root 后，还要到桌面上的「KernelSU」里再授权一次 Root（只开模拟器开关不够）。",
+            "对模拟器分辨率没有要求（横屏即可，脚本按实际屏幕坐标自适应）。",
             "设备必须是 x86_64 架构：只在 MuMu、雷电等「x86 版」模拟器上工作；" +
                 "手机等 ARM 设备（ARM 真机 / ARM 云机）暂不支持，开跑时会直接提示，不会白试。",
             "安装本应用，并在游戏里登录好账号。",
