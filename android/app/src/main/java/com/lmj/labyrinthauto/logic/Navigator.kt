@@ -9,6 +9,7 @@ import com.lmj.labyrinthauto.input.Foreground
 import com.lmj.labyrinthauto.input.InputBackend
 import com.lmj.labyrinthauto.input.InputResult
 import kotlinx.coroutines.delay
+import org.json.JSONArray
 import org.json.JSONObject
 
 /**
@@ -390,21 +391,34 @@ object Navigator {
      * 按"第一个匹配"点就会跳进活动页（246→249），越走越远。底部导航永远在最下方 ⇒ 取 y 最大。
      */
     private suspend fun findNode(nameRe: String): Pair<Int, Int>? {
-        val arr = AgentApi.findList(nameRe)
-        if (arr != null && arr.length() > 0) {
-            var best: JSONObject? = null
-            var bestY = Int.MIN_VALUE
-            for (i in 0 until arr.length()) {
-                val o = arr.optJSONObject(i) ?: continue
-                if (!o.has("x") || !o.has("y")) continue
-                val y = o.optInt("y")
-                if (best == null || y > bestY) { best = o; bestY = y }
-            }
-            if (best != null) return best.optInt("x") to best.optInt("y")
+        // ★2026-11-12（用户："缓存不可靠，直接换成轻读取"）：
+        //   原来 `AgentApi.findList(nameRe)` 走**整棵 UI 树**（实测 661 节点 ≈1.8s，还靠 1.5s 遍历缓存兜）。
+        //   而这里找的按钮（底部导航 `ButtonQuest` / `btn_back` / `labyrinth_thumb_start`）**都在当前 View 子树里**
+        //   ⇒ 先走 `root="view"`（几十节点，几十 ms）；查不到再试 `layer`（DialogArea 同层，覆盖挂在外层的按钮）；
+        //   两者都空才退回无根整树（极少见，只作兜底）。
+        for (root in arrayOf("view", "layer")) {
+            pickBottom(AgentApi.findList(nameRe, root))?.let { return it }
         }
-        val d = AgentApi.find(nameRe) ?: return null
-        if (!d.has("x") || !d.has("y")) return null
-        return d.optInt("x") to d.optInt("y")
+        // ★明确树结构就不要再全树 find（用户 2026-11-12）：`view`/`layer` 都没有 ⇒ 这页不该有这个按钮，
+        //   返回 null 让上层"下一轮再看"，比全树捞一个别的同名节点（可能是活动页入口）更安全。
+        return null
+    }
+
+    /**
+     * 同名多个时取**最靠下**的那个（2026-10-19 实测）：七周年活动页里 `GUIGroup_ButtonQuest`(243,794)
+     * 排在底部导航 `ButtonQuest`(1076,1035) 前面，按"第一个匹配"会跳进活动页；底部导航永远在最下方。
+     */
+    private fun pickBottom(arr: JSONArray?): Pair<Int, Int>? {
+        if (arr == null || arr.length() == 0) return null
+        var bx = 0
+        var by = Int.MIN_VALUE
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            if (!o.has("x") || !o.has("y")) continue
+            val y = o.optInt("y")
+            if (y > by) { by = y; bx = o.optInt("x") }
+        }
+        return if (by == Int.MIN_VALUE) null else bx to by
     }
 
     /** 通用弹窗的"确定/关闭"按钮：名字必须在白名单里，认不出来就不点（PC 版同款）。

@@ -31,8 +31,13 @@ data class RerollConfig(
     val judgeMode: Int = MODE_CLASSIC,
     /** 自定义模式的期望（JSON：`{"1":[1,2,4,2,5,6],…}`），空串 = 用默认值 */
     val areaPlan: String = "",
-    /** 每轮 enter/retire 之间小睡几毫秒（别把服务器打急） */
-    val sleepBetweenMs: Long = 150L,
+    /**
+     * 每轮 enter/retire 之间小睡几毫秒。
+     * ★2026-11-12（用户）：默认改 **0** —— autopcr 原版就是「enter → retire → top」纯串行、
+     *   没有任何 sleep，节流靠请求往返本身；这里再额外加 150ms 属于多余保守。
+     *   想放慢可在设置里调大（老用户已保存的值不受影响）。
+     */
+    val sleepBetweenMs: Long = 0L,
 ) {
     companion object {
         const val MODE_CLASSIC = 0

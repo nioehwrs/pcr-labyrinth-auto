@@ -4103,9 +4103,9 @@ object MazeLoop {
      *  空了再全树兜底（2026-10-17：全树一次实测 ~3s ✗，这些页每轮都要找它 ⇒ 单通道常被占住 ⇒
      *  便宜调用（viewId/gameTick）被挤超时）。 */
     private suspend fun findSelButtons(max: Int): org.json.JSONArray? {
-        val a = AgentApi.findTextList("选择", max, null, "dialog")
-        if (a != null && a.length() > 0) return a
-        return AgentApi.findTextList("选择", max)
+        // ★2026-11-12（用户："明确树结构就不要 find 了"）：选人/门票面板就是 DialogArea 里的
+        //   `DialogLabyrinthSelection` ⇒ 只读 `dialog` 子树，不再整树兜底。
+        return AgentApi.findTextList("选择", max, null, "dialog")
     }
 
     /**
@@ -7578,7 +7578,8 @@ object MazeLoop {
         else AppState.addLog("　status  = ${s.toString().take(400)}")
         AgentApi.dialog()?.let { AppState.addLog("　dialog  = ${it.toString().take(300)}") }
         AgentApi.labChoices()?.let { AppState.addLog("　choices = ${it.toString().take(400)}") }
-        AgentApi.findList("Btn|Button|Decide|Select|Close|Choice|Skip|Item")?.let {
+        // ★2026-11-12：诊断也限定在对话框子树（不再整树）
+        AgentApi.findList("Btn|Button|Decide|Select|Close|Choice|Skip|Item", "dialog")?.let {
             AppState.addLog("　buttons = ${it.toString().take(500)}")
         }
     }
@@ -7682,9 +7683,18 @@ object MazeLoop {
 
     /** 按**节点名**（正则）找屏内激活节点 → (x,y)；找不到 null（PC `resolve` 137） */
     private suspend fun findNode(nameRe: String): Pair<Int, Int>? {
-        val d = AgentApi.find(nameRe) ?: return null
-        if (!d.has("x") || !d.has("y")) return null
-        return d.optInt("x") to d.optInt("y")
+        // ★2026-11-12（用户："明确树结构就不要 find 了"）：先走**当前 View / 最上层对话框**子树
+        //   （几十节点，几十 ms）；这两层都没有才退整树 —— 这里只在"学迷之按钮坐标"时用一次，
+        //   成功后落盘到 [LabBtnStore]，之后直达。
+        for (root in arrayOf("view", "top")) {
+            val a = AgentApi.findList(nameRe, root) ?: continue
+            val o = a.optJSONObject(0) ?: continue
+            if (o.has("x") && o.has("y")) return o.optInt("x") to o.optInt("y")
+        }
+        // ★2026-11-12（用户："find 现在都不用了，学了也没意义"）：**不再整树兜底**。
+        //   按钮一定在 `view`/`top` 里；两层都没有就是"这页没有"，返回 null 让上层下一轮再看。
+        //   学坐标机制因此没有新输入源了 —— 旧落盘数据仍当缓存用（[LabBtnStore]），不再新增。
+        return null
     }
 
     /**

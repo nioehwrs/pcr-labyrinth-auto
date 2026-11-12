@@ -89,6 +89,9 @@ object ShopSampleLog {
             f.forEachLine { line ->
                 if (line.isBlank()) return@forEachLine
                 val o = runCatching { JSONObject(line) }.getOrNull() ?: return@forEachLine
+                // ★2026-11-11（用户）：**4 层商店整屏跳过** —— 它固定 6 件 3★ 专属件（no_area4_only），
+                //   混进来会把看板的 3★ 从 ~5% 抬到 20% 以上，没有任何参考价值。
+                if (o.optInt("area", 0) == 4) return@forEachLine
                 screens++
                 val arr = o.optJSONArray("shelf") ?: return@forEachLine
                 for (i in 0 until arr.length()) {

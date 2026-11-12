@@ -62,21 +62,15 @@ object FridaInjector {
     private const val KEY_SO = "libil2cpp.so"
 
     /**
-     * maps 里出现 libil2cpp.so 之后再静置这么久才注入。
+     * ★★2026-11-11（用户）：不再有"注入前固定静置"。
      *
-     * ★★2026-10-27 用户拍板：**固定 6 秒，不学、不随设备变**（原话："就设置成 6s 吧，这里不要动了，
-     *   也不学什么"）。注入成功后**不再回写**、失败后也不再 +=1s。
-     *
-     * 为什么要废掉原来的"学习型等待"（2026-10-21）：它成功后把**本次实际静置**固化回默认值，
-     * 而那个值里含着"慢启动额外 +4s"，于是变成**只涨不降的棘轮**：
-     *   2s →（一次慢启动）6s →（再一次）10s →（再一次）14s … 一直顶到 15s 上限，
-     * 且全无下调路径。实测 2026-10-27 20:59 那局已经卡在 14s
-     * （日志：`libil2cpp.so 已映射（游戏起了 1s）→ 静置 14s 再注入（该设备学过：注入前等 14s）`），
-     * 每局白白多等十几秒。现在写死 6s，换设备/清数据都一样。
-     *
-     * （PC 版 ATTACH_DELAY = 2.0；但模拟器上 2s 偏早，6s 是实测能稳定注入、又不浪费的值。）
+     * 旧做法是「libil2cpp.so 映射后再等 6s」——但映射 ≠ il2cpp 运行时初始化完成，
+     * 好设备白等 6s，慢设备又可能不够。现在改为：
+     *   映射 → 立即注入 → agent 每 250ms 检查 `il2cpp_domain_get()` 非空才算 ready
+     *   → 上层等 `ready`（上限 [IL2CPP_READY_TIMEOUT_MS]）。
+     * 这样"能不能用"由运行时事实决定，不再拿固定时间赌。
      */
-    private const val SETTLE_MS = 6_000L
+    private const val IL2CPP_READY_TIMEOUT_MS = 30_000L
 
     /** 等就绪的总超时（PC 版 step_wait_ready 的 timeout = 120） */
     private const val READY_TIMEOUT_MS = 120_000L
@@ -89,13 +83,6 @@ object FridaInjector {
 
     /** 调起游戏后等进程出现的上限 */
     private const val PID_WAIT_MS = 20_000L
-
-    /** ★agent 回连后**再静置**这么久才开始读页面/导航（2026-10-17）：`il2cpp 就绪` ≠ 游戏加载完，
-     *  实测注入后 ~2s 游戏还在 `NONE(0)`，那一拍做 UI 遍历最容易把进程拖死 ✓。
-     *  ★时长取 **8s**（用户 2026-10-17："5s、8s 都没事，不会拖慢多少 —— 游戏有几个开屏画面，跳不了多少"）：
-     *  静置期与开屏画面**重叠** ⇒ 等于免费；这段正是"最不该动手"的窗口。
-     *  （每次重新注入（含自愈重启后）都会走这一段 ✓。） */
-    private const val POST_INJECT_SETTLE_MS = 8_000L
 
     /**
      * 连续调起多少次都见不到游戏进程就放弃（避免"崩→拉起→崩"死循环刷屏）。
@@ -448,7 +435,7 @@ object FridaInjector {
                 // 记下"app 第一次看到这个 pid 的时刻"（时间兜底口径 + 日志用）
                 val startedAt = firstSeen.getOrPut(pid) { SystemClock.elapsedRealtime() }
                 // ★启动期闸门：等到"可以安全注入"（主判据 = libil2cpp 已映射，见常量注释）
-                //   —— 这就是"调起游戏后稍微过一会再注入"：等 il2cpp 映射 + 静置 SETTLE_MS
+                //   —— 等 il2cpp 映射后**立即注入**；真正的"il2cpp 可用"由 agent 轮询 domain，上限 30s
                 val readyWhy = waitGameReady(pid, startedAt)
                 if (readyWhy != null) {
                     // ★僵死/提前退出 => 进程已坏，别傻等，杀游戏重开（2026-10-21 uuz 实测）
@@ -600,7 +587,8 @@ object FridaInjector {
     /**
      * 等"可以安全注入"（PC 版 `step_wait_ready` + `ATTACH_DELAY` 的同款语义）。
      *
-     *   ① 主判据（需要 root）：轮询 `/proc/<pid>/maps` 直到出现 `libil2cpp.so`，再静置 SETTLE_MS；
+     *   ① 主判据（需要 root）：轮询 `/proc/<pid>/maps` 直到出现 `libil2cpp.so`；
+     *      ★映射后**立即注入**，"il2cpp 可用"交给 agent 轮询 `domain_get`（上层最多等 30s）；
      *   ② 兜底（拿不到 root）：退回"进程存活时长 >= MIN_GAME_AGE_MS"这个时间口径。
      *
      * @return true = 现在可以注入了
@@ -616,9 +604,12 @@ object FridaInjector {
                 return why
             }
             val ms = SystemClock.elapsedRealtime() - startedAt
-            // ★2026-10-27：固定 [SETTLE_MS]，不再"慢启动额外 +4s"、不再学习、不再持久化。
-            AppState.addLog("$KEY_SO 已映射（游戏起了 ${ms / 1000}s）→ 静置 ${SETTLE_MS / 1000}s 再注入")
-            delay(SETTLE_MS)
+            // ★2026-11-11（用户）：**映射后立即注入**，不再固定静置 6s。
+            //   注入本身（attach + load script）是安全的；真正会崩的是"过早调用 il2cpp API"，
+            //   而那件事已经交给 agent 的 250ms 定时器：只有 `il2cpp_domain_get()` 非空才算 ready，
+            //   上层再等 `ready`（最多 [IL2CPP_READY_TIMEOUT_MS]）才读页面。
+            //   ⇒ 好设备省 6s，慢设备自动延长，不再拿固定时间赌。
+            AppState.addLog("$KEY_SO 已映射（游戏起了 ${ms / 1000}s）→ 立即注入（就绪由 agent 自己等）")
             return null
         }
         val age = SystemClock.elapsedRealtime() - startedAt
@@ -890,6 +881,9 @@ object FridaInjector {
         var toldConnected = false
         var tick = 0
         var misses = 0
+        // ★2026-11-11：等 il2cpp 就绪的起始时刻（0 = 还没开始等）；只在"回连后"计时
+        var readyWaitAt = 0L
+        var readyWarned = false
         while (true) {                            // 取消靠 delay() 抛 CancellationException（同 AutoForegroundService）
             delay(POLL_MS)
             // ★★2026-10-27：**总闸关了就一次都别问 agent**。
@@ -920,25 +914,42 @@ object FridaInjector {
                 continue
             }
             if (!toldConnected) {
-                // 跟 PC 版一致：先等 agent 的 il2cpp 就绪（它的 ready 导出 = !!g_il2cpp），
+                // 跟 PC 版一致：先等 agent 的 il2cpp 就绪（它的 ready 导出 = !!g_il2cpp，
+                // ★cs95 起还要求 `il2cpp_domain_get()` 非空 —— 映射 ≠ 初始化完成），
                 // 没就绪就调 labStatus 只会拿到 null。
                 val r = AgentBridge.call("ready", timeoutMs = 4_000L)
                 if (r == null || !r.optBoolean("data", false)) {
-                    AppState.setFridaStatus("agent 已连，等 il2cpp 就绪…")
+                    if (readyWaitAt == 0L) readyWaitAt = SystemClock.elapsedRealtime()
+                    val waited = SystemClock.elapsedRealtime() - readyWaitAt
+                    // ★2026-11-11（用户）：最多提示到 [IL2CPP_READY_TIMEOUT_MS]=30s；超了只告警、
+                    //   继续等，**不杀游戏**（映射已在、agent 已连，多半只是启动慢）。
+                    if (waited >= IL2CPP_READY_TIMEOUT_MS && !readyWarned) {
+                        readyWarned = true
+                        AppState.addLog(
+                            "[!] 注入后 ${waited / 1000}s il2cpp 仍未就绪（domain 未建好）→ 继续等，不杀游戏",
+                        )
+                    }
+                    AppState.setFridaStatus("agent 已连，等 il2cpp 就绪…（${waited / 1000}s）")
                     continue
                 }
+                val readyMs = if (readyWaitAt > 0) SystemClock.elapsedRealtime() - readyWaitAt else 0L
+                readyWaitAt = 0L
+                readyWarned = false
                 toldConnected = true
                 // ★打脚本构建号：验证「轻读」改动时，开局就能确认注入的是哪一版 agent
                 //  （改过读逻辑时 JS_BUILD 会递增；PROBE 之外的常规日志原本看不到它）。
                 val jsb = runCatching {
                     AgentBridge.call("jsBuild", timeoutMs = 3_000L)?.optString("data")
                 }.getOrNull()
-                AppState.addLog("agent 已回连（il2cpp 就绪），脚本构建号=${jsb ?: "读不到"}，开始读页面名")
-                // ★★"再晚点挂"（2026-10-17 用户："再晚点挂就行了吧"）：il2cpp 就绪 ≠ **游戏加载完**。
-                //   实测（09:04）注入后 2s、页面还是 `NONE(0)` 时那一拍最危险 —— 我们在那儿做过 UI 遍历
-                //   ⇒ 把游戏卡死。虽然调用侧已加"加载/瞬态页不做遍历"，这里再**静置 [POST_INJECT_SETTLE_MS]**
-                //   才开始读页面（纯保险 ✓，代价只有这几秒 ✓）。
-                delay(POST_INJECT_SETTLE_MS)
+                AppState.addLog(
+                    "agent 已回连（il2cpp 就绪，等了 ${readyMs}ms），脚本构建号=${jsb ?: "读不到"}，开始读页面名",
+                )
+                // ★★2026-11-11（用户）：**去掉注入后的 8s 静置**。
+                //   那 8s 的原始原因是 2026-10-17 的旧 pollLoop 在 `NONE(0)`（游戏还在开屏）时做过
+                //   **UI 遍历**，把游戏卡死过。现在这里只调 `viewId`（`getViewId`，纯字段读、极便宜），
+                //   `labStatus` 也只在 `vid==264` 且隔 3 轮才读 ⇒ 加载页根本不会产生重操作，
+                //   再等 8s 纯属白等。
+
             }
             // ① viewId：便宜、任何页面都有 —— 状态机的分派判据（PC 版也是用它）
             val vidRes = AgentBridge.call("viewId", timeoutMs = 3_000L)

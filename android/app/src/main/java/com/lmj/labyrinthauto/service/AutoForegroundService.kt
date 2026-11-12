@@ -307,6 +307,10 @@ class AutoForegroundService : Service() {
 
                     var done = 0
                     var idx = 0
+                    // ★2026-11-11（用户反馈：撤退重开被顶号 6002）：本轮是否"被中止/没跑完"。
+                    //   还原装备要走游戏 API 登录，会挤掉正在操作的客户端 ⇒ 人工中止时**不立即还原**，
+                    //   只保留 pending，下次开跑前再补（那时脚本要接管，不会和玩家抢登录态）。
+                    var endedByStop = false
                     MazeSummary.reset()                 // ★整轮开始：清掉上一轮的汇总
                     try {
                         while (isActive && idx < total) {
@@ -381,6 +385,7 @@ class AutoForegroundService : Service() {
                                     continue
                                 }
                                 OverlayStatus.setLevel(OverlayStatus.Level.ERROR)
+                                endedByStop = true
                                 AppState.addLog("════ 第 $idx 局没跑完 → 运行结束（不带着异常状态开下一局）════")
                                 break
                             }
@@ -399,6 +404,7 @@ class AutoForegroundService : Service() {
                         //   `scope`（SupervisorJob 只隔离子协程，**不捕获**）⇒ 未捕获异常 ⇒ **整个 app
                         //   进程被杀**。日志停在"agent 监听已开启"，所以看着像"frida 一启动就闪退"。
                         //   任何一局出异常都不该带走进程 —— 记一行、归档日志、收尾退出即可。
+                        endedByStop = true
                         AppState.addLog("════ 运行异常，本轮中止：${t.javaClass.simpleName}: ${t.message}")
                         runCatching {
                             LogFile.endRun(done = false, tag = "ABORT_EXIT", reason = "异常：${t.message}")
@@ -418,8 +424,16 @@ class AutoForegroundService : Service() {
                         }
                     }
                     // ★整轮结束：按开跑前的快照还原 EX 装备（2026-11-06 用户）。
-                    //   异常退出时走不到这里 ⇒ 记录里留着 pending，下次开跑前/打开 App 时补还原。
-                    restoreExEquipAfterRun()
+                    //   ★2026-11-11（用户反馈"撤退重开被顶号 6002"）：**只有正常跑完才立即还原**。
+                    //   还原要登录游戏 API，会挤掉正在操作的客户端 ⇒ 人工中止 / 某局失败停手时
+                    //   只保留 pending，下次开跑前（或打开 App 时）再补，避免和"快速重开"抢登录态。
+                    if (endedByStop) {
+                        AppState.addLog(
+                            "EX 装备：本轮被中止/未跑完 → 保留待还原，下次开跑前再补（避免顶号）",
+                        )
+                    } else {
+                        restoreExEquipAfterRun()
+                    }
                     // ★运行已结束 ⇒ 立刻补一次心跳（running=false）。否则进程很快被杀时，
                     //   磁盘上最后一份心跳还是 running=true，下次启动会误报"上次突然中断"（2026-11-06 用户）。
                     AppState.setRunning(false)

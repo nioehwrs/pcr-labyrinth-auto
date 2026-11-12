@@ -763,14 +763,15 @@ object InGameReroll {
             val out = fullyOnScreen(raw, w, h)
             if (out.size >= 2) return out
         }
-        // 兜底：全树遍历（字段直取拿不到时）。findList 已按中心 onscreen 过滤，
-        // 但仍要剔掉「只露半个按钮」的卡，否则和上面那次错改一样会点空。
-        var list = sortedByX(AgentApi.findList("DepartureButton"))
+        // 兜底：字段直取拿不到时，从**公会设置对话框自己的子树**找（`root="dialog"`，几十节点）。
+        // ★2026-11-12（用户："明确树结构就不要 find 了"）：不再走整棵 UI 树（661 节点 ≈1.8s）。
+        //   findList 已按中心 onscreen 过滤，但仍要剔掉「只露半个按钮」的卡，否则会点空。
+        var list = sortedByX(AgentApi.findList("DepartureButton", "dialog"))
         var waited = 0L
         while (list.size < 2 && waited < 1_500L) {
             delay(POLL_MS)
             waited += POLL_MS
-            list = sortedByX(AgentApi.findList("DepartureButton"))
+            list = sortedByX(AgentApi.findList("DepartureButton", "dialog"))
         }
         return fullyOnScreen(list, w, h)
     }
@@ -1068,7 +1069,8 @@ object InGameReroll {
     private suspend fun tapDifficultyButton(input: InputBackend): Boolean {
         val t0 = SystemClock.elapsedRealtime()
         while (SystemClock.elapsedRealtime() - t0 < FIND_MS) {
-            val arr = AgentApi.findList("DifficultyChangeButton")
+            // ★限定在对话框子树（两颗同名按钮都在里面，取 y 最大那颗）
+            val arr = AgentApi.findList("DifficultyChangeButton", "dialog")
             var best: JSONObject? = null
             if (arr != null) {
                 for (i in 0 until arr.length()) {
@@ -1108,7 +1110,8 @@ object InGameReroll {
             if (bySprite != null) return bySprite.last().digitToInt()
             if (i < retries - 1) delay(300)             // 换页/弹窗动画期间可能读到旧节点，隔一拍再读
         }
-        val t = AgentApi.findText("difficultyNumOneDigit")?.optString("text").orEmpty()
+        // ★2026-11-12：数字文本也限定在难度弹窗子树（不再整树 find）
+        val t = AgentApi.findText("difficultyNumOneDigit", "dialog")?.optString("text").orEmpty()
         return Regex("\\d+").find(t)?.value?.toIntOrNull()?.also {
             AppState.addLog("局内刷开局：图标名没对上（最后读到 \"$lastSprite\"）→ 用文字兜底 = $it")
         }
@@ -1129,7 +1132,8 @@ object InGameReroll {
     private suspend fun pickDifficulty(input: InputBackend, want: Int): Boolean {
         delay(SETTLE_MS)                            // 弹窗刚点开有展开动画，立刻读会读到空
         for (round in 1..DIFF_SCROLL_MAX) {
-            val labels = AgentApi.findTextList("DifficultyNumLabel", max = 12)
+            // ★2026-11-12：限定在难度弹窗子树（`dialog`），不再整树遍历
+            val labels = AgentApi.findTextList("DifficultyNumLabel", max = 12, root = "dialog")
             // ★诊断（2026-10-19）：一直"上滑难度列表"却找不到行 ⇒ 先看看弹窗里到底有什么。
             //   只读一次，不改变点击行为；看清了再改成按节点选（而不是按文字"难度N"）。
             if (round == 1) {
@@ -1140,7 +1144,7 @@ object InGameReroll {
             }
             val idx = indexOfLabel(labels, want)
             if (idx >= 0) {
-                val radios = AgentApi.findList("SelectDifficultyButton")
+                val radios = AgentApi.findList("SelectDifficultyButton", "dialog")
                 val r = if (radios != null && radios.length() == labels!!.length()) {
                     radios.optJSONObject(idx)                       // ① 顺序配对
                 } else {
@@ -1154,7 +1158,7 @@ object InGameReroll {
             }
             // ★弹窗里压根没有可选行 ⇒ 多半是「难度变更」没打开弹窗（点了被盖住的那颗）
             //   ⇒ 再点一次按钮，而不是对着空白上滑（2026-10-19 实测：滑了 6 次共 15s 什么也没滑出来）
-            if (AgentApi.findList("SelectDifficultyButton")?.length() ?: 0 == 0) {
+            if (AgentApi.findList("SelectDifficultyButton", "dialog")?.length() ?: 0 == 0) {
                 AppState.addLog("局内刷开局：难度弹窗里没有可选行（弹窗可能没打开）→ 再点一次「难度变更」")
                 if (!tapDifficultyButton(input)) return false
                 delay(SETTLE_MS)
