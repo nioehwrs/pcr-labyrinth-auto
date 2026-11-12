@@ -1102,8 +1102,12 @@ object MazeLoop {
     /** ★出现后最多点几次（点空就用下一拍的新坐标再点；**多点当手段**，不等按钮落位） */
     private const val MOVE_CONFIRM_TAP_MAX = 5
 
-    /** ★每次点完只探这么久有没有"开始消失"（入场动画期点空是正常代价） */
-    private const val MOVE_CONFIRM_PROBE_MS = 180L
+    /**
+     * ★每次点完探这么久有没有"开始消失"（入场动画期点空是正常代价）。
+     * ★2026-11-12 实测：180ms 太短（tween 在 +200~300ms 才启动）⇒ 每次都连点到 #4 才探到；
+     *   放到 400ms，点中后一次就够，点空也只是晚 220ms 补点。
+     */
+    private const val MOVE_CONFIRM_PROBE_MS = 400L
 
     /** 探测"是否开始消失"时的轮询间隔 */
     private const val MOVE_CONFIRM_PROBE_POLL_MS = 60L
@@ -5613,6 +5617,10 @@ object MazeLoop {
                 //   探到"变了"就停；探完还没变才判"真没生效"（那时按钮已静止，再点才点得准）。
                 probe = PROBE_N,
                 probeMs = PROBE_MS,
+                // ★2026-11-12（用户实测：点「全部」行后面的选择框几乎每次都点早、要重复一次）：
+                //   刚进 setting 页时这一行还在入场动画里 ⇒ **首点前先只读不点跳 2 拍**
+                //   （2×60ms，不做长固定延迟），下一拍 xyAt 重新取落位后的坐标再点。
+                skipFirstHits = if (rule.btnKey == "prio0") 2 else 0,
                 xyAt = xyAt@{
                     // ① 页面已经切走？⇒ 这一次不点（外层循环会重新读页面状态）
                     if (exeqSigNow() != sigNow) return@xyAt null
@@ -7686,14 +7694,25 @@ object MazeLoop {
         // ★2026-11-12（用户："明确树结构就不要 find 了"）：先走**当前 View / 最上层对话框**子树
         //   （几十节点，几十 ms）；这两层都没有才退整树 —— 这里只在"学迷之按钮坐标"时用一次，
         //   成功后落盘到 [LabBtnStore]，之后直达。
-        for (root in arrayOf("view", "top")) {
+        for (root in arrayOf("view", "top", "dialog")) {
             val a = AgentApi.findList(nameRe, root) ?: continue
             val o = a.optJSONObject(0) ?: continue
             if (o.has("x") && o.has("y")) return o.optInt("x") to o.optInt("y")
         }
-        // ★2026-11-12（用户："find 现在都不用了，学了也没意义"）：**不再整树兜底**。
-        //   按钮一定在 `view`/`top` 里；两层都没有就是"这页没有"，返回 null 让上层下一轮再看。
-        //   学坐标机制因此没有新输入源了 —— 旧落盘数据仍当缓存用（[LabBtnStore]），不再新增。
+        // ★2026-11-12 实测回归（HOME 页 `ButtonQuest` 不在 view/layer/dialog）：**恢复整树兜底**，
+        //   但只在最后、并打日志说明"这个按钮需要补根"，避免再次因为删兜底卡死。
+        AgentApi.find(nameRe)?.let {
+            if (it.has("x") && it.has("y")) {
+                // ★走整树兜底时逐个根报数，方便定位按钮到底挂在哪层
+                val where = StringBuilder()
+                for (r in arrayOf("view", "top", "dialog", "layer")) {
+                    val c = runCatching { AgentApi.findList(nameRe, r)?.length() ?: 0 }.getOrDefault(0)
+                    where.append(r).append('=').append(c).append(' ')
+                }
+                AppState.addLog("迷宫：按钮「$nameRe」只在整树里找到（各根：$where）")
+                return it.optInt("x") to it.optInt("y")
+            }
+        }
         return null
     }
 
@@ -7843,6 +7862,8 @@ object MazeLoop {
         reached: (suspend (String) -> Boolean)? = null,
         /** 一次快照探针（top + 判据 + 诊断同源）；给了它就不再读 readTop / reached。 */
         probeState: (suspend () -> TapCheck.Probe)? = null,
+        /** ★首点前先「只读不点」几拍（新页入场动画期间按钮坐标还在动）；见 [TapCheck.run] */
+        skipFirstHits: Int = 0,
     ): Boolean = TapCheck.run(
         tapFn = { tx, ty, tw -> tap(input, tx, ty, tw) },
         x = x, y = y, what = what, from = from,
@@ -7854,6 +7875,7 @@ object MazeLoop {
         // ★下面三个就是原来写死在本文件里的常量，值完全一致（别在这里改行为）
         skipMax = EXEQ_SKIP_MAX,
         skipDelayMs = EXEQ_POLL_MS,
+        skipFirstHits = skipFirstHits,
         verbose = TRANS_VERBOSE,
     )
 

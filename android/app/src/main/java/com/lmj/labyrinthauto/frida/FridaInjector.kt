@@ -3,6 +3,7 @@ package com.lmj.labyrinthauto.frida
 import android.content.Context
 import android.os.SystemClock
 import com.lmj.labyrinthauto.core.AppState
+import com.lmj.labyrinthauto.input.Foreground
 import com.lmj.labyrinthauto.logic.MazeLoop
 import com.lmj.labyrinthauto.logic.Navigator
 import kotlinx.coroutines.CoroutineScope
@@ -71,6 +72,13 @@ object FridaInjector {
      * 这样"能不能用"由运行时事实决定，不再拿固定时间赌。
      */
     private const val IL2CPP_READY_TIMEOUT_MS = 30_000L
+
+    /**
+     * ★2026-11-12：注入前最多等这么久「前台变成游戏」。
+     *   启动时会先弹 `com.android.permissioncontroller`（权限页）抢前台，游戏在后台时注入容易把游戏带走。
+     *   这是**状态判定**（前台包名），不是固定 sleep；等到就立刻注入。
+     */
+    private const val FRONT_WAIT_BEFORE_INJECT_MS = 10_000L
 
     /** 等就绪的总超时（PC 版 step_wait_ready 的 timeout = 120） */
     private const val READY_TIMEOUT_MS = 120_000L
@@ -604,12 +612,20 @@ object FridaInjector {
                 return why
             }
             val ms = SystemClock.elapsedRealtime() - startedAt
-            // ★2026-11-11（用户）：**映射后立即注入**，不再固定静置 6s。
-            //   注入本身（attach + load script）是安全的；真正会崩的是"过早调用 il2cpp API"，
-            //   而那件事已经交给 agent 的 250ms 定时器：只有 `il2cpp_domain_get()` 非空才算 ready，
-            //   上层再等 `ready`（最多 [IL2CPP_READY_TIMEOUT_MS]）才读页面。
-            //   ⇒ 好设备省 6s，慢设备自动延长，不再拿固定时间赌。
-            AppState.addLog("$KEY_SO 已映射（游戏起了 ${ms / 1000}s）→ 立即注入（就绪由 agent 自己等）")
+            // ★2026-11-12（用户："优先用状态判定，而不是延迟"）：
+            //   ① 代码段 `r-xp` 已就位（见 [waitIl2CppMapped]）⇒ linker 重定位基本完成；
+            //   ② 再等**前台真的变成游戏**（权限页/系统页会抢前台，后台启动时注入容易把游戏带走）。
+            //   两个状态都满足就立刻注入，不再固定 sleep。
+            val pkg = runCatching { GameProcess.pkg() }.getOrNull().orEmpty()
+            if (pkg.isNotEmpty()) {
+                val fgOk = waitFrontGame(pkg, FRONT_WAIT_BEFORE_INJECT_MS)
+                AppState.addLog(
+                    "$KEY_SO 已映射（游戏起了 ${ms / 1000}s）+ 前台${if (fgOk) "=游戏" else "仍不是游戏（照常注入）"}" +
+                        " → 立即注入（il2cpp 就绪由 agent 自己等）",
+                )
+            } else {
+                AppState.addLog("$KEY_SO 已映射（游戏起了 ${ms / 1000}s）→ 立即注入（就绪由 agent 自己等）")
+            }
             return null
         }
         val age = SystemClock.elapsedRealtime() - startedAt
@@ -668,6 +684,21 @@ object FridaInjector {
         return parts.joinToString(" ｜ ").ifBlank { "（诊断没取到）" }
     }
 
+    /**
+     * ★2026-11-12（用户："优先用状态判定，而不是延迟"）：等**前台真的变成游戏**。
+     * 启动时会先弹 `com.android.permissioncontroller`（权限页）抢前台，游戏在后台时注入容易被带走；
+     * 这是包名状态判定，等到就立刻注入，超时返回 false（调用方照常注入，不卡死）。
+     */
+    private suspend fun waitFrontGame(pkg: String, timeoutMs: Long): Boolean {
+        val t0 = SystemClock.elapsedRealtime()
+        while (SystemClock.elapsedRealtime() - t0 < timeoutMs) {
+            val f = runCatching { Foreground.packageName(force = true) }.getOrNull()
+            if (f == pkg) return true
+            delay(250)
+        }
+        return false
+    }
+
     /** root 能不能用（探测一次就记住，失败不每轮重试）。 */
     private suspend fun rootUsable(): Boolean {
         if (rootUnavailable) return false
@@ -690,12 +721,24 @@ object FridaInjector {
     private suspend fun waitIl2CppMapped(pid: Int): String? {
         val t0 = SystemClock.elapsedRealtime()
         var said = false
+        var mappedAt = 0L
         while (true) {
             val dt = SystemClock.elapsedRealtime() - t0
-            val r = RootShell.exec("grep -m1 $KEY_SO /proc/$pid/maps", 8_000L)
+            // ★2026-11-12（用户："优先用状态判定，而不是延迟"）：等**可执行段**（`r-xp`）而不是文件头段（`r--p`）——
+            //   `r--p` 出现时 linker 还在重定位，此时注入会把游戏带走（实测 0s 注入后 1s 崩）。
+            val r = RootShell.exec("grep -m1 'r-xp.*$KEY_SO' /proc/$pid/maps", 8_000L)
             if (r.out.contains(KEY_SO)) return null
             if (r.text.contains("No such file") || r.text.contains("No such process")) {
                 return "进程提前退出（pid $pid 没了）"
+            }
+            // 兜底：so 已映射、却一直等不到 `r-xp`（个别 ROM 段标志不同）⇒ 5s 后按已加载处理，不卡死
+            if (mappedAt == 0L && dt > 1_000L) {
+                val any = RootShell.exec("grep -m1 $KEY_SO /proc/$pid/maps", 3_000L)
+                if (any.out.contains(KEY_SO)) mappedAt = SystemClock.elapsedRealtime()
+            }
+            if (mappedAt > 0L && SystemClock.elapsedRealtime() - mappedAt > 5_000L) {
+                AppState.addLog("…$KEY_SO 已映射但 5s 内没等到 r-xp 段 → 按已加载处理")
+                return null
             }
             // 进程还在、so 却一直不映射：看一眼进程状态，T/D/t（ptrace 挂起/僵死）=> 判定坏状态
             //   （2026-10-21 uuz 实测：attach 写内存失败后进程卡 T 状态，maps 停在注入前，

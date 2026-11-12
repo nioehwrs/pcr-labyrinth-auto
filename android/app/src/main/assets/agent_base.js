@@ -3630,6 +3630,7 @@ function _walkNodes() {
 //   两者会同时 active 且都是 DialogArea 的子节点，靠 activeInHierarchy 完全分不出来）。
 // 先序 DFS 会按兄弟顺序访问，故"最后一个匹配的"就是最上层的那个。
 let g_dialogArea = null;   // 缓存 DialogArea 的 Transform（长驻对象，指针对不上就重找）
+let g_footerTr = null;     // ★2026-11-12：底部导航层 `PartsFooter` 的 Transform（`_subtreeRoot("footer")` 用）
 let g_dlgBfs = 0;          // DialogArea 被"重扫"的次数（用于诊断：每轮都在涨 ⇒ 缓存失配 → 全树 BFS 开销）
 let g_vmScans = 0;         // ★查"活跃 ViewManager"时的**全堆扫描**次数（1~2s 级的重活；Python 侧看到它涨就出声）
 
@@ -4030,6 +4031,61 @@ function _topDialogGo(preferOverlay) {
     if (preferOverlay && ogo) return { go: ogo, name: onm };
     return go ? { go: go, name: nm } : null;
   } catch (e) { return null; }
+}
+
+/**
+ * ★★259「出发」按钮的**字段直取**（2026-11-12 用户："应该有一种直接通过节点的读取方式"）。
+ *
+ * `ViewLabyrinthTop`（dump.cs）：
+ *   `challengeButton` @ **0xE8**（`CustomUIButton` 子类 `LabyrinthChallengeButton`）← 就是"出发"
+ *   其它菜单按钮：rewardList 0xF0 / reinforcement 0xF8 / mission 0x100 / pictureBook 0x108
+ *   `labyrinthTempData` @0x130
+ * ⇒ 零遍历：当前 View 就是这个类时，读 +0xE8 → `get_transform` → 相机投影，直接得到按钮坐标。
+ *   不需要 findList、不需要学坐标、不依赖任何缓存。
+ *
+ * 返回：{ok, x, y, active, cls, ms, err}
+ *   · ok=false 时 `err` 说明断在哪一步（no-vm / no-view / not-top / no-btn / no-tr / no-cam）
+ */
+function labStartBtnSnapshot() {
+  const out = { ok: false, x: 0, y: 0, active: false, cls: "", ms: 0, err: null };
+  const t0 = Date.now();
+  try {
+    const vm = _viewManagerInst();
+    if (!vm || vm.isNull()) { out.err = "no-vm"; out.ms = Date.now() - t0; return out; }
+    const cv = vm.add(0x110).readPointer();
+    if (!ptrOk(cv)) { out.err = "no-view"; out.ms = Date.now() - t0; return out; }
+    try { out.cls = klassNameOf(cv); } catch (e) {}
+    if (!/ViewLabyrinthTop/i.test(out.cls)) { out.err = "not-top"; out.ms = Date.now() - t0; return out; }
+    const btn = cv.add(0xE8).readPointer();
+    if (!ptrOk(btn)) { out.err = "no-btn"; out.ms = Date.now() - t0; return out; }
+    try { out.btnCls = klassNameOf(btn); } catch (e) {}
+    // ★找 Transform 的三条路（实测 Component.get_transform 直接 invoke 会 no-tr）：
+    //   ① Component.m_GameObject(+0x10) → GameObject.get_transform
+    //   ② 直接 Component.get_transform
+    //   ③ 退化：把 Component 当 GameObject 试（有些字段存的是 GO 指针）
+    let gob = null;
+    try { const p = btn.add(0x10).readPointer(); if (ptrOk(p)) gob = p; } catch (e) {}
+    if (gob) { try { out.goCls = klassNameOf(gob); } catch (e) {} }
+    let tr = null;
+    if (gob) { try { tr = _inv(gob, "get_transform"); } catch (e) {} }
+    if (!tr || tr.isNull()) { try { tr = _inv(btn, "get_transform"); } catch (e) {} }
+    if (!tr || tr.isNull()) {
+      out.err = "no-tr(btn=" + out.btnCls + ",go=" + (out.goCls || "-") + ")";
+      out.ms = Date.now() - t0;
+      return out;
+    }
+    out.trCls = (function () { try { return klassNameOf(tr); } catch (e) { return "?"; } })();
+    const env = _camEnv();
+    if (!env) { out.err = "no-cam"; out.ms = Date.now() - t0; return out; }
+    const ss = _screenOf(tr, env.cam, env.mW2S);
+    if (!ss) { out.err = "no-screen"; out.ms = Date.now() - t0; return out; }
+    out.x = Math.round(ss.x);
+    out.y = Math.round(env.H - ss.y);
+    try { out.active = _goActive(_inv(btn, "get_gameObject")) === true; } catch (e) { out.active = true; }
+    out.ok = true;
+  } catch (e) { out.err = String(e); }
+  out.ms = Date.now() - t0;
+  return out;
 }
 
 /** 定位当前商店实例：顶层是商店就用它，否则在 DialogArea 里按最上层找（与 labShop 同口径）。 */
@@ -6302,7 +6358,7 @@ function labExEquipTop() {
 // ── 选角色页（SUMMON_UNIT=1 且 pageTop 是对话框）：初始编成 / 门票召唤（★只读）──
 // ★构建号：改过读逻辑就 +1。attach 时 pcr_auto 会打出来（rpc jsBuild）——用来确认
 //   "正在跑的到底是哪一版脚本"，免得拿旧输出讨论半天（2026-10-10 踩过）。
-const JS_BUILD = "cs95";     // ★cs95（2026-11-11）：`initIl2Cpp` 以 **domain 可用**（`il2cpp_domain_get()` 非空）作为就绪判据 —— 映射≠初始化完成；配合注入侧去掉固定 6s 静置，改由 agent 轮询就绪（Kotlin 最多等 30s）。★cs94（2026-11-11）：商店 slots **收全部** PurchaseButton（不再只收 onscreen）——屏外/半露按钮被丢会令槽位序号错位，`vis` 改按面板裁剪区判定。★cs93（2026-11-11）：`_topDialogGo(preferOverlay)` —— 商店链优先取叠加在 `DialogLabyrinthShop` 之上的确认框（商店节点索引反而更大，会把「购买完毕/角色加入」盖掉）。★cs92（2026-11-11）：新增 `labShopItems` —— 只读货架 lineup 字段（rewardId/price/isSold/availability，3~5ms），给「买完链内确认已售」用。★cs91（2026-11-11）：新增 `labDlgKids` —— 只读 DialogArea 全部直接子节点名+active，排查「角色加入」框为何不被 `_topDialogGo` 识别。★cs90（2026-11-11）：labShop 增 `resetCount` —— 读 LabyrinthTempData.ShopResetCount(+0x128)，判断本店**已刷几次**（get_resettableNum 刷新后不减，更像"上限"）。★cs89（2026-11-10）：新增 `labDlgBox` —— 弹窗箱体轻读（指针 + 关闭/出现 tween + 7 个按钮槽位，~5~8ms），给商店「新框出现 → 点确认 → 开始消失 → 下一个框」动画链用。★cs88（2026-11-10）：商店读取**不再用跨轮实例缓存** —— 每拍从当前最上层对话框现取 `_compSelf/_compInChildren`（刷新后不再读到刷新前的货架）；顶层是商店但 lineup 未填 ⇒ 直接回未就绪、不回退旧实例。★cs87（2026-11-10）：新增 `labDlgPair` —— 通用确认框**出现**轻读（`_topDialogGo` 的 GameObject 指针 + TwoButtonLeft/Right，2~4ms），给"点地图节点 → 是否前往"两步确认用。★cs86（2026-11-09）：`labGuildCards` 增加 `W`/`H`（屏幕宽高）—— 上层据此过滤**右越界**的卡（实测拉比林斯 x=2447 > 1920 被当成可见 ⇒ 点出去白等 1.8s）。★cs85（2026-11-09）：`labGuildCards` 不再用 `_ndXY.onscreen` 丢坐标 —— 半露卡（最左那张）的 departureButton 会投影到 x<0，之前被当成"不在可见区"⇒ 白拖一屏再拖回来；现在照给坐标 + `on` 标记，由 Kotlin 侧决定。★cs84（2026-11-09）：`dbgGuildCards` 转正为 **`labGuildCards`** —— 公会选择页卡列表字段直取（ViewManager→ViewLabyrinthGuildSetting+0xD0→scroll+0x20→wrap+0x30→mChildren+0x58），真机实测 **9ms**（原 findList 500~916ms），并带每卡 guildNameLabel 文本，可按名字选公会而不是"第 N 张"。★cs83（2026-11-09）【调试用·测试完请删除】：`dbgGuildCards` 修正 —— 上一版 `klassNameOf(GameObject)` 恒为 "GameObject"，改成读**节点名**；卡组件先 `_compSelf` 再 `_compInChildren`；新增 `cardKlassFound` 便于判断是不是类名找错了。★cs82（2026-11-09）【调试用·测试完请删除】：新增 `dbgGuildCards` —— 公会选择页（263）卡列表结构探针：ViewManager→ViewLabyrinthGuildSetting(+0xD0 controller→+0x20 scroll→+0x30 wrap→+0x58 mChildren)，每卡读 guildNameLabel(+0x40)/departureButton(+0x50)/clearedDifficultyObject(+0x20)，外加 LabyrinthTempData(+0xF0) 的 GuildId/Difficulty/SelectDifficulty。为了把 `findList("DepartureButton")`（~800ms 全树遍历）换成字段直取。★cs81（2026-11-09）：三选一探针改为**并进 probeState**（probe 按 150ms 节奏跑、每次读取顺带带回 proc/tween/selNum，不再同步阻塞采样）；三选一探针 RPC 由 `debugSelTrace` 转正为 `labSelState`（含 started/factor/closing）。★cs80（2026-11-09）：`labDlgClosing` 取组件改为 **DialogCommonAbstract 优先、DialogBase 兜底** —— `DialogLabyrinthSelection`（三选一页）是 DialogBase 直接子类，原先只按 DialogCommonAbstract 找会整个漏掉，读不到它的退出 tween/isProcess。配套 `debugSelTrace` 补 proc/tw。★cs79（2026-11-09）【已于 cs81 转正为 labSelState】：新增三选一页采样 `PartsLabyrinthSelectionItemView.selectionNum@0x38`、卡片列表长度、游戏显示的剩余数文本(+0x138)、剩余数 UI 是否显示(+0x130)、每卡 unitChoiceIndex(+0x98)，用来确定 selectionNum 是"已选数量"还是"选中下标"及其响应速度。★cs78（2026-11-09）：`labDlgClosing` 失败时标 `path=err`（调用方据此区分"读失败"与"窗口没了"，读失败绝不当成"已离开"）；`tapAndCheck` 阶段 1 改为**单次快照探针** `probeState`（top 与判据同源，少一次 RPC，也避免两次读之间的状态错位）。★cs77（2026-11-09）：新增 `labDlgClosing` —— 通用弹窗「关闭已启动」轻读（退出 tween 的 mStarted/factor，零 hook、3~6ms），替代"等窗口消失"当"这一下点生效了"；实测整页到 +800ms 才消失、退出 tween +200~300ms 就启动。★cs74（2026-11-09）：新增 `labDlgBtn` —— 通用弹窗按钮按 `DialogCommonAbstract +0x118` **字段直取**（零遍历，30ms 级），替代 `dialog()` 的 DialogArea 子树遍历（冷 0.5~0.6s / 大页 3~3.9s）；门票三选一两连弹改用它现取坐标。★cs73（2026-11-08）：`labStatusLite` / `labSnapshot` 补 `guildId`（`LabyrinthTempData+0x1C`）—— 局内刷"已在迷宫里要不要沿用"要核对公会，否则手动开着 A 公会的局、配置是 B 公会时会直接沿用、跑完当成 B 公会的成绩。cs72（2026-11-08）：**"最上层"只剩一个实现 + 根没了不再扫全树** —— ①`_topDialogTr`（`findList(...,"top")` 的根）改为复用 `_topDialogGo`，不再自己写一遍判据（原来有 3 份实现，正是 EX 三连页多点/点错的根源）；②`_rootWalkNodes` 的遍历缓存**加校验"根是不是同一个"**（原来只看 key ⇒ `"top"` 这个根会变，1.5s 内会把上一个对话框的子树当成当前的返回）；③新增 `_walkForRoot`：**显式给了根却取不到（如当前没有对话框）⇒ 返回空，不再退化成全树**（`findList(…,"top")` 实测 2633ms → 3ms；而且全树会捞到别处的同名节点）。cs71：**读取全面"按需"** —— ①新增 `labExBtn(key)`：EX 三连页只读**要点的那个按钮** + 当前签名（不再读整包：整包会把 setting 的 4 行文字/复选框、sort 的 11 个 toggle 文字都过一遍，纯浪费）；②新增 `labExtra()`：非分派字段（eventId/questId/eventResultId/effectNum/curChoice/remainChoice + LTD choices）拆成独立读，handler 要时才调；③`labStatusLite` 补 `next`（移动分支用，一次内存读）。cs70：**EX 整包读的按钮改按字段取**（DialogFundationObject：twoLeft 0x48 / twoRight 0x58 / threeLeft 0x70 / threeCenter 0x80 / threeRight 0x98，经对话框组件 +0x118 foundationObject），**不再遍历整棵子树**（①页遍历要 350ms+）。cs69：labExEquip(full, only) 只投影要点的那个；cs68：**"当前最上层"统一成一个实现**（_topDialogGo）—— ①_exeqFind 只查**最上层那一层**、**绝不往回退**（回退会永远读到下面那层仍 active 的①页 ⇒ 签名不变 ⇒ 误判"没生效"⇒多点⇒点错按钮）；②签名里带**最上层容器名**（"页面切了"能立刻看见）。cs67：去掉 agent 侧坐标"稳定化"（Thread.sleep 堵死单通道）；cs64：_findExTopPart 组件查找缓存；cs63：labExEquipSig 轻量签名读
+const JS_BUILD = "cs99";     // ★cs99（2026-11-12）：`labStartBtn` 取 Transform 改走 `Component.m_GameObject(+0x10)` → `GameObject.get_transform`（直接 `Component.get_transform` 实测 no-tr），并回传 btnCls/goCls/trCls 诊断。★cs98（2026-11-12）：新增 `labStartBtn` —— 259「出发」按钮字段直取（`ViewLabyrinthTop.challengeButton +0xE8` → 坐标，零遍历、零学习）。★cs97（2026-11-12）：新增 `_subtreeRoot("footer")` —— 底部导航层 `UI Root/ViewsArea/PartsFooter(Clone)`（HOME 的 `ButtonQuest` 父链实测），导航不再走整树兜底。★cs96（2026-11-12）：`findListPath` 支持**无根**（从 DialogArea 一路 get_parent 到 UI 顶）—— 用来定位"不在 view/layer/dialog/top 里"的按钮（HOME 的 `ButtonQuest` 各根全 0）。★cs95（2026-11-11）：`initIl2Cpp` 以 **domain 可用**（`il2cpp_domain_get()` 非空）作为就绪判据 —— 映射≠初始化完成；配合注入侧去掉固定 6s 静置，改由 agent 轮询就绪（Kotlin 最多等 30s）。★cs94（2026-11-11）：商店 slots **收全部** PurchaseButton（不再只收 onscreen）——屏外/半露按钮被丢会令槽位序号错位，`vis` 改按面板裁剪区判定。★cs93（2026-11-11）：`_topDialogGo(preferOverlay)` —— 商店链优先取叠加在 `DialogLabyrinthShop` 之上的确认框（商店节点索引反而更大，会把「购买完毕/角色加入」盖掉）。★cs92（2026-11-11）：新增 `labShopItems` —— 只读货架 lineup 字段（rewardId/price/isSold/availability，3~5ms），给「买完链内确认已售」用。★cs91（2026-11-11）：新增 `labDlgKids` —— 只读 DialogArea 全部直接子节点名+active，排查「角色加入」框为何不被 `_topDialogGo` 识别。★cs90（2026-11-11）：labShop 增 `resetCount` —— 读 LabyrinthTempData.ShopResetCount(+0x128)，判断本店**已刷几次**（get_resettableNum 刷新后不减，更像"上限"）。★cs89（2026-11-10）：新增 `labDlgBox` —— 弹窗箱体轻读（指针 + 关闭/出现 tween + 7 个按钮槽位，~5~8ms），给商店「新框出现 → 点确认 → 开始消失 → 下一个框」动画链用。★cs88（2026-11-10）：商店读取**不再用跨轮实例缓存** —— 每拍从当前最上层对话框现取 `_compSelf/_compInChildren`（刷新后不再读到刷新前的货架）；顶层是商店但 lineup 未填 ⇒ 直接回未就绪、不回退旧实例。★cs87（2026-11-10）：新增 `labDlgPair` —— 通用确认框**出现**轻读（`_topDialogGo` 的 GameObject 指针 + TwoButtonLeft/Right，2~4ms），给"点地图节点 → 是否前往"两步确认用。★cs86（2026-11-09）：`labGuildCards` 增加 `W`/`H`（屏幕宽高）—— 上层据此过滤**右越界**的卡（实测拉比林斯 x=2447 > 1920 被当成可见 ⇒ 点出去白等 1.8s）。★cs85（2026-11-09）：`labGuildCards` 不再用 `_ndXY.onscreen` 丢坐标 —— 半露卡（最左那张）的 departureButton 会投影到 x<0，之前被当成"不在可见区"⇒ 白拖一屏再拖回来；现在照给坐标 + `on` 标记，由 Kotlin 侧决定。★cs84（2026-11-09）：`dbgGuildCards` 转正为 **`labGuildCards`** —— 公会选择页卡列表字段直取（ViewManager→ViewLabyrinthGuildSetting+0xD0→scroll+0x20→wrap+0x30→mChildren+0x58），真机实测 **9ms**（原 findList 500~916ms），并带每卡 guildNameLabel 文本，可按名字选公会而不是"第 N 张"。★cs83（2026-11-09）【调试用·测试完请删除】：`dbgGuildCards` 修正 —— 上一版 `klassNameOf(GameObject)` 恒为 "GameObject"，改成读**节点名**；卡组件先 `_compSelf` 再 `_compInChildren`；新增 `cardKlassFound` 便于判断是不是类名找错了。★cs82（2026-11-09）【调试用·测试完请删除】：新增 `dbgGuildCards` —— 公会选择页（263）卡列表结构探针：ViewManager→ViewLabyrinthGuildSetting(+0xD0 controller→+0x20 scroll→+0x30 wrap→+0x58 mChildren)，每卡读 guildNameLabel(+0x40)/departureButton(+0x50)/clearedDifficultyObject(+0x20)，外加 LabyrinthTempData(+0xF0) 的 GuildId/Difficulty/SelectDifficulty。为了把 `findList("DepartureButton")`（~800ms 全树遍历）换成字段直取。★cs81（2026-11-09）：三选一探针改为**并进 probeState**（probe 按 150ms 节奏跑、每次读取顺带带回 proc/tween/selNum，不再同步阻塞采样）；三选一探针 RPC 由 `debugSelTrace` 转正为 `labSelState`（含 started/factor/closing）。★cs80（2026-11-09）：`labDlgClosing` 取组件改为 **DialogCommonAbstract 优先、DialogBase 兜底** —— `DialogLabyrinthSelection`（三选一页）是 DialogBase 直接子类，原先只按 DialogCommonAbstract 找会整个漏掉，读不到它的退出 tween/isProcess。配套 `debugSelTrace` 补 proc/tw。★cs79（2026-11-09）【已于 cs81 转正为 labSelState】：新增三选一页采样 `PartsLabyrinthSelectionItemView.selectionNum@0x38`、卡片列表长度、游戏显示的剩余数文本(+0x138)、剩余数 UI 是否显示(+0x130)、每卡 unitChoiceIndex(+0x98)，用来确定 selectionNum 是"已选数量"还是"选中下标"及其响应速度。★cs78（2026-11-09）：`labDlgClosing` 失败时标 `path=err`（调用方据此区分"读失败"与"窗口没了"，读失败绝不当成"已离开"）；`tapAndCheck` 阶段 1 改为**单次快照探针** `probeState`（top 与判据同源，少一次 RPC，也避免两次读之间的状态错位）。★cs77（2026-11-09）：新增 `labDlgClosing` —— 通用弹窗「关闭已启动」轻读（退出 tween 的 mStarted/factor，零 hook、3~6ms），替代"等窗口消失"当"这一下点生效了"；实测整页到 +800ms 才消失、退出 tween +200~300ms 就启动。★cs74（2026-11-09）：新增 `labDlgBtn` —— 通用弹窗按钮按 `DialogCommonAbstract +0x118` **字段直取**（零遍历，30ms 级），替代 `dialog()` 的 DialogArea 子树遍历（冷 0.5~0.6s / 大页 3~3.9s）；门票三选一两连弹改用它现取坐标。★cs73（2026-11-08）：`labStatusLite` / `labSnapshot` 补 `guildId`（`LabyrinthTempData+0x1C`）—— 局内刷"已在迷宫里要不要沿用"要核对公会，否则手动开着 A 公会的局、配置是 B 公会时会直接沿用、跑完当成 B 公会的成绩。cs72（2026-11-08）：**"最上层"只剩一个实现 + 根没了不再扫全树** —— ①`_topDialogTr`（`findList(...,"top")` 的根）改为复用 `_topDialogGo`，不再自己写一遍判据（原来有 3 份实现，正是 EX 三连页多点/点错的根源）；②`_rootWalkNodes` 的遍历缓存**加校验"根是不是同一个"**（原来只看 key ⇒ `"top"` 这个根会变，1.5s 内会把上一个对话框的子树当成当前的返回）；③新增 `_walkForRoot`：**显式给了根却取不到（如当前没有对话框）⇒ 返回空，不再退化成全树**（`findList(…,"top")` 实测 2633ms → 3ms；而且全树会捞到别处的同名节点）。cs71：**读取全面"按需"** —— ①新增 `labExBtn(key)`：EX 三连页只读**要点的那个按钮** + 当前签名（不再读整包：整包会把 setting 的 4 行文字/复选框、sort 的 11 个 toggle 文字都过一遍，纯浪费）；②新增 `labExtra()`：非分派字段（eventId/questId/eventResultId/effectNum/curChoice/remainChoice + LTD choices）拆成独立读，handler 要时才调；③`labStatusLite` 补 `next`（移动分支用，一次内存读）。cs70：**EX 整包读的按钮改按字段取**（DialogFundationObject：twoLeft 0x48 / twoRight 0x58 / threeLeft 0x70 / threeCenter 0x80 / threeRight 0x98，经对话框组件 +0x118 foundationObject），**不再遍历整棵子树**（①页遍历要 350ms+）。cs69：labExEquip(full, only) 只投影要点的那个；cs68：**"当前最上层"统一成一个实现**（_topDialogGo）—— ①_exeqFind 只查**最上层那一层**、**绝不往回退**（回退会永远读到下面那层仍 active 的①页 ⇒ 签名不变 ⇒ 误判"没生效"⇒多点⇒点错按钮）；②签名里带**最上层容器名**（"页面切了"能立刻看见）。cs67：去掉 agent 侧坐标"稳定化"（Thread.sleep 堵死单通道）；cs64：_findExTopPart 组件查找缓存；cs63：labExEquipSig 轻量签名读
 // ★cs62（2026-10-22）：新增 battleSettingsStart/Poll（战斗设定只读；getter 是 IFix 模板 ⇒ 投递游戏线程执行）
 // ★JS 侧详细日志开关（2026-10-11 加）：默认关。
 //   关掉的是"每次调用都会打、但正常情况没信息量"的那几条（如 findMap 的"跳过堆扫描"、
@@ -7516,6 +7572,21 @@ function _subtreeRoot(kind) {
       const tr = _inv(cv, "get_transform");
       return (tr && !tr.isNull()) ? tr : null;
     }
+    if (kind === "footer") {
+      // ★2026-11-12：**底部导航层**（实机父链：`UI Root/ViewsArea/PartsFooter(Clone)/SlideBottom/ButtonQuest`）。
+      //   HOME 的 `ButtonQuest` 不在 view/layer/dialog/top 任何一个根里（各根 0），原来只能整树兜底。
+      //   这里按名字找一次 `PartsFooter` 并缓存指针；失效（换局/销毁）再找。
+      if (g_footerTr && !g_footerTr.isNull()) return g_footerTr;
+      try {
+        for (const nd of _walkNodes()) {
+          if (nd.active === true && /^PartsFooter/i.test(nd.name || "")) {
+            const tr = nd.tr;
+            if (tr && !tr.isNull()) { g_footerTr = tr; return tr; }
+          }
+        }
+      } catch (e) {}
+      return null;
+    }
     if (kind === "top") return _topDialogTr();          // 最上层对话框（结算/奖励这类页面看这层）
     if (kind === "dialog") return _dialogAreaTr();      // 整个 DialogArea
     // ★`layer`（2026-10-17 加）＝ **DialogArea 的父层**（实机祖先链里是 `IgnoreBlurLayer`）——
@@ -7768,7 +7839,18 @@ rpc.exports = {
     const out = [];
     try {
       const re = new RegExp(String(reStr), "i");
-      const root = rootName ? _subtreeRoot(rootName) : null;
+      let root = rootName ? _subtreeRoot(rootName) : null;
+      if (!rootName) {
+        // ★2026-11-12：无根 = 从**整棵 UI 树的最顶端**走（从 DialogArea 一路 get_parent），
+        //   用来定位"不在 view/layer/dialog/top 里"的按钮（如 HOME 的 `ButtonQuest`）。
+        //   只在诊断时调用（一次 ~1.8s），正常流程不走这里。
+        root = _dialogAreaTr();
+        for (let i = 0; i < 12 && root && !root.isNull(); i++) {
+          const p = _inv(root, "get_parent");
+          if (!p || p.isNull()) break;
+          root = p;
+        }
+      }
       if (!root) return out;
       const env = _camEnv();
       const lim = (maxDepth == null) ? 30 : maxDepth;
@@ -8074,6 +8156,11 @@ rpc.exports = {
   labShopItems: _rpcSafe(function () {
     try { return labShopItemsSnapshot(); }
     catch (e) { return { ok: false, items: [], ms: 0, err: String(e) }; }
+  }),
+  // ★★259「出发」按钮字段直取（2026-11-12）：`ViewLabyrinthTop.challengeButton(+0xE8)` → 坐标，零遍历。
+  labStartBtn: _rpcSafe(function () {
+    try { return labStartBtnSnapshot(); }
+    catch (e) { return { ok: false, x: 0, y: 0, active: false, cls: "", ms: 0, err: String(e) }; }
   }),
   // ★三选一页的阶段 1 探针：顶框名 + 退出 tween 判据 + 顺带诊断（零 hook，8~18ms）。
   labSelState: _rpcSafe(function () {

@@ -519,6 +519,15 @@ object AgentApi {
         obj("labShopItems", timeoutMs = timeoutMs)
 
     /**
+     * ★★259「出发」按钮**字段直取**（2026-11-12）：`ViewLabyrinthTop.challengeButton(+0xE8)` → 屏幕坐标。
+     *
+     * 零遍历、零学习：当前 View 不是 `ViewLabyrinthTop` 时 `ok=false` + `err=not-top`。
+     * 返回 `{ok, x, y, active, cls, ms, err}`。
+     */
+    suspend fun labStartBtn(timeoutMs: Long = T_FAST): JSONObject? =
+        obj("labStartBtn", timeoutMs = timeoutMs)
+
+    /**
      * ★三选一页的**阶段 1 探针**（2026-11-09）：一次读取同时给「顶框名 + 关闭判据 + 诊断」。
      *
      * 三选一（`DialogLabyrinthSelection`）也是 `DialogBase` 子类 ⇒ 退出 tween 与确认框同源，
@@ -548,6 +557,19 @@ object AgentApi {
     /** 所有匹配节点 `[{name,x,y}]`（DFS 顺序）；`root` 可选（如 `"dialog"` = 只走 DialogArea 子树 ⇒ 快得多） */
     suspend fun findList(nameRe: String, root: String? = null): JSONArray? =
         arr("findList", if (root == null) listOf(nameRe) else listOf(nameRe, root), T_SLOW)
+
+    /**
+     * ★2026-11-12：同 `findList`，但每个命中多带**父链**（末 6 层，`path`）。
+     *
+     * `root == null` ⇒ 从 **UI 树顶端**走（Diagnostic 用，~1.8s）——用来定位
+     * 「`view`/`layer`/`dialog`/`top` 四个根都找不到」的按钮（实测 HOME 的 `ButtonQuest` 就是这样）。
+     */
+    suspend fun findListPath(
+        nameRe: String,
+        root: String? = null,
+        maxDepth: Int = 30,
+        timeoutMs: Long = T_SLOW,
+    ): JSONArray? = arr("findListPath", listOf(nameRe, root, maxDepth), timeoutMs = timeoutMs)
 
     /** 同 find，但连节点内标签文字一起返回 `{name,text,x,y}`；`root` 可选（如 `"dialog"` ⇒ 快得多） */
     suspend fun findText(nameRe: String, root: String? = null): JSONObject? =

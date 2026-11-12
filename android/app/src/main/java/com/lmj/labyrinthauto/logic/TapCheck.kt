@@ -74,15 +74,28 @@ object TapCheck {
         probeState: (suspend () -> Probe)? = null,
         skipMax: Int = 6,
         skipDelayMs: Long = 60L,
+        /** ★首点前先「只读不点」几拍（新页入场动画期间按钮坐标还在动，第一下必空）；每拍 [skipDelayMs] */
+        skipFirstHits: Int = 0,
         verbose: Boolean = true,
     ): Boolean {
         // ── 阶段 1：反复点，直到**离开 from**（证明这一下生效了）──
         var attempt = 0
         var skip = 0                        // "这一刻不该点"的次数（不消耗 retries，但要有上限防死循环）
+        var firstSkip = 0                   // 首点前已经跳过的拍数
         var left = false
         var nowTop = ""
         val maxProbe = probe.coerceAtLeast(1)
         while (attempt < retries.coerceAtLeast(1)) {
+            // ★2026-11-12（用户）：新页刚出现时按钮还在入场动画（RectTransform 未落位）⇒
+            //   首次点击前先**只读不点**跳几拍，下一拍 `xyAt` 会重新取落位后的坐标再点。
+            //   不做长固定延迟；跳拍不消耗 retries，但计入 skip 上限防死循环。
+            if (attempt == 0 && firstSkip < skipFirstHits) {
+                firstSkip++
+                skip++
+                if (skip > skipMax) return false
+                delay(skipDelayMs)
+                continue
+            }
             // 坐标：给了 xyAt 就**每次点击前现取**（切页动画期间坐标在动 ⇒ 旧坐标会点空）。
             var px = x
             var py = y

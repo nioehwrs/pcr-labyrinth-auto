@@ -54,6 +54,9 @@ object Navigator {
      */
     private val TAP_CENTER_VIEWS = setOf(1, 2, 104)
 
+    /** ★2026-11-12：每个按钮只抓一次父链（`findListPath` 是整树 ~1.8s，不能每次导航都抓） */
+    private val whereSaid = HashSet<String>()
+
     /** viewId → 要点的按钮节点名（PC 版 `STEP_BUTTON`；259 故意不在这里）。
      *  ★活动页（246/249 之类）**不做特判**（2026-10-19 用户：那就是普通活动页，不用仔细分辨）——
      *    它们不在表里 ⇒ 走下面的未知页面通用策略：有底部导航就点「冒险」回正常线。 */
@@ -235,7 +238,9 @@ object Navigator {
                 val ch = (sc?.optInt("h", 0) ?: 0).let { if (it > 0) it else REF_H }
                 // ★标题/加载页要等**登录+加载**（可能好几秒）⇒ 探针窗口给长一点
                 //   （探到"进到下一页"就立刻走，所以给长了也不亏）
-                tapUntilChange(input, cw / 2, ch / 2, "屏幕中心", vid, settleMs = 300L, probe = 6, probeMs = 300L)
+                // ★2026-11-12（用户）：探针 6 → 3 → **1** —— 一轮 ≈ settle 300ms + 探 1 次（300ms），
+                //   约 0.6s 就补点下一次；开屏/标题页本来就是"点一下推进一段"，多点几次更跟手。
+                tapUntilChange(input, cw / 2, ch / 2, "屏幕中心", vid, settleMs = 300L, probe = 1, probeMs = 300L)
             } else {
                 // ★未知页面（2026-10-19 用户定的**通用策略**）：活动页之类的没有通用确认按钮可点时，
                 //   只要**底部有导航栏**就直接点「冒险」（ButtonQuest，同名多个时 findNode 取最靠下的
@@ -305,17 +310,78 @@ object Navigator {
      * 未挑战 → 不自动开局（PC 同款规矩），返回 [EnterResult.NOT_CHALLENGING]。
      */
     suspend fun enterMaze(input: InputBackend, maxTries: Int = 20): EnterResult {
-        var n = 0
-        while (n++ < maxTries) {
+        // ★2026-11-12（用户："想用状态驱动的点击"）：259 → 264 这段改成**状态机**，不再"点一下盲等 14s"。
+        //   每 200ms 读一次 `labStatusLite`（viewId + pageTop，~10ms），按状态推进：
+        //     · 264              → 进图，交棒给迷宫内状态机（唯一成功出口）
+        //     · 260~263/265      → 误入黎明界菜单 → 点「返回」回 259（最多 2 次，再多就判失败）
+        //     · 0/1 (NONE/SPLASH) → 加载转场，累计等 ≤10s
+        //     · 259 + 有 Dialog*  → 先点掉公告/确认/票不足提示，再判断
+        //     · 259 + challenging=false → 没开局（多半登错号）→ NOT_CHALLENGING
+        //     · 259 + challenging=true  → 点「出发」（最多 [maxTries] 次，每次给 2.5s 反应）
+        //     · 其它页面          → FAILED（掉线/顶号/异常）
+        val t0 = System.currentTimeMillis()
+        val budgetMs = 30_000L
+        var taps = 0
+        var menuHits = 0
+        var loadWait = 0L
+        var lastSaid = ""
+        fun sayOnce(msg: String) {
+            if (msg != lastSaid) { lastSaid = msg; AppState.addLog(msg) }
+        }
+        val gamePkg = runCatching { GameProcess.pkg() }.getOrNull().orEmpty()
+        while (System.currentTimeMillis() - t0 < budgetMs) {
             if (!AgentBridge.connected.value) {
                 AppState.addLog("停手：agent 没连上")
                 return EnterResult.FAILED
             }
+            // ★2026-11-12（用户）：进图阶段也要判前台 —— 切到助手/别的 app 就停手，不盲点
+            if (gamePkg.isNotEmpty()) {
+                val fp = runCatching { Foreground.packageName() }.getOrNull()
+                if (fp != null && fp != gamePkg) {
+                    AppState.addLog("停手：前台已切到 $fp（进图阶段不再点游戏）")
+                    return EnterResult.FAILED
+                }
+            }
+            // ★2026-11-12 修「进图途中页面变成 ?(-1)」：259 页 `labStatusLite` 的零扫描取不到 LTD
+            //   （日志 `+0xF8 指向 LabyrinthTopMenuButton`）⇒ 返回 null、viewId 读成 -1。
+            //   改用独立的 `viewId`（不依赖 LTD），259/264 都能稳定读到。
             val vid = currentViewId()
-            if (vid == 264) return EnterResult.ENTERED    // 已经在迷宫地图里（子菜单不算，见 goToLabyrinthTop）
+            if (vid == 264) {
+                AppState.addLog("已进入地图 ${viewLabel(vid)} → 交给迷宫内状态机")
+                return EnterResult.ENTERED
+            }
+            if (vid in LAB_MENU_VIEWS) {
+                menuHits++
+                if (menuHits > 2) {
+                    AppState.addLog("停手：连续误入黎明界菜单（${viewLabel(vid)}）→ 不进图")
+                    return EnterResult.FAILED
+                }
+                AppState.addLog("进图途中误入菜单 ${viewLabel(vid)}（第 $menuHits 次）→ 点返回回 259")
+                val b = findNode("btn_back")
+                if (b != null) tap(input, b.first, b.second, "返回（离开菜单）")
+                delay(400)
+                continue
+            }
+            if (vid == 0 || vid == 1) {
+                loadWait += POLL_ENTER_MS
+                if (loadWait > 10_000L) {
+                    AppState.addLog("停手：加载页停留 ${loadWait / 1000}s（${viewLabel(vid)}）→ 不进图")
+                    return EnterResult.FAILED
+                }
+                delay(POLL_ENTER_MS)
+                continue
+            }
             if (vid != TARGET_VIEW) {
-                AppState.addLog("不在 259（当前 ${viewLabel(vid)}）→ 先走到位再进")
+                AppState.addLog("进图途中页面变成 ${viewLabel(vid)}（不在 259）→ 失败")
                 return EnterResult.FAILED
+            }
+            // 259：先看有没有弹窗挡着（公告 / 确认 / 票不足提示）—— 原来这种情况会白等满 14s
+            val cb = runCatching { dialogConfirmButton() }.getOrNull()
+            if (cb != null) {
+                AppState.addLog("259 上有弹窗挡着（${cb.first}）→ 先点掉")
+                tap(input, cb.second, cb.third, "弹窗·${cb.first}")
+                delay(300)
+                continue
             }
             when (AgentApi.labChallenging()) {
                 false -> {
@@ -326,37 +392,37 @@ object Navigator {
                     return EnterResult.NOT_CHALLENGING
                 }
                 null -> {
-                    if (n == 1 || n % 5 == 0) AppState.addLog("259 挑战中状态未知（第 $n/$maxTries 次）→ 本轮不点，稍后重读")
-                    delay(500)
+                    sayOnce("259 挑战中状态未知 → 稍后重读")
+                    delay(POLL_ENTER_MS)
                     continue
                 }
-                // true（挑战中）→ 往下走：点「出发」
                 else -> Unit
             }
-            // 挑战中 = 是 → 点「出发」
-            val p = findNode("labyrinth_thumb_start")
-            if (p == null) {
-                AppState.addLog("259 未找到「labyrinth_thumb_start」（第 $n/$maxTries 次）→ 稍后重试")
-                delay(700)
+            if (taps >= maxTries) break
+            // ★2026-11-12（用户："应该有一种直接通过节点的读取方式"）：**字段直取**——
+            //   不 findNode、不学坐标、不缓存。`ViewLabyrinthTop.challengeButton(+0xE8)` → transform
+            //   → 相机投影，一次 RPC（~5~15ms）直接拿到按钮坐标。
+            val sb = runCatching { AgentApi.labStartBtn() }.getOrNull()
+            val px = sb?.optInt("x", -1) ?: -1
+            val py = sb?.optInt("y", -1) ?: -1
+            if (sb?.optBoolean("ok") != true || px < 0 || py < 0) {
+                sayOnce("259 读不到出发按钮（${sb?.optString("err")?.ifEmpty { "rpc" } ?: "rpc"}）→ 稍后重试")
+                delay(POLL_ENTER_MS)
                 continue
             }
-            // ★点「出发」前先等 [ENTER_TAP_DELAY_MS]（用户 2026-10-16）：进 259 有**切屏动画**，
-            //   动画没结束时点上去游戏**不认**（白点）—— 白点之后还要白等下面那 14s 才发现没进，
-            //   等于每次进迷宫多花十几秒。
-            delay(ENTER_TAP_DELAY_MS)
-            tap(input, p.first, p.second, "出发（挑战中=是）")
-            // 等视图进迷宫（**只认 264 地图**；260~263/265 是菜单页，不算进图）
-            repeat(20) {
-                delay(700)
-                val v = currentViewId()
-                if (v == 264) {
-                    AppState.addLog("已进入地图 ${viewLabel(v)} → 交给迷宫内状态机")
-                    return EnterResult.ENTERED
-                }
+            taps++
+            tap(input, px, py, "出发（挑战中=是，第 $taps 次）")
+            // ★2026-11-12（用户："点了一下出发，下一次点击已经 2 秒后"）：
+            //   原来点完给 2.5s 反应窗口，页面没变就一直等到满 ⇒ 两次点击间隔 2s+。
+            //   现在只等 [ENTER_TAP_SETTLE_MS]（800ms，4 拍×200ms）；没变化就回去**再点一次**。
+            val w0 = System.currentTimeMillis()
+            while (System.currentTimeMillis() - w0 < ENTER_TAP_SETTLE_MS) {
+                delay(POLL_ENTER_MS)
+                val v2 = currentViewId()
+                if (v2 == 264 || v2 != TARGET_VIEW) break
             }
-            AppState.addLog("点了出发但没进迷宫（第 $n/$maxTries 次）→ 重试")
         }
-        AppState.addLog("停手：$maxTries 次都没进迷宫")
+        AppState.addLog("停手：进图超时（点了 $taps 次出发）")
         return EnterResult.FAILED
     }
 
@@ -374,8 +440,22 @@ object Navigator {
     /** 开始点击前，等游戏回到前台的时限（刚 kill→launch / 换页那一两秒"前台"常读不到） */
     private const val FRONT_WAIT_MS = 20_000L
 
-    /** ★点「出发」前的小延迟（用户 2026-10-16）：进 259 有**切屏动画**，动画没结束时点上去不被认 */
+    /**
+     * ★旧：点「出发」前固定等 500ms（等 259 切屏动画）。
+     * ★2026-11-12 停用：改为「坐标学一次 + 直点 + 点两次没进再重学」——不再靠时间等待，
+     *   也不再每次 `findNode` 遍历 view 子树。
+     */
+    @Suppress("unused")
     private const val ENTER_TAP_DELAY_MS = 500L
+
+    /** ★进图状态机（259 → 264）的探针间隔：`viewId` ~5ms，200ms 一拍够快 */
+    private const val POLL_ENTER_MS = 200L
+
+    /** ★点「出发」后的反应窗口：800ms 内页面没变就回去补点（原来 2.5s，两次点击间隔太长） */
+    private const val ENTER_TAP_SETTLE_MS = 800L
+
+    /** 黎明界子菜单页（260 奖励列表 / 261 强化 / 262 图鉴 / 263 公会设置 / 265 金币店）——不算进图 */
+    private val LAB_MENU_VIEWS = setOf(260, 261, 262, 263, 265)
 
     /** ★同一颗弹窗按钮最多连点几次（超过 ⇒ 判"点不动"，见 2026-10-17 幽灵弹窗事故） */
     private const val DLG_TAP_MAX = 3
@@ -396,11 +476,40 @@ object Navigator {
         //   而这里找的按钮（底部导航 `ButtonQuest` / `btn_back` / `labyrinth_thumb_start`）**都在当前 View 子树里**
         //   ⇒ 先走 `root="view"`（几十节点，几十 ms）；查不到再试 `layer`（DialogArea 同层，覆盖挂在外层的按钮）；
         //   两者都空才退回无根整树（极少见，只作兜底）。
-        for (root in arrayOf("view", "layer")) {
-            pickBottom(AgentApi.findList(nameRe, root))?.let { return it }
+        // ★`footer` = 底部导航层（`UI Root/ViewsArea/PartsFooter`）：HOME 的 `ButtonQuest` 就在这里，
+        //   几十个节点，比整树兜底快一个量级。
+        for (root in arrayOf("view", "footer", "layer", "dialog")) {
+            val hit = pickBottom(AgentApi.findList(nameRe, root))
+            if (hit != null) {
+                if (root == "dialog") AppState.addLog("导航：按钮「$nameRe」只在 dialog 里找到")
+                return hit
+            }
         }
-        // ★明确树结构就不要再全树 find（用户 2026-11-12）：`view`/`layer` 都没有 ⇒ 这页不该有这个按钮，
-        //   返回 null 让上层"下一轮再看"，比全树捞一个别的同名节点（可能是活动页入口）更安全。
+        // ★2026-11-12 实测回归：HOME(5) 页的底部导航 `ButtonQuest` **不在 view / layer / dialog 任何一个根里**
+        //   （删掉全树兜底后，HOME 上连续 16 轮读不到 ⇒ 停手）。⇒ 兜底恢复，但**只在最后**用，
+        //   并打日志说明"这个按钮需要补根"，方便下次定位它挂在哪个 UI 根上。
+        pickBottom(AgentApi.findList(nameRe))?.let {
+            // ★2026-11-12（用户："把捕获的内容加上"）：兜底命中时**逐个根报数**，
+            //   一眼看出这个按钮到底挂在哪层（`view/layer/dialog/top` 各几颗；全 0 = 在更外层）。
+            //   只在兜底时付出这 4 次小查询，正常页面走不到这里。
+            val where = StringBuilder()
+            for (r in arrayOf("view", "layer", "dialog", "top")) {
+                val c = runCatching { AgentApi.findList(nameRe, r)?.length() ?: 0 }.getOrDefault(0)
+                where.append(r).append('=').append(c).append(' ')
+            }
+            AppState.addLog("导航：按钮「$nameRe」只在整树里找到（各根：$where）")
+            // ★再抓一次父链（每个按钮只抓一次）：能直接看出它挂在哪个 UI 层，便于补根。
+            if (whereSaid.add(nameRe)) {
+                runCatching { AgentApi.findListPath(nameRe) }.getOrNull()?.let { a ->
+                    for (i in 0 until minOf(a.length(), 3)) {
+                        val o = a.optJSONObject(i) ?: continue
+                        val p = o.optJSONArray("path")?.toString() ?: "?"
+                        AppState.addLog("导航：「$nameRe」#${i + 1} 父链 $p（depth=${o.optInt("depth")}）")
+                    }
+                }
+            }
+            return it
+        }
         return null
     }
 
