@@ -1258,6 +1258,1231 @@
         121201,
         133701
       ]
+    },
+    "6": {
+      "lab_id": 6,
+      "cn": "慈乐之音",
+      "story_guild_id": 4,
+      "jp": "慈乐之音",
+      "char_ids": [
+        1054,
+        1139,
+        1174,
+        1348,
+        1042,
+        1084,
+        1173,
+        1344,
+        1029,
+        1116,
+        1172,
+        1248,
+        1322
+      ],
+      "selectable_ids": [
+        105401,
+        113901,
+        117401,
+        134801,
+        104201,
+        108401,
+        117301,
+        134401,
+        102901,
+        111601,
+        117201,
+        124801,
+        132201
+      ],
+      "default_picks": [
+        117201,
+        105401,
+        124801
+      ],
+      "excluded_dual": [],
+      "excluded_fes": [],
+      "pool": [
+        {
+          "char_cn": "纺希",
+          "char_ids": [
+            1054,
+            1139,
+            1174,
+            1348
+          ],
+          "best": 134801,
+          "forms": [
+            {
+              "unit_id": 105401,
+              "cn": "纺希",
+              "en": "纺希",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 113901,
+              "cn": "纺希（万圣节）",
+              "en": "纺希（万圣节）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 117401,
+              "cn": "纺希（夏日）",
+              "en": "纺希（夏日）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 134801,
+              "cn": "纺希（吉奥·矶汉拿）",
+              "en": "纺希（吉奥·矶汉拿）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            }
+          ]
+        },
+        {
+          "char_cn": "千歌",
+          "char_ids": [
+            1042,
+            1084,
+            1173,
+            1344
+          ],
+          "best": 134401,
+          "forms": [
+            {
+              "unit_id": 104201,
+              "cn": "千歌",
+              "en": "千歌",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 108401,
+              "cn": "千歌（圣诞节）",
+              "en": "千歌（圣诞节）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 117301,
+              "cn": "千歌（夏日）",
+              "en": "千歌（夏日）",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 134401,
+              "cn": "千歌（礼服）",
+              "en": "千歌（礼服）",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            }
+          ]
+        },
+        {
+          "char_cn": "望",
+          "char_ids": [
+            1029,
+            1116,
+            1172,
+            1248,
+            1322
+          ],
+          "best": 132201,
+          "forms": [
+            {
+              "unit_id": 102901,
+              "cn": "望",
+              "en": "望",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 111601,
+              "cn": "望（圣诞节）",
+              "en": "望（圣诞节）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 117201,
+              "cn": "望（夏日）",
+              "en": "望（夏日）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 124801,
+              "cn": "望（解放者）",
+              "en": "望（解放者）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 132201,
+              "cn": "望（炼金术师）",
+              "en": "望（炼金术师）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            }
+          ]
+        }
+      ]
+    },
+    "7": {
+      "lab_id": 7,
+      "cn": "恶魔伪王国军",
+      "story_guild_id": 7,
+      "jp": "恶魔伪王国军",
+      "char_ids": [
+        1044,
+        1117,
+        1209,
+        1262,
+        1006,
+        1137,
+        1240,
+        1031,
+        1081,
+        1220,
+        1271,
+        1022,
+        1138,
+        1241,
+        1007,
+        1082,
+        1199
+      ],
+      "selectable_ids": [
+        104401,
+        111701,
+        120901,
+        126201,
+        100601,
+        113701,
+        124001,
+        103101,
+        108101,
+        122001,
+        127101,
+        102201,
+        113801,
+        124101,
+        100701,
+        108201,
+        119901
+      ],
+      "default_picks": [
+        113701,
+        111701,
+        113801
+      ],
+      "excluded_dual": [],
+      "excluded_fes": [],
+      "pool": [
+        {
+          "char_cn": "伊莉亚",
+          "char_ids": [
+            1044,
+            1117,
+            1209,
+            1262
+          ],
+          "best": 126201,
+          "forms": [
+            {
+              "unit_id": 104401,
+              "cn": "伊莉亚",
+              "en": "伊莉亚",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 111701,
+              "cn": "伊莉亚（圣诞节）",
+              "en": "伊莉亚（圣诞节）",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 120901,
+              "cn": "伊莉亚（新年）",
+              "en": "伊莉亚（新年）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 126201,
+              "cn": "伊莉亚（礼服）",
+              "en": "伊莉亚（礼服）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            }
+          ]
+        },
+        {
+          "char_cn": "茜里",
+          "char_ids": [
+            1006,
+            1137,
+            1240
+          ],
+          "best": 124001,
+          "forms": [
+            {
+              "unit_id": 100601,
+              "cn": "茜里",
+              "en": "茜里",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 113701,
+              "cn": "茜里（天使）",
+              "en": "茜里（天使）",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 124001,
+              "cn": "茜里（圣诞节）",
+              "en": "茜里（圣诞节）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            }
+          ]
+        },
+        {
+          "char_cn": "忍",
+          "char_ids": [
+            1031,
+            1081,
+            1220,
+            1271
+          ],
+          "best": 127101,
+          "forms": [
+            {
+              "unit_id": 103101,
+              "cn": "忍",
+              "en": "忍",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 108101,
+              "cn": "忍（万圣节）",
+              "en": "忍（万圣节）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 122001,
+              "cn": "忍（海盗）",
+              "en": "忍（海盗）",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 127101,
+              "cn": "忍（夏日）",
+              "en": "忍（夏日）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            }
+          ]
+        },
+        {
+          "char_cn": "依里",
+          "char_ids": [
+            1022,
+            1138,
+            1241
+          ],
+          "best": 124101,
+          "forms": [
+            {
+              "unit_id": 102201,
+              "cn": "依里",
+              "en": "依里",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 113801,
+              "cn": "依里（天使）",
+              "en": "依里（天使）",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 124101,
+              "cn": "依里（圣诞节）",
+              "en": "依里（圣诞节）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            }
+          ]
+        },
+        {
+          "char_cn": "宫子",
+          "char_ids": [
+            1007,
+            1082,
+            1199
+          ],
+          "best": 119901,
+          "forms": [
+            {
+              "unit_id": 100701,
+              "cn": "宫子",
+              "en": "宫子",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 108201,
+              "cn": "宫子（万圣节）",
+              "en": "宫子（万圣节）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 119901,
+              "cn": "宫子（圣诞节）",
+              "en": "宫子（圣诞节）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            }
+          ]
+        }
+      ]
+    },
+    "8": {
+      "lab_id": 8,
+      "cn": "伊丽莎白牧场",
+      "story_guild_id": 11,
+      "jp": "伊丽莎白牧场",
+      "char_ids": [
+        1038,
+        1123,
+        1184,
+        1254,
+        1026,
+        1127,
+        1235,
+        1033,
+        1128,
+        1192,
+        1052,
+        1158
+      ],
+      "selectable_ids": [
+        103801,
+        112301,
+        118401,
+        125401,
+        102601,
+        112701,
+        123501,
+        103301,
+        112801,
+        119201,
+        105201,
+        115801
+      ],
+      "default_picks": [
+        112701,
+        125401,
+        103801
+      ],
+      "excluded_dual": [],
+      "excluded_fes": [],
+      "pool": [
+        {
+          "char_cn": "栞",
+          "char_ids": [
+            1038,
+            1123,
+            1184,
+            1254
+          ],
+          "best": 125401,
+          "forms": [
+            {
+              "unit_id": 103801,
+              "cn": "栞",
+              "en": "栞",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 112301,
+              "cn": "栞（魔法少女）",
+              "en": "栞（魔法少女）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 118401,
+              "cn": "栞（初音＆栞）",
+              "en": "栞（初音＆栞）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 125401,
+              "cn": "栞（游骑兵）",
+              "en": "栞（游骑兵）",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            }
+          ]
+        },
+        {
+          "char_cn": "铃",
+          "char_ids": [
+            1026,
+            1127,
+            1235
+          ],
+          "best": 123501,
+          "forms": [
+            {
+              "unit_id": 102601,
+              "cn": "铃",
+              "en": "铃",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 112701,
+              "cn": "铃（游骑兵）",
+              "en": "铃（游骑兵）",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 123501,
+              "cn": "铃（万圣节）",
+              "en": "铃（万圣节）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            }
+          ]
+        },
+        {
+          "char_cn": "真阳",
+          "char_ids": [
+            1033,
+            1128,
+            1192
+          ],
+          "best": 119201,
+          "forms": [
+            {
+              "unit_id": 103301,
+              "cn": "真阳",
+              "en": "真阳",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 112801,
+              "cn": "真阳（游骑兵）",
+              "en": "真阳（游骑兵）",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 119201,
+              "cn": "真阳（圣诞节）",
+              "en": "真阳（圣诞节）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            }
+          ]
+        },
+        {
+          "char_cn": "莉玛",
+          "char_ids": [
+            1052,
+            1158
+          ],
+          "best": 115801,
+          "forms": [
+            {
+              "unit_id": 105201,
+              "cn": "莉玛",
+              "en": "莉玛",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 115801,
+              "cn": "莉玛（灰姑娘）",
+              "en": "莉玛（灰姑娘）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            }
+          ]
+        }
+      ]
+    },
+    "9": {
+      "lab_id": 9,
+      "cn": "墨丘利财团",
+      "story_guild_id": 12,
+      "jp": "墨丘利财团",
+      "char_ids": [
+        1034,
+        1146,
+        1222,
+        1268,
+        1048,
+        1080,
+        1169,
+        1046,
+        1079,
+        1168,
+        1251,
+        1032,
+        1144,
+        1217,
+        1267
+      ],
+      "selectable_ids": [
+        103401,
+        114601,
+        122201,
+        126801,
+        104801,
+        108001,
+        116901,
+        104601,
+        107901,
+        116801,
+        125101,
+        103201,
+        114401,
+        121701,
+        126701
+      ],
+      "default_picks": [
+        125101,
+        116801,
+        107901
+      ],
+      "excluded_dual": [],
+      "excluded_fes": [],
+      "pool": [
+        {
+          "char_cn": "由加莉",
+          "char_ids": [
+            1034,
+            1146,
+            1222,
+            1268
+          ],
+          "best": 126801,
+          "forms": [
+            {
+              "unit_id": 103401,
+              "cn": "由加莉",
+              "en": "由加莉",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 114601,
+              "cn": "由加莉（圣诞节）",
+              "en": "由加莉（圣诞节）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 122201,
+              "cn": "由加莉（露营）",
+              "en": "由加莉（露营）",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 126801,
+              "cn": "由加莉（夏日）",
+              "en": "由加莉（夏日）",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            }
+          ]
+        },
+        {
+          "char_cn": "美冬",
+          "char_ids": [
+            1048,
+            1080,
+            1169
+          ],
+          "best": 116901,
+          "forms": [
+            {
+              "unit_id": 104801,
+              "cn": "美冬",
+              "en": "美冬",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 108001,
+              "cn": "美冬（夏日）",
+              "en": "美冬（夏日）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 116901,
+              "cn": "美冬（工作服）",
+              "en": "美冬（工作服）",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            }
+          ]
+        },
+        {
+          "char_cn": "珠希",
+          "char_ids": [
+            1046,
+            1079,
+            1168,
+            1251
+          ],
+          "best": 125101,
+          "forms": [
+            {
+              "unit_id": 104601,
+              "cn": "珠希",
+              "en": "珠希",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 107901,
+              "cn": "珠希（夏日）",
+              "en": "珠希（夏日）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 116801,
+              "cn": "珠希（工作服）",
+              "en": "珠希（工作服）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 125101,
+              "cn": "珠希（咖啡厅）",
+              "en": "珠希（咖啡厅）",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            }
+          ]
+        },
+        {
+          "char_cn": "秋乃",
+          "char_ids": [
+            1032,
+            1144,
+            1217,
+            1267
+          ],
+          "best": 126701,
+          "forms": [
+            {
+              "unit_id": 103201,
+              "cn": "秋乃",
+              "en": "秋乃",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 114401,
+              "cn": "秋乃（圣诞节）",
+              "en": "秋乃（圣诞节）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 121701,
+              "cn": "秋乃（秋乃＆咲恋）",
+              "en": "秋乃（秋乃＆咲恋）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 126701,
+              "cn": "秋乃（夏日）",
+              "en": "秋乃（夏日）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            }
+          ]
+        }
+      ]
+    },
+    "10": {
+      "lab_id": 10,
+      "cn": "暮光流星群",
+      "story_guild_id": 13,
+      "jp": "暮光流星群",
+      "char_ids": [
+        1009,
+        1132,
+        1219,
+        1027,
+        1090,
+        1170,
+        1299,
+        1056,
+        1131,
+        1208,
+        1276,
+        1013,
+        1133,
+        1237,
+        1051,
+        1175,
+        1247
+      ],
+      "selectable_ids": [
+        100901,
+        113201,
+        121901,
+        102701,
+        109001,
+        117001,
+        129901,
+        105601,
+        113101,
+        120801,
+        127601,
+        101301,
+        113301,
+        123701,
+        105101,
+        117501,
+        124701
+      ],
+      "default_picks": [
+        113301,
+        117001,
+        121901
+      ],
+      "excluded_dual": [],
+      "excluded_fes": [],
+      "pool": [
+        {
+          "char_cn": "杏奈",
+          "char_ids": [
+            1009,
+            1132,
+            1219
+          ],
+          "best": 121901,
+          "forms": [
+            {
+              "unit_id": 100901,
+              "cn": "杏奈",
+              "en": "杏奈",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 113201,
+              "cn": "杏奈（夏日）",
+              "en": "杏奈（夏日）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 121901,
+              "cn": "杏奈（海盗）",
+              "en": "杏奈（海盗）",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            }
+          ]
+        },
+        {
+          "char_cn": "惠理子",
+          "char_ids": [
+            1027,
+            1090,
+            1170,
+            1299
+          ],
+          "best": 129901,
+          "forms": [
+            {
+              "unit_id": 102701,
+              "cn": "惠理子",
+              "en": "惠理子",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 109001,
+              "cn": "惠理子（情人节）",
+              "en": "惠理子（情人节）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 117001,
+              "cn": "惠理子（夏日）",
+              "en": "惠理子（夏日）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 129901,
+              "cn": "惠理子（教官）",
+              "en": "惠理子（教官）",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            }
+          ]
+        },
+        {
+          "char_cn": "流夏",
+          "char_ids": [
+            1056,
+            1131,
+            1208,
+            1276
+          ],
+          "best": 127601,
+          "forms": [
+            {
+              "unit_id": 105601,
+              "cn": "流夏",
+              "en": "流夏",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 113101,
+              "cn": "流夏（夏日）",
+              "en": "流夏（夏日）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 120801,
+              "cn": "流夏（新年）",
+              "en": "流夏（新年）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 127601,
+              "cn": "流夏（沙漠）",
+              "en": "流夏（沙漠）",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            }
+          ]
+        },
+        {
+          "char_cn": "七七香",
+          "char_ids": [
+            1013,
+            1133,
+            1237
+          ],
+          "best": 123701,
+          "forms": [
+            {
+              "unit_id": 101301,
+              "cn": "七七香",
+              "en": "七七香",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 113301,
+              "cn": "七七香（夏日）",
+              "en": "七七香（夏日）",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 123701,
+              "cn": "七七香（万圣节）",
+              "en": "七七香（万圣节）",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            }
+          ]
+        },
+        {
+          "char_cn": "深月",
+          "char_ids": [
+            1051,
+            1175,
+            1247
+          ],
+          "best": 124701,
+          "forms": [
+            {
+              "unit_id": 105101,
+              "cn": "深月",
+              "en": "深月",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 117501,
+              "cn": "深月（大江户）",
+              "en": "深月（大江户）",
+              "rarity": 3,
+              "is_limited": 0,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            },
+            {
+              "unit_id": 124701,
+              "cn": "深月（新年）",
+              "en": "深月（新年）",
+              "rarity": 3,
+              "is_limited": 1,
+              "is_collab": 0,
+              "is_fes": 0,
+              "source": ""
+            }
+          ]
+        }
+      ]
     }
   }
 }

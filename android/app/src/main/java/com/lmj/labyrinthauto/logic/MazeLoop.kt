@@ -232,8 +232,13 @@ object MazeLoop {
      */
     private const val SHOP_ANIM_CLOSE_PROBE_MS = 400L
 
-    /** 每个框最多补点几次（动画期点空是正常代价，多点当手段） */
-    private const val SHOP_ANIM_TAP_MAX = 3
+    /**
+     * 每个框最多补点几次（动画期点空是正常代价，多点当手段）。
+     * ★2026-11-12（用户）：3 → **5** —— 停止点击的真正判据是「读到 `closing`」（[tapBoxButton] 的
+     *   `xyAt` 里一读到位就返回 null），`max` 只是兜底上限；性能差的设备 tween 更慢、需要更多次补点，
+     *   把上限调小反而对慢设备不友好。
+     */
+    private const val SHOP_ANIM_TAP_MAX = 5
 
     /** 到账确认链的最长时长（遗物 1 个框；印记 1+1；角色 1 个） */
     private const val SHOP_ANIM_RECEIPT_MS = 4_000L
@@ -2748,6 +2753,11 @@ object MazeLoop {
      */
     private var shopRefreshFailN = 0
 
+    /** ★诊断（临时 2026-11-13）：商店弹窗链里已打了几拍 tween 字段（每条链上限 6） */
+    private var boxDiagN = 0
+
+
+
     /** ★「金币读到 0/空」的起始时刻 + 所属门店（换店或读到 >0 就清）；见 [SHOP_COIN_WAIT_MS] */
     private var shopCoinBadKey: String? = null
     private var shopCoinBadAt = 0L
@@ -3471,30 +3481,55 @@ object MazeLoop {
         val base = dlgBoxNow() ?: return false
         val basePtr = base.optString("ptr")
         var taps = 0
+        boxDiagN = 0                                  // ★诊断：本次链最多打 6 拍 tween 字段
         // ★2026-11-12（用户）：**不再自己实现"首拍只读不点"** —— 统一交给 [TapCheck.run] 的
         //   `skipFirstHits`（与特别装备「全部」行同一套能力）；本函数只提供"点哪个按钮 + 什么算框没了"。
         //   判据：这个框 **开始消失**（`closing`）或换成别的框（ptr 变），都算这一下生效。
         return tapAndCheck(
             input, 0, 0, "商店：$what",
             from = setOf(basePtr),
-            settleMs = SHOP_ANIM_CLOSE_PROBE_MS,
+            settleMs = 120L,
             retries = SHOP_ANIM_TAP_MAX,
             readTop = {
                 val b = dlgBoxNow()
                 when {
                     b == null -> ""                                  // 没有对话框 = 已经关掉
-                    b.optBoolean("closing") -> ""                    // 开始收起 = 生效
+                    // ★2026-11-13 同拍对比实测：`labDlgBox` 与 `labDlgClosing` 读到的完全一致，
+                    //   `st=0`（退出 tween 从未启动）、`proc` 恒 1 ⇒ 通用提示框没有可用的"点生效"信号。
+                    //   只能靠 **框消失 / ptr 变化**（下面的 reached）判，closing 留着无害。
+                    b.optBoolean("closing") -> ""
                     else -> b.optString("ptr")
                 }
             },
             unknownTop = "",
             reached = { p -> p.isEmpty() || p != basePtr },
-            probe = 1,
-            probeMs = SHOP_ANIM_CLOSE_PROBE_MS,
+            // ★2026-11-13（用户）：**回到原来的点击频率** —— 这些框没有"点生效"信号，
+            //   接受偶尔多点一下（比等 1.2s 值得）。间隔 = settle 120ms + 6×60ms 探测 ≈ 500ms，
+            //   最多 [SHOP_ANIM_TAP_MAX] 次；框一消失立刻走，不会真的点满。
+            probe = 6,
+            probeMs = SHOP_ANIM_POLL_MS,
             skipFirstHits = skipHits,
             xyAt = xyAt@{
                 val b = dlgBoxNow() ?: return@xyAt null
                 if (b.optString("ptr") != basePtr) return@xyAt null   // 已经换框/关掉 ⇒ 不点
+                // ★2026-11-13（用户："tween 和 closing 在这里不能用吗"）：商店这几个壳的
+                //   `outStarted/outFactor` 实测**恒为 0/1**（tween 不跑或偏移不对）⇒ 改用
+                //   `proc`（`DialogBase.isProcess` +0xB4）：点生效后 0→1，比 tween 可靠。
+                if (b.optBoolean("closing")) return@xyAt null
+                // 诊断（临时）：只剩前 6 拍，把 proc 也打出来，确认它确实会变 1。
+                // ★另外同时调一次 `labDlgClosing`（不带 preferOverlay）做**同拍对比**：
+                //   若 box.closing=false 而 close.closing=true ⇒ 两者取到了不同对象/不同层。
+                if (boxDiagN < 6) {
+                    boxDiagN++
+                    val cl = runCatching { AgentApi.labDlgClosing() }.getOrNull()
+                    AppState.addLog(
+                        "框字段：box[${b.optString("top")}] closing=${b.opt("closing")}" +
+                            " out=${b.opt("outStarted")}/${b.opt("outFactor")} proc=${b.opt("proc")}" +
+                            " ptr=${b.optString("ptr").takeLast(5)}" +
+                            " ｜ close[${cl?.optString("top")}] closing=${cl?.opt("closing")}" +
+                            " st=${cl?.opt("started")}/${cl?.opt("factor")} proc=${cl?.opt("proc")}",
+                    )
+                }
                 val hit = pickBoxBtn(b, keys) ?: return@xyAt null
                 taps++
                 AppState.addLog("商店：$what → 点「${hit.first}」#$taps (${hit.second},${hit.third})")
@@ -3653,12 +3688,14 @@ object MazeLoop {
     private suspend fun shopRefreshChain(
         input: InputBackend, tx: Int, ty: Int, beforeSig: String,
     ): Boolean {
-        if (!shopTapThenConfirm(
-                input, tx, ty, "更新",
-                listOf("TwoButtonRight", "ThreeButtonRight", "OneButtonWhite"),
-                expectReceipts = false,
-            )
-        ) return false
+        // ★2026-11-12（用户实测 5 层商店"连刷两次、跳过一整页"）：**点空/框没探到 ≠ 没刷新**。
+        //   以前这里 `!shopTapThenConfirm(...) → return false`，但游戏可能已经刷了（只是确认框的
+        //   closing 没探到）⇒ 下一轮又刷一次，中间那页商品直接丢掉。现在只要**货架签名变了**就算成功。
+        val tapped = shopTapThenConfirm(
+            input, tx, ty, "更新",
+            listOf("TwoButtonRight", "ThreeButtonRight", "OneButtonWhite"),
+            expectReceipts = false,
+        )
         val t0 = SystemClock.elapsedRealtime()
         while (SystemClock.elapsedRealtime() - t0 < SHOP_ANIM_REFRESH_MS) {
             val sh = AgentApi.labShop()
@@ -3672,7 +3709,10 @@ object MazeLoop {
             }
             delay(SHOP_ANIM_POLL_MS)
         }
-        AppState.addLog("[!] 商店：刷新确认框关掉后 ${SHOP_ANIM_REFRESH_MS}ms 货架签名没变（刷新可能没生效）")
+        AppState.addLog(
+            "[!] 商店：${SHOP_ANIM_REFRESH_MS}ms 内货架签名没变" +
+                "（点击${if (tapped) "已确认" else "未确认"} → 刷新可能没生效）",
+        )
         return false
     }
 
@@ -7530,9 +7570,12 @@ object MazeLoop {
             tapAndCheck(
                 input, win.optInt("x"), win.optInt("y"), "下一步",
                 from = setOf("DialogBackKeyCapture", "DialogLabyrinthExResult", "DialogQuestResultWin"),
-                settleMs = 200L,
-                // ★结算页按钮落位时间不稳定（2026-11-07 用户）：容错次数拉到 25 次 × 200ms ≈ 5 秒，
-                //   覆盖"战斗刚结束、按钮还没出来"的那段窗口。
+                // ★2026-11-13（用户："走了几个节点之后闪退"）：200ms → **400ms**。
+                //   日志 00:38:58~59 在 1.4s 内连点 7 次「下一步」（每次都是 root `input tap`），
+                //   紧接着 00:39:01 系统 `device is not responding` 触发 lmkd 杀进程 —— 点击太密会把
+                //   input/系统拖到无响应。400ms/次（含 tap ~110ms）≈ 2 次/秒，够推进又不会打满。
+                settleMs = 400L,
+                // 结算页按钮落位不稳（2026-11-07）：25 次 × 400ms ≈ 10 秒窗口
                 retries = 25,
                 // 阶段2：普通战 → 选人/选遗物（Selection）；**最终 Boss(50801) → 直接进迷宫结算**
                 //   （实测 17:41:39 顶框=DialogLabyrinthResult）⇒ 两个都要认，否则会白等 6 秒
@@ -8333,6 +8376,20 @@ object MazeLoop {
      * @return true = 点了
      */
     private suspend fun tapDialogConfirm(input: InputBackend, top: String, tag: String = ""): Boolean {
+        // ★2026-11-13（用户："走了几个节点之后闪退" + "消失中的按钮位置"）：
+        //   弹窗**已经在收起**（out tween 启动 / factor 开始降）就别再点 —— 按钮位置在飘，
+        //   点下去等于点在空处（日志 00:48:48：`确认框：开始消失 +893ms` 之后又点了
+        //   `TwoButtonRight @(1096,667)`）。直接返回 true 表示"已处理"，主循环等它消失。
+        val cl = runCatching { AgentApi.labDlgClosing() }.getOrNull()
+        if (cl != null) {
+            val cTop = cl.optString("top")
+            val closingNow = cl.optBoolean("closing") ||
+                (cl.optInt("started", 0) == 1 && cl.optDouble("factor", 1.0) < 0.99)
+            if (closingNow && (top.isEmpty() || cTop.contains(top.removeSuffix("(Clone)")))) {
+                if (tag.isNotEmpty()) AppState.addLog("弹窗已在收起（$cTop）→ 不再点")
+                return true
+            }
+        }
         // ★2026-10-20：弹窗按钮链接 [LabBtnStore] 跨局回喂（结算页那种大弹窗的 DialogArea 子树
         //   要 3s+，2026-10-20 00:40 实测局末连 4 次 dialog 3.2~3.8s 只为点一颗 OneButtonWhite）。
         //   第一次遍历顺带学链落盘，之后（含跨局）直达零遍历。key = "dlg|<弹窗规范名>"。

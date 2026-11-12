@@ -735,7 +735,26 @@ object FridaInjector {
             // ★2026-11-12（用户："优先用状态判定，而不是延迟"）：等**可执行段**（`r-xp`）而不是文件头段（`r--p`）——
             //   `r--p` 出现时 linker 还在重定位，此时注入会把游戏带走（实测 0s 注入后 1s 崩）。
             val r = RootShell.exec("grep -m1 'r-xp.*$KEY_SO' /proc/$pid/maps", 8_000L)
-            if (r.out.contains(KEY_SO)) return null
+            if (r.out.contains(KEY_SO)) {
+                // ★2026-11-13（用户："现在为什么这么容易闪退"）：`r-xp` 只代表**代码段映射完**，
+                //   linker 重定位 / `il2cpp_init` 未必完成 —— 冷启动 0s 就注入正是之前把游戏带崩的场景。
+                //   再等 `global-metadata.dat` 出现在 maps（`il2cpp_init` 才 mmap 它）＝"可安全注入"的状态。
+                //   最多等 6s；等不到也放行（个别包 metadata 打包在 so 里/名字不同，不能因此卡死）。
+                val md0 = SystemClock.elapsedRealtime()
+                while (SystemClock.elapsedRealtime() - md0 < 6_000L) {
+                    val md = RootShell.exec("grep -m1 'global-metadata.dat' /proc/$pid/maps", 3_000L)
+                    if (md.out.contains("global-metadata.dat")) {
+                        AppState.addLog(
+                            "…$KEY_SO 已映射 + global-metadata 已加载" +
+                                "（+${SystemClock.elapsedRealtime() - md0}ms）→ 注入",
+                        )
+                        return null
+                    }
+                    delay(200)
+                }
+                AppState.addLog("…$KEY_SO 已映射，6s 内没看到 global-metadata.dat → 按 r-xp 放行注入")
+                return null
+            }
             if (r.text.contains("No such file") || r.text.contains("No such process")) {
                 return "进程提前退出（pid $pid 没了）"
             }

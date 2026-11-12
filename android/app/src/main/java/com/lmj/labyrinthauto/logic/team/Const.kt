@@ -29,6 +29,9 @@ object TagIds {   // PC: T
         "heal" to "u_heal",               // 治疗
         "jiasu" to "t1791357742634",      // 加速（减少待机时间）
         "first" to "u_first_tp",          // 首动群充（速通关键角色）
+        // ★2026-11-12：**物理**首动群充（目前只有「望（解放者）」）——只惠及物理角色，
+        //   与上面泛用的 `u_first_tp` 分开，避免把物理速通队带进魔法速通的判断。
+        "first_phys" to "u_first_tp_phys",
         "dbreak" to "u_dbreak",           // 双破甲
         "dbreakq" to "u_dbreak_eq",       // 等效双破甲（霸瞳皇帝，加分项）
         "both" to "u_both",               // 物法通用

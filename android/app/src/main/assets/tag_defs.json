@@ -1,362 +1,369 @@
 {
- "tags": [
-  {
-   "color": "#e67e22",
-   "group": "能力",
-   "id": "u_dps",
-   "name": "输出核心",
-   "scope": "unit"
-  },
-  {
-   "color": "#e67e22",
-   "group": "能力",
-   "id": "u_aoe",
-   "name": "群体输出",
-   "scope": "unit"
-  },
-  {
-   "color": "#e67e22",
-   "group": "能力",
-   "id": "u_burst",
-   "name": "单体输出",
-   "scope": "unit"
-  },
-  {
-   "color": "#d35400",
-   "group": "能力",
-   "id": "u_break",
-   "name": "物理破甲",
-   "scope": "unit"
-  },
-  {
-   "color": "#16a085",
-   "group": "能力",
-   "id": "u_buff",
-   "name": "物理buff",
-   "scope": "unit"
-  },
-  {
-   "color": "#8e44ad",
-   "group": "能力",
-   "id": "u_debuff",
-   "name": "减益",
-   "scope": "unit"
-  },
-  {
-   "color": "#27ae60",
-   "group": "能力",
-   "id": "u_heal",
-   "name": "治疗",
-   "scope": "unit"
-  },
-  {
-   "color": "#2980b9",
-   "group": "能力",
-   "id": "u_tank",
-   "name": "坦克",
-   "scope": "unit"
-  },
-  {
-   "color": "#9b59b6",
-   "group": "能力",
-   "id": "u_tp",
-   "name": "群充",
-   "scope": "unit"
-  },
-  {
-   "color": "#8e44ad",
-   "group": "能力",
-   "id": "u_cc",
-   "name": "控制",
-   "scope": "unit"
-  },
-  {
-   "color": "#f1c40f",
-   "group": "用法",
-   "id": "u_clear",
-   "name": "速通",
-   "scope": "unit"
-  },
-  {
-   "color": "#5d6d7e",
-   "group": "用法",
-   "id": "u_magetank",
-   "name": "兼职坦克",
-   "scope": "unit"
-  },
-  {
-   "color": "#d35400",
-   "group": "需求",
-   "id": "s_need_tank",
-   "name": "需要坦克",
-   "scope": "stage"
-  },
-  {
-   "color": "#27ae60",
-   "group": "需求",
-   "id": "s_need_heal",
-   "name": "需要治疗",
-   "scope": "stage"
-  },
-  {
-   "color": "#e67e22",
-   "group": "需求",
-   "id": "s_need_aoe",
-   "name": "需要群攻",
-   "scope": "stage"
-  },
-  {
-   "color": "#8e44ad",
-   "group": "需求",
-   "id": "s_need_cc",
-   "name": "需要控制",
-   "scope": "stage"
-  },
-  {
-   "color": "#f1c40f",
-   "group": "目标",
-   "id": "s_burst",
-   "name": "目标速杀",
-   "scope": "stage"
-  },
-  {
-   "color": "#2980b9",
-   "group": "需求",
-   "id": "s_need_dot",
-   "name": "需要dot",
-   "scope": "stage"
-  },
-  {
-   "color": "#888888",
-   "group": "能力",
-   "id": "t1791357742634",
-   "name": "加速",
-   "scope": "unit"
-  },
-  {
-   "color": "#888888",
-   "group": "能力",
-   "id": "t1791357843971",
-   "name": "减攻击",
-   "scope": "unit"
-  },
-  {
-   "color": "#d35400",
-   "group": "能力",
-   "id": "t1791357917170",
-   "name": "魔法破甲",
-   "scope": "unit"
-  },
-  {
-   "color": "#888888",
-   "group": "用法",
-   "id": "t1791358032871",
-   "name": "前3图",
-   "scope": "unit"
-  },
-  {
-   "color": "#c24ca3",
-   "group": "能力",
-   "id": "t1791358112291",
-   "name": "魅惑",
-   "scope": "unit"
-  },
-  {
-   "color": "#3a97df",
-   "group": "能力",
-   "id": "t1791358447882",
-   "name": "抽蓝",
-   "scope": "unit"
-  },
-  {
-   "color": "#41c85c",
-   "group": "能力",
-   "id": "t1791358546995",
-   "name": "强击退",
-   "scope": "unit"
-  },
-  {
-   "color": "#bc01d5",
-   "group": "能力",
-   "id": "t1791358674360",
-   "name": "dot",
-   "scope": "unit",
-   "single": false
-  },
-  {
-   "color": "#00cc4e",
-   "group": "能力",
-   "id": "t1791358691734",
-   "name": "毒",
-   "scope": "unit"
-  },
-  {
-   "color": "#04b701",
-   "group": "能力",
-   "id": "t1791358700885",
-   "name": "猛毒",
-   "scope": "unit"
-  },
-  {
-   "color": "#e100ff",
-   "group": "能力",
-   "id": "t1791358706735",
-   "name": "诅咒",
-   "scope": "unit"
-  },
-  {
-   "color": "#b900d1",
-   "group": "能力",
-   "id": "t1791358710590",
-   "name": "恶咒",
-   "scope": "unit"
-  },
-  {
-   "color": "#f03d3d",
-   "group": "能力",
-   "id": "t1791358716756",
-   "name": "火伤",
-   "scope": "unit"
-  },
-  {
-   "color": "#b801d0",
-   "group": "能力",
-   "id": "t1791358726369",
-   "name": "其他dot",
-   "scope": "unit"
-  },
-  {
-   "color": "#737373",
-   "group": "能力",
-   "id": "t1791358736683",
-   "name": "dot抑制",
-   "scope": "unit"
-  },
-  {
-   "color": "#b4cc00",
-   "group": "能力",
-   "id": "t1791358891825",
-   "name": "嘲讽",
-   "scope": "unit"
-  },
-  {
-   "color": "#16a085",
-   "group": "能力",
-   "id": "t1791367420540",
-   "name": "魔法buff",
-   "scope": "unit"
-  },
-  {
-   "color": "#888888",
-   "group": "用法",
-   "id": "t1791367928106",
-   "name": "NPC可用",
-   "scope": "unit"
-  },
-  {
-   "color": "#888888",
-   "group": "用法",
-   "id": "t1791369642591",
-   "name": "单体效果低",
-   "scope": "unit"
-  },
-  {
-   "color": "#cdd016",
-   "group": "能力",
-   "id": "t1791380357831",
-   "name": "领域",
-   "scope": "unit"
-  },
-  {
-   "color": "#0a9962",
-   "group": "用法",
-   "id": "t1791380776914",
-   "name": "属性限定",
-   "scope": "unit"
-  },
-  {
-   "color": "#888888",
-   "group": "未分组",
-   "id": "t1791384412603",
-   "name": "类型反转",
-   "scope": "unit"
-  },
-  {
-   "color": "#888888",
-   "group": "需求",
-   "id": "s_multi",
-   "name": "多目标",
-   "scope": "stage"
-  },
-  {
-   "color": "#888888",
-   "group": "用法",
-   "id": "u_both",
-   "name": "物法通用",
-   "scope": "unit"
-  },
-  {
-   "color": "#c9a227",
-   "group": "速通关键",
-   "id": "u_first_tp",
-   "name": "首动群充",
-   "scope": "unit"
-  },
-  {
-   "color": "#d35400",
-   "group": "速通关键",
-   "id": "u_dbreak",
-   "name": "双破甲",
-   "scope": "unit"
-  },
-  {
-   "color": "#a9713a",
-   "group": "速通关键",
-   "id": "u_dbreak_eq",
-   "name": "等效双破甲",
-   "scope": "unit"
-  },
-  {
-   "color": "#8e44ad",
-   "group": "对策",
-   "id": "u_fix_multi",
-   "name": "对策·多目标boss",
-   "scope": "unit"
-  },
-  {
-   "color": "#8e44ad",
-   "group": "对策",
-   "id": "u_fix_relic",
-   "name": "对策·美空",
-   "scope": "unit"
-  },
-  {
-   "color": "#8e44ad",
-   "group": "对策",
-   "id": "u_fix_backline",
-   "name": "对策·最后排",
-   "scope": "unit"
-  },
-  {
-   "color": "#8e44ad",
-   "group": "对策",
-   "id": "u_fix_icewolf",
-   "name": "对策·冰狼",
-   "scope": "unit"
-  },
-  {
-   "color": "#8e44ad",
-   "group": "对策",
-   "id": "u_fix_ghost",
-   "name": "对策·幽灵领主",
-   "scope": "unit"
-  },
-  {
-   "color": "#888888",
-   "group": "用法",
-   "id": "t1791857432869",
-   "name": "对boss弱",
-   "scope": "unit"
-  }
- ]
+  "tags": [
+    {
+      "color": "#e67e22",
+      "group": "能力",
+      "id": "u_dps",
+      "name": "输出核心",
+      "scope": "unit"
+    },
+    {
+      "color": "#e67e22",
+      "group": "能力",
+      "id": "u_aoe",
+      "name": "群体输出",
+      "scope": "unit"
+    },
+    {
+      "color": "#e67e22",
+      "group": "能力",
+      "id": "u_burst",
+      "name": "单体输出",
+      "scope": "unit"
+    },
+    {
+      "color": "#d35400",
+      "group": "能力",
+      "id": "u_break",
+      "name": "物理破甲",
+      "scope": "unit"
+    },
+    {
+      "color": "#16a085",
+      "group": "能力",
+      "id": "u_buff",
+      "name": "物理buff",
+      "scope": "unit"
+    },
+    {
+      "color": "#8e44ad",
+      "group": "能力",
+      "id": "u_debuff",
+      "name": "减益",
+      "scope": "unit"
+    },
+    {
+      "color": "#27ae60",
+      "group": "能力",
+      "id": "u_heal",
+      "name": "治疗",
+      "scope": "unit"
+    },
+    {
+      "color": "#2980b9",
+      "group": "能力",
+      "id": "u_tank",
+      "name": "坦克",
+      "scope": "unit"
+    },
+    {
+      "color": "#9b59b6",
+      "group": "能力",
+      "id": "u_tp",
+      "name": "群充",
+      "scope": "unit"
+    },
+    {
+      "color": "#8e44ad",
+      "group": "能力",
+      "id": "u_cc",
+      "name": "控制",
+      "scope": "unit"
+    },
+    {
+      "color": "#f1c40f",
+      "group": "用法",
+      "id": "u_clear",
+      "name": "速通",
+      "scope": "unit"
+    },
+    {
+      "color": "#5d6d7e",
+      "group": "用法",
+      "id": "u_magetank",
+      "name": "兼职坦克",
+      "scope": "unit"
+    },
+    {
+      "color": "#d35400",
+      "group": "需求",
+      "id": "s_need_tank",
+      "name": "需要坦克",
+      "scope": "stage"
+    },
+    {
+      "color": "#27ae60",
+      "group": "需求",
+      "id": "s_need_heal",
+      "name": "需要治疗",
+      "scope": "stage"
+    },
+    {
+      "color": "#e67e22",
+      "group": "需求",
+      "id": "s_need_aoe",
+      "name": "需要群攻",
+      "scope": "stage"
+    },
+    {
+      "color": "#8e44ad",
+      "group": "需求",
+      "id": "s_need_cc",
+      "name": "需要控制",
+      "scope": "stage"
+    },
+    {
+      "color": "#f1c40f",
+      "group": "目标",
+      "id": "s_burst",
+      "name": "目标速杀",
+      "scope": "stage"
+    },
+    {
+      "color": "#2980b9",
+      "group": "需求",
+      "id": "s_need_dot",
+      "name": "需要dot",
+      "scope": "stage"
+    },
+    {
+      "color": "#888888",
+      "group": "能力",
+      "id": "t1791357742634",
+      "name": "加速",
+      "scope": "unit"
+    },
+    {
+      "color": "#888888",
+      "group": "能力",
+      "id": "t1791357843971",
+      "name": "减攻击",
+      "scope": "unit"
+    },
+    {
+      "color": "#d35400",
+      "group": "能力",
+      "id": "t1791357917170",
+      "name": "魔法破甲",
+      "scope": "unit"
+    },
+    {
+      "color": "#888888",
+      "group": "用法",
+      "id": "t1791358032871",
+      "name": "前3图",
+      "scope": "unit"
+    },
+    {
+      "color": "#c24ca3",
+      "group": "能力",
+      "id": "t1791358112291",
+      "name": "魅惑",
+      "scope": "unit"
+    },
+    {
+      "color": "#3a97df",
+      "group": "能力",
+      "id": "t1791358447882",
+      "name": "抽蓝",
+      "scope": "unit"
+    },
+    {
+      "color": "#41c85c",
+      "group": "能力",
+      "id": "t1791358546995",
+      "name": "强击退",
+      "scope": "unit"
+    },
+    {
+      "color": "#bc01d5",
+      "group": "能力",
+      "id": "t1791358674360",
+      "name": "dot",
+      "scope": "unit",
+      "single": false
+    },
+    {
+      "color": "#00cc4e",
+      "group": "能力",
+      "id": "t1791358691734",
+      "name": "毒",
+      "scope": "unit"
+    },
+    {
+      "color": "#04b701",
+      "group": "能力",
+      "id": "t1791358700885",
+      "name": "猛毒",
+      "scope": "unit"
+    },
+    {
+      "color": "#e100ff",
+      "group": "能力",
+      "id": "t1791358706735",
+      "name": "诅咒",
+      "scope": "unit"
+    },
+    {
+      "color": "#b900d1",
+      "group": "能力",
+      "id": "t1791358710590",
+      "name": "恶咒",
+      "scope": "unit"
+    },
+    {
+      "color": "#f03d3d",
+      "group": "能力",
+      "id": "t1791358716756",
+      "name": "火伤",
+      "scope": "unit"
+    },
+    {
+      "color": "#b801d0",
+      "group": "能力",
+      "id": "t1791358726369",
+      "name": "其他dot",
+      "scope": "unit"
+    },
+    {
+      "color": "#737373",
+      "group": "能力",
+      "id": "t1791358736683",
+      "name": "dot抑制",
+      "scope": "unit"
+    },
+    {
+      "color": "#b4cc00",
+      "group": "能力",
+      "id": "t1791358891825",
+      "name": "嘲讽",
+      "scope": "unit"
+    },
+    {
+      "color": "#16a085",
+      "group": "能力",
+      "id": "t1791367420540",
+      "name": "魔法buff",
+      "scope": "unit"
+    },
+    {
+      "color": "#888888",
+      "group": "用法",
+      "id": "t1791367928106",
+      "name": "NPC可用",
+      "scope": "unit"
+    },
+    {
+      "color": "#888888",
+      "group": "用法",
+      "id": "t1791369642591",
+      "name": "单体效果低",
+      "scope": "unit"
+    },
+    {
+      "color": "#cdd016",
+      "group": "能力",
+      "id": "t1791380357831",
+      "name": "领域",
+      "scope": "unit"
+    },
+    {
+      "color": "#0a9962",
+      "group": "用法",
+      "id": "t1791380776914",
+      "name": "属性限定",
+      "scope": "unit"
+    },
+    {
+      "color": "#888888",
+      "group": "未分组",
+      "id": "t1791384412603",
+      "name": "类型反转",
+      "scope": "unit"
+    },
+    {
+      "color": "#888888",
+      "group": "需求",
+      "id": "s_multi",
+      "name": "多目标",
+      "scope": "stage"
+    },
+    {
+      "color": "#888888",
+      "group": "用法",
+      "id": "u_both",
+      "name": "物法通用",
+      "scope": "unit"
+    },
+    {
+      "color": "#c9a227",
+      "group": "速通关键",
+      "id": "u_first_tp",
+      "name": "首动群充",
+      "scope": "unit"
+    },
+    {
+      "color": "#d35400",
+      "group": "速通关键",
+      "id": "u_dbreak",
+      "name": "双破甲",
+      "scope": "unit"
+    },
+    {
+      "color": "#a9713a",
+      "group": "速通关键",
+      "id": "u_dbreak_eq",
+      "name": "等效双破甲",
+      "scope": "unit"
+    },
+    {
+      "color": "#8e44ad",
+      "group": "对策",
+      "id": "u_fix_multi",
+      "name": "对策·多目标boss",
+      "scope": "unit"
+    },
+    {
+      "color": "#8e44ad",
+      "group": "对策",
+      "id": "u_fix_relic",
+      "name": "对策·美空",
+      "scope": "unit"
+    },
+    {
+      "color": "#8e44ad",
+      "group": "对策",
+      "id": "u_fix_backline",
+      "name": "对策·最后排",
+      "scope": "unit"
+    },
+    {
+      "color": "#8e44ad",
+      "group": "对策",
+      "id": "u_fix_icewolf",
+      "name": "对策·冰狼",
+      "scope": "unit"
+    },
+    {
+      "color": "#8e44ad",
+      "group": "对策",
+      "id": "u_fix_ghost",
+      "name": "对策·幽灵领主",
+      "scope": "unit"
+    },
+    {
+      "color": "#888888",
+      "group": "用法",
+      "id": "t1791857432869",
+      "name": "对boss弱",
+      "scope": "unit"
+    },
+    {
+      "color": "#c9a227",
+      "group": "速通关键",
+      "id": "u_first_tp_phys",
+      "name": "首动群充（物理）",
+      "scope": "unit"
+    }
+  ]
 }

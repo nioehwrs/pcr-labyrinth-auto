@@ -51,6 +51,10 @@ class TeamBuild(private val tables: Tables) {
         forceHeal: String? = null,
         /** ★枚举结构位组合时指定"首动群充"用谁（null = 按原规则 max(tier)） */
         forceTp: String? = null,
+        /** ★2026-11-12：遗物「技能值上升量」之和 ÷100（= TP 上升倍率，0.05 = +5%） */
+        tpUp: Double = 0.0,
+        /** ★2026-11-12：遗物「战斗开始时技能值回复」之和（= 初始 TP） */
+        initTp: Int = 0,
     ): Res {
         var pf: Map<String, Any?> = Profiles.applyFloor(Profiles.profileOf(stage), floor)
         // ★结构位台账（2026-11-4）：只在外层主调用时打一行，列出这关要求哪些结构位
@@ -143,7 +147,7 @@ class TeamBuild(private val tables: Tables) {
         if (pf["todo"] != null) res.warn.add("⚠ ${pf["todo"]}")
 
         when (algo) {
-            "sutong" -> algoSutong(pf, res.cands, res.weak, n, relicsSkill, res)
+            "sutong" -> algoSutong(pf, res.cands, res.weak, n, relicsSkill, res, tpUp, initTp)
             "dot_only" -> algoDot(pf, res.cands, res.weak, n, relicsSkill, res)
             "aoe" -> algoAoe(pf, res.cands, res.weak, n, relicsSkill, res)
             else -> algoBurst(pf, res.cands, res.weak, n, relicsSkill, res)
@@ -438,6 +442,8 @@ class TeamBuild(private val tables: Tables) {
         n: Int,
         relicsSkill: Int,
         res: Res,
+        tpUp: Double = 0.0,
+        initTp: Int = 0,
     ) {
         val w = C.W["sutong"]!!
         val bonus: Map<String, Double> = (pf["bonus_tags"] as? Map<*, *>)
@@ -477,10 +483,45 @@ class TeamBuild(private val tables: Tables) {
             }
         }
 
-        firstTp(res, cands, relicsSkill)
+        // ★2026-11-12（新版本 / 望·解放者）：物理速通的核心。
+        val magicTp = cands.firstOrNull { TagIds.T["first"] in rules.tagsOf(it) }
+        val physTp = cands.firstOrNull { TagIds.T["first_phys"] in rules.tagsOf(it) }
+        // ★2026-11-12（用户）：
+        //   ① **有水电（泛用首动群充）就不走物理速通** —— 两者不并存；
+        //   ② TP 溢出时连首动群充也不用（遗物已经把 TP 顶起来）：
+        //      经典（水电）：(1.4 + 遗物TP上升) × 遗物初始TP ≥ 500 → 不用；
+        //      物理（望）  ：(1.35 + 遗物TP上升) × 遗物初始TP ≥ 500 → 不用；
+        //   ③ 都不用 ⇒ 走「无首动群充」的速通群体输出队。
+        val magicTpOk = magicTp != null && (1.4 + tpUp) * initTp < 500.0
+        val physTpOk = magicTp == null && physTp != null && (1.35 + tpUp) * initTp < 500.0
+        when {
+            magicTpOk -> firstTp(res, cands, relicsSkill)
+            physTpOk -> take(res, physTp!!, "首动群充")
+            else -> {
+                // TP 已溢出（或没有首动群充）：两个核心都移出候选，转向群体输出
+                val drop = listOfNotNull(magicTp, physTp).toSet()
+                if (drop.isNotEmpty()) cands.removeAll(drop)
+            }
+        }
+        // 本次是否走物理速通（决定破甲优先物理群体破甲还是双破甲）
+        val physBoosting = physTpOk
 
         val dbr = cands.filter { TagIds.T["dbreak"] in rules.tagsOf(it) }
-        if (dbr.isNotEmpty()) {
+        val pbrk = cands.filter { TagIds.T["pbreak"] in rules.tagsOf(it) }
+        val pbrkAoe = pbrk.filter {
+            TagIds.T["aoe"] in rules.tagsOf(it) && rules.effAtk(it) == "物理"
+        }
+        if (physBoosting) {
+            // ★2026-11-12（用户）：**物理群体破甲 > 双破甲**，不再考虑「非群体物理破甲」。
+            val pick = pbrkAoe.filter { it !in res.picked }.maxWithOrNull(compareByDouble { sc(it) })
+            if (pick != null) {
+                take(res, pick, "物理群体破甲")
+            } else if (dbr.isNotEmpty()) {
+                take(res, dbr.maxWithOrNull(compareByDouble { sc(it) })!!, "双破甲")
+            } else {
+                res.warn.add("⚠ 池里没有破甲角色")
+            }
+        } else if (dbr.isNotEmpty()) {
             take(res, dbr.maxWithOrNull(compareByDouble { sc(it) })!!, "双破甲（至少一个）")
         } else {
             res.log.add("没有「双破甲」→ 备选路线：同系「群攻 + 单破甲」")
@@ -548,7 +589,7 @@ class TeamBuild(private val tables: Tables) {
             }
         }
 
-        // 排序键：(对策加分或速通, 群攻, 场景评级, 评分)
+        // 排序键：(对策加分或速通, 群攻, 场景评级, 评分) —— ★主排序保持原样（用户 2026-11-12）
         fun rank(u: String): ComparableKey {
             val ts = rules.tagsOf(u)
             val bbu = bonusTs.isNotEmpty() && ts.any { it in bonusTs }
@@ -688,9 +729,11 @@ class TeamBuild(private val tables: Tables) {
         floor: Int = 1,
         size: Int? = null,
         failed: Boolean = false,
+        tpUp: Double = 0.0,
+        initTp: Int = 0,
     ): Res {
         val n = size ?: C.SIZE
-        var res = build(stage, pool, relicsSkill, floor, size, failed = failed)
+        var res = build(stage, pool, relicsSkill, floor, size, failed = failed, tpUp = tpUp, initTp = initTp)
         res = variantBest(stage, pool, relicsSkill, floor, size, res, failed)
 
         val al = res.attrlimUnits

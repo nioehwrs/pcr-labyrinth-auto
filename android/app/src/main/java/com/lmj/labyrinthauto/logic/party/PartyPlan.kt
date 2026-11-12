@@ -94,6 +94,7 @@ object PartyPlan {
         val res = tb.buildBest(
             stage, pool.map { it.toString() }, relicsSkill = ctx.sk, floor = floor,
             size = LAB_PARTY_SIZE, failed = failed,
+            tpUp = ctx.tpUp, initTp = ctx.sk,
         )
         rememberBuild(BuildKey(stage, floor, failed, ctx.sk, pool), res)
         AppState.addLog(
@@ -285,6 +286,24 @@ object PartyPlan {
         return total to detail
     }
 
+    /**
+     * ★2026-11-12（用户）：遗物「技能值上升量」合计 ÷100 → TP 上升倍率（0.15 = +15%）。
+     *   速通的首动群充判定要用：(1.4 + tpUp) × 初始TP ≥ 500 就不用水电；(1.35 + tpUp) × 初始TP 同理用于望。
+     */
+    fun relicTpUp(own: JSONObject?): Double {
+        val relics = own?.optJSONArray("relics") ?: return 0.0
+        val rt = relicTables ?: return 0.0
+        val seen = mutableSetOf<String>()
+        var up = 0.0
+        for (i in 0 until relics.length()) {
+            val x = relics.optJSONObject(i) ?: continue
+            val rid = x.opt("relicId")?.toString()?.takeIf { it != "null" && it.isNotEmpty() } ?: continue
+            if (!seen.add(rid)) continue
+            up += (rt.rk(rid)?.opt("skill_up") as? Number)?.toDouble() ?: 0.0
+        }
+        return up / 100.0
+    }
+
     data class PartyCtx(
         val sk: Int,
         val det: List<String>,
@@ -293,6 +312,8 @@ object PartyPlan {
         val ownErr: String?,
         /** ★持有池明细（USER/NPC 各几个 + 集合内部计数）——2026-10-16 查"池读少"用 */
         val poolNote: String = "",
+        /** ★2026-11-12：遗物 TP 上升倍率（Σ skill_up ÷100） */
+        val tpUp: Double = 0.0,
     )
 
     /** PC `party_ctx_cached`(2443)：本页只问一次 RPC（加速遗物技能值 + 本局持有角色池） */
@@ -325,7 +346,7 @@ object PartyPlan {
             " ｜ 集合 count=${pu?.opt("setCount")} cap=${pu?.opt("setCap")} 扫描=${pu?.opt("setScan")}" +
             " 空槽=${pu?.opt("setEmpty")} 命中=${pu?.opt("setHit")}" +
             (errTxt?.let { " ｜ err=$it" } ?: "")
-        return PartyCtx(sk, det, unitIds, relics, pu?.optString("err"), poolNote)
+        return PartyCtx(sk, det, unitIds, relics, pu?.optString("err"), poolNote, tpUp = relicTpUp(own))
     }
 
     /** PC `_stage_for`(2413)：当前格子 → team_build 的关卡 key */
@@ -519,6 +540,7 @@ object PartyPlan {
             tb = teamBuild!!.buildBest(
                 stage, pool.map { it.toString() }, relicsSkill = ctx.sk, floor = floor,
                 size = LAB_PARTY_SIZE, failed = failed,          // ★失败过 ⇒ 让规则表决定要不要补坦克
+                tpUp = ctx.tpUp, initTp = ctx.sk,
             )
             if (tb.team.isNullOrEmpty()) {
                 // ★空队兜底（2026-10-19 用户）：放宽属性限定重编一次——过滤链（前3图屏蔽/attrlim 剔除/
@@ -622,7 +644,10 @@ object PartyPlan {
         if (allOrdered.size != ctx.own.size) {
             lines.add("对照：本页可编入 ${allOrdered.size} 个 ｜ labUnits 持有 ${ctx.own.size} 个（以页面为准）")
         }
-        tb.log.take(8).forEach { lines.add("算法：$it") }
+        // ★2026-11-12（用户："日志不要写出组队逻辑，各种队伍都是，只给出结果"）：
+        //   不再把 `tb.log`（算法内部推导：备选路线/对策加分/属性换人…）写进编队日志，
+        //   只保留结果（关卡/算法名/池/目标/缺谁/操作）。
+
         if (note != null) lines.add("注：$note")
         if (miss.isEmpty() && extra.isEmpty()) {
             lines.add("✓ 已就绪（集合一致；顺序由游戏按攻击范围自排）→ 接下来：战斗开始(自动)")
