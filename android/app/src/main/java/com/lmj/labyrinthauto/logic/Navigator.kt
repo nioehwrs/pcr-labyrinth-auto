@@ -7,6 +7,8 @@ import com.lmj.labyrinthauto.frida.AgentBridge
 import com.lmj.labyrinthauto.frida.GameProcess
 import com.lmj.labyrinthauto.input.Foreground
 import com.lmj.labyrinthauto.input.InputBackend
+import android.content.Context
+import com.lmj.labyrinthauto.frida.FridaInjector
 import com.lmj.labyrinthauto.input.InputResult
 import kotlinx.coroutines.delay
 import org.json.JSONArray
@@ -96,7 +98,12 @@ object Navigator {
      * 从"当前页面"一路点到 LABYRINTH_TOP(259)。
      * @return true = 已到达（或本来就在）259；false = 中途停手（原因会写进日志）
      */
-    suspend fun goToLabyrinthTop(input: InputBackend, maxRounds: Int = 200): Boolean {
+    suspend fun goToLabyrinthTop(
+        input: InputBackend,
+        maxRounds: Int = 200,
+        /** 用于"游戏进程不在就主动拉起"；传 null 时只等前台（旧行为） */
+        ctx: Context? = null,
+    ): Boolean {
         AppState.addLog("── 目标：点到黎明界 top（259）──")
         if (!input.isAvailable()) {
             AppState.addLog("停手：点击后端不可用（没有 root）")
@@ -110,11 +117,25 @@ object Navigator {
         //   现在：**给游戏 [FRONT_WAIT_MS] 时间回到前台**，只有"读到、且不是游戏"才停手。
         val t0 = SystemClock.elapsedRealtime()
         var front = ""
+        var launched = 0
+        var pidCheckedAt = 0L
         while (true) {
             val p = Foreground.packageName()
             if (p == GameProcess.pkg()) break
             front = p ?: "读不到"
-            if (SystemClock.elapsedRealtime() - t0 >= FRONT_WAIT_MS) {
+            val now = SystemClock.elapsedRealtime()
+            // ★2026-11-12（用户："闪退恢复没有游戏进程检测和重启"）：闪退后前台一直是助手，
+            //   只等前台永远等不到（等满 [FRONT_WAIT_MS] 就停手）。这里每 3s 看一眼游戏进程，
+            //   不在就主动 `am start` 拉起（最多 2 次），再继续等它到前台。
+            if (ctx != null && now - pidCheckedAt >= 3_000L) {
+                pidCheckedAt = now
+                if (FridaInjector.gamePid() <= 0 && launched < 2) {
+                    launched++
+                    AppState.addLog("…前台不是游戏、进程也不在 → 主动调起游戏（第 $launched 次）")
+                    GameProcess.launch(ctx)
+                }
+            }
+            if (now - t0 >= FRONT_WAIT_MS) {
                 AppState.addLog(
                     "停手：${FRONT_WAIT_MS / 1000}s 内游戏没到前台（前台=$front）—— 自动点击只允许打在游戏上",
                 )

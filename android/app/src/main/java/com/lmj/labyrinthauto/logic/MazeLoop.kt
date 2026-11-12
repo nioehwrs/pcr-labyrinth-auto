@@ -145,6 +145,7 @@ object MazeLoop {
      */
     private const val FRONT_NULL_MAX = 12
 
+
     /** PC `DLG_OWN_PAGE_EVERY`(340)："我们自己 handler 驱动的页"每隔这么多轮才查一次通用弹窗 */
     private const val DLG_OWN_PAGE_EVERY = 5
 
@@ -388,6 +389,7 @@ object MazeLoop {
         shopRelicCtx = null; shopRelicCtxKey = null   // ★商店遗物序的上下文（按店缓存，跨局必须清）
         shopBuyStep = 0; shopBuyAt = 0L              // ★购买子链也不能跨局（上一局杀进程前的半截交易）
         frontNullRounds = 0                          // 前台读空计数（见 [FRONT_NULL_MAX]）
+        switchArmed = false                          // 切屏保护每局重新按阶段开启（见字段注释）
         evSnapId = null                              // 事件效果快照（跨局必须清，见 [settleEventDiff]）
         relicChoiceTries.clear()
         partyScroll.clear()                     // 编队页"滚动找缺员"的每页状态（本局重来）
@@ -521,6 +523,8 @@ object MazeLoop {
         stopRequested = false                   // handler 判定"卡死了"→ 请求收工（字段见类底部）
         lastPickedSig = null
         resetFrameWatch()                       // 帧看门狗：本局从零建立基线
+        // ★2026-11-12（用户）：本局启动阶段"前台不是游戏"只提示一次（不判切屏，见 switchArmed）
+        var startupSaid = ""
 
         while (true) {                  // 取消靠 delay() 抛 CancellationException（服务停止时 scope.cancel）
             if (!AgentBridge.connected.value) {
@@ -554,6 +558,20 @@ object MazeLoop {
             // ★force：主循环每轮必须"现查"，切走检测不能依赖 tap 里那个 2s 缓存
             val frontPkg = Foreground.packageName(force = true)
             if (frontPkg != null && frontPkg != GameProcess.pkg()) {
+                // ★2026-11-12（用户："不用限制时间，规定运行到某个阶段才开始算"）：
+                //   切屏判定只在**本局进过迷宫之后**才生效（见下面的 `switchArmed` 置位）。
+                //   启动/重启阶段（前台是桌面/助手、游戏还在加载或刚闪退）一律不算切屏，
+                //   交给注入器自愈（进程没了/15s 没映射 → kill+launch），这里只等。
+                if (!switchArmed) {
+                    if (startupSaid != frontPkg) {
+                        startupSaid = frontPkg
+                        AppState.addLog(
+                            "启动阶段：前台是 $frontPkg → 还没进过迷宫，不判切屏（等游戏起来）",
+                        )
+                    }
+                    delay(500)
+                    continue
+                }
                 AppState.addLog("停手：前台已切到 $frontPkg（不再碰游戏）")
                 return
             }
@@ -643,6 +661,15 @@ object MazeLoop {
             //   不再拉整包 —— eventId/questId/choices 这些**只有个别 handler 用得到**的字段，
             //   由那些 handler 自己按需读（[AgentApi.labExtra]，纯内存读，~0ms）。
             val st = AgentApi.labStatusLite()
+            // ★2026-11-12（用户）：切屏保护从**本局第一次在迷宫里读到状态**开始生效。
+            //   启动/重启阶段（还没进迷宫）前台怎么变都不算切屏；进过迷宫后再切走才停手。
+            if (st != null && !switchArmed) {
+                val v0 = st.optInt("viewId", -1)
+                if (Navigator.isLabyrinthView(v0)) {
+                    switchArmed = true
+                    AppState.addLog("切屏保护已开启（已进入迷宫 ${Navigator.viewLabel(v0)}）")
+                }
+            }
             if (st == null) {
                 nullReads++
                 // ★"读不到"（不在迷宫 / 换区途中 / 游戏重启中）不算"同一现场的延续"——把心跳计时往前推，
@@ -1513,6 +1540,13 @@ object MazeLoop {
     /** 前台连续"读不到焦点窗口"的轮数（见 [FRONT_NULL_MAX]）；每局开头清零 */
     private var frontNullRounds = 0
 
+    /**
+     * ★2026-11-12（用户："不用限制时间，规定运行到某个阶段才开始算"）：
+     *   本局**切屏保护是否已开启** —— 只有第一次在迷宫里读到状态（260~265）才置 true。
+     *   启动/重启阶段（还没进迷宫、前台是桌面/助手/游戏闪退中）一律不算切屏。
+     */
+    private var switchArmed = false
+
     /** 上次已经取证过的顶框名（同一页面不重复 dump —— 见 [dumpBattleResult]） */
     private var lastDumpTop: String? = null
 
@@ -2044,7 +2078,44 @@ object MazeLoop {
         val rule = pick.ruleLine(q, n == 1)
         if (CharaPick.AUTO && rule != null) {
             pick.autoPick(input, q, rule.second)           // ★自动点选三人 / 点「去邀请」
+            // ★2026-11-12（用户）：点过「去邀请」后**必定**弹「收到角色」框 ⇒ 纳入状态链并点掉；
+            //   之后可能是额外奖励框（拉比林斯等公会）也可能直接进地图，交给主循环按页面状态走。
+            if (pick.consumeInvited()) drainSummonReceipts(input)
         }
+    }
+
+    /**
+     * ★2026-11-12（用户）：选角「去邀请」后的**收到角色**链。
+     *
+     * 必定出现的「收到角色」框（`DialogCommonMiddle` + `OneButtonWhite`，和买印记同款）先点掉；
+     * 之后不同公会不一样（拉比林斯有额外奖励框、有的直接进地图）⇒ 这里只做「见到 Dialog 就点掉」，
+     * **连续 4 拍没有对话框**就收手，把后续交给主循环按页面状态决定。
+     */
+    private suspend fun drainSummonReceipts(input: InputBackend) {
+        val keys = listOf("OneButtonWhite", "OneButtonBlue", "TwoButtonRight", "ThreeButtonCenter")
+        val t0 = SystemClock.elapsedRealtime()
+        var idle = 0
+        var taps = 0
+        while (SystemClock.elapsedRealtime() - t0 < 8_000L && taps < 6) {
+            val b = dlgBoxNow()
+            val top = b?.optString("top").orEmpty()
+            if (b == null || !top.startsWith("Dialog")) {
+                idle++
+                if (idle >= 4) {
+                    AppState.addLog("选角后：收到角色框已处理完（$taps 个）→ 交回主循环")
+                    return
+                }
+                delay(120)
+                continue
+            }
+            idle = 0
+            if (pickBoxBtn(b, keys) == null) { delay(120); continue }
+            taps++
+            AppState.addLog("选角后：收到角色 → 点掉（第 $taps 个框，$top）")
+            tapBoxButton(input, keys, "收到角色", skipHits = 2)
+            delay(150)
+        }
+        AppState.addLog("选角后：收到角色处理结束（$taps 个框）")
     }
 
     /** PC `EVENT_SKIP_RE`(462)：事件演出页的「跳过」按钮名（找不到才退点屏幕中心） */
@@ -3386,19 +3457,6 @@ object MazeLoop {
         return null
     }
 
-    /** 等 [ptr] 这个框**开始消失**（out tween 启动）或已换框/消失。 */
-    private suspend fun awaitBoxClosing(ptr: String, timeoutMs: Long): Boolean {
-        val t0 = SystemClock.elapsedRealtime()
-        while (SystemClock.elapsedRealtime() - t0 < timeoutMs) {
-            val b = dlgBoxNow()
-            if (b == null) { delay(SHOP_ANIM_POLL_MS); continue }
-            if (b.optString("ptr") != ptr) return true
-            if (b.optBoolean("closing")) return true
-            delay(SHOP_ANIM_POLL_MS)
-        }
-        return false
-    }
-
     /**
      * 点当前框的某个按钮；没点中就**用下一拍的新坐标补点**（多点当手段），
      * 点完只探 [SHOP_ANIM_CLOSE_PROBE_MS] 有没有"开始消失"。
@@ -3410,28 +3468,39 @@ object MazeLoop {
         what: String,
         skipHits: Int = 1,
     ): Boolean {
+        val base = dlgBoxNow() ?: return false
+        val basePtr = base.optString("ptr")
         var taps = 0
-        var skipLeft = skipHits
-        while (taps < SHOP_ANIM_TAP_MAX) {
-            val b = dlgBoxNow()
-            if (b == null) { delay(SHOP_ANIM_POLL_MS); continue }
-            val hit = pickBoxBtn(b, keys)
-            if (hit == null) { delay(SHOP_ANIM_POLL_MS); continue }
-            // ★2026-11-11（用户）：新框刚弹出的前几拍按钮还在入场动画里，点必空 ⇒
-            //   按 [skipHits] 先"只读不点"若干拍（探测频率不变，还是 60ms 一拍，只放宽首次点击时机）。
-            //   购买确认框 skip=1；到账框（购买完毕 / 角色加入）按钮落位更晚，用 skip=2。
-            if (skipLeft > 0) {
-                skipLeft--
-                delay(SHOP_ANIM_POLL_MS)
-                continue
-            }
-            val ptr = b.optString("ptr")
-            taps++
-            AppState.addLog("商店：$what → 点「${hit.first}」#$taps (${hit.second},${hit.third})")
-            input.tap(hit.second, hit.third)
-            if (awaitBoxClosing(ptr, SHOP_ANIM_CLOSE_PROBE_MS)) return true
-        }
-        return false
+        // ★2026-11-12（用户）：**不再自己实现"首拍只读不点"** —— 统一交给 [TapCheck.run] 的
+        //   `skipFirstHits`（与特别装备「全部」行同一套能力）；本函数只提供"点哪个按钮 + 什么算框没了"。
+        //   判据：这个框 **开始消失**（`closing`）或换成别的框（ptr 变），都算这一下生效。
+        return tapAndCheck(
+            input, 0, 0, "商店：$what",
+            from = setOf(basePtr),
+            settleMs = SHOP_ANIM_CLOSE_PROBE_MS,
+            retries = SHOP_ANIM_TAP_MAX,
+            readTop = {
+                val b = dlgBoxNow()
+                when {
+                    b == null -> ""                                  // 没有对话框 = 已经关掉
+                    b.optBoolean("closing") -> ""                    // 开始收起 = 生效
+                    else -> b.optString("ptr")
+                }
+            },
+            unknownTop = "",
+            reached = { p -> p.isEmpty() || p != basePtr },
+            probe = 1,
+            probeMs = SHOP_ANIM_CLOSE_PROBE_MS,
+            skipFirstHits = skipHits,
+            xyAt = xyAt@{
+                val b = dlgBoxNow() ?: return@xyAt null
+                if (b.optString("ptr") != basePtr) return@xyAt null   // 已经换框/关掉 ⇒ 不点
+                val hit = pickBoxBtn(b, keys) ?: return@xyAt null
+                taps++
+                AppState.addLog("商店：$what → 点「${hit.first}」#$taps (${hit.second},${hit.third})")
+                hit.second to hit.third
+            },
+        )
     }
 
     /**

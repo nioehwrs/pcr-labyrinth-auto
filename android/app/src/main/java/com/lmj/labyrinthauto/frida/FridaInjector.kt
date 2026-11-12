@@ -83,6 +83,14 @@ object FridaInjector {
     /** 等就绪的总超时（PC 版 step_wait_ready 的 timeout = 120） */
     private const val READY_TIMEOUT_MS = 120_000L
 
+    /**
+     * ★2026-11-12（用户："闪退恢复没有进程状态检测和重启"）：
+     *   起游戏后这么久 `libil2cpp.so` 仍没出现在 maps ⇒ 判定"进程卡死/闪退残留"，
+     *   立刻返回失败让注入循环 kill + launch（不再傻等 [READY_TIMEOUT_MS] 的 120s）。
+     *   正常冷启动 2~5s 内就会映射，15s 留足慢设备余量。
+     */
+    private const val IL2CPP_MAP_STUCK_MS = 15_000L
+
     /** 轮询 maps 的间隔（PC 版 0.5s；这里是设备内 `su -c`，稍缓一点免得频繁起进程） */
     private const val MAPS_POLL_MS = 800L
 
@@ -746,9 +754,16 @@ object FridaInjector {
             if (dt > 3_000) {
                 val st = RootShell.exec("awk '{print \$3}' /proc/$pid/stat", 3_000L)
                 val state = st.out.trim()
-                if (state == "T" || state == "D" || state == "t") {
-                    return "进程僵死（pid $pid 状态=$state，注入 ptrace 失败留下的坏状态）"
+                if (state.isEmpty()) return "进程提前退出（pid $pid 的 /proc 没了）"
+                if (state == "T" || state == "D" || state == "t" || state == "Z" || state == "X") {
+                    return "进程僵死/已退出（pid $pid 状态=$state）"
                 }
+            }
+            // ★2026-11-12（用户："闪退恢复没有进程状态检测和重启"）：pid 还在、可 `maps` 里连
+            //   `libil2cpp.so` 的影子都没有 ⇒ 进程只是"在"，实际卡在开屏/白屏（闪退残留）。
+            //   再傻等 120s 没意义 ⇒ 判卡死，交给注入循环 kill + launch。
+            if (dt >= IL2CPP_MAP_STUCK_MS) {
+                return "起游戏后 ${IL2CPP_MAP_STUCK_MS / 1000}s 内 $KEY_SO 一直没映射（进程卡死/闪退残留）"
             }
             if (dt >= READY_TIMEOUT_MS) {
                 return "等 $KEY_SO 映射超时（${READY_TIMEOUT_MS / 1000}s；最后输出：${r.text.take(80)}）"

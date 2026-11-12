@@ -191,13 +191,13 @@ object InGameReroll {
             null -> Unit   // 不在迷宫（或已撤退回 259）→ 走正常"到 top → 开新局"流程
         }
 
-        var atTop = Navigator.goToLabyrinthTop(input)
+        var atTop = Navigator.goToLabyrinthTop(input, ctx = ctx)
         if (!atTop) {
             // 实测 2026-10-19：跑到一半前台被打回助手（前台=com.lmj.labyrinthauto）→ 顶起游戏再来一次
             AppState.addLog("局内刷开局：导航没到 top → 重新顶起游戏再试一次")
             GameProcess.launch(ctx)
             delay(2_500)
-            atTop = Navigator.goToLabyrinthTop(input)
+            atTop = Navigator.goToLabyrinthTop(input, ctx = ctx)
         }
         if (!atTop) {
             AppState.addLog("局内刷开局：还是没走到黎明界 top → 停手")

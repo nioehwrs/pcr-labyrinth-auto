@@ -169,7 +169,7 @@ class AutoForegroundService : Service() {
                         AppState.addLog("停手：没有可用的点击后端（没有 root：frida/点击都做不了）")
                         return@launch
                     }
-                    Navigator.goToLabyrinthTop(input)
+                    Navigator.goToLabyrinthTop(input, ctx = applicationContext)
                     refreshNotification()
                 }
                 return START_NOT_STICKY
@@ -356,6 +356,28 @@ class AutoForegroundService : Service() {
                             }
                             // ★本局局号（日志页按局展示用）：写进本局日志文件头
                             MazeLoop.roundLabel = "$idx/$totalTxt"
+                            // ★★2026-11-12（用户反馈 iiii：0.6.14 "设置跑 10 次，刷完一次就运行结束"）：
+                            //   上一局**正常完成**时会 [bringAssistantToFront] 把助手带回前台；
+                            //   下一局如果直接进 MazeLoop，主循环第一轮读到"前台=助手"就判切走 →
+                            //   「第 2 局没跑完 → 运行结束」。⇒ 每局开始前先把游戏顶回前台（am start
+                            //   不重启进程、保留游戏内状态），再等它真的到前台。
+                            if (idx > 1) {
+                                val fg = runCatching {
+                                    com.lmj.labyrinthauto.input.Foreground.packageName(force = true)
+                                }.getOrNull()
+                                if (fg != GameProcess.pkg()) {
+                                    AppState.addLog("第 $idx 局开始前：前台是 ${fg ?: "读不到"} → 先把游戏带回前台")
+                                    GameProcess.launch(applicationContext)
+                                    val ft = SystemClock.elapsedRealtime()
+                                    while (SystemClock.elapsedRealtime() - ft < 10_000L) {
+                                        val p = runCatching {
+                                            com.lmj.labyrinthauto.input.Foreground.packageName(force = true)
+                                        }.getOrNull()
+                                        if (p == GameProcess.pkg()) break
+                                        delay(300)
+                                    }
+                                }
+                            }
                             if (!runOneMaze(input)) {
                                 ticker.cancel()
                                 // ★策略「撤退重跑」：本局作废（不算完成、不消耗计划次数）→ 撤销当前局后继续下一局
@@ -802,7 +824,7 @@ class AutoForegroundService : Service() {
      */
     private suspend fun enterMazeWithRetry(input: InputBackend): Boolean {
         repeat(ENTER_RETRY) { i ->
-            if (Navigator.goToLabyrinthTop(input)) {
+            if (Navigator.goToLabyrinthTop(input, ctx = applicationContext)) {
                 when (Navigator.enterMaze(input)) {
                     Navigator.EnterResult.ENTERED -> return true
                     Navigator.EnterResult.NOT_CHALLENGING -> return false   // 登错号/没开局：重试无意义

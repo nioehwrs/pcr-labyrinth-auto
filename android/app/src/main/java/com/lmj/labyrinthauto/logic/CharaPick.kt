@@ -29,11 +29,29 @@ import org.json.JSONObject
  */
 class CharaPick(
     private val tables: Tables,
+
     private val pool: GuildPoolData,
     private val pickResolver: (Int) -> List<Int>,
     private val rules: Rules,
     private val relics: RelicTables,
 ) {
+
+    /**
+     * ★2026-11-12（用户）：点过「去邀请」后，**必定**弹一个「收到角色」框（和买印记的到账框同款）。
+     *   `autoPick` 只负责点「去邀请」，框由 [MazeLoop] 的状态链接住并点掉；
+     *   这里只留一个一次性标志，让调用方知道"该开始收框了"。
+     */
+    @Volatile private var invitedPending = false
+    private var justInvited: Boolean
+        get() = invitedPending
+        set(v) { invitedPending = v }
+
+    /** 取走「刚点过去邀请」标志（取一次就清，避免重复进收框链） */
+    fun consumeInvited(): Boolean {
+        val v = invitedPending
+        invitedPending = false
+        return v
+    }
 
     companion object {
         /** PC: `LAB_CHARA_AUTO`(1488) / `LAB_CHARA_INVITE`(1489) —— 自动点选 + 自动邀请 */
@@ -46,14 +64,17 @@ class CharaPick(
 
         /** ★连点（PC: LAB_CHARA_BURST 1492）：一次把"取消多余+补齐缺失"全点掉，三格之间不回读 */
         const val BURST = true
-        const val TAP_MS = 350L                // PC: LAB_CHARA_TAP_MS(1493)：够游戏识别成两次独立点击
-        const val BURST_SETTLE_MS = 1_200L     // PC: LAB_CHARA_BURST_SETTLE(1494)：连点后静置再回读
+        /** ★2026-11-12（用户："组队页飞快，初始选还在一个个点"）：格间间隔 350 → 120。
+         *  `input.tap` 本身 ~110ms，120ms 足够游戏识别成两次独立点击（编队页就是无间隔连点）；
+         *  万一太快被吞，下一轮回读会纠正（`batch` 最多 2 批）。 */
+        const val TAP_MS = 120L
+        /** 连点后回读静置：原来 1.2s 是保守值，现在 600ms（核对由下一轮回读做，点错会补点） */
+        const val BURST_SETTLE_MS = 600L
         const val BATCH_MAX = 2                // PC: LAB_CHARA_BATCH_MAX(1495)：最多连点几批
 
-        /** ★本页**第一次点击前**的延迟（2026-10-17 用户："初始选角色加 0.5 延迟就好"）：
-         *  页面刚弹出时格子还在落位，直接连点会点歪（实测把「铃莓（春日）」点成「铃莓（新年）」✗）。
-         *  只等一次；重试/补点不再等。 */
-        const val FIRST_TAP_DELAY_MS = 500L
+        /** ★2026-11-12（用户）：本页**第一次点击前**等 120ms —— 和格间间隔一致；
+         *  实测 60ms 时首批第一个偶发被吃掉（`已选 2/3`），补点一次即可接受（`batch` 最多 2 批）。 */
+        const val FIRST_TAP_DELAY_MS = 120L
 
         /** ★格子坐标「尚未落位」时最多等几轮（2026-10-18）：页面刚弹出那几拍 cells 还没有 x/y，
          *  早期实现一见没坐标就 `done=true` 永久停手 ⇒ 新模拟器（首读略慢）必现「卡在选角色页不点」。
@@ -411,6 +432,7 @@ class CharaPick(
             act.at = now + 3_000L                          // 邀请后多等一会（页面要变）
             AppState.addLog("邀请角色")
             tap(input, fb!!.optInt("x"), fb.optInt("y"), "去邀请")
+            justInvited = true                             // ★交给 [MazeLoop] 把「收到角色」框点掉
             return
         }
         act.done = true
