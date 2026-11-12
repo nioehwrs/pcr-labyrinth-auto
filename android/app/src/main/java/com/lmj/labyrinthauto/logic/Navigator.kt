@@ -146,16 +146,34 @@ object Navigator {
         var lastView = -1
         var stuck = 0
         var frontNull = 0
+        // ★2026-11-12（用户反馈 ik："开始游戏界面无限点击"）：TITLE/SPLASH 上点中心的累计次数
+        var centerTaps = 0
+        // ★2026-11-12（用户）：**当前页面停留起点** —— 超过 [PAGE_STUCK_RESTART_MS] 没换页就重启游戏。
+        //   `0` = 还没开始计（agent 未连/刚注入完成），注入前的启动时间一律不算。
+        var pageSince = 0L
         // ★防"幽灵弹窗"无限连点（2026-10-17 事故：agent 学习路径给出同名幽灵节点 ⇒ 这里连点 40+ 次
         //   把"进迷宫"顶死）。同一颗按钮（名字+坐标）连点 [DLG_TAP_MAX] 次仍没换页 ⇒ 判定"点它没用"，
         //   不再点它（交给下面的 stuck 判定收工），比无限连点安全。
         var lastDlgSig: String? = null
         var dlgTapN = 0
+        var agentWaitAt = 0L
         repeat(maxRounds) {
+            // ★2026-11-12（用户）：**注入完成前不算"页面停留"** —— 拉起游戏 → 等映射 → 注入 →
+            //   回连 → ready 这一段页面当然一直不变，不能因此触发 [PAGE_STUCK_RESTART_MS] 的
+            //   "25s 重启"（否则启动慢的机器会被反复杀掉）。这里只等，最多 [AGENT_WAIT_MS]。
             if (!AgentBridge.connected.value) {
-                AppState.addLog("停手：agent 没连上")
-                return false
+                val nw = SystemClock.elapsedRealtime()
+                if (agentWaitAt == 0L) agentWaitAt = nw
+                if (nw - agentWaitAt >= AGENT_WAIT_MS) {
+                    AppState.addLog("停手：等 agent 注入/回连 ${AGENT_WAIT_MS / 1000}s 仍未连上")
+                    return false
+                }
+                pageSince = 0L                    // 不计入页面停留
+                delay(500)
+                return@repeat
             }
+            agentWaitAt = 0L
+            if (pageSince == 0L) pageSince = SystemClock.elapsedRealtime()
             // 闸门每轮复查：**读到、且不是游戏** ⇒ 立刻停手（真切走了）；只是"读不到" ⇒ 本轮先不点、
             //   继续等（刚换页/刚重启时偶发读空，不该把整局判成失败）
             val fp = Foreground.packageName()
@@ -185,6 +203,8 @@ object Navigator {
                 AppState.addLog("页面 → ${viewLabel(vid)}")
                 lastView = vid
                 stuck = 0
+                centerTaps = 0
+                pageSince = SystemClock.elapsedRealtime()
                 lastDlgSig = null                 // 换页 ⇒ 弹窗熔断计数清零
                 dlgTapN = 0
             } else {
@@ -193,6 +213,16 @@ object Navigator {
                 if (vid !in TAP_CENTER_VIEWS) stuck++
             }
 
+            // ★2026-11-12（用户："25s 没到下个页面就直接重启进程"）：
+            //   同一页面停留超过 [PAGE_STUCK_RESTART_MS] ⇒ 直接 kill（注入器会重新拉起+注入），
+            //   不再靠"点别的位置"去猜 —— 停在标题页/加载页本身就是游戏侧卡住。
+            if (pageSince > 0L && SystemClock.elapsedRealtime() - pageSince >= PAGE_STUCK_RESTART_MS) {
+                AppState.addLog(
+                    "停手：${viewLabel(vid)} 停留 ${PAGE_STUCK_RESTART_MS / 1000}s 没推进 → 重启游戏进程",
+                )
+                GameProcess.kill()
+                return false
+            }
             if (vid == TARGET_VIEW) {
                 // ★文案（2026-10-30）：原来写"不点出发，这一步到此结束"，下一行迷宫状态机就点了出发，
                 //   日志看起来自相矛盾。真实语义 = 本阶段只负责"点到 top"，出发交给迷宫状态机。
@@ -257,10 +287,31 @@ object Navigator {
                 val sc = AgentApi.screen()
                 val cw = (sc?.optInt("w", 0) ?: 0).let { if (it > 0) it else REF_W }
                 val ch = (sc?.optInt("h", 0) ?: 0).let { if (it > 0) it else REF_H }
-                // ★标题/加载页要等**登录+加载**（可能好几秒）⇒ 探针窗口给长一点
-                //   （探到"进到下一页"就立刻走，所以给长了也不亏）
-                // ★2026-11-12（用户）：探针 6 → 3 → **1** —— 一轮 ≈ settle 300ms + 探 1 次（300ms），
-                //   约 0.6s 就补点下一次；开屏/标题页本来就是"点一下推进一段"，多点几次更跟手。
+                // ★2026-11-12（用户反馈 ik："开始游戏界面无限点击，进不去"）：
+                //   TITLE/SPLASH 点中心是**不限次数**的，一旦这一页的"开始"不在中心（新版 UI/公告挡住/
+                //   点中心不响应），就会无限打转。⇒ 点上 6 次还没推进：先 dump 一次现场（顶框/按钮/
+                //   DialogArea 子节点），之后每 4 轮改点一次**底部**（有些标题页的「开始」在下方）。
+                centerTaps++
+                if (centerTaps > 6 && centerTaps % 4 == 1) {
+                    val b = runCatching { AgentApi.labDlgBox() }.getOrNull()
+                    val kids = runCatching { AgentApi.labDlgKids() }.getOrNull()
+                    val kb = StringBuilder()
+                    val ka = kids?.optJSONArray("kids")
+                    for (i in 0 until (ka?.length() ?: 0)) {
+                        val o = ka?.optJSONObject(i) ?: continue
+                        kb.append(o.optString("name")).append(if (o.optBoolean("active")) "✓" else "✗").append(' ')
+                    }
+                    val ba = b?.optJSONArray("buttons")
+                    val bn = if (ba == null) "" else
+                        (0 until ba.length()).joinToString(",") { ba.optJSONObject(it)?.optString("name").orEmpty() }
+                    AppState.addLog(
+                        "标题页点中心 $centerTaps 次没推进｜顶框=${b?.optString("top").orEmpty().ifEmpty { "无" }}" +
+                            " 按钮=$bn｜DialogArea=[$kb]",
+                    )
+                }
+                // ★2026-11-12（用户："不要猜着点，25s 没到下个页面就重启进程"）：
+                //   不再试点底部（那是猜坐标）；只在卡住时 dump 一次现场，重启由下面的
+                //   [PAGE_STUCK_RESTART_MS] 统一兜底。
                 tapUntilChange(input, cw / 2, ch / 2, "屏幕中心", vid, settleMs = 300L, probe = 1, probeMs = 300L)
             } else {
                 // ★未知页面（2026-10-19 用户定的**通用策略**）：活动页之类的没有通用确认按钮可点时，
@@ -460,6 +511,20 @@ object Navigator {
 
     /** 开始点击前，等游戏回到前台的时限（刚 kill→launch / 换页那一两秒"前台"常读不到） */
     private const val FRONT_WAIT_MS = 20_000L
+
+    /**
+     * ★2026-11-12（用户）：**注入/回连没完成时最多等这么久**。
+     *   拉起游戏 → 等 `libil2cpp.so` 映射 → 注入 → 回连 → ready（agent 侧上限 30s）这段
+     *   全都发生在注入完成前，不能算作"页面卡住"；60s 覆盖慢设备，超了才停手。
+     */
+    private const val AGENT_WAIT_MS = 60_000L
+
+    /**
+     * ★2026-11-12（用户）：**同一页面停留这么久还没换页 ⇒ 直接重启游戏进程**。
+     *   标题页/加载页本来就"点一下推进一段"，但一旦卡住（点中心不响应/公告挡住/游戏侧卡死），
+     *   以前会无限点下去（0.6.14 实机：TITLE 页点了 1 分 40 秒）。25s 足够覆盖正常冷启动+登录。
+     */
+    private const val PAGE_STUCK_RESTART_MS = 25_000L
 
     /**
      * ★旧：点「出发」前固定等 500ms（等 259 切屏动画）。
