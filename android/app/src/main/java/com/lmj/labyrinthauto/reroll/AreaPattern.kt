@@ -53,9 +53,21 @@ object AreaPattern {
         1 to listOf(listOf(T_START), listOf(T_NORMAL), listOf(T_TICKET, T_EVENT), listOf(T_NORMAL), listOf(T_TICKET, T_EVENT), listOf(T_RELIC)),
         2 to listOf(listOf(T_START), listOf(T_TICKET, T_EVENT), listOf(T_NORMAL), listOf(T_RELIC, T_SHOP), listOf(T_NORMAL, T_EX), listOf(T_TICKET, T_EVENT), listOf(T_RELIC)),
         3 to listOf(listOf(T_START), listOf(T_NORMAL), listOf(T_EVENT, T_RELIC), listOf(T_TICKET, T_EVENT), listOf(T_NORMAL, T_EX), listOf(T_SHOP), listOf(T_BOSS)),
-        4 to listOf(listOf(T_START), listOf(T_TICKET, T_RELIC), listOf(T_NORMAL, T_EX), listOf(T_EVENT), listOf(T_NORMAL), listOf(T_NORMAL, T_EX), listOf(T_TICKET, T_RELIC), listOf(T_SHOP)),
+        // ★2026-11-12（实测 54 条路线）：区域 4 第 5、6 列「**有且仅有一个 EX**」，但 EX 在哪一列不固定，
+        //   （6/7 次 405=EX/406=普通，1/7 次 405=普通/406=EX）⇒ 第 5 列池子也必须含 EX。
+        //   UI 上两列都显示「EX战」且不可改（含普通+EX ⇒ isFixed），判定按**组约束**见 [matchArea]。
+        4 to listOf(listOf(T_START), listOf(T_TICKET, T_RELIC), listOf(T_NORMAL, T_EX), listOf(T_EVENT), listOf(T_NORMAL, T_EX), listOf(T_NORMAL, T_EX), listOf(T_TICKET, T_RELIC), listOf(T_SHOP)),
         5 to listOf(listOf(T_START), listOf(T_NORMAL), listOf(T_EVENT, T_RELIC), listOf(T_NORMAL, T_EX), listOf(T_RELIC), listOf(T_NORMAL, T_EX), listOf(T_SHOP), listOf(T_BOSS)),
     )
+
+    /**
+     * ★2026-11-12（实测）：**区域 4 的第 5、6 列合计只有一个 EX 战**（EX 可能在任意一列），
+     *   所以这两列不能各自要求 EX，而是「组内至少走一个 EX」。
+     *
+     * 注意与**单列必须 EX** 的区别（区域 2/3/5 也有含 EX 的列，那些是单列精确匹配、必须 EX）；
+     * 只有这里登记的区域才走「组约束」。
+     */
+    private val EX_GROUP: Map<Int, IntRange> = mapOf(4 to 5..6)
 
     /** 这一列能选什么；池里只有一项 ⇒ 固定 */
     fun poolOf(area: Int, col: Int): List<Int> = COL_POOL[area]?.getOrNull(col - 1).orEmpty()
@@ -166,35 +178,50 @@ object AreaPattern {
         val byId = HashMap<Int, LabyrinthMapNode>(nodes.size)
         for (n in nodes) byId[n.blockId.toInt()] = n
         val lastCol = nodes.maxOf { it.column }
+        // ★2026-11-12（用户："区域4 第5、6列有且仅有 1 个 EX，必须走 EX，但 EX 在哪列不重要"）：
+        //   两列类型都放宽为 NORMAL/EX，但整条路径**必须走过至少一个 EX**（走到最后一列时校验）。
+        //   原来按单列精确匹配 ⇒ 405 是 EX 的局（6/7）会被判失败。
+        // ★区域 4 第 5/6 列走**组约束**（见 [EX_GROUP]）；其余区域（含区域 3 的第 5 列）
+        //   仍是单列精确匹配，`want = EX` 就**必须 EX**，不会被放宽。
+        val exCols: IntRange = plan?.let { EX_GROUP[it.area] } ?: IntRange.EMPTY
         fun ok(n: LabyrinthMapNode): Boolean {
             val w = plan?.want(n.column) ?: ANY
-            return w == ANY || n.blockType == w
+            if (w == ANY) return true
+            if (n.column in exCols) {
+                return n.blockType == T_NORMAL || n.blockType == T_EX
+            }
+            return n.blockType == w
         }
         var furthest = 0                       // 这一区能合法走到的最远列
-        // 记忆化：blockId → 从它出发能不能走到最后（null = 走不通）
+        // 记忆化： (blockId, 是否已走过 EX) → 从它出发能不能走到最后（null = 走不通）
         val memo = HashMap<Int, List<Int>?>()
-        fun dfs(n: LabyrinthMapNode): List<Int>? {
+        fun dfs(n: LabyrinthMapNode, sawEx: Boolean): List<Int>? {
             val id = n.blockId.toInt()
             if (n.column > furthest) furthest = n.column
-            if (n.column >= lastCol) return listOf(id)
-            if (memo.containsKey(id)) return memo[id]
-            memo[id] = null            // 先占位，防环
+            val hasEx = sawEx || (n.column in exCols && n.blockType == T_EX)
+            if (n.column >= lastCol) {
+                if (!exCols.isEmpty() && !hasEx) return null   // 组内没走到 EX ⇒ 这条路线不合格
+                return listOf(id)
+            }
+            val key = id * 2 + (if (hasEx) 1 else 0)
+            if (memo.containsKey(key)) return memo[key]
+            memo[key] = null            // 先占位，防环
             for (nid in n.nextBlockIds) {
                 val m = byId[nid.toInt()] ?: continue
                 if (m.column <= n.column) continue
                 if (!ok(m)) continue
-                val p = dfs(m) ?: continue
+                val p = dfs(m, hasEx) ?: continue
                 val res = ArrayList<Int>(p.size + 1)
                 res += id
                 res += p
-                memo[id] = res
+                memo[key] = res
                 return res
             }
             return null
         }
         // 起点必须是第 1 列且类型对得上
         for (s in nodes.filter { it.column == 1 && ok(it) }.sortedBy { it.row }) {
-            dfs(s)?.let { return it to 0 }
+            dfs(s, false)?.let { return it to 0 }
         }
         return null to (furthest + 1).coerceAtMost(lastCol)
     }

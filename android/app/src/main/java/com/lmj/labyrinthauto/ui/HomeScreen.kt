@@ -1925,7 +1925,9 @@ private fun AreaPatternEditor(
                         Box(Modifier.height(slotH), contentAlignment = Alignment.Center) {
                             if (plan.locked(col) || pool.size <= 1) {
                                 Text(
-                                    AreaPattern.name(want),
+                                    // ★区域4 第5/6列：两列合计只有一个 EX（位置不固定）⇒ 显示成一个整体
+                                    if (plan.area == 4 && col in 5..6) "（EX战+普通战）"
+                                    else AreaPattern.name(want),
                                     style = ts,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
