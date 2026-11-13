@@ -117,6 +117,38 @@ object RerollUseCase {
     }
 
     /**
+     * ★刷开局连续 enter 报错、退避到 16s 时重登一次（2026-11-13 用户要求）。
+     *
+     * 与 [ensureLogin] 的区别：那条是撤退专用（失败就交给下一局兜底），这条要拿回**可用的新 api**
+     * 继续刷开局；日志也按刷开局场景写，避免串成"撤退："误导排查。
+     */
+    private suspend fun reloginForReroll(context: Context): BilibiliLabyrinthApi? {
+        val acct = Accounts.selected(context)
+        if (acct == null || !acct.ready) {
+            AppState.addLog("刷开局重试：没有可用的账号凭证，无法重新登录")
+            return null
+        }
+        AppState.setRerollStatus(if (acct.isChannel) "刷开局重试：重新登录渠道服…" else "刷开局重试：重新登录 B 站…")
+        client = LabyrinthLoginClient(context, acct)
+        return when (val r = client!!.login()) {
+            is LoginOutcome.Session -> {
+                session = r.session
+                AppState.addLog("刷开局重试：重新登录成功 → 继续刷开局")
+                BilibiliLabyrinthApi(r.session)
+            }
+            is LoginOutcome.Failure -> {
+                AppState.addLog("刷开局重试：重新登录失败（${r.message}）")
+                null
+            }
+            is LoginOutcome.CaptchaNeeded -> {
+                // 自动流程没人解验证码；不挂起干等，按退避继续（下一次 enter 可能已经恢复）
+                AppState.addLog("刷开局重试：重新登录触发验证码（自动流程无人解）→ 继续退避重试")
+                null
+            }
+        }
+    }
+
+    /**
      * ★按策略「撤退重跑」：把当前局从服务端撤掉（`labyrinth/retire`，不算完成）。
      * 会话失效/撤退失败都返回 false —— 下一局的刷开局（[reroll]）本身会再兜底撤退一次，不会卡住。
      */
@@ -205,6 +237,8 @@ object RerollUseCase {
                 }
                 lastAttempt = p.attempt
             },
+            // ★退避到 16s 时由 controller 回调：重登一次并换新会话继续刷
+            onRelogin = { reloginForReroll(context) },
         )
         AppState.setRerollStatus("开始刷开局…")
         return when (val r = controller.run()) {
