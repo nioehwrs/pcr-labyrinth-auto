@@ -2,6 +2,7 @@ package com.lmj.labyrinthauto.reroll
 
 import android.content.Context
 import com.lmj.labyrinthauto.core.Account
+import com.lmj.labyrinthauto.core.AppState
 import com.lmj.labyrinthauto.net.bilibili.AccountLoginMaterial
 import com.lmj.labyrinthauto.net.bilibili.AccountLoginResult
 import com.lmj.labyrinthauto.net.bilibili.BilibiliGameGateway
@@ -15,6 +16,7 @@ import com.lmj.labyrinthauto.net.bilibili.CaptchaProof
 import com.lmj.labyrinthauto.net.bilibili.CaptchaSolution
 import com.lmj.labyrinthauto.net.bilibili.GameLoginResult
 import com.lmj.labyrinthauto.net.bilibili.InMemorySdkSessionStore
+import com.lmj.labyrinthauto.net.bilibili.RemoteCaptchaSolver
 import com.lmj.labyrinthauto.net.bilibili.SdkCaptchaResult
 import com.lmj.labyrinthauto.net.bilibili.SdkSession
 import com.lmj.labyrinthauto.net.bilibili.SdkSessionStore
@@ -47,8 +49,19 @@ class LabyrinthLoginClient(context: Context, private val account: Account) {
     //   连"渠道服登录"都还没开始就崩了。渠道服直通用不到 SDK 网关，就不该付这个代价。
     private val sdkGateway: BilibiliSdkGateway by lazy { BilibiliSdkGatewayFactory.create(appContext) }
     private val sessionStore: SdkSessionStore = InMemorySdkSessionStore()
+
+    /** ★自动打码（2026-11-13）：复刻 autopcr remoteValidator，失败才弹手动极验。 */
+    private val captchaSolver: RemoteCaptchaSolver by lazy {
+        RemoteCaptchaSolver(
+            baseUrl = captchaService(appContext),
+            onStatus = { msg ->
+                AppState.setRerollStatus(msg)
+                AppState.addLog("自动验证：$msg")
+            },
+        )
+    }
     private val loginCoordinator: BilibiliLoginCoordinator by lazy {
-        BilibiliLoginCoordinator(sdkGateway, sessionStore)
+        BilibiliLoginCoordinator(sdkGateway, sessionStore, autoCaptcha = { captchaSolver.solve() })
     }
     private val gameGateway: BilibiliGameGateway by lazy {
         BilibiliGameGatewayFactory.create(
@@ -84,8 +97,19 @@ class LabyrinthLoginClient(context: Context, private val account: Account) {
         val session = SdkSession(account.loginId, account.secret, System.currentTimeMillis())
         return when (val g = gameGateway.loginAndLoadProfile(session, CHANNEL_DEVICE_SEED)) {
             is GameLoginResult.Success -> LoginOutcome.Session(g.session)
-            is GameLoginResult.RiskRequired ->
-                LoginOutcome.Failure("游戏服要求验证码：渠道服没有 SDK 会话可续，先在游戏里手动进一次黎明界")
+            is GameLoginResult.RiskRequired -> {
+                // 渠道服虽没有 SDK 账密，但 tool/sdk_login 只需要 uid/access_key + 验证结果，
+                // 与 autopcr qsdkclient 一样可以直接自动打码重试。
+                val solution = runCatching { captchaSolver.solve() }.getOrNull()
+                if (solution == null) {
+                    LoginOutcome.Failure("游戏服要求验证码：自动验证不可用，先在游戏里手动进一次黎明界")
+                } else {
+                    when (val g2 = gameGateway.loginAndLoadProfile(session, CHANNEL_DEVICE_SEED, solution)) {
+                        is GameLoginResult.Success -> LoginOutcome.Session(g2.session)
+                        else -> LoginOutcome.Failure("游戏服要求验证码：自动验证未通过，先在游戏里手动进一次黎明界")
+                    }
+                }
+            }
             is GameLoginResult.SessionRejected -> LoginOutcome.Failure(g.message)
             is GameLoginResult.Rejected -> LoginOutcome.Failure(g.message)
             is GameLoginResult.Maintenance -> LoginOutcome.Failure(g.message)
@@ -147,14 +171,18 @@ class LabyrinthLoginClient(context: Context, private val account: Account) {
     private suspend fun finishGameLogin(session: SdkSession): LoginOutcome {
         return when (val g = gameGateway.loginAndLoadProfile(session, ACCOUNT_ID.toString())) {
             is GameLoginResult.Success -> LoginOutcome.Session(g.session)
-            is GameLoginResult.RiskRequired -> when (val c = sdkGateway.startCaptcha()) {
-                is SdkCaptchaResult.Ready -> {
-                    riskPending[ACCOUNT_ID] = session to c.challenge
-                    LoginOutcome.CaptchaNeeded(ACCOUNT_ID, c.challenge)
+            is GameLoginResult.RiskRequired -> {
+                // ★autopcr `sessionmgr._ensure_token` 在 is_risk 时同样 do_captcha() 后重试
+                //   tool/sdk_login；这里先自动解，失败才退回手动弹窗。
+                val solution = runCatching { captchaSolver.solve() }.getOrNull()
+                if (solution != null) {
+                    when (val g2 = gameGateway.loginAndLoadProfile(session, ACCOUNT_ID.toString(), solution)) {
+                        is GameLoginResult.Success -> LoginOutcome.Session(g2.session)
+                        else -> riskViaManual(session)
+                    }
+                } else {
+                    riskViaManual(session)
                 }
-                is SdkCaptchaResult.NetworkFailure -> LoginOutcome.Failure("游戏服要求验证但验证码初始化网络失败")
-                is SdkCaptchaResult.ProtocolFailure -> LoginOutcome.Failure("游戏服要求验证但验证码响应无法解析")
-                is SdkCaptchaResult.Rejected -> LoginOutcome.Failure("游戏服要求验证但被拒：${c.message}")
             }
             is GameLoginResult.SessionRejected -> LoginOutcome.Failure(g.message)
             is GameLoginResult.Rejected -> LoginOutcome.Failure(g.message)
@@ -164,6 +192,18 @@ class LabyrinthLoginClient(context: Context, private val account: Account) {
         }
     }
 
+    /** 手动兜底：游戏服风控时拿一组新的 gt/challenge 交给 WebView。 */
+    private suspend fun riskViaManual(session: SdkSession): LoginOutcome =
+        when (val c = sdkGateway.startCaptcha()) {
+            is SdkCaptchaResult.Ready -> {
+                riskPending[ACCOUNT_ID] = session to c.challenge
+                LoginOutcome.CaptchaNeeded(ACCOUNT_ID, c.challenge)
+            }
+            is SdkCaptchaResult.NetworkFailure -> LoginOutcome.Failure("游戏服要求验证但验证码初始化网络失败")
+            is SdkCaptchaResult.ProtocolFailure -> LoginOutcome.Failure("游戏服要求验证但验证码响应无法解析")
+            is SdkCaptchaResult.Rejected -> LoginOutcome.Failure("游戏服要求验证但被拒：${c.message}")
+        }
+
     private suspend fun readSession(): SdkSession? = sessionStore.read(CREDENTIAL_KEY)
 
     private companion object {
@@ -172,5 +212,12 @@ class LabyrinthLoginClient(context: Context, private val account: Account) {
 
         /** 渠道服没有 SDK 设备种子，协议只要求非空（与 B 服一样用固定串，避免每次登录变化触发风控）。 */
         const val CHANNEL_DEVICE_SEED = "1"
+
+        /** `assets/config.json` 的 captcha_service；读不到就用 autopcr 同一个默认地址。 */
+        fun captchaService(ctx: Context): String = runCatching {
+            val txt = ctx.assets.open("config.json").bufferedReader().use { it.readText() }
+            org.json.JSONObject(txt).optString("captcha_service")
+                .takeIf { it.startsWith("http", ignoreCase = true) }
+        }.getOrNull() ?: RemoteCaptchaSolver.DEFAULT_SERVICE
     }
 }

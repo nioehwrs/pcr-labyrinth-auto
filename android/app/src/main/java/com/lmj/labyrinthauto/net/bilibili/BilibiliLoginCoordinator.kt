@@ -7,6 +7,8 @@ class BilibiliLoginCoordinator(
     private val gateway: BilibiliSdkGateway,
     private val sessionStore: SdkSessionStore,
     private val clock: () -> Long = System::currentTimeMillis,
+    /** ★autopcr 口径：自动打码器；返回 null / 抛异常时回退手动极验弹窗。 */
+    private val autoCaptcha: (suspend () -> CaptchaSolution?)? = null,
 ) {
     private val mutex = Mutex()
     private val pending = mutableMapOf<Long, PendingLogin>()
@@ -15,20 +17,43 @@ class BilibiliLoginCoordinator(
         pending.remove(material.accountId)
         when (val result = gateway.login(material.toCredentials())) {
             is SdkLoginResult.Success -> persistSuccess(material, result.session)
-            SdkLoginResult.CaptchaRequired -> when (val captcha = gateway.startCaptcha()) {
-                is SdkCaptchaResult.Ready -> {
-                    pending[material.accountId] = PendingLogin(material, captcha.challenge)
-                    AccountLoginResult.CaptchaRequired(captcha.challenge)
+            SdkLoginResult.CaptchaRequired -> {
+                // ★autopcr `bsgamesdk.login()`：login1 返回 200000 后立刻 make_captch() → login2()，
+                //   不把「需要验证码」抛给上层。这里同样先自动解，失败才退回手动弹窗。
+                val solution = try {
+                    autoCaptcha?.invoke()
+                } catch (failure: Throwable) {
+                    null
                 }
-                is SdkCaptchaResult.NetworkFailure -> failure(LoginFailureKind.Network, captcha.message, material)
-                is SdkCaptchaResult.ProtocolFailure -> failure(LoginFailureKind.Protocol, captcha.message, material)
-                is SdkCaptchaResult.Rejected -> failure(LoginFailureKind.Rejected, captcha.message, material)
+                if (solution != null) {
+                    when (val retry = gateway.login(material.toCredentials(), solution)) {
+                        is SdkLoginResult.Success -> persistSuccess(material, retry.session)
+                        SdkLoginResult.CaptchaRequired -> manualCaptcha(material)
+                        is SdkLoginResult.Rejected -> failure(LoginFailureKind.Rejected, retry.message, material)
+                        is SdkLoginResult.NetworkFailure -> failure(LoginFailureKind.Network, retry.message, material)
+                        is SdkLoginResult.ProtocolFailure -> failure(LoginFailureKind.Protocol, retry.message, material)
+                    }
+                } else {
+                    manualCaptcha(material)
+                }
             }
             is SdkLoginResult.NetworkFailure -> failure(LoginFailureKind.Network, result.message, material)
             is SdkLoginResult.ProtocolFailure -> failure(LoginFailureKind.Protocol, result.message, material)
             is SdkLoginResult.Rejected -> failure(LoginFailureKind.Rejected, result.message, material)
         }
     }
+
+    /** 手动兜底：拿 start_captcha 的 gt/challenge 给 WebView，等用户解完 [completeCaptcha]。 */
+    private suspend fun manualCaptcha(material: AccountLoginMaterial): AccountLoginResult =
+        when (val captcha = gateway.startCaptcha()) {
+            is SdkCaptchaResult.Ready -> {
+                pending[material.accountId] = PendingLogin(material, captcha.challenge)
+                AccountLoginResult.CaptchaRequired(captcha.challenge)
+            }
+            is SdkCaptchaResult.NetworkFailure -> failure(LoginFailureKind.Network, captcha.message, material)
+            is SdkCaptchaResult.ProtocolFailure -> failure(LoginFailureKind.Protocol, captcha.message, material)
+            is SdkCaptchaResult.Rejected -> failure(LoginFailureKind.Rejected, captcha.message, material)
+        }
 
     suspend fun completeCaptcha(
         accountId: Long,
