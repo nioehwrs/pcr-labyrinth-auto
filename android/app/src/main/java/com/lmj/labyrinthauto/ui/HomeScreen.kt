@@ -1651,8 +1651,8 @@ private fun EventRow(entry: EventEntry, selected: Int, onPick: (Int) -> Unit) {
 
 /**
  * 黎明界「初始公会」表（master 库 `labyrinth_enter_guild`）。默认 id=3 = 咲恋救济院。
- * ★2026-11-13 维护新增 5 家：公告只给名单没给 id ⇒ **暂按公告顺序假设为 6..10**，
- *   维护后拿到正式 master 库再校准（同时看 [RerollSettings.GUILD_MAX]）。
+ * ★2026-11-13：新增 5 家的 id 已用维护后的 master 库校准为 6..10，顺序同公告
+ *   （原先按公告顺序的猜测成立；同时看 [RerollSettings.GUILD_MAX]）。
  */
 private val REROLL_GUILDS: List<Pair<String, Int>> = listOf(
     "美食殿堂" to 1,

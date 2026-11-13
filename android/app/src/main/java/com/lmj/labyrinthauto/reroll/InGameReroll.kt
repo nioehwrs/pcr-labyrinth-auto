@@ -124,7 +124,9 @@ object InGameReroll {
     private var appCtx: Context? = null
 
     /** 迷宫公会 id → 公会选择页上的名字（卡内 `GuildNameLabel` 的文字）。
-     *  ★2026-11-13 维护新增 5 家：id 暂按公告顺序假设为 6..10（与 `RerollSettings.GUILD_IDS` 对齐）。 */
+     *  ★2026-11-13：id 与名称已由 master 库 `labyrinth_enter_guild` 校准（guild_id 1..10，
+     *    新增 5 家为 6..10，顺序同公告）；与 `RerollSettings.GUILD_IDS` 对齐。
+     *    库里 2/4/10 的 guild_name 带字面 `\n`（卡上实测读成空格），见 [normGuildName]。 */
     private val GUILD_CN = mapOf(
         1 to "美食殿堂",
         2 to "破晓之星",

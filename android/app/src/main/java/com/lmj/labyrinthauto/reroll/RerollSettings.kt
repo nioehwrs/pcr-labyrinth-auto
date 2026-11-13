@@ -19,8 +19,9 @@ object RerollSettings {
 
     /**
      * ★黎明界「初始公会」id 范围（2026-11-13 维护新增 5 家）。
-     * 公告只给了名单、没给 id ⇒ **暂按公告顺序假设为 6..10**；维护后拿到 master 库
-     * `labyrinth_enter_guild` 再校准。UI 选项 / 局数持久化 / 运行计划 / 校验都引用这里。
+     * ★已用维护后的 master 库 `labyrinth_enter_guild` 校准：`guild_id` 1..10，
+     *   新增 5 家确为 6..10，顺序同公告（原先按公告顺序的猜测成立）。
+     * UI 选项 / 局数持久化 / 运行计划 / 校验都引用这里。
      */
     const val GUILD_MAX = 10
     val GUILD_IDS: IntRange = 1..GUILD_MAX
