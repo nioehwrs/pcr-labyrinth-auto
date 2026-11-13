@@ -12,6 +12,9 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -210,6 +213,35 @@ object FridaInjector {
     @Volatile
     var autoRecover = false
 
+    /** 注入循环当前卡在哪一步（只给日志/诊断看，不参与决策；上层 90s 超时会读它）。 */
+    @Volatile
+    var stage: String = "未启动"
+        private set
+
+    /**
+     * ★「这一代游戏的 agent 已连 + il2cpp ready」完成信号（2026-11-13）。
+     *
+     * 值是就绪当时的 [GameProcess.kills]；上层重启后等 `>= 本次 kill 后的代际`，
+     * 而不是等裸 [AgentBridge.connected] —— 后者只证明有 loopback socket 连上，
+     * 既不证明属于这一代进程，也不证明 il2cpp domain 已建好（pollLoop 里还要单独等 ready）。
+     * 用代际而不是布尔，天然杜绝「上一代残留的 true 秒过等待」；-1 = 当前没有可用 agent。
+     */
+    private val _readyGen = MutableStateFlow(-1)
+    val readyGen: StateFlow<Int> = _readyGen.asStateFlow()
+
+    /**
+     * 注入循环最近一次**成功注入**的 pid 与当时的游戏代际。
+     * pollLoop 的 `ready` 只是 agent 端 il2cpp domain 好了，不能证明它属于这一代游戏：
+     * 旧进程里 eternalize 的脚本重连也会让 ready 通过。发布 [readyGen] 前必须核对这两个值。
+     */
+    @Volatile
+    var boundPid = -1
+        private set
+
+    @Volatile
+    var boundGen = -1
+        private set
+
 
     fun start(ctx: Context) {
         if (running) {
@@ -232,6 +264,9 @@ object FridaInjector {
             }
         }
         firstSeen.clear()
+        boundPid = -1
+        boundGen = -1
+        _readyGen.value = -1
         AgentBridge.stop()
         AppState.setFridaStatus("已停止")
         AppState.setPageName(null)
@@ -284,12 +319,45 @@ object FridaInjector {
         var reinjectDead = false         // ★重注入"超时"失败 ⇒ 进程已僵，别再试，直接杀游戏（见 [REINJECT_TIMEOUT_MS]）
         var serverReady = false          // 本次跑迷宫期间 frida-server / libfrida 是否已就绪
         var wasRecover = false           // 上一轮 autoRecover 是否开着（用于检测"刚进/刚出"跑迷宫）
+        // ★2026-11-13：自愈 kill 之后，下一拍必须真的走「调起游戏」分支。
+        //   `am force-stop` 是异步的，残留/僵死 pid 仍会被 gamePid() 读到 ⇒ 旧逻辑认为"游戏在跑"，
+        //   永远不调 am start，只对着坏 pid 反复等映射，直到上层 90s 超时停手（见事故诊断包）。
+        var forceLaunch = false
+        /** 本次自愈杀掉的坏 pid：forceLaunch 期间仍被 [gamePid] 读到就一律当残留忽略。 */
+        var stalePid = -1
         // ★架构闸门（2026-10-29）：每次进城只查一次（dumpsys 也有开销）。见 [AbiRepair.ensure]。
         var abiChecked = false
         // ★确定性修不了（包内无 x86_64 / 没装 / 没 root）⇒ 本次进城彻底静默，别再折腾游戏。
         var abiBlocked = false
         // ★pid 误读只报一次/局（2026-11-03，见下面 pid 校验；每拍刷屏没意义）
         var saidPidOdd = 0
+        var pidChangeTries = 0           // 连续「注入撞上旧 pid」的次数（见 [InjectRecoveryPolicy.pidChanged]）
+
+        /** 「agent 还连着」必须同时满足：连在这个 pid 上、且这期间没发生过 kill（代际没变）。 */
+        fun agentAliveFor(pid: Int): Boolean =
+            pid > 0 && AgentBridge.connected.value && boundPid == pid && boundGen == GameProcess.kills
+
+        /** 开闸 / 关闸都过一遍：上一局的失败计数、pid 误读、残留标记一律不带进下一局。 */
+        fun resetLoopState() {
+            lastPid = -1
+            pidMisses = 0
+            launchTries = 0
+            injectFails = 0
+            injectCycles = 0
+            pidChangeTries = 0
+            agentLostSince = 0L
+            lastReinjectAt = 0L
+            reinjectN = 0
+            reinjectDead = false
+            forceLaunch = false
+            stalePid = -1
+            boundPid = -1
+            boundGen = -1
+            saidPidOdd = 0
+            firstSeen.clear()
+            _readyGen.value = -1
+        }
+
         while (true) {
             // ★注入只服务于「自动黎明界」：总闸关着就**待命** —— 不调起游戏、不注入、不自愈、不读页。
             //   这样"助手开着"也绝不碰游戏进程（用户 2026-10-16 要求：关着时没必要注入）。
@@ -297,14 +365,9 @@ object FridaInjector {
                 if (wasRecover) {
                     wasRecover = false
                     serverReady = false
-                    lastPid = -1
-                    launchTries = 0
-                    injectFails = 0
-                    agentLostSince = 0L
-                    lastReinjectAt = 0L
-                    reinjectN = 0
-                    reinjectDead = false
                     abiBlocked = false               // 下次进城重新给一次机会（用户可能换了包 / 给了 root）
+                    resetLoopState()
+                    stage = "待命（未跑迷宫）"
                     AppState.addLog("自动黎明界结束 → 停止注入/自愈，之后不再碰游戏进程（待命）")
                 }
                 AppState.setFridaStatus("待命（未跑迷宫，不注入游戏）")
@@ -315,8 +378,14 @@ object FridaInjector {
                 wasRecover = true
                 abiChecked = false               // 新一轮进城 → 重新确认一次游戏架构
                 abiBlocked = false
+                resetLoopState()
+                stage = "接管中"
                 AppState.addLog("进入自动黎明界 → 接管游戏进程（调起 → 等就绪 → 注入；崩溃/卡死自愈）")
             }
+
+            // ★窗口内不再"整体停摆"：serverReady / 架构闸门 / 等就绪 / 注入都照常做，
+            //   只有「pid<=0 时自己 am start」那一下被压住（见下面）。这样局内刷那种
+            //   长时间窗口也不会挡住 agent 回连，又能保证启动意图唯一。
 
             // frida-server / libfrida 就绪检查（**只在开闸后做**；失败记一次、下轮重试，不 return 掉整个循环，
             // 这样每次跑迷宫都会重新尝试接管）
@@ -377,6 +446,30 @@ object FridaInjector {
             }
 
             var pid = gamePid()
+            // ★自愈闭环（2026-11-13 事故）：kill 之后 `am force-stop` 是异步的，残留 pid 会让下面
+            //   `pid <= 0` 那个**唯一调 am start** 的分支进不去 ⇒ 每轮对着同一个坏进程白等 15s 映射，
+            //   连等 4 轮直到上层 90s 超时停手。只在 forceLaunch 这个异常分支纠偏：
+            //   正常路径连一次多出来的查询都没有，更没有新增等待。
+            if (forceLaunch) {
+                when {
+                    // ★只有 agent 确实连在**这个 pid**、且期间没 kill 过，才算"进程活着"。
+                    //   旧写法光看 connected：kill 之后滞后为 true 会把刚设的 forceLaunch 清掉。
+                    agentAliveFor(pid) -> {
+                        forceLaunch = false
+                        stalePid = -1
+                    }
+                    pid > 0 && pid != stalePid -> {
+                        AppState.addLog("自愈后游戏已换成新 pid=$pid（旧 $stalePid 退干净了）→ 按新进程继续等就绪")
+                        forceLaunch = false
+                        stalePid = -1
+                    }
+                    pid > 0 -> {
+                        AppState.addLog("自愈后旧 pid=$pid 仍在（force-stop 残留）→ 不认它，重新调起游戏")
+                        pid = -1
+                        pidMisses = 0
+                    }
+                }
+            }
             // ★2026-11-03 用户报障（12:26:42 那次"突然回到登录页"）：
             //   `gamePid()` 偶尔会返回**不是游戏**的 pid（实测拿到 6185 —— 那既不是 AMS 起过的进程、
             //   exit-info 里也没有，纯属误读：pidof/frida 枚举在内存吃紧、pushservice 反复起停时会吐垃圾）。
@@ -386,7 +479,7 @@ object FridaInjector {
             //   下面两道闸（顺序不能反）：
             //   ① **agent 还连着 ⇒ 游戏只可能是 lastPid**（agent 在进程内，连着就证明那个进程活着）；
             //   ② pid 变了必须先验 `/proc/<pid>/cmdline` 是不是包名本体（挡 :pushservice / su 包装 / 同名进程）。
-            if (lastPid > 0 && pid != lastPid && AgentBridge.connected.value) {
+            if (lastPid > 0 && pid != lastPid && agentAliveFor(lastPid)) {
                 if (saidPidOdd == 0) {
                     saidPidOdd++
                     AppState.addLog("pid 读成 $pid，但 agent 还连在 pid=$lastPid 上 ⇒ 当误读，忽略（不换 pid、不杀游戏）")
@@ -420,6 +513,15 @@ object FridaInjector {
             }
             if (pid > 0) pidMisses = 0
             if (pid <= 0) {
+                // ★上层正在显式操作进程（kill / launch / 重装）：启动意图归它，这一拍不发 am start，
+                //   只等下一拍看到 pid。窗口结束（或上层失败后 reset）时 forceLaunch / pidMisses
+                //   都还在，注入循环会照常补调起，不存在"没人拉起游戏"的死角。
+                if (GameProcess.externalRestart) {
+                    stage = "显式进程操作窗口：等上层调起游戏"
+                    pidMisses = 0
+                    delay(POLL_MS)
+                    continue
+                }
                 // 开闸期间游戏没在跑 → 调起它（= "刷完开局 / 重启后调起游戏"的入口）
                 if (lastPid > 0) {
                     AppState.addLog(
@@ -438,10 +540,18 @@ object FridaInjector {
                     continue
                 }
                 AppState.setFridaStatus("游戏没在跑，调起它（第 $launchTries 次）…")
+                // ★forceLaunch 时排除刚 force-stop 的残留 pid：它还挂在 pidof 里，但不是新调起的游戏。
+                //   复用原有 20s 等待窗口，不新增等待；正常路径 excludePid=-1，行为完全不变。
+                val excludePid = stalePid
+                forceLaunch = false
+                stalePid = -1
                 GameProcess.launch(ctx)
-                pid = waitForGamePid(GameProcess.pkg(), PID_WAIT_MS)
+                pid = waitForGamePid(GameProcess.pkg(), PID_WAIT_MS, excludePid)
+                if (!autoRecover) continue               // 等 pid 期间上层停手了 ⇒ 不碰游戏
                 if (pid <= 0) {
                     AppState.addLog("调起后 ${PID_WAIT_MS / 1000}s 没看到游戏进程（第 $launchTries 次）")
+                    stalePid = excludePid
+                    forceLaunch = true                // 下轮仍强制重新调起，别退回"对着残留 pid 等映射"
                     delay(3_000)
                     continue
                 }
@@ -452,20 +562,30 @@ object FridaInjector {
                 val startedAt = firstSeen.getOrPut(pid) { SystemClock.elapsedRealtime() }
                 // ★启动期闸门：等到"可以安全注入"（主判据 = libil2cpp 已映射，见常量注释）
                 //   —— 等 il2cpp 映射后**立即注入**；真正的"il2cpp 可用"由 agent 轮询 domain，上限 30s
+                stage = "等 libil2cpp 映射（pid=$pid）"
                 val readyWhy = waitGameReady(pid, startedAt)
+                // ★总闸可能在这段等待里被上层关掉（90s 超时停手）⇒ 别拿结果继续 kill / 注入
+                if (!autoRecover) continue
                 if (readyWhy != null) {
-                    // ★僵死/提前退出 => 进程已坏，别傻等，杀游戏重开（2026-10-21 uuz 实测）
-                    if (readyWhy.contains("僵死") || readyWhy.contains("提前退出")) {
-                        // ★2026-11-03 兜底闸：agent 还连着就说明进程活着（在跑迷宫），**绝不杀**。
-                        //   能走到这里正常情况已被上面的 pid 校验挡住；留这一道防将来又改出同类误判。
-                        if (AgentBridge.connected.value) {
-                            AppState.addLog("等就绪异常（$readyWhy），但 agent 还连着 ⇒ 不杀游戏（pid=$pid），继续跑")
+                    // ★进程已坏 ⇒ 别傻等，杀游戏重开（2026-10-21 uuz 实测）。
+                    //   2026-11-13 补：判据统一交给 [InjectRecoveryPolicy]（纯函数、有单测）——
+                    //   事故里那句「15s 内 libil2cpp.so 一直没映射（进程卡死/闪退残留）」旧判据漏了，
+                    //   于是对同一个坏 pid 连等 4 轮 15s，直到上层 90s 超时停手。
+                    if (InjectRecoveryPolicy.badProcess(readyWhy)) {
+                        // ★2026-11-03 兜底闸（2026-11-13 收紧）：只有 agent 确实连在**这个 pid**、
+                        //   且期间没 kill 过，才说明进程活着。kill 后 connected 滞后为 true 时，
+                        //   旧写法会跳过自愈，对着坏 pid 一轮轮等 15s 映射直到上层 90s 停手。
+                        if (agentAliveFor(pid)) {
+                            AppState.addLog("等就绪异常（$readyWhy），但 agent 还连在 pid=$pid 上 ⇒ 不杀游戏，继续跑")
                             delay(POLL_MS)
                             continue
                         }
+                        stage = "等就绪判坏进程（$readyWhy）→ 自愈杀游戏重开"
                         launchTries = 0
                         GameProcess.kill()
                         lastPid = -1
+                        forceLaunch = true
+                        stalePid = pid
                         waitGameGone()
                         continue
                     }
@@ -475,6 +595,7 @@ object FridaInjector {
                 if (lastPid <= 0) {
                     AppState.addLog("找到游戏 pid=$pid（起了 ${(SystemClock.elapsedRealtime() - startedAt) / 1000}s），开始注入")
                 }
+                stage = "注入 pid=$pid"
                 AppState.setFridaStatus("注入中（运行组件）…")
                 // ★V7（2026-10-30）：首次注入原来**没有超时** —— 进程僵住时会一直等到 frida 内部超时
                 //   （实测 25s），把"决定重试/杀游戏"整整拖后。这里补上限：取重注入上限的 2 倍
@@ -483,15 +604,23 @@ object FridaInjector {
                 val err = withTimeoutOrNull(injectTimeout) {
                     FridaCore.attachAndLoad(FRIDA_SERVER, pid, agent.absolutePath, eternalize = true)
                 } ?: "超时（${injectTimeout / 1000}s 没回来）"
+                if (!autoRecover) continue               // 关闸期间别再按注入结果杀/拉游戏
                 if (err.isEmpty()) {
                     lastPid = pid
                     launchTries = 0                  // 游戏活了（被注入成功）→ 调起计数清零
                     injectFails = 0
                     injectCycles = 0
+                    pidChangeTries = 0
+                    forceLaunch = false
+                    stalePid = -1
+                    boundPid = pid
+                    boundGen = GameProcess.kills     // 之后任何一次 kill 都会让这条连接失效
+                    stage = "已注入 pid=$pid，等 agent 回连"
                     AppState.addLog("已让运行组件把 agent 注入进 pid=$pid（脚本 ${agent.length()} 字节）")
                     AppState.setFridaStatus("注入完成，等 agent 回连…")
                 } else {
                     injectFails++
+                    stage = "注入失败（第 $injectFails 次）：${err.take(60)}"
                     AppState.addLog("注入失败（第 $injectFails 次）：$err")
                     AppState.setFridaStatus("注入失败：${err.take(72)}")
                     // ptrace 类失败 => 进程大概率已僵死（2026-10-21 uuz 设备实测）：attach 写内存
@@ -506,16 +635,36 @@ object FridaInjector {
                         val diag = diagnoseInject(pid)
                         AppState.addLog("注入失败诊断：$diag")
                         val alive = gamePid(GameProcess.pkg())
+                        // ★★2026-11-13（0.6.20 诊断包）：attach 的是**上一局已死的旧 pid**，而上层
+                        //   刚 kill→launch 调起的新进程正在跑（日志 `pidof=22124（≠21741）`）。
+                        //   旧逻辑只在 `alive == pid` 时原地重试，这种"换代"一律判成进程僵死 ⇒
+                        //   force-stop 把健康的新进程一起杀掉，之后再没人 am start ⇒ 90s 超时停手。
+                        //   ⇒ 换代就不杀，下一轮直接按新 pid 重新等就绪 + 注入（不加等待、不动正常流程）；
+                        //   累计失败到 [MAX_INJECT_FAILS] 仍会退回下面的 kill 自愈，不会空转。
+                        if (InjectRecoveryPolicy.pidChanged(pid, alive) && pidChangeTries < MAX_INJECT_FAILS) {
+                            pidChangeTries++
+                            injectFails = 0           // 换了进程，失败计数从头算（原来会累加到第 3 次就误杀新进程）
+                            stage = "注入撞上旧 pid=$pid → 按新 pid=$alive 重注"
+                            AppState.addLog(
+                                "注入撞上旧 pid=$pid（当前游戏已是 pid=$alive）⇒ 不杀新进程，下一轮按新 pid 重新注入",
+                            )
+                            lastPid = -1
+                            continue
+                        }
                         if (alive == pid && injectFails == 1) {
                             AppState.addLog("进程（pid=$pid）还在 ⇒ 先原地重试注入一次，不杀游戏")
                             delay(2_000)
                             continue
                         }
                         injectFails = 0
+                        pidChangeTries = 0
                         injectCycles++
                         if (injectCycles >= MAX_INJECT_CYCLES) {
                             injectCycles = 0
+                            stage = "注入反复失败 → 暂停自愈 ${CYCLE_PAUSE_MS / 1000}s"
                             GameProcess.kill()
+                            stalePid = pid
+                            forceLaunch = true        // 暂停结束后必须真的重新调起，别对着残留 pid 等映射
                             lastPid = -1
                             AppState.addLog(
                                 "连续 $MAX_INJECT_CYCLES 次「注入失败 → 杀游戏重开」→ **暂停自愈 " +
@@ -524,15 +673,23 @@ object FridaInjector {
                                     "反作弊拦注入、运行组件与游戏 ABI 不匹配。诊断：$diag",
                             )
                             AppState.setFridaStatus("注入反复失败，已暂停自愈 2 分钟（看日志里的诊断）")
-                            delay(CYCLE_PAUSE_MS)
+                            // ★分段可取消：上层关闸后最长 1s 退出，不再把 120s 阻塞段带进下一局
+                            var paused = 0L
+                            while (paused < CYCLE_PAUSE_MS && autoRecover) {
+                                delay(1_000)
+                                paused += 1_000
+                            }
                             continue
                         }
                         AppState.addLog(
                             if (fatal) "注入失败且进程多半已僵死 → 自愈：杀掉游戏重开"
                             else "连续 $MAX_INJECT_FAILS 次注入失败 → 自愈：杀掉游戏重开",
                         )
+                        stage = "注入失败自愈：杀掉游戏重开"
                         GameProcess.kill()
                         lastPid = -1                 // 下一轮走"游戏没在跑，调起它"
+                        forceLaunch = true
+                        stalePid = pid
                         waitGameGone()
                         continue
                     }
@@ -584,8 +741,11 @@ object FridaInjector {
                         )
                         reinjectN = 0
                         reinjectDead = false
+                        stalePid = lastPid
+                        stage = "agent 掉线自愈：杀掉游戏重开"
                         GameProcess.kill()
                         lastPid = -1
+                        forceLaunch = true
                         waitGameGone()
                         continue
                     }
@@ -867,7 +1027,13 @@ object FridaInjector {
         if (pid <= 0) return false
         val r = RootShell.exec("cat /proc/$pid/cmdline", 4_000L)
         val arg0 = r.out.substringBefore('\u0000').trim().substringAfterLast('/')
-        if (arg0.isEmpty()) return null            // 读不到（进程没了 / 没 root）
+        if (arg0.isEmpty()) {
+            // ★2026-11-13：cmdline 读不到 ≠ 健康。僵尸 / T 状态进程的 cmdline 就是空的，
+            //   旧逻辑乐观放行 ⇒ 对着它白等 15s 映射。补一次状态判定（只在读不到时才有这次开销）。
+            val stat = RootShell.exec("cat /proc/$pid/stat", 3_000L).out.trim()
+            val state = stat.substringAfterLast(')').trim().split(' ').firstOrNull().orEmpty()
+            return if (state.isEmpty() || state in setOf("Z", "T", "D", "t", "X")) false else null
+        }
         return arg0 == pkg
     }
 
@@ -884,12 +1050,18 @@ object FridaInjector {
         out.split(' ', '\n', '\t').mapNotNull { it.trim().toIntOrNull() }.firstOrNull { it > 0 } ?: -1
 
     /** 等游戏进程出现（调起之后用）。@return pid；-1 = 超时没等到 */
-    suspend fun waitForGamePid(pkg: String = GameProcess.pkg(), timeoutMs: Long): Int {
+    suspend fun waitForGamePid(
+        pkg: String = GameProcess.pkg(),
+        timeoutMs: Long,
+        excludePid: Int = -1,
+    ): Int {
         val t0 = SystemClock.elapsedRealtime()
         while (SystemClock.elapsedRealtime() - t0 < timeoutMs) {
             delay(1_000)
             val p = gamePid(pkg)
-            if (p > 0) return p
+            // ★只给自愈用：排除刚 force-stop 的残留 pid（它仍挂在 pidof 里，却不是新调起的游戏）。
+            //   复用原有 20s 窗口，不新增等待；正常路径 excludePid=-1，行为不变。
+            if (p > 0 && p != excludePid) return p
         }
         return -1
     }
@@ -972,13 +1144,17 @@ object FridaInjector {
                 toldConnected = false             // 下次开闸重新握手，别复用旧状态
                 lastPage = null
                 lastPageTop = null
+                _readyGen.value = -1
                 AppState.setFridaStatus("待命（未跑迷宫，不注入游戏）")
                 continue
             }
             if (!AgentBridge.connected.value) {
                 if (toldConnected) {
                     toldConnected = false
+                    _readyGen.value = -1          // 上一代 agent 不可用，别让上层误判"重启完成"
                     AppState.addLog("agent 掉线，等它重连…")
+                } else {
+                    _readyGen.value = -1
                 }
                 AppState.setFridaStatus(
                     when {
@@ -1009,10 +1185,19 @@ object FridaInjector {
                     AppState.setFridaStatus("agent 已连，等 il2cpp 就绪…（${waited / 1000}s）")
                     continue
                 }
+                // ★agent 端 ready 只说明 il2cpp domain 好了，还得确认它属于**这一代游戏**：
+                //   残留旧进程里 eternalize 的脚本重连也会让 ready 通过。注入循环成功注入后
+                //   才写 [boundPid]/[boundGen]；还没写就下一拍再看（别锁 toldConnected）。
+                if (boundPid <= 0 || boundGen != GameProcess.kills) {
+                    AppState.setFridaStatus("agent 已连，等注入循环确认这一代…")
+                    continue
+                }
                 val readyMs = if (readyWaitAt > 0) SystemClock.elapsedRealtime() - readyWaitAt else 0L
                 readyWaitAt = 0L
                 readyWarned = false
                 toldConnected = true
+                // ★只有「agent 已连 + il2cpp domain 就绪」才宣布这一代完成，上层等的正是它
+                _readyGen.value = GameProcess.kills
                 // ★打脚本构建号：验证「轻读」改动时，开局就能确认注入的是哪一版 agent
                 //  （改过读逻辑时 JS_BUILD 会递增；PROBE 之外的常规日志原本看不到它）。
                 val jsb = runCatching {

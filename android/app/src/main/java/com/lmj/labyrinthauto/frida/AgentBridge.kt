@@ -73,6 +73,18 @@ object AgentBridge {
      *  之前发出的**重活**（堆扫描 `labChoices` 实测 3.1s ✗、全树 find ✗）—— 只看"第一个超时"会误判。 */
     private val pendingInfo = ConcurrentHashMap<Long, Pair<String, Long>>()
 
+    /**
+     * ★连接代际（2026-11-13）：一次 attach 的读线程只能改自己那一代的连接状态。
+     *
+     * 踩过的坑：新 agent 回连后，旧连接的读线程 `finally` 晚到，把新连接的 true 覆盖成 false
+     * ⇒ 幽灵掉线（20s 后原地重注入），或让上层 `first { it }` 等待被旧状态误满足。
+     * `noteStale` / `stop` 也会推进代际，使在飞的旧读线程立刻失效。
+     */
+    private val connectionSeq = java.util.concurrent.atomic.AtomicInteger(0)
+
+    @Volatile
+    private var currentConnectionId = 0
+
     private val _connected = MutableStateFlow(false)
     val connected: StateFlow<Boolean> = _connected.asStateFlow()
 
@@ -94,6 +106,7 @@ object AgentBridge {
 
     fun stop() {
         running = false
+        currentConnectionId = connectionSeq.incrementAndGet()   // 在飞的旧读线程立刻失效
         runCatching { clientOut?.close() }
         clientOut = null
         runCatching { serverSocket?.close() }
@@ -101,6 +114,11 @@ object AgentBridge {
         _connected.value = false
         pending.values.forEach { runCatching { it.cancel() } }
         pending.clear()
+        // ★跨会话残留会让新会话头 20s 被「拥堵豁免」误判、或只超时一两次就判掉线（2026-11-13）
+        pendingInfo.clear()
+        timeoutStreak.set(0)
+        lastOkAt = 0L
+        lastTimeoutFn = null
     }
 
     private fun acceptLoop() {
@@ -128,6 +146,10 @@ object AgentBridge {
             runCatching { sock.close() }
             return
         }
+        // ★先在关旧 socket **之前**换掉代际：close 会触发旧读线程的 finally，
+        //   让它看到"自己已过期"，就不会把下面这行的 _connected=true 覆盖成 false。
+        val myId = connectionSeq.incrementAndGet()
+        currentConnectionId = myId
         runCatching { clientOut?.close() }
         clientOut = sock.getOutputStream()
         AppState.addLog("agent 已连上（来自 ${sock.inetAddress?.hostAddress}）")
@@ -141,8 +163,10 @@ object AgentBridge {
                 }
             } catch (_: Throwable) {
             } finally {
-                _connected.value = false
-                AppState.addLog("agent 断开（会自动重连）")
+                if (myId == currentConnectionId) {
+                    _connected.value = false
+                    AppState.addLog("agent 断开（会自动重连）")
+                }
             }
         }, "agent-read").apply { isDaemon = true }.start()
     }
@@ -152,8 +176,14 @@ object AgentBridge {
      * 让 agent 侧的看门狗/重连逻辑重新连进来（对端进程被杀时，我们的写不会报错）。
      */
     fun noteStale(reason: String) {
+        // 无论当前有没有连接，超时计数都按「这一代」重来：重启/换连接时旧请求的超时
+        // 不能攒进新会话，否则连续 3 次就会把刚连上的新 agent 又判掉线。
+        timeoutStreak.set(0)
+        lastTimeoutFn = null
+        lastOkAt = 0L
         if (!_connected.value && clientOut == null) return
         AppState.addLog("agent 疑似掉线（$reason）→ 等它重连")
+        currentConnectionId = connectionSeq.incrementAndGet()   // 旧读线程失效，别回头覆盖新连接
         _connected.value = false
         runCatching { clientOut?.close() }
         clientOut = null
@@ -181,6 +211,8 @@ object AgentBridge {
      */
     suspend fun call(fn: String, args: List<Any?> = emptyList(), timeoutMs: Long = 5_000L): JSONObject? {
         val out = clientOut ?: return null
+        // ★这次请求属于哪一代连接：连接换掉之后，它的超时绝不能算到新连接头上（2026-11-13）
+        val gen = currentConnectionId
         val id = ids.incrementAndGet()
         val t0 = System.currentTimeMillis()
         val deferred = CompletableDeferred<JSONObject>()
@@ -207,8 +239,10 @@ object AgentBridge {
         } catch (t: Throwable) {
             pending.remove(id)
             if (t is TimeoutException || t is InterruptedException) {
-                AppState.addLog("[agent] 写请求超时（$fn）→ 断开连接，让 agent 重连")
-                noteStale("写请求超时（$fn）")
+                if (gen == currentConnectionId) {
+                    AppState.addLog("[agent] 写请求超时（$fn）→ 断开连接，让 agent 重连")
+                    noteStale("写请求超时（$fn）")
+                }
             }
             return null
         }
@@ -220,6 +254,9 @@ object AgentBridge {
         //   ★并且把**此刻还没回来的调用**一起报出来 —— 先超时的往往是便宜调用（`viewId` 3s），
         //   真正卡住 agent 的多半是之前那次**重活**（`labChoices` 扫堆 3.1s / 全树 find ✗）。
         if (res == null) {
+            // ★旧连接的在飞请求超时：连接都换了，这次超时不算数，更不能触发 noteStale
+            //   把**刚连上的新 agent** 判掉线（否则上层 90s 等待会被莫名打断）。
+            if (gen != currentConnectionId) return null
             val timeoutAt = System.currentTimeMillis()
             // ★★连续超时 ⇒ 判定"这条连接死了"并触发自愈（2026-10-17 第四次卡死复盘）：
             //   原来只有**注入循环**的 `viewId` 计数会调 [noteStale]，而导航阶段卡住时那个循环没在看

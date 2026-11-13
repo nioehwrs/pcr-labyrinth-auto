@@ -87,27 +87,34 @@ class MainActivity : ComponentActivity() {
     private fun maybeDumpTree(intent: android.content.Intent?) {
         val tag = intent?.getStringExtra("uiTag")?.takeIf { it.isNotBlank() } ?: return
         lifecycleScope.launch {
-            if (!AgentBridge.connected.value) {
-                // ★平时只有"跑迷宫"窗口才注入（autoRecover=false 时注入器待命），采集期间临时打开
-                FridaInjector.autoRecover = true
-                FridaInjector.start(applicationContext)
-                var i = 0
-                while (!AgentBridge.connected.value && i++ < 60) delay(1000)
-                if (!AgentBridge.connected.value) {
-                    AppState.addLog("UI 树导出失败：agent 未连上（游戏没起 / 注入失败）")
-                    return@launch
+            // ★2026-11-13：这个调试入口原来把 autoRecover 打开后**永不复位**（失败分支直接 return），
+            //   助手会长期接管游戏进程、还会挡住抓凭证。只在自己打开的情况下用 finally 关回去。
+            val openedGate = !AgentBridge.connected.value
+            try {
+                if (openedGate) {
+                    // 平时只有"跑迷宫"窗口才注入（autoRecover=false 时注入器待命），采集期间临时打开
+                    FridaInjector.autoRecover = true
+                    FridaInjector.start(applicationContext)
+                    var i = 0
+                    while (!AgentBridge.connected.value && i++ < 60) delay(1000)
+                    if (!AgentBridge.connected.value) {
+                        AppState.addLog("UI 树导出失败：agent 未连上（游戏没起 / 注入失败）")
+                        return@launch
+                    }
                 }
+                val nodes = AgentApi.tree()
+                val st = AgentApi.labStatus()
+                val obj = org.json.JSONObject()
+                    .put("tag", tag)
+                    .put("status", st ?: org.json.JSONObject.NULL)
+                    .put("diffNum", AgentApi.obj("labDiffNum", timeoutMs = 3_000L) ?: org.json.JSONObject.NULL)
+                    .put("nodes", nodes ?: org.json.JSONArray())
+                val f = java.io.File(filesDir, "tree_$tag.json")
+                runCatching { f.writeText(obj.toString()) }
+                AppState.addLog("UI 树已导出（$tag）：${f.name}，${nodes?.length() ?: 0} 个节点")
+            } finally {
+                if (openedGate) FridaInjector.autoRecover = false
             }
-            val nodes = AgentApi.tree()
-            val st = AgentApi.labStatus()
-            val obj = org.json.JSONObject()
-                .put("tag", tag)
-                .put("status", st ?: org.json.JSONObject.NULL)
-                .put("diffNum", AgentApi.obj("labDiffNum", timeoutMs = 3_000L) ?: org.json.JSONObject.NULL)
-                .put("nodes", nodes ?: org.json.JSONArray())
-            val f = java.io.File(filesDir, "tree_$tag.json")
-            runCatching { f.writeText(obj.toString()) }
-            AppState.addLog("UI 树已导出（$tag）：${f.name}，${nodes?.length() ?: 0} 个节点")
         }
     }
 

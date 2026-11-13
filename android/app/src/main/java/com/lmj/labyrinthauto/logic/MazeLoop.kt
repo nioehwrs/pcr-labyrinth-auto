@@ -443,6 +443,9 @@ object MazeLoop {
         } else {
             AppState.addLog("未检测到刷开局产物（RerollState 为空）→ 局内按 DP 现算路线走（PC 同款兜底）")
         }
+        // ★2026-11-13：产物只属于这一局，消费完立刻清掉 —— 否则某局刷开局失败却仍进了状态机时，
+        //   会沿用上一局的 Boss / 预计算路线走错图（全局单例跨局不清）。
+        RerollState.result = null
         // 事件选项表（PC load_event_choice 5923）：event_id → 第几项（缺省 1）
         EventPick.load { name ->
             ctx.assets.open(name).bufferedReader(Charsets.UTF_8).use { it.readText() }

@@ -64,6 +64,34 @@ object GameProcess {
         private set
 
     /**
+     * ★显式进程操作窗口（2026-11-13）：上层正在 kill / launch / 重装（`pm install` 也会杀游戏）时，
+     *   用 [beginExternalOp] / [endExternalOp] 包住。注入循环这段**不主动发 am start**，
+     *   其余（等就绪、注入、读页）照常 —— 既不抢启动意图，也不耽误 agent 回连。
+     *
+     * 用计数是为了允许嵌套（例如整段重启窗口里又调了一次架构自检）；@Synchronized 保证
+     * 上层协程与注入循环两条线程不会把计数改丢。整局结束用 [resetExternalOps] 兜底清干净。
+     */
+    @Volatile
+    private var externalOpsDepth = 0
+
+    val externalRestart: Boolean get() = externalOpsDepth > 0
+
+    @Synchronized
+    fun beginExternalOp() {
+        externalOpsDepth++
+    }
+
+    @Synchronized
+    fun endExternalOp() {
+        if (externalOpsDepth > 0) externalOpsDepth--
+    }
+
+    @Synchronized
+    fun resetExternalOps() {
+        externalOpsDepth = 0
+    }
+
+    /**
      * [1] 杀掉游戏进程（= PC 版 `step_kill()` 的 `am force-stop`）。
      * 杀别的 app 需要 root。
      *

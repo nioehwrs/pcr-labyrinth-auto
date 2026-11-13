@@ -80,7 +80,12 @@ class AutoForegroundService : Service() {
         // ★目标客户端（2026-10-30 用户："按当前账号的渠道启动对应的客户端"）：
         //   每个意图进来都先同步一次 —— 之后 kill / launch / pid / 前台判定 / 架构自检
         //   全部走 GameProcess.pkg()，选中的是渠道服账号就走渠道包，不再写死国服。
-        GameProcess.syncTargetFromAccount(applicationContext)
+        // ★跑局中冻结目标客户端（2026-11-13）：连跑期间收到任意意图（PROBE/TREE/START…）都重同步，
+        //   会把 GameProcess.pkg() 换成另一个渠道包；注入循环每拍按新包查 pid ⇒ 把在跑的游戏判死、
+        //   甚至调起别的客户端。整轮结束（runFull/watcher 都停了）再允许同步。
+        if (runFull?.isActive != true && watcher?.isActive != true) {
+            GameProcess.syncTargetFromAccount(applicationContext)
+        }
         when (intent?.action) {
             ACTION_INJECT -> {
                 FridaInjector.start(applicationContext)
@@ -488,6 +493,8 @@ class AutoForegroundService : Service() {
                     OverlayStatus.setFloor("刷开局中（局内）")
                     OverlayStatus.setLevel(OverlayStatus.Level.RUNNING)
                     FridaInjector.autoRecover = true
+                    // ★只刷开局同样由业务层独占进程操作（架构闸门重装 + InGameReroll 的 launch）
+                    GameProcess.beginExternalOp()
                     // ★刷开局也要有**独立的运行日志**（2026-10-19 用户问"刷开局现在没有日志吗"）：
                     //   之前只有跑迷宫（MazeLoop）开 run_ 文件，刷开局的日志全混在 session 里，
                     //   用户想发"某一次刷开局"根本挑不出来。现在独立成 run_*_REROLL.txt，
@@ -523,6 +530,7 @@ class AutoForegroundService : Service() {
                         AppState.addLog("════ 刷开局异常中止：${e.javaClass.simpleName}: ${e.message}")
                         LogFile.endRun(done = false, tag = "ABORT_EXIT", reason = "异常：${e.message}")
                     } finally {
+                        GameProcess.resetExternalOps()
                         // 正常结束在这里收尾；异常分支已收尾过（endRun 幂等：runSinks 空了就跳过）
                         LogFile.endRun(
                             done = ok,
@@ -685,6 +693,9 @@ class AutoForegroundService : Service() {
         if (RerollSettings.loadRerollMode(applicationContext) == RerollSettings.REROLL_IN_GAME) {
             OverlayStatus.setFloor("刷开局中（局内）")
             FridaInjector.autoRecover = true
+            // ★显式进程操作窗口：局内刷里 `AbiRepair.ensure`（重装会杀游戏）和 InGameReroll 的
+            //   三处 launch 都由业务层独占；注入循环这段照常注入/读页，只是不抢发 am start。
+            GameProcess.beginExternalOp()
             return try {
                 // ★架构闸门（2026-10-30 用户："局内模式也要修，杀进程不是硬限制"）：
                 //   局内一般不需要杀进程，但**架构不对时注入根本连不上**，不修这一步也没法跑。
@@ -702,6 +713,8 @@ class AutoForegroundService : Service() {
                     AppState.addLog("局内刷开局未成功 → 本局不进入迷宫")
                     return false
                 }
+                // ★窗口到此为止：后面 MazeLoop 看门狗 kill 之后是要靠注入器把游戏拉起来的
+                GameProcess.endExternalOp()
                 OverlayStatus.setFloor("进入迷宫中")
                 if (Navigator.currentViewId() != 264) {
                     // 极少见（刷完却不在迷宫地图上）→ 按老路再进一次
@@ -709,6 +722,7 @@ class AutoForegroundService : Service() {
                 }
                 MazeLoop.run(input, applicationContext)
             } finally {
+                GameProcess.resetExternalOps()
                 FridaInjector.autoRecover = false
             }
         }
@@ -724,6 +738,9 @@ class AutoForegroundService : Service() {
         // ② 进入「自动黎明界」窗口（重启游戏 → 结算，**不含刷开局**）：这段开自愈总闸，
         //    期间游戏崩了/卡死由本进程杀进程/重启；窗口一结束（含异常/提前返回）就关掉。
         FridaInjector.autoRecover = true
+        // ★窗口从开闸这一刻就开始（覆盖下面的架构闸门）：`AbiRepair.ensure` 修 ABI 时
+        //   `pm install` 会杀游戏，注入循环若此时自主就会抢先 launch，随后又被下面的 kill 杀掉。
+        GameProcess.beginExternalOp()
         return try {
             // ★架构闸门（2026-10-30）：下面马上就要 kill 游戏，这是**确定性**的修复窗口 ——
             //   不再依赖注入循环里"恰好拍到 pid<=0"的时序（POLL_MS=1.5s，可能刚好错过）。
@@ -740,35 +757,45 @@ class AutoForegroundService : Service() {
             //   reroll 只改了**服务器**状态，客户端必须冷启动才会同步到这个合格开局
             //   （PC keep_opening(sync=False) 注释：调用方自己的"杀进程→启动→attach"就是同步）。
             AppState.addLog("刷开局完成 → 杀进程重启游戏以同步开局（PC 同款 step_kill→step_launch）")
+            // ★★2026-11-13：把「靠 4s 等待赌两个启动意图不打架」改成明确的重启窗口。
+            //   ① oldPid 排除 `am force-stop` 的残留进程（它还挂在 pidof 里，会被当成新游戏）；
+            //   ② 注入循环在本窗口内不自己 am start（其余照常：等就绪/注入/读页），启动意图归上层；
+            //   ③ [AgentBridge.noteStale] 主动断掉旧 agent 连接，否则 connected 滞后为 true 时，
+            //      注入循环会误判「进程还活着」而不自愈。
+            val oldPid = FridaInjector.gamePid()
             GameProcess.kill()
-            // ★★2026-11-09 用户报障（"还没跑完三局，自己就停下了"）：
-            //   原来只 sleep 1s 就 `am start`。但 `am force-stop` 是**异步**的，旧进程往往没退干净，
-            //   于是注入循环又自己 launch 一次 ⇒ **两个启动意图打架**，游戏起来 1s 就崩：
-            //     已调起游戏 → 已调起游戏（重复） → 游戏已起来 pid=7355 → 静置 6s
-            //     → 注入失败 No such process → 崩溃线索 `has died: fg TOP` → 连撞 3 次 → 暂停自愈 → 停手
-            //   改成：先等 pid 真的消失（最多 4s），再启动；启动后再等 pid 出来，
-            //   以免注入循环误判"没在跑"又 launch 一次。
+            // ★本次重启的代际：下面等的是「这一代游戏」的 agent 已就绪，不是任何一次 socket 连上
+            val restartGen = GameProcess.kills
+            AgentBridge.noteStale("刷开局完成，重启游戏进程")
             val goneAt = android.os.SystemClock.elapsedRealtime()
             while (android.os.SystemClock.elapsedRealtime() - goneAt < 4_000L) {
-                if (FridaInjector.gamePid() <= 0) break
+                val p = FridaInjector.gamePid()
+                if (p <= 0 || (oldPid > 0 && p != oldPid)) break
                 delay(300)
             }
             GameProcess.launch(applicationContext)
             val upAt = android.os.SystemClock.elapsedRealtime()
             while (android.os.SystemClock.elapsedRealtime() - upAt < 10_000L) {
-                if (FridaInjector.gamePid() > 0) break
+                val p = FridaInjector.gamePid()
+                if (p > 0 && p != oldPid) break
                 delay(300)
             }
+            // ★窗口保持到「新 pid 已出现」：launch 之后进程还没冒出来的这几秒里，
+            //   注入循环若恢复自主，会判 pid<=0 又发一次 am start ⇒ 两个启动意图打架。
+            GameProcess.endExternalOp()
 
-            // ②-b 等注入循环把新进程的 agent 起来：先等**旧 agent 掉线**（确认重启生效，
-            //   否则可能拿着重启前的旧连接往下跑），再等**新 agent 连上**（冷启动+就绪+注入）。
+            // ②-b 等注入循环把这一代游戏的 agent 起来。
+            // ★注入循环是常驻的，[FridaInjector.start] 幂等（服务一启动就跑过），这里只兜底确保已启动。
+            // ★等 [FridaInjector.readyGen] 而不是裸 connected：它只在「agent 已连 + il2cpp domain 就绪」
+            //   且代际 >= 本次 kill 时发布。裸 connected 只证明有 socket —— 残留进程里 eternalize 的
+            //   脚本重连、或 domain 还没建好，都会让上层带着错状态往下跑（启动阶段的结构性缺口）。
             FridaInjector.start(applicationContext)
-            withTimeoutOrNull(15_000L) { AgentBridge.connected.first { !it } }
-            val connected = withTimeoutOrNull(90_000L) {
-                AgentBridge.connected.first { it }
-            } ?: false
-            if (!connected) {
-                AppState.addLog("重启后 agent 90s 内未连上（冷启动/注入是否成功？）→ 本局停手，不碰迷宫")
+            val ready = withTimeoutOrNull(90_000L) {
+                FridaInjector.readyGen.first { it >= restartGen }
+            } != null
+            if (!ready) {
+                AppState.addLog("重启后 90s 内 agent 没就绪（冷启动/注入/il2cpp domain？）→ 本局停手，不碰迷宫")
+                AppState.addLog("诊断：注入循环停在「${FridaInjector.stage}」；上层已放弃，下层可能仍在自愈（看上面的注入日志）")
                 return false
             }
 
@@ -780,6 +807,7 @@ class AutoForegroundService : Service() {
             if (!enterMazeWithRetry(input)) return false
             MazeLoop.run(input, applicationContext)
         } finally {
+            GameProcess.resetExternalOps()       // 异常路径也不能把窗口留着挡住注入循环
             FridaInjector.autoRecover = false
         }
     }
@@ -874,6 +902,7 @@ class AutoForegroundService : Service() {
         runFull?.cancel()          // ★连跑也要停（否则按了"停止"还在跑下一局 ✗）
         runFull = null
         AppState.setMazeProgress(null)
+        GameProcess.resetExternalOps()      // 停服务一律清显式窗口，别把注入循环永久挡住
         FridaInjector.autoRecover = false   // 停服务一律关自愈，别留着把游戏重启了
         FridaInjector.stop()
         AgentBridge.stop()

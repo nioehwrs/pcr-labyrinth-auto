@@ -219,6 +219,14 @@ object Navigator {
                     "停手：${viewLabel(vid)} 停留 ${PAGE_STUCK_RESTART_MS / 1000}s 没推进 → 重启游戏进程",
                 )
                 GameProcess.kill()
+                // ★2026-11-13：总闸没开时注入循环在待命，没人把游戏拉回来（ACTION_GOTO_LAB
+                //   这类独立入口就是这个状态）⇒ 自己补一次 am start，别留个死进程。
+                // ★显式进程操作窗口内注入器被压制、不会自己 am start ⇒ 这个「卡页重启」的
+                //   拉起动作必须由导航自己负责，否则游戏被 kill 后没人调回来。
+                if (ctx != null && (!FridaInjector.autoRecover || GameProcess.externalRestart)) {
+                    AppState.addLog("…注入器待命 / 显式进程操作窗口 ⇒ 自己把游戏调回来（不留死进程）")
+                    GameProcess.launch(ctx)
+                }
                 return false
             }
             if (vid == TARGET_VIEW) {
