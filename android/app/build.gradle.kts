@@ -27,8 +27,8 @@ android {
         minSdk = 26
         targetSdk = 35
         // 0.4.0：渠道服支持 + 多账号 + 凭证加密 + 架构自检/修复
-        versionCode = 44
-        versionName = "0.6.19"
+        versionCode = 45
+        versionName = "0.6.20"
 
         // 本阶段只保证 MuMu（x86_64）。P0 没有 native 库；
         // 等 PLAN.md §4 方案 B（内嵌 libfrida-core.so）时这条才会真正生效。
