@@ -34,6 +34,11 @@ class CharaPick(
     private val pickResolver: (Int) -> List<Int>,
     private val rules: Rules,
     private val relics: RelicTables,
+    /** ★属性印记选择顺序（2026-11-13 用户）：门票三选一按它取第一张；默认沿用旧的 暗>火>光>风>水。 */
+    private val attrOrder: List<String> = ATTR_ORDER,
+    /** ★不使用 NPC 角色（2026-11-13 用户）：战后角色三选一先跳过 agent 标了 `npc` 的卡；
+     *  三张全是 NPC 时忽略该设置（照常选，别停手）。 */
+    private val excludeNpc: Boolean = false,
 ) {
 
     /**
@@ -86,6 +91,10 @@ class CharaPick(
         const val DOT_KINDS_MAX = 3            // PICK_RULES["dot_kinds_max"]
         const val DOT_SOFT_BONUS = 1           // PICK_RULES["dot_soft_bonus"]
         const val TANK_AREA = 3                // PICK_RULES["tank_area"]
+
+        /** 属性次序（PC ATTR_ORDER / PICK_ATTR_ORDER / TICKET_ATTR_ORDER 同源）：暗>火>光>风>水。
+         *  ★2026-11-13 起可通过策略页「角色选择 → 属性印记选择顺序」调整；这里只作默认值。 */
+        val ATTR_ORDER: List<String> = listOf("暗", "火", "光", "风", "水")
     }
 
     /** PC `_CHARA_ACT`(1590)：页面实例(ta) → 动作状态 */
@@ -113,15 +122,12 @@ class CharaPick(
     // 逐字对应 PC pcr_auto.py：常量区(420~443) + lab_pick_ctx(4110) + lab_select_rank(4153)
     //   + handle_ticket_choice(4333)。底座 + L5~L1 特殊优先全在这里，handler 只取 PLAN 点击。
 
-    /** 属性次序（PC ATTR_ORDER / PICK_ATTR_ORDER / TICKET_ATTR_ORDER 同源）：暗>火>光>风>水 */
-    private val ATTR_ORDER = listOf("暗", "火", "光", "风", "水")
-
     /** 遗物 id 规律兜底（PC DOT_RELIC_ID_RE）：x2003=毒 / x2002=诅咒（1/2/3★ 各一件） */
     private val DOT_RELIC_ID_RE = Regex("^[123]200[23]$")
 
     private fun attrIdx(attr: String): Int {
-        val i = ATTR_ORDER.indexOf(attr)
-        return if (i < 0) ATTR_ORDER.size else i
+        val i = attrOrder.indexOf(attr)
+        return if (i < 0) attrOrder.size else i
     }
 
     /** 卡面属性：优先按 unitId 查表；门票/遗物卡可能无 unitId → 从 topText/bottomText 抠 暗火光风水 */
@@ -183,8 +189,18 @@ class CharaPick(
         if (cards.isEmpty()) return null
         val tankTag = TagIds.T["tank"]!!; val mtankTag = TagIds.T["mtank"]!!
         val knockTag = TagIds.T["knock"]!!; val drainTag = TagIds.T["drain"]!!
-        val rows = ArrayList<RankRow>(cards.size)
-        for ((i, c) in cards.withIndex()) {
+        // ★不使用 NPC 角色（2026-11-13 用户）：agent 的 labSelection 给每张卡带 `npc`（unitType==2）。
+        //   先剔掉 NPC 卡；**三张全是 NPC 时忽略该设置**（照常选，别停手）。
+        //   用原始下标取卡，不要重排 —— 返回的 index 要拿去点第几张卡。
+        val idxs = if (excludeNpc) {
+            val nonNpc = cards.indices.filter { !cards[it].optBoolean("npc", false) }
+            if (nonNpc.isNotEmpty()) nonNpc else cards.indices.toList()
+        } else {
+            cards.indices.toList()
+        }
+        val rows = ArrayList<RankRow>(idxs.size)
+        for (i in idxs) {
+            val c = cards[i]
             val uid = (c.opt("unitId") as? Number)?.toInt() ?: 0
             val s = uid.toString()
             val ts = if (uid != 0) rules.tagsOf(s) else emptySet()
@@ -251,7 +267,7 @@ class CharaPick(
      */
     fun pickTicket(cards: List<JSONObject>): LabPickResult? {
         if (cards.isEmpty()) return null
-        for (attr in ATTR_ORDER) {
+        for (attr in attrOrder) {
             val hit = cards.firstOrNull { cardAttr(it) == attr } ?: continue
             return LabPickResult(hit, cards.indexOf(hit), "门票：$attr 属性优先", 0, 0)
         }

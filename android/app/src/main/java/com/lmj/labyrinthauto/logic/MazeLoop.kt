@@ -357,6 +357,10 @@ object MazeLoop {
             { labId -> RerollSettings.loadGuildPicks(ctx)[labId] ?: emptyList() },
             Rules(GameData.tables(ctx)),
             GameData.relicTables(ctx),
+            // ★策略页「角色选择」的两项设置（2026-11-13）：属性印记顺序 + 不使用 NPC。
+            //   每局构造时读一次 ⇒ 改设置后下一局生效（与 RerollSettings 其它项同口径）。
+            attrOrder = RerollSettings.loadAttrOrder(ctx),
+            excludeNpc = RerollSettings.loadExcludeNpc(ctx),
         )
         charaPickRef = charaPick            // ★悬浮窗"编队：五个名字"要查名册（见 handlePartyEdit）
         // ★结算奖励的名字表（中文）：道具 / EX装备 id → 中文名
@@ -457,6 +461,7 @@ object MazeLoop {
         // ★叠加用户在策略页「事件」里改过的选择（相对表内默认值的覆盖）
         EventPick.applyPicks(EventSettings.loadPicks(ctx))
         // 每个新局重置编队缓存（角色池/加速技能值可能不同）
+        PartyPlan.appCtx = ctx          // ★「不使用 NPC」设置要读 App 存储（2026-11-13）
         partyCtxCache = null
         partyPlanSig = null
         partyDoneAt = 0L
@@ -3800,7 +3805,8 @@ object MazeLoop {
      * 读取走 agent 的 `labSelection`（堆扫描 DialogLabyrinthSelection 实例，返回每张卡的 unitId + 决定按钮坐标）。
      * **架构**：handler 不做选择——决策全在 P4（`CharaPick`），本函数只负责取 PLAN 并点「决定」：
      *   · 战后选人 → `pickLabReward(cards, ctx)`（PC `lab_select_rank`：底座 + L5~L1 特殊优先，完整）；
-     *   · 门票     → `pickTicket(cards)`（PC `handle_ticket_choice`：按属性次序 暗>火>光>风>水 取首个匹配）。
+     *   · 门票     → `pickTicket(cards)`（PC `handle_ticket_choice`：按策略页「属性印记顺序」取首个匹配，
+     *                默认仍是 暗>火>光>风>水，2026-11-13 起可在设置里调）。
      * 决策所需的 own 数据（本局持有角色/遗物 + 层数）由 `CharaPick.buildCtx` 从 agent 的
      * labUnits/labOwnRelics/labStatus.area 折算；handler 按卡片签名缓存，避免每轮重打慢 RPC。
      */
@@ -3982,8 +3988,8 @@ object MazeLoop {
         }
         // ★P4 判不出 / 选中的那张没坐标 ⇒ **不猜**（2026-10-16 用户："盲选太不靠谱，宁可重启游戏"）：
         //   走 [selNoDecide]（等 → 有界自愈重启 → 停手），**不再"退化为点第 1 张"**。
-        //   （印记页本身的规则在 P4 `CharaPick.pickTicket`：按卡面文字属性顺序 暗>火>光>风>水 选，
-        //     全不匹配才取第 1 张 —— 那是 PC 同款的**规则缺省**，不是这里的瞎猜。）
+        //   （印记页本身的规则在 P4 `CharaPick.pickTicket`：按策略页设置的属性顺序（默认 暗>火>光>风>水）
+        //     取第一张匹配的卡，全不匹配返回 null —— 那是 PC 同款的**规则缺省**，不是这里的瞎猜。）
         var chosen = res?.card
         val why = res?.why.orEmpty()
         val level = res?.level ?: 0

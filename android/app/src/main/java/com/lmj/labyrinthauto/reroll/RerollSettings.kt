@@ -493,4 +493,42 @@ object RerollSettings {
         context.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()
             .putString("guildPicks", jo.toString()).apply()
     }
+
+    // ────────────────────────── 角色选择（2026-11-13 用户：策略页新增折叠卡）──────────────────────────
+
+    /** 五属性的全部取值（也是属性印记顺序的默认值：暗>火>光>风>水，与旧写死顺序一致）。 */
+    val ATTR_ALL: List<String> = listOf("暗", "火", "光", "风", "水")
+
+    /**
+     * ★属性印记选择顺序：门票（印记）节点三选一按这个顺序取第一张属性匹配的卡。
+     * 存逗号串；读取时只保留合法属性并补齐缺失项 —— 旧数据/坏数据不能让某个属性凭空消失。
+     */
+    fun loadAttrOrder(context: Context): List<String> {
+        val raw = context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getString("attrOrder", null)
+            ?: return ATTR_ALL
+        val out = LinkedHashSet<String>()
+        for (x in raw.split(',')) {
+            val a = x.trim()
+            if (a in ATTR_ALL) out.add(a)
+        }
+        out.addAll(ATTR_ALL)
+        return out.toList()
+    }
+
+    fun saveAttrOrder(context: Context, order: List<String>) {
+        val clean = LinkedHashSet<String>()
+        for (a in order) if (a in ATTR_ALL) clean.add(a)
+        clean.addAll(ATTR_ALL)
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()
+            .putString("attrOrder", clean.joinToString(",")).apply()
+    }
+
+    /** ★角色选择页面与组队时不使用 NPC 角色（2026-11-13 用户），默认 false。 */
+    fun loadExcludeNpc(context: Context): Boolean =
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getBoolean("excludeNpc", false)
+
+    fun saveExcludeNpc(context: Context, on: Boolean) {
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()
+            .putBoolean("excludeNpc", on).apply()
+    }
 }

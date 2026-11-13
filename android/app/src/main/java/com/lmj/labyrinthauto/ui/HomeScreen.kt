@@ -21,6 +21,7 @@ import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -76,6 +77,7 @@ import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -86,6 +88,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
 import android.widget.Toast
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
@@ -1073,6 +1079,12 @@ private fun StrategyTab() {
                 }
             }
         }
+        // ★「角色选择」（2026-11-13 用户）：属性印记顺序 + 不使用 NPC；默认折叠，放在「遗物选择」上面
+        item {
+            StrategyCard("角色选择") {
+                PickSettingsCard(context)
+            }
+        }
         item { StrategyCard("遗物选择", implemented = false) }
         // ★「商店购买」卡（2026-11-03 用户）：买什么、买几件、刷不刷全部由内置换算法算，
         //   **没有任何可调项** —— 所以这里既不摆开关也不摆下拉框，展开只有一段说明 + 算法文档链接。
@@ -1551,6 +1563,120 @@ private fun GuildPickCard(
             }
         }
         HorizontalDivider()
+    }
+}
+
+/**
+ * ★策略页「角色选择」（2026-11-13 用户）：
+ *  ① 属性印记（门票）三选一的优先顺序 —— 一行 chip，**按住左右拖动**即可排序，前 3 个高亮表示"可能选到"；
+ *  ② 「不使用 NPC 角色」开关 —— 战后角色三选一优先不选 NPC 卡、组队优先不编 NPC。
+ * 改动即时落盘（与「开局角色选择」一致，没有"确定"按钮）。
+ */
+@Composable
+private fun PickSettingsCard(context: Context) {
+    var order by remember { mutableStateOf(RerollSettings.loadAttrOrder(context)) }
+    var excludeNpc by remember { mutableStateOf(RerollSettings.loadExcludeNpc(context)) }
+    // 拖动排序状态：被拖的 attr / 手指水平位移 / 目标位置
+    var dragAttr by remember { mutableStateOf<String?>(null) }
+    var dragDx by remember { mutableFloatStateOf(0f) }
+    var targetIdx by remember { mutableIntStateOf(-1) }
+    val chipWidths = remember { HashMap<String, Int>() }
+    val gapPx = with(LocalDensity.current) { 6.dp.toPx() }
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            "属性印记选择顺序",
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.SemiBold,
+        )
+        Text(
+            "门票（印记）三选一按这个顺序取第一张；前 3 个会优先拿到。按住 chip 左右拖动即可调整。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        // ★拖动排序（2026-11-14 用户："点一下提到最前"反直觉）：
+        //   拖的时候**不重排列表**（否则重组会打断手势），只让被拖的 chip 跟手、其余按目标位置平移让位；
+        //   松手才真正落到新位置并落盘。
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            val drag = dragAttr
+            val from = if (drag == null) -1 else order.indexOf(drag)
+            order.forEachIndexed { i, attr ->
+                val isDrag = drag == attr
+                val step = (chipWidths[attr] ?: 56).toFloat() + gapPx
+                val shift = when {
+                    drag == null || isDrag || targetIdx < 0 -> 0f
+                    from < targetIdx && i in (from + 1)..targetIdx -> -step
+                    from > targetIdx && i in targetIdx until from -> step
+                    else -> 0f
+                }
+                FilterChip(
+                    selected = i < 3,          // 前三高亮 = 更可能被选到
+                    onClick = {},              // 只拖动排序；点击不重排，避免误触
+                    label = { Text("${i + 1} $attr", style = MaterialTheme.typography.labelSmall) },
+                    modifier = Modifier
+                        .onSizeChanged { chipWidths[attr] = it.width }
+                        .graphicsLayer {
+                            translationX = if (isDrag) dragDx else shift
+                            alpha = if (isDrag) 0.85f else 1f
+                            scaleX = if (isDrag) 1.06f else 1f
+                            scaleY = if (isDrag) 1.06f else 1f
+                        }
+                        .pointerInput(attr) {
+                            detectDragGestures(
+                                onDragStart = {
+                                    dragAttr = attr
+                                    dragDx = 0f
+                                    targetIdx = order.indexOf(attr)
+                                },
+                                onDragEnd = {
+                                    val to = targetIdx
+                                    val f = order.indexOf(attr)
+                                    if (to in order.indices && to != f) {
+                                        val next = order.toMutableList().apply { add(to, removeAt(f)) }
+                                        order = next
+                                        RerollSettings.saveAttrOrder(context, next)
+                                    }
+                                    dragAttr = null
+                                    dragDx = 0f
+                                    targetIdx = -1
+                                },
+                                onDragCancel = {
+                                    dragAttr = null
+                                    dragDx = 0f
+                                    targetIdx = -1
+                                },
+                                onDrag = { change, amount ->
+                                    change.consume()
+                                    dragDx += amount.x
+                                    val f = order.indexOf(attr)
+                                    val stepPx = (chipWidths[attr] ?: 56).toFloat() + gapPx
+                                    targetIdx = (f + (dragDx / stepPx).roundToInt())
+                                        .coerceIn(0, (order.size - 1).coerceAtLeast(0))
+                                },
+                            )
+                        },
+                )
+            }
+        }
+        HorizontalDivider()
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text("不使用 NPC 角色", style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    "开启后，战后角色三选一优先不选 NPC 卡（三张都是 NPC 时照常选）；" +
+                        "组队优先只用非 NPC，凑不满一队时再用 NPC 补齐。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = excludeNpc,
+                onCheckedChange = {
+                    excludeNpc = it
+                    RerollSettings.saveExcludeNpc(context, it)
+                },
+            )
+        }
     }
 }
 

@@ -11,6 +11,7 @@ import com.lmj.labyrinthauto.logic.team.C
 import com.lmj.labyrinthauto.logic.team.Profiles
 import com.lmj.labyrinthauto.logic.team.Res
 import com.lmj.labyrinthauto.logic.team.TeamBuild
+import com.lmj.labyrinthauto.reroll.RerollSettings
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -22,6 +23,10 @@ import org.json.JSONObject
  *   3 层 / 其它层按初始策略只编第 1 队，只有本节点失败过才补后备队。
  */
 object PartyPlan {
+
+    /** ★局内上下文：读「不使用 NPC」设置用（2026-11-13）。由 MazeLoop 每局进入时设置。 */
+    @Volatile
+    var appCtx: Context? = null
 
     const val LAB_PARTY_SIZE = 5
     const val LAB_PARTY_TEAM_AUTO = true
@@ -314,6 +319,8 @@ object PartyPlan {
         val poolNote: String = "",
         /** ★2026-11-12：遗物 TP 上升倍率（Σ skill_up ÷100） */
         val tpUp: Double = 0.0,
+        /** ★「不使用 NPC」开启时：本局持有池里的 NPC 角色（unitType==2），组队时排除（2026-11-13）。 */
+        val npcIds: Set<Int> = emptySet(),
     )
 
     /** PC `party_ctx_cached`(2443)：本页只问一次 RPC（加速遗物技能值 + 本局持有角色池） */
@@ -330,10 +337,16 @@ object PartyPlan {
         //   租借/NPC），还是我们**漏读**（cap 明明够大却没命中——槽位步长/偏移不对）。
         var nUser = 0; var nNpc = 0; var nOther = 0
         val us = pu?.optJSONArray("units") ?: JSONArray()
+        val excludeNpc = appCtx?.let { RerollSettings.loadExcludeNpc(it) } ?: false
+        val npcIds = HashSet<Int>()
         for (i in 0 until us.length()) {
-            when ((us.optJSONObject(i)?.opt("unitType") as? Number)?.toInt()) {
+            val o = us.optJSONObject(i) ?: continue
+            when ((o.opt("unitType") as? Number)?.toInt()) {
                 1 -> nUser++
-                2 -> nNpc++
+                2 -> {
+                    nNpc++
+                    if (excludeNpc) (o.opt("unitId") as? Number)?.toInt()?.let { npcIds.add(it) }
+                }
                 else -> nOther++
             }
         }
@@ -346,7 +359,7 @@ object PartyPlan {
             " ｜ 集合 count=${pu?.opt("setCount")} cap=${pu?.opt("setCap")} 扫描=${pu?.opt("setScan")}" +
             " 空槽=${pu?.opt("setEmpty")} 命中=${pu?.opt("setHit")}" +
             (errTxt?.let { " ｜ err=$it" } ?: "")
-        return PartyCtx(sk, det, unitIds, relics, pu?.optString("err"), poolNote, tpUp = relicTpUp(own))
+        return PartyCtx(sk, det, unitIds, relics, pu?.optString("err"), poolNote, tpUp = relicTpUp(own), npcIds = npcIds)
     }
 
     /** PC `_stage_for`(2413)：当前格子 → team_build 的关卡 key */
@@ -521,6 +534,12 @@ object PartyPlan {
             }
         }
         if (usedOther.isNotEmpty()) pool = pool.filter { it !in usedOther }
+        // ★「不使用 NPC」（2026-11-13 用户）：优先只用非 NPC 角色；**不够编满一队时再用 NPC 补齐**，
+        //   池子不够就全用上（例：本局只有 3 个角色时，最终就是这 3 个，不管里面有没有 NPC）。
+        if (ctx.npcIds.isNotEmpty()) {
+            val nonNpc = pool.filter { it !in ctx.npcIds }
+            pool = if (nonNpc.size >= LAB_PARTY_SIZE) nonNpc else nonNpc + pool.filter { it in ctx.npcIds }
+        }
         if (pool.isEmpty()) {
             return Plan(false, false, emptyList(), cur, emptyList(), emptyList(), emptyList(), emptyList(), emptyList(),
                 listOf("读不到角色池 → 不点任何东西"), emptyList())
