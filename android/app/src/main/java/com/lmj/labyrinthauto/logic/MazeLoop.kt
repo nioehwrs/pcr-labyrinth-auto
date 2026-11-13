@@ -81,6 +81,13 @@ object MazeLoop {
      *  这里改为"遇到 BOSS 节点时记下来"，让遗物特殊条件（毒液沙罗曼蛇）能对上（见 [handleRelicChoice]） */
     private val bossByArea = mutableMapOf<Int, Int>()
 
+    /** ★2026-11-13：最近一次「事件节点」的时刻/事件 id（判断三选一遗物、事件战斗是否来自事件） */
+    private var lastEventAt = 0L
+    private var lastEventId = 0
+
+    /** ★2026-11-13：本场战斗是否已经记过「事件战斗」采样（进战斗时置位，离开战斗时清） */
+    private var eventBattleSampled = false
+
     /** 同一组候选卡已点次数（按 tag；组变了重置）—— PC `REL_TAP_MAX`(471) 防重复砸同一坐标把游戏点卡 */
     private val relicChoiceTries = mutableMapOf<String, Pair<String, Int>>()
 
@@ -256,8 +263,12 @@ object MazeLoop {
     /** 关闭确认后，等"离开商店页"的上限 */
     private const val SHOP_ANIM_CLOSE_BOX_MS = 2_000L
 
-    /** 动画链探针间隔（`labDlgBox` ~5~8ms，60ms 足够快又不刷 RPC） */
-    private const val SHOP_ANIM_POLL_MS = 60L
+    /**
+     * 动画链探针间隔（`labDlgBox` ~5~8ms）。
+     * ★2026-11-13（用户）：60 → **70ms** —— 商店这些链只在等框出现/消失，70ms 一拍足够跟手，
+     *   还能少刷一点 RPC（这个常量只被商店链用，其它模块不受影响）。
+     */
+    private const val SHOP_ANIM_POLL_MS = 70L
 
 
     /** 金币重读间隔（配合 [SHOP_COIN_WAIT_MS]） */
@@ -273,25 +284,6 @@ object MazeLoop {
      *
      * @return true = 这一局**完整跑完**（连跑迷宫据此决定要不要开下一局）
      */
-    /**
-     * 采样 [AgentApi.labTop] 的真实往返耗时（20 次），打一行日志。
-     * 用途：状态机轮询间隔的取值依据——中位 30ms 就能上 60ms 轮询，中位 150ms 就只能 200ms。
-     */
-    private suspend fun probeLabTop() {
-        val ms = ArrayList<Long>(20)
-        repeat(20) {
-            val t0 = android.os.SystemClock.elapsedRealtime()
-            runCatching { AgentApi.labTop() }
-            ms.add(android.os.SystemClock.elapsedRealtime() - t0)
-            kotlinx.coroutines.delay(20)
-        }
-        ms.sort()
-        AppState.addLog(
-            "labTop 耗时：中位 ${ms[ms.size / 2]}ms ｜ P90 ${ms[(ms.size * 9) / 10]}ms ｜ " +
-                "最大 ${ms.last()}ms（20 次采样，用于状态机轮询间隔）",
-        )
-    }
-
     suspend fun run(input: InputBackend, ctx: Context): Boolean {
         appCtx = ctx.applicationContext          // ★给 [LabBtnStore]（按钮路径跨局回喂）用
         // ★「结算后点中心」是**本局**语义：每局开始先关（2026-10-22 用户：第二局开局选角色被误点）
@@ -301,12 +293,6 @@ object MazeLoop {
         LogFile.beginRun("maze")
         PlanProbe.startRun(ctx.applicationContext)      // ★观测：一局一个 maze_seq_*.jsonl
         BossChain.reset()                              // ★Boss 链影子：每局从头算
-        // ★状态机基础设施标定（2026-11-06）：采样一次 labTop 的真实往返耗时，
-        //   用来决定「等窗口变化」时该用 60ms 还是 100ms 轮询。只看第一局，避免刷屏。
-        if (!labTopProbed) {
-            labTopProbed = true
-            probeLabTop()
-        }
         // ★局号写进**本局文件**（见 [roundLabel] 的注释）：日志页靠这行认「第几局」
         roundLabel?.let { AppState.addLog("── 本局：第 $it 局 ──") }
         runFinished = false
@@ -432,6 +418,7 @@ object MazeLoop {
         shopDragCount = 0; shopDragTarget = null
         shopCoinBadKey = null; shopCoinBadAt = 0L
         shopRelicCtx = null
+        SampleLog.reset()                        // ★本局随机信息采样：去重表清零（同一节点每局都可再记）
         // 刷开局产物（reroll）注入：开局前就已知 3/5 区 Boss 与每区最优路线，
         // 消除"开局读不到 3 区 Boss / 完整地图"的差异（PLAN §0.6 原定不碰，本次已实现）。
         val reroll = RerollState.result
@@ -814,6 +801,21 @@ object MazeLoop {
             //      ⇒ 战斗之上若已压着"我们认识的选取页/失败页"，就不走进战斗分支（PC 6113）。
             val inBattleBranch = st.optBoolean("inBattle", false) &&
                 BATTLE_INTERRUPT_PAGES.none { it in top }
+            // ★2026-11-13（用户）：**事件触发的战斗**（魔物竞技场 1105x 这类）直接从事件页进 BATTLE、
+            //   不走预览页 ⇒ 在这里补一条采样（"敌人编号" = 事件 id，事件决定打哪队敌人）。
+            //   只在「15s 内刚有事件」时记，避免普通战斗重复记账。
+            if (inBattleBranch) {
+                if (!eventBattleSampled) {
+                    eventBattleSampled = true
+                    runCatching {
+                        if (SystemClock.elapsedRealtime() - lastEventAt < 15_000L && lastEventId > 0) {
+                            SampleLog.eventBattle(appCtx, jStr(st, "blockId"), lastEventId)
+                        }
+                    }
+                }
+            } else {
+                eventBattleSampled = false
+            }
             if (inBattleBranch) {
                 // ★★「等待接手」的解除点（2026-11-09 用户）："检测到战斗中才继续自动操作"。
                 //   用户自己组队开战后把「手动节点」标记清掉 ⇒ 后续流程恢复自动。
@@ -2192,6 +2194,13 @@ object MazeLoop {
         val ev = runCatching { AgentApi.labEvent() }.getOrNull()
         val eidEv = ev?.optInt("eventId")?.takeIf { it > 0 }
         val eid = eidEv ?: (extraIds()?.opt("eventId") as? Number)?.toInt()
+        // ★2026-11-13（用户）：事件节点采样 —— {节点编号, 事件编号}；本 handler 没有 st，节点号从 tag 里取
+        runCatching {
+            val bid = Regex("节点(\\d+)").find(tag)?.groupValues?.getOrNull(1).orEmpty()
+            SampleLog.event(appCtx, bid, eid ?: 0)
+        }
+        lastEventAt = SystemClock.elapsedRealtime()
+        lastEventId = eid ?: 0
         // ★事件切换（2026-11-03）：先把**上一个事件**的效果差结算掉（它就是本事件的"before"），再给本事件拍快照
         if (n == 1) {
             if (evSnapId != null && evSnapId != eid) settleEventDiff(eid, "事件切换")
@@ -2752,9 +2761,6 @@ object MazeLoop {
      * 连续 [SHOP_REFRESH_FAIL_MAX] 次都点不到才 `stopRequested`（停手留人工，**不关店**）。
      */
     private var shopRefreshFailN = 0
-
-    /** ★诊断（临时 2026-11-13）：商店弹窗链里已打了几拍 tween 字段（每条链上限 6） */
-    private var boxDiagN = 0
 
 
 
@@ -3481,7 +3487,6 @@ object MazeLoop {
         val base = dlgBoxNow() ?: return false
         val basePtr = base.optString("ptr")
         var taps = 0
-        boxDiagN = 0                                  // ★诊断：本次链最多打 6 拍 tween 字段
         // ★2026-11-12（用户）：**不再自己实现"首拍只读不点"** —— 统一交给 [TapCheck.run] 的
         //   `skipFirstHits`（与特别装备「全部」行同一套能力）；本函数只提供"点哪个按钮 + 什么算框没了"。
         //   判据：这个框 **开始消失**（`closing`）或换成别的框（ptr 变），都算这一下生效。
@@ -3516,20 +3521,6 @@ object MazeLoop {
                 //   `outStarted/outFactor` 实测**恒为 0/1**（tween 不跑或偏移不对）⇒ 改用
                 //   `proc`（`DialogBase.isProcess` +0xB4）：点生效后 0→1，比 tween 可靠。
                 if (b.optBoolean("closing")) return@xyAt null
-                // 诊断（临时）：只剩前 6 拍，把 proc 也打出来，确认它确实会变 1。
-                // ★另外同时调一次 `labDlgClosing`（不带 preferOverlay）做**同拍对比**：
-                //   若 box.closing=false 而 close.closing=true ⇒ 两者取到了不同对象/不同层。
-                if (boxDiagN < 6) {
-                    boxDiagN++
-                    val cl = runCatching { AgentApi.labDlgClosing() }.getOrNull()
-                    AppState.addLog(
-                        "框字段：box[${b.optString("top")}] closing=${b.opt("closing")}" +
-                            " out=${b.opt("outStarted")}/${b.opt("outFactor")} proc=${b.opt("proc")}" +
-                            " ptr=${b.optString("ptr").takeLast(5)}" +
-                            " ｜ close[${cl?.optString("top")}] closing=${cl?.opt("closing")}" +
-                            " st=${cl?.opt("started")}/${cl?.opt("factor")} proc=${cl?.opt("proc")}",
-                    )
-                }
                 val hit = pickBoxBtn(b, keys) ?: return@xyAt null
                 taps++
                 AppState.addLog("商店：$what → 点「${hit.first}」#$taps (${hit.second},${hit.third})")
@@ -4709,6 +4700,13 @@ object MazeLoop {
             AppState.addLog("[✗] 遗物候选重启 $RELIC_BAD_HEAL_MAX 次后读数仍是垃圾（$idsBrief）→ 停手（留人工）")
             stopRequested = true
             return false
+        }
+        // ★2026-11-13（用户）：三选一遗物采样 ——{节点编号, 三个候选星级}；事件触发的单独标记
+        runCatching {
+            // 事件触发的三选一：①紧跟在事件选择后（8s 内）；②或者**本场战斗就是事件战斗**
+            //   （魔物竞技场选 HARD 后打完的遗物奖励——战斗耗时可能远超 8s，只靠时间窗会漏判）
+            val fromEvent = eventBattleSampled || SystemClock.elapsedRealtime() - lastEventAt < 8_000L
+            SampleLog.relic(appCtx, jStr(st, "blockId"), cards.map { relicPick.rarityOf(it) }, fromEvent)
         }
         val area = (st.opt("area") as? Number)?.toInt()
         val own = AgentApi.labOwnRelics()
@@ -6614,6 +6612,14 @@ object MazeLoop {
                     PartyPlan.precompute(preCtx, st, (nodeFailed[nodeKey(st)] ?: 0) > 0)
                 }
             }
+            // ★2026-11-13（用户）：战斗节点采样（普通战 / EX 战，**不含 Boss**）——{节点编号, 关卡(敌人组)编号}
+            //   Boss 也走这个预览页（`panelTypeName=BOSS`）⇒ 必须显式排除。
+            runCatching {
+                val ptn = jStr(st, "panelTypeName")
+                if (!ptn.equals("BOSS", true)) {
+                    SampleLog.battle(appCtx, jStr(st, "blockId"), jStr(st, "questId"), ptn.equals("HARD", true))
+                }
+            }
             tapAndCheck(
                 input, pFinal.first, pFinal.second, "预览·开打（进编组，questId=${jStr(st, "questId")}）",
                 from = setOf("DialogQuestDetail"),
@@ -8049,7 +8055,7 @@ object MazeLoop {
     private var transPend: Triple<String, String, Long>? = null
     private var transCount = 0
     /** labTop 耗时采样只做一次（跨局保持） */
-    private var labTopProbed = false
+
 
     /** `tapAndAwait` 命中时是否打日志（先开着，方便逐条核对转移；稳定后可关） */
     private val TRANS_VERBOSE = true

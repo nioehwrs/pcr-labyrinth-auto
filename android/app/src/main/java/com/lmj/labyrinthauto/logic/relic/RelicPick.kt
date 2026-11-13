@@ -265,6 +265,9 @@ class RelicPick(private val tables: RelicTables) {
      *   [pickCard] 的兜底"等价于取第一张"= **盲选**，用户当场看出"退避第一件了"）。 */
     fun isKnown(c: JSONObject): Boolean = tables.rk(c.opt("rewardId")) != null
 
+    /** ★2026-11-13：候选卡的星级（采样统计用；表里没有 ⇒ 0） */
+    fun rarityOf(c: JSONObject): Int = tables.rk(c.opt("rewardId"))?.optInt("rarity") ?: 0
+
     /**
      * ★给人看的一行（2026-10-17 用户：悬浮窗要"购买 2★ xxx（遗物名字）"）：`2★ 毒液沙罗曼蛇`。
      * 查不到名字（表里没这个 rewardId，比如印记/道具）⇒ 空串，调用方自己退化成别的描述。

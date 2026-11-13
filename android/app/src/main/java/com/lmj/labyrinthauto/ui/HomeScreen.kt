@@ -9,6 +9,7 @@ import com.lmj.labyrinthauto.logic.EventPick
 import com.lmj.labyrinthauto.logic.EventRetreatRule
 import com.lmj.labyrinthauto.logic.EventRuleData
 import com.lmj.labyrinthauto.logic.EventSettings
+import com.lmj.labyrinthauto.logic.SampleLog
 import com.lmj.labyrinthauto.logic.shop.ShopSampleLog
 import com.lmj.labyrinthauto.data.GameData
 import com.lmj.labyrinthauto.data.GuildPool
@@ -126,6 +127,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+/** ★2026-11-13（用户）：全部用户反馈的列表（放在「日志与诊断包」标题旁，不在每条日志里） */
+private const val FEEDBACK_LIST_URL = "https://gitee.com/nioehwrs/labyrinth-auto-release/issues?q=is%3Aall"
 
 /**
  * 助手的唯一界面（2026-10-17 重排 → 当天按用户意见分三页）。
@@ -2223,7 +2227,22 @@ private fun LogExportDialog(onDismiss: () -> Unit) {
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
-        title = { Text("日志与诊断包") },
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("日志与诊断包")
+                Spacer(Modifier.width(8.dp))
+                // ★2026-11-13（用户）：**全部用户反馈**的列表入口放在这一级（不是每条日志里），
+                //   用户能自己看处理进度；App 侧不收集任何额外用户信息。
+                TextButton(onClick = {
+                    runCatching {
+                        ctx.startActivity(
+                            Intent(Intent.ACTION_VIEW, Uri.parse(FEEDBACK_LIST_URL))
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                        )
+                    }
+                }) { Text("查看反馈", style = MaterialTheme.typography.labelSmall) }
+            }
+        },
         text = {
             Column {
                 Text(
@@ -2309,8 +2328,7 @@ private fun LogExportDialog(onDismiss: () -> Unit) {
                     }
                     item {
                         HorizontalDivider(Modifier.padding(vertical = 6.dp))
-                        TeamRunEntry(remember { TeamRunLog.stats() })
-                        ShopSampleEntry()
+                        SampleStatsSection()
                     }
                 }
             }
@@ -2539,6 +2557,125 @@ private fun LogBadge(text: String, tone: LogFile.Tone) {
             .background(c.copy(alpha = 0.14f))
             .padding(horizontal = 6.dp, vertical = 2.dp),
     )
+}
+
+/**
+ * ★「信息统计」（2026-11-13 用户）：把原来散在日志页的「组队记录」「商店统计」和新加的
+ *   「战斗 / 三选一遗物 / 事件」样本收成一个入口，点开展开子项。
+ */
+@Composable
+private fun SampleStatsSection() {
+    var open by remember { mutableStateOf(false) }
+    Column(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .clickable { open = !open }
+                .padding(vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("信息统计", style = MaterialTheme.typography.bodyLarge)
+                Text(
+                    "组队 · 商店 · 战斗 · 遗物 · 事件",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Spacer(Modifier.width(8.dp))
+            LogBadge(if (open) "已展开" else "点开", LogFile.Tone.IDLE)
+            Spacer(Modifier.width(6.dp))
+            Text(
+                if (open) "▾" else "▸",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+            )
+        }
+        if (open) {
+            Column(Modifier.padding(start = 8.dp)) {
+                TeamRunEntry(remember { TeamRunLog.stats() })
+                ShopSampleEntry()
+                RandomSampleEntry()
+            }
+        }
+        HorizontalDivider()
+    }
+}
+
+/**
+ * 「战斗 / 遗物 / 事件」样本（2026-11-13 用户）：`logs/event_samples.jsonl` 的条数统计。
+ *
+ * 每局记：战斗节点 `{节点, 关卡(敌人组)}`、三选一遗物 `{节点, 候选星级}`、事件 `{节点, 事件编号}`；
+ * 同一节点每局只记一次，见 [SampleLog]。
+ */
+@Composable
+private fun RandomSampleEntry() {
+    val ctx = LocalContext.current
+    val stats = remember { SampleLog.stats(ctx) }
+    Column(Modifier.fillMaxWidth()) {
+        for (k in SampleLog.Kind.values()) {
+            val one = stats[k] ?: SampleLog.One()
+            val sub = when (k) {
+                SampleLog.Kind.BATTLE -> "战斗 ${one.count}"
+                SampleLog.Kind.RELIC ->
+                    if (one.count2 > 0) "遗物 ${one.count} ｜ 事件触发 ${one.count2}" else "遗物 ${one.count}"
+                SampleLog.Kind.EVENT -> "事件 ${one.count}"
+            }
+            SampleFileRow(
+                title = k.cn + "样本",
+                sub = if (one.total > 0) "$sub ｜ ${(one.bytes + 1023) / 1024} KB" else "还没有样本",
+                file = SampleLog.fileOf(ctx, k),
+                enabled = one.total > 0,
+            )
+        }
+        HorizontalDivider()
+    }
+}
+
+/** 单个样本文件的一行（点击展开 → 分享/打开/复制到下载） */
+@Composable
+private fun SampleFileRow(title: String, sub: String, file: java.io.File, enabled: Boolean) {
+    val ctx = LocalContext.current
+    var open by remember { mutableStateOf(false) }
+    Column(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .clickable(enabled = enabled, onClick = { open = !open })
+                .padding(vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(title, style = MaterialTheme.typography.bodyLarge)
+                Text(
+                    sub,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Spacer(Modifier.width(8.dp))
+            LogBadge(if (enabled) "可导出" else "空", LogFile.Tone.IDLE)
+        }
+        if (open && enabled) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                TextButton(onClick = {
+                    runCatching { LogFile.share(ctx, file) }
+                        .onFailure { Toast.makeText(ctx, "分享失败：${it.message ?: "原因未知"}", Toast.LENGTH_LONG).show() }
+                }) { Text("分享", style = MaterialTheme.typography.labelSmall) }
+                TextButton(onClick = {
+                    if (!LogFile.openWithViewer(ctx, file)) {
+                        Toast.makeText(ctx, "没有能打开它的应用", Toast.LENGTH_SHORT).show()
+                    }
+                }) { Text("打开", style = MaterialTheme.typography.labelSmall) }
+                TextButton(onClick = {
+                    runCatching { LogFile.copyToDownloads(ctx, file) }
+                        .onSuccess { Toast.makeText(ctx, "已复制到下载目录", Toast.LENGTH_SHORT).show() }
+                        .onFailure { Toast.makeText(ctx, "复制失败：${it.message ?: "原因未知"}", Toast.LENGTH_LONG).show() }
+                }) { Text("复制到下载", style = MaterialTheme.typography.labelSmall) }
+            }
+        }
+        HorizontalDivider()
+    }
 }
 
 /**

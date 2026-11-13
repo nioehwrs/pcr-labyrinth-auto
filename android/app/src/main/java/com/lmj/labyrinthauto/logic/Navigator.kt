@@ -56,8 +56,6 @@ object Navigator {
      */
     private val TAP_CENTER_VIEWS = setOf(1, 2, 104)
 
-    /** ★2026-11-12：每个按钮只抓一次父链（`findListPath` 是整树 ~1.8s，不能每次导航都抓） */
-    private val whereSaid = HashSet<String>()
 
     /** viewId → 要点的按钮节点名（PC 版 `STEP_BUTTON`；259 故意不在这里）。
      *  ★活动页（246/249 之类）**不做特判**（2026-10-19 用户：那就是普通活动页，不用仔细分辨）——
@@ -584,16 +582,6 @@ object Navigator {
                 where.append(r).append('=').append(c).append(' ')
             }
             AppState.addLog("导航：按钮「$nameRe」只在整树里找到（各根：$where）")
-            // ★再抓一次父链（每个按钮只抓一次）：能直接看出它挂在哪个 UI 层，便于补根。
-            if (whereSaid.add(nameRe)) {
-                runCatching { AgentApi.findListPath(nameRe) }.getOrNull()?.let { a ->
-                    for (i in 0 until minOf(a.length(), 3)) {
-                        val o = a.optJSONObject(i) ?: continue
-                        val p = o.optJSONArray("path")?.toString() ?: "?"
-                        AppState.addLog("导航：「$nameRe」#${i + 1} 父链 $p（depth=${o.optInt("depth")}）")
-                    }
-                }
-            }
             return it
         }
         return null
