@@ -79,6 +79,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -1606,6 +1607,7 @@ private fun MethodRow(
 private fun TeamSettingsCard(context: Context) {
     var byModel by remember { mutableStateOf(RerollSettings.loadTeamByModel(context)) }
     var bossCount by remember { mutableIntStateOf(RerollSettings.loadBossPartyCount(context)) }
+    val modelState by AppState.model.collectAsState()
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         MethodRow(
@@ -1642,6 +1644,13 @@ private fun TeamSettingsCard(context: Context) {
                 label = { Text("3 队", style = MaterialTheme.typography.labelSmall) },
             )
         }
+        HorizontalDivider()
+        Text("模型组件", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+        Text(
+            modelState ?: "未下载（首次使用时后台自动下载，约 13MB）",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 
@@ -3290,10 +3299,12 @@ private fun MarkdownColumn(text: String) {
  */
 @Composable
 private fun ComponentBar(status: String?, onFetch: () -> Unit) {
-    if (status == null || status.startsWith("运行组件已就绪")) return
-    val downloading = status.startsWith("运行组件下载中")
+    // ★2026-11-14：三个组件统一由 ComponentPrep 串行准备，文案变成「组件准备 1/3…」「组件已就绪」，
+    //   这里两种都要认（老文案"运行组件已就绪"仍可能来自 FridaServerInstaller 的旧路径）。
+    if (status == null || status.startsWith("运行组件已就绪") || status.startsWith("组件已就绪")) return
+    val downloading = status.startsWith("运行组件下载中") || status.startsWith("组件准备")
     val missing = status.startsWith("运行组件不可用")       // 架构没发布件，点也没用
-    val failed = status.startsWith("运行组件下载失败") || missing
+    val failed = status.startsWith("运行组件下载失败") || status.startsWith("组件未就绪") || missing
     val pct = Regex("(\\d+)%").find(status)?.groupValues?.get(1)?.toIntOrNull() ?: 0
     val tint = when {
         failed -> MaterialTheme.colorScheme.error
@@ -3308,10 +3319,12 @@ private fun ComponentBar(status: String?, onFetch: () -> Unit) {
             .padding(horizontal = 16.dp, vertical = 6.dp),
     ) {
         Text(
+            // ★2026-11-14：组件准备不再限制 WiFi（用户："游戏没网就是跑不了"），
+            //   所以不再提示"用流量下载 42MB"；只有失败/未就绪时才给"点此重试"。
             text = when {
                 downloading || missing -> status
                 failed -> "$status · 点此重试"
-                else -> "$status · 用流量下载 42MB"
+                else -> status
             },
             style = MaterialTheme.typography.labelSmall,
             color = tint,

@@ -112,6 +112,18 @@ object AppState {
     }
 
     /**
+     * ★编队模型组件（2026-11-14）：**单独一条**，不占运行组件那个进度条 ——
+     * 两个下载可能并发（启动时运行组件先下、模型后下），共用一个槽会互相覆盖。
+     * 语义：null = 还没开始 / "已就绪" / "下载中 37%（5/13MB）" / "下载失败（暂用规则版）"。
+     */
+    private val _model = MutableStateFlow<String?>(null)
+    val model: StateFlow<String?> = _model.asStateFlow()
+
+    fun setModel(status: String?) {
+        _model.value = status
+    }
+
+    /**
      * ★上次进程是不是**突然没了**（2026-10-26：Android 15 反馈"跑着跑着游戏和工具都没了"）。
      *
      * null = 首次启动 / 上次正常；非 null = 一句人话（"上次运行在 11:02 突然中断（战斗中）"）。

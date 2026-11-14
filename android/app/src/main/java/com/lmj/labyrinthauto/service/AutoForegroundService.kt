@@ -74,6 +74,14 @@ class AutoForegroundService : Service() {
     override fun onCreate() {
         super.onCreate()
         createChannel()
+        // ★模型组件后台预热（2026-11-14）：**不阻塞任何流程**。
+        //   MainActivity 启动时也会调一次；这里补"服务被系统重启 / 没走过 Activity"的场景，
+        //   否则首局编队会静默回落规则版（默认设置是模型版，用户会觉得"没生效"）。
+        //   下载失败/没网都无所谓 —— LabModel 看不到文件就当模型不可用。
+        scope.launch {
+            runCatching { com.lmj.labyrinthauto.core.ComponentPrep.run(applicationContext) }
+                .onFailure { AppState.addLog("组件准备失败：${it.message}") }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

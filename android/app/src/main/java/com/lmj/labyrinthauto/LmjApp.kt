@@ -2,6 +2,7 @@ package com.lmj.labyrinthauto
 
 import android.app.Application
 import com.lmj.labyrinthauto.core.AppState
+import com.lmj.labyrinthauto.core.ComponentPrep
 import com.lmj.labyrinthauto.core.CrashGuard
 import com.lmj.labyrinthauto.core.LogFile
 import com.lmj.labyrinthauto.core.UpdateChecker
@@ -73,14 +74,10 @@ class LmjApp : Application() {
         //    不会误判 —— RootShell.detect() 自己会阻塞等授权结果，拿不到 root 就返回"没有"，
         //    与几秒后才调用结论一致；并发重复探测的问题已在 RootShell.detect 里用 Mutex 合并。
         appScope.launch {
-            runCatching { FridaServerInstaller.prepare(this@LmjApp, wifiOnly = true) }
-                .onFailure { AppState.addLog("运行组件预热失败：${it.message}") }
-            // ②b 注入桥 .so（2026-11-4 从 APK 里摘出来，首次启动下载 ~46MB）
-            //    准备好就立刻加载；没下载完/失败也不影响 App 其他功能，注入前还会兜底再试。
-            runCatching {
-                FridaServerInstaller.prepareBridge(this@LmjApp, wifiOnly = true)
-                    ?.let { FridaCore.ensureLoaded(this@LmjApp) }
-            }.onFailure { AppState.addLog("注入桥预热失败：${it.message}") }
+            // ★2026-11-14（用户："三个组件都变成必须下载，放同一个进度条"）：
+            //   运行组件 + 注入桥 + 模型组件统一由 ComponentPrep 串行准备，同一个进度条推进。
+            runCatching { ComponentPrep.run(this@LmjApp) }
+                .onFailure { AppState.addLog("组件准备失败：${it.message}") }
         }
     }
 }
