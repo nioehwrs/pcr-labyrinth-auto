@@ -329,9 +329,15 @@ object MazeLoop {
                 },
             )
         }
-        // ★一局收尾：把悬浮窗的"层数/状态"清掉（"第几局"由连跑循环管，别在这儿动）
-        OverlayStatus.setState(null)
-        OverlayStatus.setFloor(null)
+        // ★一局收尾：正常结束才清掉"层数/状态"（"第几局"由连跑循环管，别在这儿动）。
+        //   ★2026-11-14（用户）：停手（打不过 / 判不出 / 需要人接手）时**保留**第 3 格并换醒目配色，
+        //   否则界面上什么都看不到，用户不知道已经停了。下次 setFloor/setState 自动恢复普通样式。
+        if (stopRequested) {
+            OverlayStatus.setState("已停手：${stopReason ?: "需要手动处理"}", attention = true)
+        } else {
+            OverlayStatus.setState(null)
+            OverlayStatus.setFloor(null)
+        }
         return runFinished
     }
 
@@ -341,6 +347,7 @@ object MazeLoop {
         //   在同一失败页从 4/3 起步、一失败就再触发撤退（实测 19:51/19:52 连续 4/3、5/3 死循环）
         nodeFailed.clear()
         manualTeamNodes.clear()
+        stopReason = null                    // ★本局停手原因从头记（悬浮窗提示用）
         scoreChaseChecked = false            // ★凹分检测：每局重置（新局重新查一次）
         pendingEventRetreat = null            // ★条件 2：上局命中的断言不能带到本局
         saidLogicMode2 = false
@@ -1097,9 +1104,6 @@ object MazeLoop {
 
     // ────────────────────────── handler：SUMMON_UNIT(1) ──────────────────────────
 
-    /** PC 版 `MAZE_BATTLE_WAIT`(373)：战斗/演出状态的等待轮数上限（≈几~十分钟，防真卡死） */
-    private const val MAZE_BATTLE_WAIT = 1200
-
     /** ★卡死判据（PC 口径）：游戏帧计数（`UnityEngine.Time.frameCount`）连续这么久**不推进** ⇒ 判定卡死。
      *  用户 2026-10-16 指定：跑迷宫期间游戏"暂停"30s 即可认为卡死。 */
     private const val GAME_FRAME_STUCK_MS = 30_000L
@@ -1371,7 +1375,7 @@ object MazeLoop {
      * ★久战兜底（2026-10-23）：战斗打了这么久还"没认出"结算页 ⇒ 退而允许用"顶框非空"当信号。
      *
      * 防的是"某个结算页 `resPageKind` 认不出、顶框类名也对不上"（EX / 新结构 / prefab 改名）时，
-     * 一路干等到 [MAZE_BATTLE_WAIT]（≈120s）超时停手。久战里冒出来的对话框基本就是结算页；
+     * 一直认不出来。久战里冒出来的对话框基本就是结算页；
      * 即便不是，找不到按钮也只是继续等（[BATTLE_RESULT_GRACE_MS] 会报警），不会误点。
      */
     private const val RESULT_TOP_FALLBACK_MS = 90_000L
@@ -1402,9 +1406,6 @@ object MazeLoop {
     // 战斗中状态（PC maze_loop 5995~6001 的那几个 locals）
     @Volatile
     private var inBattlePrev = false
-
-    @Volatile
-    private var waitBattle = 0
 
     /** 上次"找按钮"探测的时刻（贵动作，[BATTLE_READY_GAP_MS] 节流） */
     private var battleProbeAt = 0L
@@ -1931,6 +1932,10 @@ object MazeLoop {
     @Volatile
     private var stopRequested = false           // handler 判定"卡死了"→ 请求收工
 
+    /** ★停手原因（写进悬浮窗第 3 格，让人知道为什么要手动处理；2026-11-14 用户）。 */
+    @Volatile
+    private var stopReason: String? = null
+
     /** ★handler 请求"自愈重启"的原因（主循环会在帧看门狗那一步一起处理）；null = 无请求 */
     @Volatile
     private var selfHealReason: String? = null
@@ -2037,15 +2042,14 @@ object MazeLoop {
         val inBattle = st.optBoolean("inBattle", false) || vb.contains("ViewBattle")
         if (inBattle || top.isEmpty()) {                   // ② 战斗中 / 演出（含"召唤出场"动画）
             val nm = jStr(st, "statusTypeName")
-            val n = bump(tries, "WAIT|$tag")
             if (nm !in waitSaid) {
                 waitSaid.add(nm)
                 AppState.addLog("（$nm：战斗中/演出 → 只等不点）")
             }
-            if (n >= MAZE_BATTLE_WAIT) {
-                AppState.addLog("[✗] $nm 等待 $MAZE_BATTLE_WAIT 轮仍未推进，判定异常")
-                stopRequested = true
-            }
+            // ★2026-11-14（用户）：这里**不再按"同一状态轮数"判停手**。
+            //   90s 是游戏内计时，角色 UB 演出期间是暂停的 ⇒ 实际墙钟可能远超这个值，
+            //   按轮数判会把"正常但很长的战斗/演出"误杀。真卡死交给帧看门狗
+            //   （GAME_FRAME_STUCK_MS / GAME_FRAME_UNREADABLE_MS）。
             return
         }
         // ① 选角色页：**精准读取**（不再整树遍历/不 hook/不差分 —— PC 1847 定案）
@@ -2326,6 +2330,7 @@ object MazeLoop {
                 tries[ks] = (SystemClock.elapsedRealtime() / 1000L).toInt().coerceAtLeast(1)
             } else if (SystemClock.elapsedRealtime() / 1000L - first >= EVENT_NOPICK_GIVEUP_S) {
                 AppState.addLog("[✗] 事件(${eid ?: "?"}) 未配置且已等 ${EVENT_NOPICK_GIVEUP_S}s → 停手（留人工/补配置）")
+                stopReason = "事件未配置（id=${eid ?: "?"}）"
                 stopRequested = true
             }
             return
@@ -4851,7 +4856,7 @@ object MazeLoop {
         if (nk0 in manualTeamNodes) {
             if (manualSaid.add(nk0)) {
                 AppState.addLog("[手动] 节点 ${jStr(st, "blockId")}：等待你组队/开战（本节点自动组队已关闭）")
-                OverlayStatus.setState("手动组队：等待你操作")
+                OverlayStatus.setState("等待接手：请组队并开战", attention = true)
             }
             return PARTY_STEP_DONE
         }
@@ -5027,6 +5032,7 @@ object MazeLoop {
                     }
                     else -> {
                         AppState.addLog("[✗] 编组页连续 $n 轮算不出目标 → 停手")
+                        stopReason = "编组算不出可用队伍"
                         stopRequested = true
                         return PARTY_STEP_DONE
                     }
@@ -6477,7 +6483,7 @@ object MazeLoop {
         if (nk in manualTeamNodes) {
             if (manualSaid.add("$nk#qd")) {
                 AppState.addLog("[手动] 节点 ${jStr(st, "blockId")}：预览页不点「挑战」，等你点开战")
-                OverlayStatus.setState("手动组队：等你开战")
+                OverlayStatus.setState("等待接手：请点开战", attention = true)
             }
             return
         }
@@ -6736,6 +6742,7 @@ object MazeLoop {
                 }
                 else -> {
                     AppState.addLog("[✗] 同一节点连续失败 3 次 → 停手（PC note_battle_failed 同款）")
+                    stopReason = "节点连续失败 3 次"
                     stopRequested = true
                     return
                 }
@@ -7558,6 +7565,7 @@ object MazeLoop {
                     }
                     else -> {
                         AppState.addLog("[✗] 同一节点连续失败 3 次 → 停手（PC note_battle_failed 同款）")
+                        stopReason = "节点连续失败 3 次"
                         stopRequested = true
                         return true
                     }
@@ -7617,11 +7625,8 @@ object MazeLoop {
                     AppState.addLog("战斗中…（已 ${k * 30}s）")
                 }
             }
-            waitBattle++
-            if (waitBattle >= MAZE_BATTLE_WAIT) {
-                AppState.addLog("[✗] 在战斗视图里等待 $waitBattle 轮仍未结束，判定异常")
-                stopRequested = true
-            }
+            // ★2026-11-14（用户）：不再按轮数判"战斗不结束"。上面已有每 30s 一行的
+            //   「战斗中…（已 Xs）」进度日志；真卡死由帧看门狗兜底。
             return true
         }
         return false
@@ -7637,7 +7642,6 @@ object MazeLoop {
         battleWinSaid = false
         battleSaid = 0
         battleRes0 = 0L
-        waitBattle = 0
     }
 
     private fun intListOf(o: JSONObject, key: String): List<Int> {
