@@ -157,6 +157,11 @@ dependencies {
     implementation(libs.okhttp)
     implementation(libs.kotlinx.serialization.json)
 
+    // ★2026-11-14（用户：策略页接「推理模型」方法）：ONNX Runtime Android 包。
+    //   只做推理，不含训练；模型文件走预下载组件（filesDir/labmodel），不进 APK。
+    //   选 1.20.0：与模型导出用的 onnx 1.19 / ORT 1.23 的 opset 兼容，且是稳定线。
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
+
     debugImplementation(libs.androidx.compose.ui.tooling)
 
     testImplementation(libs.junit4)

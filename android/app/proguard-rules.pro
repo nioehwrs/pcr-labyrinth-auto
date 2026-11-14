@@ -22,3 +22,8 @@
 -keepclasseswithmembers class com.lmj.labyrinthauto.** {
     kotlinx.serialization.KSerializer serializer(...);
 }
+
+# ★ONNX Runtime（2026-11-14）：JNI 侧用 FindClass 硬编码 `ai/onnxruntime/OrtException`
+#   等类名，混淆后会 Pending exception ClassNotFoundException → SIGABRT（实测 release 包首次推理必崩）。
+-keep class ai.onnxruntime.** { *; }
+-dontwarn ai.onnxruntime.**

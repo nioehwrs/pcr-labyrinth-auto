@@ -59,6 +59,10 @@ class MainActivity : ComponentActivity() {
         //   → 把当前页 DialogArea 节点树落到 files/tree_<tag>.json（服务不导出，只能从 Activity 进）
         maybeDumpTree(intent)
 
+        // ★模型探针（2026-11-14）：策略页接「推理模型」之前，先确认模拟器能加载 onnx、
+        //   一次前向多久。模型文件缺失时静默跳过，失败只打日志，不影响任何功能。
+        com.lmj.labyrinthauto.labmodel.LabModelProbe.runOnce(applicationContext)
+
         setContent {
             // ★深色为主、日间浅色可切（2026-10-17 用户选的方向）：状态由这里持有，
             //   因为主题必须在 HomeScreen **之外**才能生效 ⇒ 开关和值都在 Activity 这一层。
