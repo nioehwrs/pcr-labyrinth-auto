@@ -5,6 +5,7 @@ import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import android.content.Context
+import android.os.SystemClock
 import com.lmj.labyrinthauto.core.AppState
 import org.json.JSONArray
 import org.json.JSONObject
@@ -101,7 +102,10 @@ object LabModel {
     }
 
     private fun doLoad(ctx: Context) {
-        val dir = File(ctx.getExternalFilesDir(null), DIR)
+        // ★统一读私有目录（组件下载落在这里）；外部目录那份只作兼容（老的手动 push）
+        val dir = LabModelInstaller.dirOf(ctx)
+            .takeIf { File(it, "metadata.json").isFile }
+            ?: File(ctx.getExternalFilesDir(null), DIR)
         val metaFile = File(dir, "metadata.json")
         require(metaFile.exists()) { "缺少 metadata.json" }
         val meta = JSONObject(metaFile.readText())
@@ -155,6 +159,24 @@ object LabModel {
     fun supportsQuest(questId: Int): Boolean = questIndex.containsKey(questId)
 
     /**
+     * 反查「某个区、某个首领」在**模型词表里**的关卡 id（2026-11-14）。
+     *
+     * 为什么不用 `labyrinth_boss.json` 的 questId：那里的编号（如 770530201）**不在模型词表**里，
+     * 直接拿去问模型会被过滤掉，多目标就退化成单目标。这里改成用模型自己的
+     * `critic_enemies`（每个关卡的 5 个敌人）+ `layers`（层数）反查，拿到的 id 一定是它认的。
+     */
+    fun bossQuestOf(area: Int, unitId: Int): Int? {
+        if (!ready) return null
+        for (q in questIndex.keys) {
+            val ci = criticIndex[q] ?: continue
+            if ((layers.getOrNull(ci) ?: 0) != area) continue
+            val es = enemies.getOrNull(ci) ?: continue
+            if (es.contains(unitId)) return q
+        }
+        return null
+    }
+
+    /**
      * 给**指定的几支队伍**打分（对拍用）：同一套 critic、同一关卡，直接比 win/goal/seconds。
      * 用来验证"我们选的队"和"桌面版选的队"到底谁被模型认为更强。
      */
@@ -199,25 +221,96 @@ object LabModel {
     }
 
     /** 单个最优队伍：候选生成 → critic 打分 → 按 C++ `ranked` 的完整规则排序后取第一。 */
-    private fun bestTeam(questId: Int, qi: Int, pool: List<Int>, goal: Int, seconds: Int): List<Int>? {
-        val t0 = android.os.SystemClock.elapsedRealtime()
-        val cands = generateCandidates(questId, qi, pool, goal, candidatesTeam)
+    private fun bestTeam(questId: Int, qi: Int, pool: List<Int>, goal: Int, seconds: Int): List<Int>? =
+        bestScored(questId, qi, pool, goal, seconds, candidatesTeam, logTiming = true)?.team
+
+    private fun bestScored(
+        questId: Int,
+        qi: Int,
+        pool: List<Int>,
+        goal: Int,
+        seconds: Int,
+        target: Int,
+        logTiming: Boolean = false,
+    ): Scored? {
+        val t0 = SystemClock.elapsedRealtime()
+        val cands = generateCandidates(questId, qi, pool, goal, target)
         if (cands.isEmpty()) return null
-        val t1 = android.os.SystemClock.elapsedRealtime()
-        val scored = score(questId, cands, seconds)
-        val t2 = android.os.SystemClock.elapsedRealtime()
-        val best = scored
+        val t1 = SystemClock.elapsedRealtime()
+        val best = score(questId, cands, seconds)
             .sortedWith(Comparator { a, b -> if (before(a, b)) -1 else if (before(b, a)) 1 else 0 })
             .firstOrNull()
-            ?.team
-        if (best != null) {
+        if (logTiming && best != null) {
             AppState.addLog(
-                "[模型] 编队耗时：生成 ${t1 - t0}ms（${cands.size} 个候选）+ 打分 ${t2 - t1}ms" +
-                    "（$inferThreads 线程）",
+                "[模型] 编队耗时：生成 ${t1 - t0}ms（${cands.size} 个候选）+ " +
+                    "打分 ${SystemClock.elapsedRealtime() - t1}ms（$inferThreads 线程）",
             )
         }
         return best
     }
+
+    /**
+     * 战后三选一：**多目标加权**（C++ `recruitment.cpp` 的 `gain` 同款思路）。
+     *
+     * 对每个候选 x：`gain(x) = Σ w_i·( win_i(池+x) − win_i(池) ) / Σ w_i`，
+     * i 遍历 [targets]（本局 3/5 区首领 + 4 个 EX 关卡，权重见 [EX_TARGET_WEIGHTS]）。
+     * 返回**卡片下标**；null = 算不出（调用方回落规则版）。
+     */
+    fun pickChar(
+        candidates: List<Int>,
+        owned: List<Int>,
+        targets: List<Pair<Int, Double>>,
+        questType: Int,
+    ): Int? {
+        if (!ready || targets.isEmpty()) return null
+        val seconds = if (questType == 3) 90 else 30
+        val goal = OBJECTIVE_TIMES.indexOf(seconds).let { if (it >= 0) it else 1 }
+        val known = owned.filter { unitIndex.containsKey(it) }.distinct()
+        if (known.size < TEAM_SIZE) return null
+        val qs = targets.mapNotNull { (q, w) -> questIndex[q]?.let { Triple(q, it, w) } }
+        if (qs.isEmpty()) return null
+
+        val base = DoubleArray(qs.size)
+        for (i in qs.indices) {
+            base[i] = bestScored(qs[i].first, qs[i].second, known, goal, seconds, candidatesPick)?.win
+                ?: return null
+        }
+        var bestIdx = -1
+        var bestGain = Double.NEGATIVE_INFINITY
+        for (i in candidates.indices) {
+            val c = candidates[i]
+            if (!unitIndex.containsKey(c)) continue
+            var sum = 0.0
+            var wsum = 0.0
+            var ok = true
+            for (t in qs.indices) {
+                val (q, qi, w) = qs[t]
+                val win = bestScored(q, qi, known + c, goal, seconds, candidatesPick)?.win
+                if (win == null) { ok = false; break }
+                sum += w * (win - base[t])
+                wsum += w
+            }
+            if (!ok || wsum <= 0.0) continue
+            val gain = sum / wsum
+            if (gain > bestGain) {
+                bestGain = gain
+                bestIdx = i
+            }
+        }
+        return if (bestIdx >= 0) bestIdx else null
+    }
+
+    /**
+     * EX 目标关卡与权重（2026-11-14，取自决策系统 `config/labyrinth.json` 的
+     * `policies.unit_choice_targets.ex_weights`，只保留权重非零的 4 个）。
+     * 区号 = `questId / 100000 % 10`，按"当前区及以后"过滤。
+     */
+    val EX_TARGET_WEIGHTS: List<Pair<Int, Double>> = listOf(
+        770120101 to 2.0,   // 幽灵领主
+        770120201 to 4.0,   // 好朋友X
+        770421301 to 3.0,   // 岛屿
+        770421401 to 3.0,   // 反物质兽
+    )
 
     /**
      * C++ `Engine::ranked` 的比较器（原样照抄）：

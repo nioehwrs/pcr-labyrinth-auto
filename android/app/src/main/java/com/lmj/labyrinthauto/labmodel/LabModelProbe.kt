@@ -3,7 +3,6 @@ package com.lmj.labyrinthauto.labmodel
 import android.content.Context
 import android.os.SystemClock
 import com.lmj.labyrinthauto.core.AppState
-import java.io.File
 
 /**
  * 模型探针（2026-11-14）—— 只做两件事：
@@ -14,7 +13,6 @@ import java.io.File
  */
 object LabModelProbe {
 
-    private const val DIR = "labmodel"
     private const val TAG = "[模型]"
 
     /** 对拍用：2026-11-14 那局的真实池（24 个，其中 2 个模型不认识会被丢掉） */
@@ -31,16 +29,17 @@ object LabModelProbe {
         if (started) return
         started = true
         Thread({
-            runCatching { probe(ctx.applicationContext) }
-                .onFailure { AppState.addLog("$TAG 探针异常：${it.javaClass.simpleName}: ${it.message}") }
+            runCatching {
+                // 先保证组件就绪（首次会下载约 13MB；失败不影响任何功能）
+                kotlinx.coroutines.runBlocking { LabModelInstaller.ensure(ctx.applicationContext) }
+                probe(ctx.applicationContext)
+            }.onFailure { AppState.addLog("$TAG 探针异常：${it.javaClass.simpleName}: ${it.message}") }
         }, "lab-model-probe").apply { isDaemon = true }.start()
     }
 
     private fun probe(ctx: Context) {
-        val dir = File(ctx.getExternalFilesDir(null), DIR)
-        if (!File(dir, "metadata.json").exists() || !File(dir, "context.onnx").exists()) {
-            return      // 没下载模型 → 什么都不做（正式版会走组件下载）
-        }
+        // ★用组件的就绪判定（私有目录 + 兼容外部目录），不要只看 getExternalFilesDir
+        if (!LabModelInstaller.ready(ctx)) return
         val t0 = SystemClock.elapsedRealtime()
         if (!LabModel.load(ctx)) return
         AppState.addLog("$TAG 加载完成：${SystemClock.elapsedRealtime() - t0}ms（三张 onnx + 词表）")
@@ -65,5 +64,23 @@ object LabModelProbe {
                 AppState.addLog("$TAG 打分：$it")
             }
         }
+
+        // ④ 三选一：3 个候选 × **两个目标**（EX + 5 区 BOSS）× 32 候选束搜索
+        //   5 区 Boss 的关卡 id 用模型自己的敌人表反查（`labyrinth_boss.json` 的编号模型不认）
+        val boss5 = LabModel.bossQuestOf(5, 301701)
+        AppState.addLog("$TAG 5 区首领关卡（模型词表）= $boss5")
+        val t3 = SystemClock.elapsedRealtime()
+        val probeTargets = mutableListOf(770520101 to 1.0)
+        boss5?.let { probeTargets.add(it to 1.0) }
+        val pickIdx = LabModel.pickChar(
+            listOf(135501, 110601, 129901),
+            PROBE_POOL,
+            probeTargets,
+            2,
+        )
+        AppState.addLog(
+            "$TAG 三选一：${SystemClock.elapsedRealtime() - t3}ms → " +
+                (if (pickIdx == null) "算不出（回落规则版）" else "第 ${pickIdx + 1} 张"),
+        )
     }
 }

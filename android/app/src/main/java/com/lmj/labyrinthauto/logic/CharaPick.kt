@@ -1,6 +1,8 @@
 package com.lmj.labyrinthauto.logic
 
+import android.os.SystemClock
 import com.lmj.labyrinthauto.core.AppState
+import com.lmj.labyrinthauto.labmodel.LabModel
 import com.lmj.labyrinthauto.data.GuildPoolData
 import com.lmj.labyrinthauto.data.RelicTables
 import com.lmj.labyrinthauto.data.Tables
@@ -39,7 +41,13 @@ class CharaPick(
     /** ★不使用 NPC 角色（2026-11-13 用户）：战后角色三选一先跳过 agent 标了 `npc` 的卡；
      *  三张全是 NPC 时忽略该设置（照常选，别停手）。 */
     private val excludeNpc: Boolean = false,
+    /** ★三选一用推理模型（2026-11-14 用户）：算不出时静默走规则版。 */
+    private val byModel: Boolean = false,
 ) {
+
+    /** 模型版选人的缓存（同一组卡 + 同一池 + 同一目标 ⇒ 结果复用，别每轮重算 4 秒） */
+    private var modelKey: String? = null
+    private var modelPick: LabPickResult? = null
 
     /**
      * ★2026-11-12（用户）：点过「去邀请」后，**必定**弹一个「收到角色」框（和买印记的到账框同款）。
@@ -175,7 +183,7 @@ class CharaPick(
         }
         val relicDot = HashSet<String>(); for (rid in relicIds) relicDot.addAll(relicDotOf(rid))
         return LabSelCtx(area, unitIds.size, nRelics, dotKinds, relicDot,
-            hasTank, hasMtank, hasKnock, hasDrainTank, ownFix, fixBest, "")
+            hasTank, hasMtank, hasKnock, hasDrainTank, ownFix, fixBest, "", own = unitIds)
     }
 
     /**
@@ -185,8 +193,44 @@ class CharaPick(
      * ★PC 表示不一致（原样保留）：ctx.dotKinds 是标签 id、ctx.relicDot 是中文名，union 不重叠 ⇒
      *   dotTotal 实为两边条目相加（不是"去重种类数"）。
      */
-    fun pickLabReward(cards: List<JSONObject>, ctx: LabSelCtx): LabPickResult? {
+    fun pickLabReward(
+        cards: List<JSONObject>,
+        ctx: LabSelCtx,
+        questId: Int = 0,
+        /** ★多目标（2026-11-14 用户："按已选全部敌人加权"）：关卡 questId → 权重 */
+        targets: List<Pair<Int, Double>> = emptyList(),
+    ): LabPickResult? {
         if (cards.isEmpty()) return null
+        // ★推理模型（2026-11-14 用户）：逐个候选算「加进池子后最优队胜率提升」，多目标按权重加权；
+        //   模型不可用 / 关卡不在词表 / 候选全不认识 ⇒ 静默走下面的规则版。
+        if (byModel && ctx.own.isNotEmpty()) {
+            val ids = cards.map { (it.opt("unitId") as? Number)?.toInt() ?: 0 }
+            // ★缓存（2026-11-14）：模型算一次要 4~5 秒，而 `handleLabSelection` 每轮循环都会调进来，
+            //   卡片还没被点中之前会**重复算好几遍**（实测同一组卡算了两次，白等一倍时间）。
+            //   key = 三张卡 + 持有池 + 目标关卡，任一变化就重算。
+            val key = ids.joinToString(",") + "|" + ctx.own.sorted().hashCode() + "|" +
+                targets.joinToString(",") { it.first.toString() } + "|" + questId
+            val cached = modelPick
+            if (key == modelKey && cached != null) {
+                AppState.addLog("选角色：模型版（命中缓存）→ 第 ${cached.index + 1} 张")
+                return cached
+            }
+            val qs = targets.ifEmpty {
+                if (questId > 0) listOf(questId to 1.0) else emptyList()
+            }
+            val t0 = SystemClock.elapsedRealtime()
+            val idx = LabModel.pickChar(ids, ctx.own, qs, 2)
+            if (idx != null && idx in cards.indices) {
+                AppState.addLog(
+                    "选角色：模型版 ${SystemClock.elapsedRealtime() - t0}ms（${qs.size} 个目标）" +
+                        " → 第 ${idx + 1} 张（unitId=${ids[idx]}）",
+                )
+                val pick = LabPickResult(cards[idx], idx, "模型：胜率增益最高", 0, 0)
+                modelKey = key
+                modelPick = pick
+                return pick
+            }
+        }
         val tankTag = TagIds.T["tank"]!!; val mtankTag = TagIds.T["mtank"]!!
         val knockTag = TagIds.T["knock"]!!; val drainTag = TagIds.T["drain"]!!
         // ★不使用 NPC 角色（2026-11-13 用户）：agent 的 labSelection 给每张卡带 `npc`（unitType==2）。
@@ -280,6 +324,8 @@ class CharaPick(
         val dotKinds: Set<String>, val relicDot: Set<String>,
         val hasTank: Boolean, val hasMtank: Boolean, val hasKnock: Boolean, val hasDrainTank: Boolean,
         val ownFix: Set<String>, val fixBest: Map<String, Int>, val err: String,
+        /** ★本局持有角色（2026-11-14）：三选一接推理模型时要用。 */
+        val own: List<Int> = emptyList(),
     )
 
     /** 决策结果（= PLAN）：选中哪张卡 + 为什么（供日志/统计复盘） */

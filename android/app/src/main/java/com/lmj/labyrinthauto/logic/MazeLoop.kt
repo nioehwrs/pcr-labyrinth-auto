@@ -81,6 +81,9 @@ object MazeLoop {
      *  这里改为"遇到 BOSS 节点时记下来"，让遗物特殊条件（毒液沙罗曼蛇）能对上（见 [handleRelicChoice]） */
     private val bossByArea = mutableMapOf<Int, Int>()
 
+    /** ★每区 Boss 的**实战 questId**（2026-11-14）：来自刷开局地图，三选一多目标加权用。 */
+    private val bossQuestByArea = mutableMapOf<Int, Int>()
+
     /** ★2026-11-13：最近一次「事件节点」的时刻/事件 id（判断三选一遗物、事件战斗是否来自事件） */
     private var lastEventAt = 0L
     private var lastEventId = 0
@@ -369,6 +372,7 @@ object MazeLoop {
             //   每局构造时读一次 ⇒ 改设置后下一局生效（与 RerollSettings 其它项同口径）。
             attrOrder = RerollSettings.loadAttrOrder(ctx),
             excludeNpc = RerollSettings.loadExcludeNpc(ctx),
+            byModel = RerollSettings.loadPickByModel(ctx),
         )
         charaPickRef = charaPick            // ★悬浮窗"编队：五个名字"要查名册（见 handlePartyEdit）
         // ★结算奖励的名字表（中文）：道具 / EX装备 id → 中文名
@@ -389,6 +393,7 @@ object MazeLoop {
         PartyPlan.loadTables(ctx)
         // 本局遗物决策用的"已遇 Boss / 已点次数"状态
         bossByArea.clear()
+        bossQuestByArea.clear()
         shopRelicCtx = null; shopRelicCtxKey = null   // ★商店遗物序的上下文（按店缓存，跨局必须清）
         shopBuyStep = 0; shopBuyAt = 0L              // ★购买子链也不能跨局（上一局杀进程前的半截交易）
         frontNullRounds = 0                          // 前台读空计数（见 [FRONT_NULL_MAX]）
@@ -439,6 +444,8 @@ object MazeLoop {
         if (reroll != null) {
             reroll.bossByArea[3]?.let { bossByArea[3] = it }
             reroll.bossByArea[5]?.let { bossByArea[5] = it }
+            reroll.bossQuestByArea[3]?.let { bossQuestByArea[3] = it }
+            reroll.bossQuestByArea[5]?.let { bossQuestByArea[5] = it }
             val b3 = bossByArea[3]
             val b5 = bossByArea[5]
             val routeAreas = rerollRoute?.keys?.sorted()?.joinToString(",") ?: "无"
@@ -4010,7 +4017,22 @@ object MazeLoop {
                 pick.buildCtx(area, unitIds, relicIds, relicArr?.length() ?: 0)
                     .also { lastCtx = it; lastCtxSig = sig }
             }
-            pick.pickLabReward(cards, ctx)
+            // ★三选一的目标（2026-11-14 用户："按已选全部敌人加权"）：本局 3 区/5 区首领的关卡 id。
+            //   bossByArea 从刷开局产物带过来（见上面 reroll.bossByArea 那段），所以开局就知道这两个是谁。
+            //   ★关卡 id 必须用**模型词表里的**（`labyrinth_boss.json` 的那套编号模型不认），
+            //     所以走 LabModel.bossQuestOf（按"该区 + 敌人含这个 Boss"反查）。
+            val targets = ArrayList<Pair<Int, Double>>(6)
+            val curArea = (st.opt("area") as? Number)?.toInt() ?: 1
+            // 首领：权重取决策系统配置（3 区 3、5 区 2）
+            bossQuestByArea[3]?.takeIf { curArea <= 3 }?.let { targets.add(it to 3.0) }
+            bossQuestByArea[5]?.takeIf { curArea <= 5 }?.let { targets.add(it to 2.0) }
+            // EX：4 个（权重 2/4/3/3），按"当前区及以后"过滤
+            for ((q, w) in com.lmj.labyrinthauto.labmodel.LabModel.EX_TARGET_WEIGHTS) {
+                if (q / 100000 % 10 >= curArea) targets.add(q to w)
+            }
+            pick.pickLabReward(
+                cards, ctx, (st.opt("questId") as? Number)?.toInt() ?: 0, targets,
+            )
         }
         // ★P4 判不出 / 选中的那张没坐标 ⇒ **不猜**（2026-10-16 用户："盲选太不靠谱，宁可重启游戏"）：
         //   走 [selNoDecide]（等 → 有界自愈重启 → 停手），**不再"退化为点第 1 张"**。

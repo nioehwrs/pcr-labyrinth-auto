@@ -97,14 +97,27 @@ object PartyPlan {
         val pool = ctx.own.filter { it != 0 }.sorted()
         if (pool.isEmpty()) return
         val t0 = SystemClock.elapsedRealtime()
-        val res = tb.buildBest(
-            stage, pool.map { it.toString() }, relicsSkill = ctx.sk, floor = floor,
-            size = LAB_PARTY_SIZE, failed = failed,
-            tpUp = ctx.tpUp, initTp = ctx.sk,
-        )
+        // ★2026-11-14：预计算原来**直接跑规则版并写缓存** ⇒ 编组页一律"命中缓存"，
+        //   模型分支根本没机会执行（真机上"组队：模型版"出现 0 次就是这个原因）。
+        //   这里必须走同一套"模型优先、算不出再规则"的逻辑。
+        val modelTeam = modelTeamOf(stage, st, pool)
+        val res = if (modelTeam != null) {
+            Res(
+                stage = stage, algo = "model", cands = mutableListOf(), weak = mutableListOf(),
+                drop = mutableListOf(), attrlimUnits = mutableListOf(), todo = null,
+                forceAttr = null, floorRule = null, failed = failed,
+            ).apply { team = modelTeam.map { it.toString() } }
+        } else {
+            tb.buildBest(
+                stage, pool.map { it.toString() }, relicsSkill = ctx.sk, floor = floor,
+                size = LAB_PARTY_SIZE, failed = failed,
+                tpUp = ctx.tpUp, initTp = ctx.sk,
+            )
+        }
         rememberBuild(BuildKey(stage, floor, failed, ctx.sk, pool), res)
         AppState.addLog(
-            "… 提前算队伍 ${SystemClock.elapsedRealtime() - t0}ms（池 ${pool.size} 个，大地图持有池）",
+            "… 提前算队伍 ${SystemClock.elapsedRealtime() - t0}ms" +
+                "（${if (modelTeam != null) "模型版" else "规则版"}，池 ${pool.size} 个，大地图持有池）",
         )
     }
     /** PC `LAB_SELECT_TAP_MAX`(447)：同一组候选卡最多点几次（点不动就停手，免得把游戏点卡）。
@@ -157,6 +170,8 @@ object PartyPlan {
     val LAB_BOSS_FILL_ALL_AREAS = setOf(5)
 
     private var bossMap: Map<String, Int> = emptyMap()   // questId → 敌人 unitId
+    /** `(区, Boss unitId) → 关卡 questId`（lab_boss_quests.json，模型认的那套编号） */
+    private var bossQuestMap: Map<Long, Int> = emptyMap()
     private var bossNameMap: Map<Int, String> = emptyMap() // unitId → 名字（labyrinth_boss.json 的 name）
     private var exMap: Map<String, Int> = emptyMap()      // questId → 敌人 unitId（与区无关）
     private var relicTables: RelicTables? = null
@@ -170,6 +185,7 @@ object PartyPlan {
         bossMap = loadBossMap(read)
         exMap = loadExMap(read)
         bossNameMap = loadBossNames(ctx)
+        bossQuestMap = loadBossQuestMap(ctx)
         // 把登记的 EX_<questId> 档镜像成与区无关的 EX_<敌人unitId>
         var mirrors = 0
         for ((k, v) in Profiles.PROFILES) {
@@ -195,6 +211,28 @@ object PartyPlan {
         if (exMap.isEmpty()) {
             AppState.addLog("[!] stages.json 的 questId→敌人映射为空 ⇒ **所有 EX 格都会退成速通队**（查 loadExMap 的解析）")
         }
+    }
+
+    /** 读 `lab_boss_quests.json`（45 条）：区 + Boss unitId → 关卡 questId（模型词表那套） */
+    private fun loadBossQuestMap(ctx: Context): Map<Long, Int> {
+        val out = HashMap<Long, Int>()
+        try {
+            val arr = JSONArray(
+                ctx.assets.open("lab_boss_quests.json").bufferedReader(Charsets.UTF_8).use { it.readText() },
+            )
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val reg = o.optInt("region")
+                val uid = o.optInt("unitId")
+                val q = o.optInt("questId")
+                if (reg <= 0 || uid <= 0 || q <= 0) continue
+                val k = (reg.toLong() shl 32) or (uid.toLong() and 0xFFFFFFFFL)
+                out.putIfAbsent(k, q)
+            }
+        } catch (e: Exception) {
+            Log.e("PartyPlan", "lab_boss_quests.json 读取失败", e)
+        }
+        return out
     }
 
     fun loadBossMap(read: (String) -> String): Map<String, Int> {
@@ -383,6 +421,19 @@ object PartyPlan {
     /** 按 questId 查本局 Boss 的 unitId（PC `labyrinth_boss.json` 映射；遗物特殊条件用） */
     fun bossOf(questId: String?): Int? = if (questId.isNullOrBlank()) null else bossMap[questId]
 
+    /**
+     * 反向查：`(区, Boss unitId) → 关卡 questId`（2026-11-14，三选一「多目标加权」要用**模型认识的**关卡 id）。
+     *
+     * ★不能用 `labyrinth_boss.json` 的 key：那套编号（如 770530201）不在模型词表里。
+     *   这里读 `lab_boss_quests.json`（从决策系统的 `labyrinth_boss_quests` 表抽出，45 条），
+     *   它的 questId 就是模型训练/推理用的那套。
+     */
+    fun bossQuestOf(area: Int, unitId: Int?): Int? {
+        if (unitId == null) return null
+        val k = (area.toLong() shl 32) or (unitId.toLong() and 0xFFFFFFFFL)
+        return bossQuestMap[k]
+    }
+
     /** 按 unitId 查 Boss 名字（展示用，如「3 区 Boss 是谁」） */
     fun bossName(unitId: Int?): String? = if (unitId == null) null else bossNameMap[unitId]
 
@@ -482,16 +533,36 @@ object PartyPlan {
      * 与规则版"一次编一队、按实际队伍重算"的节奏一致。
      */
     private fun modelTeamOf(stage: String, st: JSONObject, pool: List<Int>): List<Int>? {
-        val app = appCtx ?: return null
-        if (!RerollSettings.loadTeamByModel(app)) return null
-        val questId = (st.opt("questId") as? Number)?.toInt()?.takeIf { it > 0 } ?: return null
-        if (!LabModel.load(app)) return null
+        val app = appCtx ?: run {
+            AppState.addLog("[模型] 编队回落规则版：没有 Context")
+            return null
+        }
+        if (!RerollSettings.loadTeamByModel(app)) return null          // 用户主动选的规则版，不刷日志
+        val questId = (st.opt("questId") as? Number)?.toInt()?.takeIf { it > 0 } ?: run {
+            AppState.addLog("[模型] 编队回落规则版：读不到 questId（stage=$stage）")
+            return null
+        }
+        if (!LabModel.load(app)) {
+            AppState.addLog("[模型] 编队回落规则版：模型未加载（${LabModel.lastError}）")
+            return null
+        }
+        if (!LabModel.supportsQuest(questId)) {
+            AppState.addLog("[模型] 编队回落规则版：关卡 $questId 不在模型词表（stage=$stage）")
+            return null
+        }
         val type = when {
             stage.startsWith("Boss_") -> 3
             stage.startsWith("EX_") -> 2
             else -> 1
         }
-        return LabModel.planTeam(questId, pool, 1, type)?.firstOrNull()
+        val teams = LabModel.planTeam(questId, pool, 1, type)
+        if (teams == null) {
+            AppState.addLog(
+                "[模型] 编队回落规则版：算不出（池 ${pool.size} 个，stage=$stage，questId=$questId）",
+            )
+            return null
+        }
+        return teams.firstOrNull()
     }
 
     /**
@@ -579,22 +650,25 @@ object PartyPlan {
             // ★2026-11-14（用户）：编队可切「推理模型」。算不出（未加载 / 关卡不在词表 /
             //   认识的角色不足 5 人）就**静默**回落规则版，不打扰用户。
             val modelTeam = modelTeamOf(stage, st, pool)
-            tb = if (modelTeam != null) {
+            if (modelTeam != null) {
                 AppState.addLog(
                     "组队：模型版 ${SystemClock.elapsedRealtime() - t0}ms（池 ${pool.size} 个）→ " +
                         modelTeam.joinToString(","),
                 )
-                Res(
+                tb = Res(
                     stage = stage, algo = "model", cands = mutableListOf(), weak = mutableListOf(),
                     drop = mutableListOf(), attrlimUnits = mutableListOf(), todo = null,
                     forceAttr = null, floorRule = null, failed = failed,
                 ).apply { team = modelTeam.map { it.toString() } }
             } else {
-                teamBuild!!.buildBest(
+                tb = teamBuild!!.buildBest(
                     stage, pool.map { it.toString() }, relicsSkill = ctx.sk, floor = floor,
                     size = LAB_PARTY_SIZE, failed = failed,      // ★失败过 ⇒ 让规则表决定要不要补坦克
                     tpUp = ctx.tpUp, initTp = ctx.sk,
                 )
+                // ★这行只在规则版打（2026-11-14）：模型版本来就有"组队：模型版 …"，
+                //   两者都打会让人误以为"模型算完又用规则重算了一遍"（用户就因此以为模型没生效）。
+                AppState.addLog("组队算法 ${SystemClock.elapsedRealtime() - t0}ms（实算，池 ${pool.size} 个）")
             }
             if (tb.team.isNullOrEmpty()) {
                 // ★空队兜底（2026-10-19 用户）：放宽属性限定重编一次——过滤链（前3图屏蔽/attrlim 剔除/
@@ -605,7 +679,6 @@ object PartyPlan {
                 )
             }
             rememberBuild(bkey, tb)
-            AppState.addLog("组队算法 ${SystemClock.elapsedRealtime() - t0}ms（实算，池 ${pool.size} 个）")
         }
         val target = tb.team?.mapNotNull { it.toIntOrNull() } ?: emptyList()
         if (target.isEmpty()) {
