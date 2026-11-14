@@ -1691,8 +1691,9 @@ private fun PickTargetsEditor(context: Context) {
 private fun MethodRow(
     title: String,
     desc: String,
-    byModel: Boolean,
-    onChange: (Boolean) -> Unit,
+    options: List<Pair<String, String>>,
+    selected: String,
+    onChange: (String) -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Text(title, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
@@ -1702,16 +1703,13 @@ private fun MethodRow(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            FilterChip(
-                selected = !byModel,
-                onClick = { onChange(false) },
-                label = { Text("旧版规则", style = MaterialTheme.typography.labelSmall) },
-            )
-            FilterChip(
-                selected = byModel,
-                onClick = { onChange(true) },
-                label = { Text("推理模型", style = MaterialTheme.typography.labelSmall) },
-            )
+            options.forEach { (key, label) ->
+                FilterChip(
+                    selected = selected == key,
+                    onClick = { onChange(key) },
+                    label = { Text(label, style = MaterialTheme.typography.labelSmall) },
+                )
+            }
         }
     }
 }
@@ -1719,19 +1717,24 @@ private fun MethodRow(
 /** ★策略页「编队」（2026-11-14 用户）：编队方法 + 3 区首领编队数。 */
 @Composable
 private fun TeamSettingsCard(context: Context) {
-    var byModel by remember { mutableStateOf(RerollSettings.loadTeamByModel(context)) }
+    var teamMode by remember { mutableStateOf(RerollSettings.loadTeamMode(context)) }
     var bossCount by remember { mutableIntStateOf(RerollSettings.loadBossPartyCount(context)) }
     val modelState by AppState.model.collectAsState()
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         MethodRow(
             title = "计算方法",
-            desc = "推理模型按胜率预测挑队（每关约 0.4 秒，进编组页前就开始算）；" +
-                "旧版按角色评分和结构位打分。模型不可用时自动用旧版。",
-            byModel = byModel,
+            desc = "混合（默认）：这个节点第一次打用推理模型，打不过就切旧版规则（规则版会补坦克，更稳）；" +
+                "也可以固定只用其中一种。",
+            options = listOf(
+                RerollSettings.TEAM_RULE to "旧版规则",
+                RerollSettings.TEAM_MODEL to "推理模型",
+                RerollSettings.TEAM_MIXED to "混合",
+            ),
+            selected = teamMode,
         ) {
-            byModel = it
-            RerollSettings.saveTeamByModel(context, it)
+            teamMode = it
+            RerollSettings.saveTeamMode(context, it)
         }
         HorizontalDivider()
         Text("3 区首领编队数", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
@@ -1790,10 +1793,11 @@ private fun PickSettingsCard(context: Context) {
         MethodRow(
             title = "计算方法",
             desc = "战后三选一用哪套逻辑：推理模型看「这张卡对后续首领战的帮助」，旧版按角色评分排序。",
-            byModel = byModel,
+            options = listOf("rule" to "旧版规则", "model" to "推理模型"),
+            selected = if (byModel) "model" else "rule",
         ) {
-            byModel = it
-            RerollSettings.savePickByModel(context, it)
+            byModel = it == "model"
+            RerollSettings.savePickByModel(context, byModel)
         }
         if (byModel) {
             PickTargetsEditor(context)

@@ -100,7 +100,7 @@ object PartyPlan {
         // ★2026-11-14：预计算原来**直接跑规则版并写缓存** ⇒ 编组页一律"命中缓存"，
         //   模型分支根本没机会执行（真机上"组队：模型版"出现 0 次就是这个原因）。
         //   这里必须走同一套"模型优先、算不出再规则"的逻辑。
-        val modelTeam = modelTeamOf(stage, st, pool)
+        val modelTeam = modelTeamOf(stage, st, pool, failed)
         val res = if (modelTeam != null) {
             Res(
                 stage = stage, algo = "model", cands = mutableListOf(), weak = mutableListOf(),
@@ -532,12 +532,19 @@ object PartyPlan {
      * 只返回**第一队**：多队场景下后续轮次的池已排除上一队的人，模型会自然算出下一队，
      * 与规则版"一次编一队、按实际队伍重算"的节奏一致。
      */
-    private fun modelTeamOf(stage: String, st: JSONObject, pool: List<Int>): List<Int>? {
+    private fun modelTeamOf(stage: String, st: JSONObject, pool: List<Int>, failed: Boolean): List<Int>? {
         val app = appCtx ?: run {
             AppState.addLog("[模型] 编队回落规则版：没有 Context")
             return null
         }
-        if (!RerollSettings.loadTeamByModel(app)) return null          // 用户主动选的规则版，不刷日志
+        val mode = RerollSettings.loadTeamMode(app)
+        if (mode == RerollSettings.TEAM_RULE) return null              // 用户主动选的规则版，不刷日志
+        // ★混合模式（2026-11-15 用户）：本节点第一次打用模型，失败过就切旧版规则 ——
+        //   规则版在 failed=true 时会按关卡档补坦克，比模型"硬着头皮再试一次"更稳。
+        if (mode == RerollSettings.TEAM_MIXED && failed) {
+            AppState.addLog("[模型] 混合模式：本节点失败过 → 这次改用旧版规则")
+            return null
+        }
         val questId = (st.opt("questId") as? Number)?.toInt()?.takeIf { it > 0 } ?: run {
             AppState.addLog("[模型] 编队回落规则版：读不到 questId（stage=$stage）")
             return null
@@ -649,7 +656,7 @@ object PartyPlan {
         } else {
             // ★2026-11-14（用户）：编队可切「推理模型」。算不出（未加载 / 关卡不在词表 /
             //   认识的角色不足 5 人）就**静默**回落规则版，不打扰用户。
-            val modelTeam = modelTeamOf(stage, st, pool)
+            val modelTeam = modelTeamOf(stage, st, pool, failed)
             if (modelTeam != null) {
                 AppState.addLog(
                     "组队：模型版 ${SystemClock.elapsedRealtime() - t0}ms（池 ${pool.size} 个）→ " +

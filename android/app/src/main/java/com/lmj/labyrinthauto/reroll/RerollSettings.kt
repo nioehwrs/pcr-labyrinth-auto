@@ -532,16 +532,30 @@ object RerollSettings {
             .putBoolean("excludeNpc", on).apply()
     }
 
-    /**
-     * ★编队方法（2026-11-14 用户）：true = 推理模型，false = 旧版规则。**默认模型**。
-     * 模型不可用 / 该关卡不在词表 / 角色不足 5 人时会静默回落规则版（见 PartyPlan）。
-     */
-    fun loadTeamByModel(context: Context): Boolean =
-        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getBoolean("teamByModel", true)
+    /** 编队方法：旧版规则 */
+    const val TEAM_RULE = "rule"
+    /** 编队方法：推理模型 */
+    const val TEAM_MODEL = "model"
+    /** 编队方法：**混合** —— 第一次用模型，打不过就切旧版规则（2026-11-15 用户） */
+    const val TEAM_MIXED = "mixed"
 
-    fun saveTeamByModel(context: Context, on: Boolean) {
+    /**
+     * ★编队方法（2026-11-15 用户）：三选一，**默认混合**。
+     *
+     * 混合 = 本节点**第一次**打用模型（模型可能更强），失败过就用旧版规则（规则版会按关卡档补坦克，
+     * 在"知道打不过"之后更稳）。理由：模型不一定比原来的策略好，别一条道走到黑。
+     *
+     * 不管哪种模式，模型算不出（未加载 / 关卡不在词表 / 角色不足 5 人）都会静默回落规则版。
+     */
+    fun loadTeamMode(context: Context): String =
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+            .getString("teamMode", TEAM_MIXED)
+            ?.takeIf { it == TEAM_RULE || it == TEAM_MODEL || it == TEAM_MIXED }
+            ?: TEAM_MIXED
+
+    fun saveTeamMode(context: Context, mode: String) {
         context.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()
-            .putBoolean("teamByModel", on).apply()
+            .putString("teamMode", mode).apply()
     }
 
     /** ★战后角色三选一方法（2026-11-14 用户）：true = 推理模型，false = 旧版规则。**默认模型**。 */
