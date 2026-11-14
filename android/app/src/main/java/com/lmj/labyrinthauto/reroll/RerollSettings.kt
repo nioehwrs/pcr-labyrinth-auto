@@ -531,4 +531,34 @@ object RerollSettings {
         context.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()
             .putBoolean("excludeNpc", on).apply()
     }
+
+    /**
+     * ★编队方法（2026-11-14 用户）：true = 推理模型，false = 旧版规则。**默认模型**。
+     * 模型不可用 / 该关卡不在词表 / 角色不足 5 人时会静默回落规则版（见 PartyPlan）。
+     */
+    fun loadTeamByModel(context: Context): Boolean =
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getBoolean("teamByModel", true)
+
+    fun saveTeamByModel(context: Context, on: Boolean) {
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()
+            .putBoolean("teamByModel", on).apply()
+    }
+
+    /** ★战后角色三选一方法（2026-11-14 用户）：true = 推理模型，false = 旧版规则。**默认模型**。 */
+    fun loadPickByModel(context: Context): Boolean =
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getBoolean("pickByModel", true)
+
+    fun savePickByModel(context: Context, on: Boolean) {
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()
+            .putBoolean("pickByModel", on).apply()
+    }
+
+    /** 3 区首领编几队（模型设置；默认 1，失败过强制 3）。 */
+    fun loadBossPartyCount(context: Context): Int =
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getInt("bossPartyCount", 1)
+
+    fun saveBossPartyCount(context: Context, n: Int) {
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()
+            .putInt("bossPartyCount", n.coerceIn(1, 3)).apply()
+    }
 }

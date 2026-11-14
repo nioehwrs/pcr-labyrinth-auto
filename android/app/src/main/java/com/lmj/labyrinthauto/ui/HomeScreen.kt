@@ -1118,7 +1118,12 @@ private fun StrategyTab() {
                 GuildPickEditor(context)
             }
         }
-        item { StrategyCard("编队", implemented = false) }
+        item {
+            // ★「编队」（2026-11-14 用户）：编队方法（规则/模型）+ 首领编队数
+            StrategyCard("编队") {
+                TeamSettingsCard(context)
+            }
+        }
         item {
             // 事件默认折叠（2026-11-01 用户）：条目多，展开后整页被它占满
             StrategyCard("事件") {
@@ -1566,6 +1571,80 @@ private fun GuildPickCard(
     }
 }
 
+/** 计算方法二选一（规则 / 模型），「角色选择」「编队」两张卡共用。 */
+@Composable
+private fun MethodRow(
+    title: String,
+    desc: String,
+    byModel: Boolean,
+    onChange: (Boolean) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(title, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+        Text(
+            desc,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            FilterChip(
+                selected = !byModel,
+                onClick = { onChange(false) },
+                label = { Text("旧版规则", style = MaterialTheme.typography.labelSmall) },
+            )
+            FilterChip(
+                selected = byModel,
+                onClick = { onChange(true) },
+                label = { Text("推理模型", style = MaterialTheme.typography.labelSmall) },
+            )
+        }
+    }
+}
+
+/** ★策略页「编队」（2026-11-14 用户）：编队方法 + 3 区首领编队数。 */
+@Composable
+private fun TeamSettingsCard(context: Context) {
+    var byModel by remember { mutableStateOf(RerollSettings.loadTeamByModel(context)) }
+    var bossCount by remember { mutableIntStateOf(RerollSettings.loadBossPartyCount(context)) }
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        MethodRow(
+            title = "计算方法",
+            desc = "推理模型按胜率预测挑队（每关约 0.4 秒，进编组页前就开始算）；" +
+                "旧版按角色评分和结构位打分。模型不可用时自动用旧版。",
+            byModel = byModel,
+        ) {
+            byModel = it
+            RerollSettings.saveTeamByModel(context, it)
+        }
+        HorizontalDivider()
+        Text("3 区首领编队数", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+        Text(
+            "默认只编 1 队；该节点失败过会自动改编 3 队。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            FilterChip(
+                selected = bossCount == 1,
+                onClick = {
+                    bossCount = 1
+                    RerollSettings.saveBossPartyCount(context, 1)
+                },
+                label = { Text("1 队", style = MaterialTheme.typography.labelSmall) },
+            )
+            FilterChip(
+                selected = bossCount == 3,
+                onClick = {
+                    bossCount = 3
+                    RerollSettings.saveBossPartyCount(context, 3)
+                },
+                label = { Text("3 队", style = MaterialTheme.typography.labelSmall) },
+            )
+        }
+    }
+}
+
 /**
  * ★策略页「角色选择」（2026-11-13 用户）：
  *  ① 属性印记（门票）三选一的优先顺序 —— 一行 chip，**按住左右拖动**即可排序，前 3 个高亮表示"可能选到"；
@@ -1576,6 +1655,7 @@ private fun GuildPickCard(
 private fun PickSettingsCard(context: Context) {
     var order by remember { mutableStateOf(RerollSettings.loadAttrOrder(context)) }
     var excludeNpc by remember { mutableStateOf(RerollSettings.loadExcludeNpc(context)) }
+    var byModel by remember { mutableStateOf(RerollSettings.loadPickByModel(context)) }
     // 拖动排序状态：被拖的 attr / 手指水平位移 / 目标位置
     var dragAttr by remember { mutableStateOf<String?>(null) }
     var dragDx by remember { mutableFloatStateOf(0f) }
@@ -1584,6 +1664,15 @@ private fun PickSettingsCard(context: Context) {
     val gapPx = with(LocalDensity.current) { 6.dp.toPx() }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        MethodRow(
+            title = "计算方法",
+            desc = "战后三选一用哪套逻辑：推理模型看「这张卡对后续首领战的帮助」，旧版按角色评分排序。",
+            byModel = byModel,
+        ) {
+            byModel = it
+            RerollSettings.savePickByModel(context, it)
+        }
+        HorizontalDivider()
         Text(
             "属性印记选择顺序",
             style = MaterialTheme.typography.labelLarge,
