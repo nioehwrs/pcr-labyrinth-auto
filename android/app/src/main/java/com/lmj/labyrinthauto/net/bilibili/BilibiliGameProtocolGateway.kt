@@ -170,7 +170,17 @@ class BilibiliGameProtocolGateway(
         //   以前这里直接 error("响应数据缺失") ⇒ 明明改成功了却报失败（2026-11-06 实测）。
         val data = root.map("data") ?: emptyMap()
         data.map("server_error")?.let { serverError ->
-            throw GameApiFailure(stage, serverError.string("message").orEmpty())
+            // ★2026-11-14（用户："enter 失败没有更多描述了吗"）：服务器只给一句弹窗文案
+            //   （如「发生了错误。回到标题界面。」）。把 server_error 里的其它字段 + 本次 request_id
+            //   一并带上，反馈时至少能区分「服务器拒绝」的具体字段和对应请求。
+            val parts = ArrayList<String>(4)
+            serverError.string("message").orEmpty().takeIf { it.isNotBlank() }?.let { parts.add(it) }
+            serverError.entries
+                .filter { (k, v) -> k != "message" && v != null && v.toString() != "null" }
+                .take(4)
+                .forEach { (k, v) -> parts.add("$k=$v") }
+            headers.string("request_id")?.takeIf { it.isNotBlank() }?.let { parts.add("req=$it") }
+            throw GameApiFailure(stage, parts.joinToString(" ／ ").take(MAX_MESSAGE_LENGTH))
         }
         return data
     }

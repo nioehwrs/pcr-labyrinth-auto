@@ -124,7 +124,6 @@ class RerollController(
         val nMax = if (config.maxCount <= 0) Int.MAX_VALUE else config.maxCount
         var attempt = 0
         var errStreak = 0
-        var reloginTried = false          // 本条失败链是否已重登过（enter 成功后随 errStreak 一起复位）
 
         while (true) {
             attempt++
@@ -142,13 +141,16 @@ class RerollController(
                     //   总次数上限仍由 maxCount 控制（<=0 = 不限次数，沿用用户定的口径）。
                     //   退避序列：2s、4s、8s、16s、32s、60s（封顶）。
                     val backoffMs = (2_000L shl (errStreak - 1).coerceAtMost(5)).coerceAtMost(60_000L)
-                    // ★退避升到 16s 这一档时重新登录一次（2026-11-13 用户）：会话被挤掉/过期时，
-                    //   光退避永远等不回来。重登成功 ⇒ 换新 api、退避链从头算（不额外等待）；
-                    //   重登失败 ⇒ 按原退避继续。每条失败链只重登一次，避免反复挤客户端。
-                    if (!reloginTried && backoffMs >= 16_000L && onRelogin != null) {
-                        reloginTried = true
+                    // ★退避到 16s 及以后（16/32/60s）**每次等待前都重新登录**（2026-11-14 用户；
+                    //   原来是"每条失败链只重登一次"）。会话被挤掉/过期时光退避永远等不回来；
+                    //   重登成功 ⇒ 换新 api、退避链从头算（不额外等待）；失败 ⇒ 按原退避继续。
+                    if (backoffMs >= 16_000L && onRelogin != null) {
                         onProgress(
-                            RerollProgress(attempt, nMax, "enter 连续 $errStreak 次失败 → 重新登录一次", null),
+                            RerollProgress(
+                                attempt, nMax,
+                                "enter 连续 $errStreak 次失败 → 重新登录（${backoffMs / 1000}s 档）",
+                                null,
+                            ),
                         )
                         val newApi = onRelogin.invoke()
                         if (newApi != null) {
@@ -162,7 +164,7 @@ class RerollController(
                         RerollProgress(
                             attempt,
                             nMax,
-                            "enter 失败（连续 $errStreak 次）：${r.message} → ${backoffMs / 1000}s 后重试",
+                            "enter 失败（连续 $errStreak 次，${r.kind}）：${r.message} → ${backoffMs / 1000}s 后重试",
                             null,
                         ),
                     )
@@ -171,7 +173,6 @@ class RerollController(
                 }
             }
             errStreak = 0
-            reloginTried = false
 
             val j = RerollJudge.judge(enter.map, config)
             onProgress(
