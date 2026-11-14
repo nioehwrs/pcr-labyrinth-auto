@@ -72,9 +72,13 @@ object OverlayWindow {
     private const val C_RUN = 0xFFD98E04.toInt()       // 琥珀（局）
     private const val C_FLOOR = 0xFF1E88A8.toInt()      // 青（层）
     private const val C_STATE = 0xFF2B2F36.toInt()      // 深灰（状态）
+    /** ★需要人接手时的第 3 格底色（橙红，明显但不刺眼） */
+    private const val C_WARN = 0xFFD84315.toInt()
     private const val STROKE = 0x55FFFFFF.toInt()
+    private const val STROKE_WARN = 0xFFFFD180.toInt()
     // 状态色点（实心圆）
     private const val DOT_IDLE = 0xFF9E9E9E.toInt()     // 灰：空闲
+    private const val DOT_WARN = 0xFFFFA726.toInt()     // 橙：需要人接手
     private const val DOT_RUN = 0xFF4CAF50.toInt()      // 绿：运行中
     private const val DOT_ERR = 0xFFE53935.toInt()      // 红：出错
 
@@ -226,12 +230,19 @@ object OverlayWindow {
             job?.cancel()
             job = launch {
                 OverlayStatus.snap.collect { s ->
-                    (dot?.background as? GradientDrawable)?.setColor(dotColor(s.level))
+                    (dot?.background as? GradientDrawable)?.setColor(if (s.attention) DOT_WARN else dotColor(s.level))
                     // ★run 由关键点事件直接置（"未运行"初始化 / "第 x/x 局"每局 / "运行结束 x/x"结束），这里只原样显示
                     applyChip(chipRun, s.run, pulse = false)
                     applyChip(chipFloor, s.floor, pulse = false)
                     // ★状态段每次内容变化都轻微闪一下（"变化段高亮"），其余段不闪
                     applyChip(chipState, s.state, pulse = true)
+                    // ★需要人接手（停手/等待接手）：第 3 格换橙红底 + 亮边，一眼能看见；内容一变自动恢复
+                    applyChipBg(
+                        chipState,
+                        if (s.attention) C_WARN else C_STATE,
+                        if (s.attention) 2 else 1,
+                        if (s.attention) STROKE_WARN else STROKE,
+                    )
                     placeholder?.visibility = View.GONE
                     // ★内容变长 => 窗口宽度变（WRAP_CONTENT）=> 按**中心点**重算左缘，
                     //   保持居中、放不下才贴边（2026-10-20 用户：拖到最左后运行中会不会超出）
@@ -395,6 +406,23 @@ object OverlayWindow {
             chip.clearAnimation()
             chip.alpha = 0.45f
             chip.animate().alpha(1f).setDuration(450).start()
+        }
+    }
+
+    /**
+     * 换气泡底色/描边（"需要人接手"用）。同配置不重建 —— collect 每拍都会走，
+     * 避免每拍 new 一个 drawable。
+     */
+    private fun applyChipBg(chip: TextView?, bg: Int, stroke: Int, strokeColor: Int) {
+        if (chip == null) return
+        val tag = "$bg/$stroke/$strokeColor"
+        if (chip.tag == tag) return
+        chip.tag = tag
+        chip.background = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = 14f
+            setColor(bg)
+            setStroke(stroke, strokeColor)
         }
     }
 

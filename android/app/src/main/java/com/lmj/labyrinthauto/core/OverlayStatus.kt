@@ -29,6 +29,8 @@ object OverlayStatus {
         val floor: String = "",
         val state: String = "",
         val level: Level = Level.IDLE,
+        /** ★需要人接手（停手 / 等待接手）：第 3 格用醒目配色。正常内容变化会自动清掉。 */
+        val attention: Boolean = false,
     ) {
         /** 合成一行（空段自动省略）—— 悬浮窗显示的就是它 */
         val line: String
@@ -39,16 +41,22 @@ object OverlayStatus {
     val snap: StateFlow<Snap> = _snap.asStateFlow()
 
     fun setRun(s: String?) {
+        // run 只是"第几局 / 运行结束"，不算第 3 格内容 ⇒ 不动 attention
         _snap.value = _snap.value.copy(run = s?.take(20).orEmpty())
     }
 
     fun setFloor(s: String?) {
         // 放宽到 20：节点类型改成中文短名后（如「节点12345 普通战」）需要更多字数
-        _snap.value = _snap.value.copy(floor = s?.take(20).orEmpty())
+        _snap.value = _snap.value.copy(floor = s?.take(20).orEmpty(), attention = false)
     }
 
-    fun setState(s: String?) {
-        _snap.value = _snap.value.copy(state = s?.take(64).orEmpty())
+    /**
+     * @param attention true = 需要人接手（停手 / 等待接手），悬浮窗第 3 格用醒目配色。
+     *   ★下一次普通的 [setState] / [setFloor] 会自动恢复，不需要手动"关掉高亮"。
+     */
+    fun setState(s: String?, attention: Boolean = false) {
+        val text = s?.take(64).orEmpty()
+        _snap.value = _snap.value.copy(state = text, attention = attention && text.isNotEmpty())
     }
 
     /** 显式设运行等级（色点用）。连跑开始 ⇒ RUNNING；失败 ⇒ ERROR；clear ⇒ IDLE */

@@ -441,9 +441,15 @@ class AutoForegroundService : Service() {
                         //   第一格显示"运行结束 成功/计划"，其余两格清空，等级复位 IDLE
                         AppState.setMazeProgress(null)
                         OverlayStatus.setRun("运行结束 $done/$totalTxt")
-                        OverlayStatus.setFloor("")
-                        OverlayStatus.setState("")
-                        OverlayStatus.setLevel(OverlayStatus.Level.IDLE)
+                        // ★2026-11-14（用户）：某局停手（需要人接手）时**保留**第 3 格的醒目提示，
+                        //   别在这里清空 —— 否则用户根本看不到"已经停了、要你处理"。
+                        if (!endedByStop) {
+                            OverlayStatus.setFloor("")
+                            OverlayStatus.setState("")
+                        }
+                        OverlayStatus.setLevel(
+                            if (endedByStop) OverlayStatus.Level.ERROR else OverlayStatus.Level.IDLE,
+                        )
                         // ★整轮汇总（自然跑完 / 某局失败 break / 手动停止取消 / 异常都走这里）：
                         //   只输出**已完成**的局；中断时前面跑完的也算。
                         if (done > 0) {
