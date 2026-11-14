@@ -549,8 +549,9 @@ object Navigator {
     /** 黎明界子菜单页（260 奖励列表 / 261 强化 / 262 图鉴 / 263 公会设置 / 265 金币店）——不算进图 */
     private val LAB_MENU_VIEWS = setOf(260, 261, 262, 263, 265)
 
-    /** ★同一颗弹窗按钮最多连点几次（超过 ⇒ 判"点不动"，见 2026-10-17 幽灵弹窗事故） */
-    private const val DLG_TAP_MAX = 3
+    /** ★同一颗弹窗按钮最多连点几次（超过 ⇒ 判"点不动"，见 2026-10-17 幽灵弹窗事故）。
+     *  ★2026-11-14（用户）：3 → **8**，理由同上 —— 多点几下是安全动作，别把正常弹窗误判成幽灵。 */
+    private const val DLG_TAP_MAX = 8
 
     /** 当前视图号（agent 的 `viewId` 导出；-1 = 没读到）。给服务/上层判断"现在在哪"用 */
     suspend fun currentViewId(): Int = AgentApi.viewId()

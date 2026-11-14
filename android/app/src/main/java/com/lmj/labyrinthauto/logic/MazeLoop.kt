@@ -91,8 +91,9 @@ object MazeLoop {
     /** 同一组候选卡已点次数（按 tag；组变了重置）—— PC `REL_TAP_MAX`(471) 防重复砸同一坐标把游戏点卡 */
     private val relicChoiceTries = mutableMapOf<String, Pair<String, Int>>()
 
-    /** PC 版 `REL_TAP_MAX`(471)：同一组候选卡最多点几次（点不动就不再点，等 idle 上限停手） */
-    private const val REL_TAP_MAX = 2
+    /** PC 版 `REL_TAP_MAX`(471)：同一组候选卡最多点几次（点不动就不再点，等 idle 上限停手）。
+     *  ★2026-11-14（用户）：2 → 4 —— 点空/点早再点一次是安全动作，别卡在同一坐标上干等。 */
+    private const val REL_TAP_MAX = 4
 
     /** PC 版 `MAZE_DIALOG_CONFIRM`(324)：通用弹窗"确定/关闭"白名单（按顺序找，命中即点；认不出不猜） */
     private val DIALOG_CONFIRM = listOf(
@@ -245,7 +246,7 @@ object MazeLoop {
      *   `xyAt` 里一读到位就返回 null），`max` 只是兜底上限；性能差的设备 tween 更慢、需要更多次补点，
      *   把上限调小反而对慢设备不友好。
      */
-    private const val SHOP_ANIM_TAP_MAX = 5
+    private const val SHOP_ANIM_TAP_MAX = 8
 
     /** 到账确认链的最长时长（遗物 1 个框；印记 1+1；角色 1 个） */
     private const val SHOP_ANIM_RECEIPT_MS = 4_000L
@@ -1146,7 +1147,7 @@ object MazeLoop {
     private const val MOVE_NO_DIALOG_SETTLE_MS = 300L
 
     /** ★出现后最多点几次（点空就用下一拍的新坐标再点；**多点当手段**，不等按钮落位） */
-    private const val MOVE_CONFIRM_TAP_MAX = 5
+    private const val MOVE_CONFIRM_TAP_MAX = 8
 
     /**
      * ★每次点完探这么久有没有"开始消失"（入场动画期点空是正常代价）。
@@ -1262,7 +1263,7 @@ object MazeLoop {
      *  而 `BATTLE_TAP_MAX=1` 是"永不重试" ⇒ 会永远停在预览页刷心跳（实测卡了 2 分钟、第 450 轮）。
      *  重试前提（见 [handleQuestDetail]）：最上层仍是预览页 + **编组页零件没在屏**（说明上一次确实没打开
      *  编组页）+ 距上次点击够久 + 总次数未超上限。 */
-    private const val BATTLE_TAP_MAX_TOTAL = 3
+    private const val BATTLE_TAP_MAX_TOTAL = 5
     private const val BATTLE_RETAP_GAP_MS = 6_000L
 
     /** PC `BATTLE_IDLE_WARN`(478)：点过挑战后停在本页这么多轮才提示"可能被盖住" */
@@ -1277,7 +1278,7 @@ object MazeLoop {
 
     /** PC `LAB_RESULT_TAP_MAX`(417)：结算页最多点几次（①②两屏各一次即可；点不动就不再砸）。
      *  ⚠数的是**真点下去的次数**（2026-10-16 修：原来数的是轮数，读不到按钮时 6 轮就把额度耗光）。 */
-    private const val LAB_RESULT_TAP_MAX = 6
+    private const val LAB_RESULT_TAP_MAX = 10
 
     /** PC `LAB_RESULT_NEXT_RES`(5359) / `LAB_RESULT_CLOSE_RES`(5360)：结算页按钮的**节点名**候选
      *  —— `cands`（对象字段）拿不到时，按名字在结算子树里找（PC 的第 2 档兜底）。
@@ -1535,8 +1536,9 @@ object MazeLoop {
     /** ★奖励页"点屏幕中央"的次数（按现场 tag 计，最多 [REWARD_CENTER_MAX] 次） */
     private val rewardCenterTaps = HashMap<String, Int>()
 
-    /** ★奖励页定向兜底：同一现场最多点几次屏幕中央（一般 1~2 屏奖励，够了） */
-    private const val REWARD_CENTER_MAX = 2
+    /** ★奖励页定向兜底：同一现场最多点几次屏幕中央（一般 1~2 屏奖励，够了）。
+     *  ★2026-11-14（用户）：2 → 4 —— 这页点中心只是推进，多点几下无害。 */
+    private const val REWARD_CENTER_MAX = 4
 
     /** ★刷开局算好的**每区最优路线**（`RerollState` 的 `routePerArea`）：移动分支要用它，
      *  不能再只在开局那一次传（见 [handleMove] 里的说明）。 */
@@ -1545,10 +1547,17 @@ object MazeLoop {
     /** ★最多等几轮让按钮落位（超过 ⇒ 不再等，直接点；防"坐标每轮抖 1px"死等） */
     private const val LAB_RESULT_SETTLE_N = 8
 
-    /** ★弹窗点击熔断（2026-10-17）：同一颗按钮最多连点 [DLG_TAP_MAX] 次（防"幽灵弹窗"无限连点） */
-    private const val DLG_TAP_MAX = 3
+    /** ★弹窗点击熔断（2026-10-17）：同一颗按钮最多连点 [DLG_TAP_MAX] 次（防"幽灵弹窗"无限连点）。
+     *  ★2026-11-14（用户）：3 → **8** —— 这类"提前点/点空再点"是安全动作，代价只是一次 tap；
+     *  阈值太小会把"动画还没结束"的正常弹窗误判成幽灵弹窗（商店买完遗物卡死就是这个）。 */
+    private const val DLG_TAP_MAX = 8
+
+    /** ★熔断后静默多久允许再试（2026-11-14）：原来熔断是**永久**的，一旦某次连点没生效
+     *  （点早了 / 动画还没结束），压在商店上的到账弹窗就再也没人点，商店"等它关掉"等到用户手动点。 */
+    private const val DLG_RETRY_MS = 10_000L
     private var dlgTapSig: String? = null
     private var dlgTapN = 0
+    private var dlgTapAt = 0L
 
     /** 上次见到的"游戏被杀次数"（[GameProcess.kills]）；一变 ⇒ 说明游戏被重建过，清编队/装备缓存 */
     private var seenKills = 0
@@ -1686,8 +1695,8 @@ object MazeLoop {
     private const val EXEQ_MAX_STEPS = 18            // 一次流程最多点几下（PC EXEQ_MAX_STEPS=8；
                                                        //   ★这里要多留：整条链最少 6 下（自动装备→优先→系别贯穿→确认→确认→装备确定），
                                                        //   每一下还有"没生效重试"的余量）
-    private const val EXEQ_TAP_TRIES = 3             // 同一次调用里最多点几下（tapAndCheck 的 retries）
-    private const val EXEQ_TAP_MAX = 6               // 同一个按钮最多点几下（防止在一个按钮上狂点）
+    private const val EXEQ_TAP_TRIES = 4             // 同一次调用里最多点几下（tapAndCheck 的 retries）
+    private const val EXEQ_TAP_MAX = 8               // 同一个按钮最多点几下（防止在一个按钮上狂点）
     /** ★★连续"点不动/读不到"几次就**放弃这次装备**（2026-11-08 实测 11:44 那轮卡死 30 秒的教训）：
      *  EX 装备只是锦上添花，卡住就该放过 ⇒ 放过它，编组页照常开打。 */
     private const val EXEQ_STALL_MAX = 3
@@ -3643,6 +3652,16 @@ object MazeLoop {
         // ★2026-11-10 用户反馈"这次点错了"：上一件的角色确认框还没关时，`labShop` 仍能从底下读到商店，
         //   于是这里直接点了商品 —— 那一下其实打在确认框上。顶层不是商店页就**先不点**（撤销购买意图）。
         if (baseTop.isNotEmpty() && !baseTop.startsWith("DialogLabyrinthShop")) {
+            // ★2026-11-14（用户反馈"3 层 BOSS 前商店买完遗物不能自动关闭，要手动点"）：
+            //   到账/确认框（`DialogCommon*`）会压在商店上面，它**要人点一下才会关**。
+            //   原来这里只"等它关掉"，而主循环的通用弹窗白名单在本页被 ownPage 跳过 ⇒ 两边互相等，
+            //   日志刷到 90s+，直到用户手动点。改成：先主动点掉挡路的通用弹窗。
+            if (baseTop.startsWith("DialogCommon")) {
+                if (tapDialogConfirm(input, baseTop.removeSuffix("(Clone)"), "shop")) {
+                    AppState.addLog("[!] 商店：$what 前顶层「$baseTop」挡路 → 先点掉它再继续")
+                    return false
+                }
+            }
             AppState.addLog("[!] 商店：$what 前顶层「$baseTop」不是商店页 → 先不点（等它关掉）")
             shopBuyStep = 0; shopPendKind = null; shopPendGi = -1; shopPendRetry = 0
             return false
@@ -8087,7 +8106,7 @@ object MazeLoop {
 
     /** 确认按钮「落位」探测：弹窗打开动画里按钮会漂，连读这么多次、两次差 ≤8px 才用。
      *  不是加大等待换准确，是用 30ms 的轻读**更快知道现在能不能点**（2026-11-09 事故）。 */
-    private const val DLG_XY_TRIES = 4
+    private const val DLG_XY_TRIES = 6
     private const val DLG_XY_GAP_MS = 60L
 
     /** 选人页最多点几次（每次都重新读卡片位置/属性；2026-11-07 用户定为 10） */
@@ -8446,16 +8465,25 @@ object MazeLoop {
         //   坐标一模一样 ⇒ 前两次明明**成功移动了**，计数却一直累加 ⇒ 第 3 次把正常弹窗
         //   误判成幽灵弹窗熔断，卡在「移动目标确认」18s（与 [labResultSig] 同款修法）。
         val sig = "$tag|${hit.optString("name")}@${hit.optInt("x")},${hit.optInt("y")}"
+        val now = SystemClock.elapsedRealtime()
         if (sig == dlgTapSig) dlgTapN++ else { dlgTapSig = sig; dlgTapN = 1 }
         if (dlgTapN > DLG_TAP_MAX) {
-            if (dlgTapN == DLG_TAP_MAX + 1) {
-                AppState.addLog(
-                    "[!] 同一颗弹窗按钮「${hit.optString("name")}」连点 $DLG_TAP_MAX 次都没推进 → **不再点它**" +
-                        "（幽灵弹窗或点不动）",
-                )
+            // ★2026-11-14（用户反馈"买完遗物商店不能自动关闭"）：熔断不再永久 —— 静默
+            //   [DLG_RETRY_MS] 后再试一轮。"幽灵节点"最坏只是每 10s 白点一次；而
+            //   "点早了 / 动画还没结束"的弹窗能自救，不会再和商店互相干等。
+            if (now - dlgTapAt < DLG_RETRY_MS) {
+                if (dlgTapN == DLG_TAP_MAX + 1) {
+                    AppState.addLog(
+                        "[!] 同一颗弹窗按钮「${hit.optString("name")}」连点 $DLG_TAP_MAX 次都没推进 → " +
+                            "暂缓 ${DLG_RETRY_MS / 1000}s 再试",
+                    )
+                }
+                return false
             }
-            return false
+            AppState.addLog("… 弹窗「${hit.optString("name")}」已静默 ${DLG_RETRY_MS / 1000}s → 再点一轮")
+            dlgTapN = 1
         }
+        dlgTapAt = now
         tap(input, hit.optInt("x"), hit.optInt("y"), "对话框「${hit.optString("name")}」")
         return true
     }
