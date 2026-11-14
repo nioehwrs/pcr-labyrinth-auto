@@ -20,6 +20,7 @@ import android.provider.Settings
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.horizontalScroll
@@ -37,6 +38,8 @@ import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -48,6 +51,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
@@ -87,6 +92,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
@@ -105,6 +111,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -1572,6 +1579,113 @@ private fun GuildPickCard(
     }
 }
 
+/**
+ * ★三选一目标配置（2026-11-14 用户）：每项 = 权重 + 生效区间。
+ *
+ * 权重 0 = 不参与；条件按当前节点 blockId 判断（3图前 = 只到 20601，3图后 = 30101 起，
+ * 3图boss后 = 30701 起）。**每个非 0 项都会让选人多算一轮**（1 次基线 + 3 个候选）。
+ */
+@Composable
+private fun PickTargetsEditor(context: Context) {
+    var list by remember { mutableStateOf(RerollSettings.loadPickTargets(context)) }
+    // ★2026-11-14（用户）：宽屏下名称和控件被拉到两端、看着费劲。整块靠右，并给 900dp 横向上限
+    //   （手机窄屏时 widthIn 不生效，仍是一列铺满）。
+    // ★2026-11-14（用户）：整块**靠左**排列，宽度最多 500dp —— 宽屏下控件不会飘到屏幕最右边，
+    //   窄屏（手机）时 widthIn 不生效，退化成铺满一列。
+    Column(
+        modifier = Modifier.widthIn(max = 500.dp).fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        Text("三选一目标", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+        Text(
+            "权重 0 = 不用。每多一个非 0 项，选人都要多算一轮（约 0.7 秒）—— 6 项全开约 5 秒。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        list.forEachIndexed { i, t ->
+            var menu by remember { mutableStateOf(false) }
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                // ★权重 0 = 该项不参与 ⇒ 整行置灰（只改透明度，不动背景色）
+                modifier = Modifier.alpha(if (t.weight <= 0.0) 0.38f else 1f),
+            ) {
+                // ★名称给**固定宽度**（不用 weight 撑开）：weight 会把控件顶到行尾，
+                //   宽屏下名称和控件隔着一大片空白，看着像两块东西。
+                Text(
+                    t.label,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.width(140.dp),
+                )
+                // 权重：带边框的 − 数值 + 三段
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .border(
+                            1.dp,
+                            MaterialTheme.colorScheme.outlineVariant,
+                            RoundedCornerShape(8.dp),
+                        )
+                        .padding(horizontal = 2.dp),
+                ) {
+                    TextButton(
+                        onClick = {
+                            if (t.weight > 0) {
+                                list = list.toMutableList().also { it[i] = t.copy(weight = t.weight - 1) }
+                                RerollSettings.savePickTargets(context, list)
+                            }
+                        },
+                        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+                        modifier = Modifier.height(32.dp),
+                    ) { Text("−", style = MaterialTheme.typography.labelMedium) }
+                    Text(
+                        "%.0f".format(t.weight),
+                        style = MaterialTheme.typography.labelMedium,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.width(18.dp),
+                    )
+                    TextButton(
+                        onClick = {
+                            if (t.weight < 10) {
+                                list = list.toMutableList().also { it[i] = t.copy(weight = t.weight + 1) }
+                                RerollSettings.savePickTargets(context, list)
+                            }
+                        },
+                        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+                        modifier = Modifier.height(32.dp),
+                    ) { Text("+", style = MaterialTheme.typography.labelMedium) }
+                }
+                // 条件：下拉框样式（带 ▾）
+                Box {
+                    OutlinedButton(
+                        onClick = { menu = true },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                        modifier = Modifier.height(32.dp),
+                    ) {
+                        Text(
+                            (RerollSettings.PICK_CONDS.firstOrNull { it.first == t.cond }?.second
+                                ?: "通用") + " ▾",
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                    }
+                    DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                        RerollSettings.PICK_CONDS.forEach { (k, v) ->
+                            DropdownMenuItem(
+                                text = { Text(v, style = MaterialTheme.typography.bodySmall) },
+                                onClick = {
+                                    menu = false
+                                    list = list.toMutableList().also { it[i] = t.copy(cond = k) }
+                                    RerollSettings.savePickTargets(context, list)
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /** 计算方法二选一（规则 / 模型），「角色选择」「编队」两张卡共用。 */
 @Composable
 private fun MethodRow(
@@ -1680,6 +1794,9 @@ private fun PickSettingsCard(context: Context) {
         ) {
             byModel = it
             RerollSettings.savePickByModel(context, it)
+        }
+        if (byModel) {
+            PickTargetsEditor(context)
         }
         HorizontalDivider()
         Text(

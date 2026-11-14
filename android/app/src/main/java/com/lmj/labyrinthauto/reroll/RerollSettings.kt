@@ -561,4 +561,107 @@ object RerollSettings {
         context.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()
             .putInt("bossPartyCount", n.coerceIn(1, 3)).apply()
     }
+
+    // ────────────────────────── 三选一的「目标」配置（2026-11-14 用户）──────────────────────────
+
+    /**
+     * 一个三选一目标：权重 + 生效区间。
+     *
+     * ★权重为 0 表示不参与；★**每个非 0 项都会增加计算时间**（每项 = 1 次基线 + 3 个候选）。
+     *
+     * 条件语义（用户 2026-11-14 定义，按节点 blockId 判断，5 位数字）：
+     *  · `ANY`            始终适用
+     *  · `BEFORE_2`       2 图前（不含 2 图）⇒ blockId < 20000
+     *  · `AFTER_2`        2 图后（含 2 图）   ⇒ blockId >= 20000
+     *  · `BEFORE_3`       3 图前（不含 3 图） ⇒ blockId < 30000（= 20601 及之前）
+     *  · `AFTER_3`        3 图后（含 3 图）   ⇒ blockId >= 30000（= 30101 及之后）
+     *  · `BEFORE_3_BOSS`  3 图首领前          ⇒ blockId < 30701
+     *  · `AFTER_3_BOSS`   3 图首领后（含）    ⇒ blockId >= 30701
+     *
+     * 例：某项权重 3、条件「3 图前」，那么到了 3 图及之后这一项按 0 处理。
+     */
+    data class PickTargetCfg(
+        val id: String,
+        val label: String,
+        val weight: Double,
+        val cond: String,
+    )
+
+    /** 条件枚举（顺序 = UI 下拉顺序） */
+    val PICK_CONDS: List<Pair<String, String>> = listOf(
+        "ANY" to "通用",
+        "BEFORE_2" to "2图前",
+        "AFTER_2" to "2图后",
+        "BEFORE_3" to "3图前",
+        "AFTER_3" to "3图后",
+        "BEFORE_3_BOSS" to "3图boss前",
+        "AFTER_3_BOSS" to "3图boss后",
+    )
+
+    /**
+     * 默认值（对齐决策系统 `unit_choice_targets`）：
+     * 2 个首领 + **ex_weights 里的全部 14 项**（含 PC 上权重为 0 的那 10 项，方便按需开启）。
+     */
+    val PICK_TARGET_DEFAULTS: List<PickTargetCfg> = listOf(
+        PickTargetCfg("boss3", "3 层首领", 3.0, "BEFORE_3_BOSS"),
+        PickTargetCfg("boss5", "5 层首领", 2.0, "AFTER_3_BOSS"),
+        // 名字取自 game_catalog.json 的 `recruitment.ex_quests`（原样照抄，和 PC 界面一致）
+        PickTargetCfg("ex_770120101", "幽灵领主", 2.0, "BEFORE_3_BOSS"),
+        PickTargetCfg("ex_770120201", "好朋友X", 4.0, "BEFORE_3_BOSS"),
+        PickTargetCfg("ex_770120301", "岛鲸", 0.0, "ANY"),
+        PickTargetCfg("ex_770120401", "反物质兽", 0.0, "ANY"),
+        PickTargetCfg("ex_770120501", "巨大吞拿鱼", 0.0, "ANY"),
+        PickTargetCfg("ex_770120601", "熔岩龙", 0.0, "ANY"),
+        PickTargetCfg("ex_770120701", "爆炸·遗物", 0.0, "ANY"),
+        PickTargetCfg("ex_770120801", "破坏·遗物", 0.0, "ANY"),
+        PickTargetCfg("ex_770120901", "护盾·遗物", 0.0, "ANY"),
+        PickTargetCfg("ex_770121001", "治愈·遗物", 0.0, "ANY"),
+        PickTargetCfg("ex_770121101", "攻击·遗物", 0.0, "ANY"),
+        PickTargetCfg("ex_770121201", "诅咒·遗物", 0.0, "ANY"),
+        PickTargetCfg("ex_770421301", "黄蜂女王", 3.0, "AFTER_3_BOSS"),
+        PickTargetCfg("ex_770421401", "美空", 3.0, "AFTER_3_BOSS"),
+    )
+
+    fun loadPickTargets(context: Context): List<PickTargetCfg> {
+        val raw = context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+            .getString("pickTargets", null) ?: return PICK_TARGET_DEFAULTS
+        return try {
+            val arr = JSONArray(raw)
+            val out = ArrayList<PickTargetCfg>(PICK_TARGET_DEFAULTS.size)
+            for (d in PICK_TARGET_DEFAULTS) {
+                val o = (0 until arr.length()).map { arr.optJSONObject(it) }
+                    .firstOrNull { it?.optString("id") == d.id }
+                out.add(
+                    if (o == null) d
+                    else d.copy(
+                        weight = o.optDouble("w", d.weight).coerceIn(0.0, 10.0),
+                        cond = o.optString("c").takeIf { c -> PICK_CONDS.any { it.first == c } } ?: d.cond,
+                    ),
+                )
+            }
+            out
+        } catch (e: Exception) {
+            PICK_TARGET_DEFAULTS
+        }
+    }
+
+    fun savePickTargets(context: Context, list: List<PickTargetCfg>) {
+        val arr = JSONArray()
+        for (t in list) {
+            arr.put(JSONObject().put("id", t.id).put("w", t.weight).put("c", t.cond))
+        }
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()
+            .putString("pickTargets", arr.toString()).apply()
+    }
+
+    /** 条件是否命中（`blockId` 是 5 位节点编号，如 20601 / 30701） */
+    fun condMatch(cond: String, blockId: Int): Boolean = when (cond) {
+        "BEFORE_2" -> blockId < 20000
+        "AFTER_2" -> blockId >= 20000
+        "BEFORE_3" -> blockId < 30000
+        "AFTER_3" -> blockId >= 30000
+        "BEFORE_3_BOSS" -> blockId < 30701
+        "AFTER_3_BOSS" -> blockId >= 30701
+        else -> true          // ANY
+    }
 }

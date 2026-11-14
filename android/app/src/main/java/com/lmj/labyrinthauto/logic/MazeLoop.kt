@@ -4021,14 +4021,22 @@ object MazeLoop {
             //   bossByArea 从刷开局产物带过来（见上面 reroll.bossByArea 那段），所以开局就知道这两个是谁。
             //   ★关卡 id 必须用**模型词表里的**（`labyrinth_boss.json` 的那套编号模型不认），
             //     所以走 LabModel.bossQuestOf（按"该区 + 敌人含这个 Boss"反查）。
+            // ★2026-11-14（用户）：目标改成可配置（权重 + 生效区间），在「角色选择 → 推理模型」里调。
+            //   条件按当前节点 blockId 判断（3图前 = blockId<30000、3图boss后 = >=30701）。
+            val blockId = (st.opt("blockId") as? String)?.toIntOrNull()
+                ?: (st.opt("blockId") as? Number)?.toInt() ?: 0
             val targets = ArrayList<Pair<Int, Double>>(6)
-            val curArea = (st.opt("area") as? Number)?.toInt() ?: 1
-            // 首领：权重取决策系统配置（3 区 3、5 区 2）
-            bossQuestByArea[3]?.takeIf { curArea <= 3 }?.let { targets.add(it to 3.0) }
-            bossQuestByArea[5]?.takeIf { curArea <= 5 }?.let { targets.add(it to 2.0) }
-            // EX：4 个（权重 2/4/3/3），按"当前区及以后"过滤
-            for ((q, w) in com.lmj.labyrinthauto.labmodel.LabModel.EX_TARGET_WEIGHTS) {
-                if (q / 100000 % 10 >= curArea) targets.add(q to w)
+            PartyPlan.appCtx?.let { app ->
+                for (cfg in RerollSettings.loadPickTargets(app)) {
+                    if (cfg.weight <= 0.0) continue
+                    if (!RerollSettings.condMatch(cfg.cond, blockId)) continue
+                    val q = when (cfg.id) {
+                        "boss3" -> bossQuestByArea[3]
+                        "boss5" -> bossQuestByArea[5]
+                        else -> cfg.id.removePrefix("ex_").toIntOrNull()
+                    }
+                    if (q != null && q > 0) targets.add(q to cfg.weight)
+                }
             }
             pick.pickLabReward(
                 cards, ctx, (st.opt("questId") as? Number)?.toInt() ?: 0, targets,
