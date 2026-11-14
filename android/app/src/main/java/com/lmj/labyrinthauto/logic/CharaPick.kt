@@ -208,15 +208,24 @@ class CharaPick(
         // ★推理模型（2026-11-14 用户）：逐个候选算「加进池子后最优队胜率提升」，多目标按权重加权；
         //   模型不可用 / 关卡不在词表 / 候选全不认识 ⇒ 静默走下面的规则版。
         if (byModel && ctx.own.isNotEmpty()) {
-            val ids = cards.map { (it.opt("unitId") as? Number)?.toInt() ?: 0 }
+            // ★不选 NPC 角色（2026-11-13 用户）：模型路径也必须遵守 —— 先把 NPC 卡从候选里剔除
+            //   （与下方规则版同口径：三张全 NPC 时忽略该设置）。模型只在剩下的卡里算、选。
+            val candIdx = if (excludeNpc) {
+                val nonNpc = cards.indices.filter { !cards[it].optBoolean("npc", false) }
+                if (nonNpc.isNotEmpty()) nonNpc else cards.indices.toList()
+            } else {
+                cards.indices.toList()
+            }
+            val candCards = candIdx.map { cards[it] }
+            val ids = candCards.map { (it.opt("unitId") as? Number)?.toInt() ?: 0 }
             // ★缓存（2026-11-14）：模型算一次要 4~5 秒，而 `handleLabSelection` 每轮循环都会调进来，
             //   卡片还没被点中之前会**重复算好几遍**（实测同一组卡算了两次，白等一倍时间）。
-            //   key = 三张卡 + 持有池 + 目标关卡，任一变化就重算。
+            //   key = 候选卡（已排除 NPC）+ 持有池 + 目标关卡，任一变化就重算；modelIdx 存候选下标，取时映射回原 cards。
             val key = ids.joinToString(",") + "|" + ctx.own.sorted().hashCode() + "|" +
                 targets.joinToString(",") { it.first.toString() } + "|" + questId
-            if (key == modelKey && modelIdx in cards.indices) {
+            if (key == modelKey && modelIdx in candCards.indices) {
                 // ★用**当前这轮**的卡片对象（坐标是新的），只复用下标
-                val i = modelIdx
+                val i = candIdx[modelIdx]
                 AppState.addLog("选角色：模型版（命中缓存）→ 第 ${i + 1} 张")
                 return LabPickResult(cards[i], i, "模型：胜率增益最高", 0, 0)
             }
@@ -225,14 +234,15 @@ class CharaPick(
             }
             val t0 = SystemClock.elapsedRealtime()
             val idx = LabModel.pickChar(ids, ctx.own, qs, 2)
-            if (idx != null && idx in cards.indices) {
+            if (idx != null && idx in candCards.indices) {
+                val i = candIdx[idx]
                 AppState.addLog(
                     "选角色：模型版 ${SystemClock.elapsedRealtime() - t0}ms（${qs.size} 个目标）" +
-                        " → 第 ${idx + 1} 张（unitId=${ids[idx]}）",
+                        " → 第 ${i + 1} 张（unitId=${ids[idx]}）",
                 )
                 modelKey = key
                 modelIdx = idx
-                return LabPickResult(cards[idx], idx, "模型：胜率增益最高", 0, 0)
+                return LabPickResult(cards[i], i, "模型：胜率增益最高", 0, 0)
             }
         }
         val tankTag = TagIds.T["tank"]!!; val mtankTag = TagIds.T["mtank"]!!

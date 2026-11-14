@@ -4313,10 +4313,11 @@ function labSelectionSnapshot(diag, force) {
     const ui = it.add(0xB8).readPointer();
     if (ptrOk(ui)) {
       c.unitId = decOI(ui.add(0x10));
-      try { c.unitType = ui.add(0x1C).readS32(); } catch (e) {}
-      // ★NPC 判据就在 LabyrinthUnitInfo.UnitType：
-      //   eLabyrinthUnitType { USER = 1, NPC = 2, INVALID_VALUE = -1 }
-      //   实测：带 NPC 标志的卡 type=2，正常卡 type=1（与画面一致）。
+      // ★unitType：选人卡片（LabyrinthUnitInfo 之类）的 UnitType 是**明文** int @0x1C（1=USER 2=NPC）。
+      //   实测 NPC 卡 0x1C=2、USER 卡 0x1C=1（与注释原本一致；之前 decOI 解密明文反而得乱值，是错的）。
+      let ut = null;
+      try { ut = ui.add(0x1c).readS32(); } catch (e) {}
+      c.unitType = ut;
       c.npc = (c.unitType === 2);
     }
     const sb = it.add(0x60).readPointer();          // selectButton =「决定」
@@ -7496,7 +7497,7 @@ function _rpcSafe(fn) {
 
 // 本局"已持有角色"（速通组队要用：角色池，用户 2026-10-08）：
 //   LabyrinthTempData+0x28 OwnUnitInfoSet: HashSet<LabyrinthUnitType>
-//     LabyrinthUnitType: UnitId@0x10（**明文模板 id**，如 110301）/ UnitType@0x1C（1=USER 2=NPC）
+//     LabyrinthUnitType: UnitId@0x10（**明文模板 id**，如 110301）/ UnitType@0x14（**明文** 1=USER 2=NPC）
 //   ★NPC 形态也算"本轮抽到了"（抽到时账号未持有/练度不够 → 以 NPC 出场），所以两种都返回。
 function labUnitsSnapshot() {
   // ★带"读了多少"的计数（2026-10-16 查"持有池读少"）：setCap = `_entries` 数组长度、
@@ -7529,7 +7530,7 @@ function labUnitsSnapshot() {
       if (!ptrOk(v)) continue;
       let uid = -1, utype = null;
       try { uid = v.add(0x10).readS32(); } catch (e) {}   // 明文模板 id
-      try { utype = v.add(0x1C).readS32(); } catch (e) {} // 1=USER 2=NPC
+      try { utype = v.add(0x14).readS32(); } catch (e) {} // 1=USER 2=NPC（明文@0x14；旧注释说0x1C已过时：游戏更新后字段前移4字节）
       if (uid >= 0) { res.unitIds.push(uid); res.units.push({ unitId: uid, unitType: utype }); res.setHit++; }
     }
     res.unitIds.sort(function (a, b) { return a - b; });
