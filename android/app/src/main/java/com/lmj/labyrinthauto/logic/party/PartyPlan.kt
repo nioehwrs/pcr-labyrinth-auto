@@ -10,6 +10,7 @@ import com.lmj.labyrinthauto.frida.AgentApi
 import com.lmj.labyrinthauto.logic.team.C
 import com.lmj.labyrinthauto.logic.team.Profiles
 import com.lmj.labyrinthauto.logic.team.Res
+import com.lmj.labyrinthauto.labmodel.LabModel
 import com.lmj.labyrinthauto.logic.team.TeamBuild
 import com.lmj.labyrinthauto.reroll.RerollSettings
 import org.json.JSONArray
@@ -475,6 +476,25 @@ object PartyPlan {
     )
 
     /**
+     * 模型版目标队伍（null = 走规则版）。
+     *
+     * 只返回**第一队**：多队场景下后续轮次的池已排除上一队的人，模型会自然算出下一队，
+     * 与规则版"一次编一队、按实际队伍重算"的节奏一致。
+     */
+    private fun modelTeamOf(stage: String, st: JSONObject, pool: List<Int>): List<Int>? {
+        val app = appCtx ?: return null
+        if (!RerollSettings.loadTeamByModel(app)) return null
+        val questId = (st.opt("questId") as? Number)?.toInt()?.takeIf { it > 0 } ?: return null
+        if (!LabModel.load(app)) return null
+        val type = when {
+            stage.startsWith("Boss_") -> 3
+            stage.startsWith("EX_") -> 2
+            else -> 1
+        }
+        return LabModel.planTeam(questId, pool, 1, type)?.firstOrNull()
+    }
+
+    /**
      * PC `party_plan`(2698)：目标队伍 vs 当前队伍 + 一次算好的全部操作。
      * @param st 状态（取 questId / panelType / area）
      * @param pt 编队页快照（AgentApi.labParty 的 JSON）
@@ -556,11 +576,26 @@ object PartyPlan {
             tb = cached
             AppState.addLog("组队算法 ${SystemClock.elapsedRealtime() - t0}ms（命中缓存，池 ${pool.size} 个）")
         } else {
-            tb = teamBuild!!.buildBest(
-                stage, pool.map { it.toString() }, relicsSkill = ctx.sk, floor = floor,
-                size = LAB_PARTY_SIZE, failed = failed,          // ★失败过 ⇒ 让规则表决定要不要补坦克
-                tpUp = ctx.tpUp, initTp = ctx.sk,
-            )
+            // ★2026-11-14（用户）：编队可切「推理模型」。算不出（未加载 / 关卡不在词表 /
+            //   认识的角色不足 5 人）就**静默**回落规则版，不打扰用户。
+            val modelTeam = modelTeamOf(stage, st, pool)
+            tb = if (modelTeam != null) {
+                AppState.addLog(
+                    "组队：模型版 ${SystemClock.elapsedRealtime() - t0}ms（池 ${pool.size} 个）→ " +
+                        modelTeam.joinToString(","),
+                )
+                Res(
+                    stage = stage, algo = "model", cands = mutableListOf(), weak = mutableListOf(),
+                    drop = mutableListOf(), attrlimUnits = mutableListOf(), todo = null,
+                    forceAttr = null, floorRule = null, failed = failed,
+                ).apply { team = modelTeam.map { it.toString() } }
+            } else {
+                teamBuild!!.buildBest(
+                    stage, pool.map { it.toString() }, relicsSkill = ctx.sk, floor = floor,
+                    size = LAB_PARTY_SIZE, failed = failed,      // ★失败过 ⇒ 让规则表决定要不要补坦克
+                    tpUp = ctx.tpUp, initTp = ctx.sk,
+                )
+            }
             if (tb.team.isNullOrEmpty()) {
                 // ★空队兜底（2026-10-19 用户）：放宽属性限定重编一次——过滤链（前3图屏蔽/attrlim 剔除/
                 //   tier 门槛）可能把薄池筛空（实测 4-2 HARD：池 32 个算不出目标 → 编组页死等 33 分钟）
