@@ -188,11 +188,48 @@ data class GuildPool(
 
 /** 全部迷宫公会花名册（按迷宫公会 id 1~5 主键） */
 data class GuildPoolData(val guilds: Map<Int, GuildPool>) {
-    /** 由屏上候选 unitIds 识别当前公会（各公会角色互不相交 ⇒ 候选角色全落在一家里即唯一） */
+
+    /** [identify] 的诊断日志节流（每 10s 最多一条，避免每拍刷屏）。 */
+    @Volatile
+    private var lastIdentifyLogAt = 0L
+    /**
+     * 由屏上候选 unitIds 识别当前公会。
+     *
+     * 各公会角色互不相交 ⇒ 「候选全落在一家里」就是唯一解。
+     * ★2026-11-14 用户反馈（新公会卡在选角色页、要手动勾）：实测候选池会混进不属于该公会的
+     *   角色（NPC / 未解锁槽位 / 双人卡之类），严格匹配直接失败 ⇒ 没人点，只能人工勾。
+     *   这里加一层退化：按「落在某公会的角色最多」判定，要求至少 3 个且占比 ≥ 60%
+     *   （防止把"全角色池"误判成某一家）；命中后把外来角色打进日志，方便下次定位。
+     */
     fun identify(cands: List<Int>): Int? {
-        val candChars = cands.map { it / 100 }.toSet()
+        val candChars = cands.map { it / 100 }.filter { it > 0 }.toSet()
         if (candChars.isEmpty()) return null
-        return guilds.values.firstOrNull { g -> candChars.all { c -> c in g.charIds } }?.labId
+        guilds.values.firstOrNull { g -> candChars.all { c -> c in g.charIds } }?.let { return it.labId }
+        val best = guilds.values
+            .map { g -> g to candChars.count { c -> c in g.charIds } }
+            .maxByOrNull { it.second } ?: return null
+        val (g, hit) = best
+        val ratio = hit.toDouble() / candChars.size
+        val now = System.currentTimeMillis()
+        if (hit < 3 || ratio < 0.6) {
+            if (now - lastIdentifyLogAt > 10_000) {      // 每 10s 最多一条，别刷屏
+                lastIdentifyLogAt = now
+                AppState.addLog(
+                    "[规则] 公会识别失败：候选 ${candChars.size} 个角色，最高命中「${g.cn}」" +
+                        "$hit 个（${(ratio * 100).toInt()}%）",
+                )
+            }
+            return null
+        }
+        val extras = candChars.filter { it !in g.charIds }.sorted()
+        if (now - lastIdentifyLogAt > 10_000) {
+            lastIdentifyLogAt = now
+            AppState.addLog(
+                "[规则] 公会识别（容忍外来角色）：候选 ${candChars.size} 个，命中「${g.cn}」$hit 个" +
+                    (if (extras.isEmpty()) "" else "，外来=${extras.joinToString(",")}"),
+            )
+        }
+        return g.labId
     }
 
     /**

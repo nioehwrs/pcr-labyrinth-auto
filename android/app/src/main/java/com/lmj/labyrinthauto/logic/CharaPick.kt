@@ -299,8 +299,25 @@ class CharaPick(
     fun ruleLine(q: JSONObject, firstTime: Boolean): Pair<String, List<Int>>? {
         if (pool.guilds.isEmpty()) return null
         val cands = intList(q, "cands")
+        // ★2026-11-14：旧日志把「候选池为空」和「有角色不属本公会」混成同一句"匹配不到"，
+        //   排查时只能靠猜。这里分开，并且首次失败就把 cands 原样打出来（最多 40 个）。
+        if (cands.isEmpty()) {
+            if (firstTime) {
+                AppState.addLog(
+                    "[规则] 选角色页候选池为空（cands=[]）：已选 ${intList(q, "picked").size} 个、" +
+                        "可选数=${q.opt("selectableNum")}、节点=${q.optString("node")} " +
+                        "→ 读不到候选，不是花名册漏角色",
+                )
+            }
+            return null
+        }
         val labId = pool.identify(cands) ?: run {
-            if (firstTime) AppState.addLog("[规则] 候选池匹配不到任何公会花名册（lab_guild_pool.json 可能漏了角色）")
+            if (firstTime) {
+                AppState.addLog(
+                    "[规则] 候选池匹配不到公会花名册：cands=" + cands.take(40).joinToString(",") +
+                        " ／ /100=" + cands.take(40).map { it / 100 }.joinToString(","),
+                )
+            }
             return null
         }
         val g = pool.guilds[labId]!!
