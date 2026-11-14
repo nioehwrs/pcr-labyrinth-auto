@@ -5,6 +5,7 @@ import com.lmj.labyrinthauto.net.bilibili.BilibiliGameSession
 import com.lmj.labyrinthauto.net.bilibili.GameSessionResult
 import com.lmj.labyrinthauto.reroll.LabyrinthLoginClient
 import com.lmj.labyrinthauto.reroll.LoginOutcome
+import kotlinx.coroutines.delay
 
 /**
  * **EX 装备的读 / 写**（2026-11-06）：走游戏 HTTP API（与 autopcr 完全同一套），
@@ -122,9 +123,16 @@ object ExEquipService {
             val alive = aliveSerialIds(data)
                 .ifEmpty { record.state.values.flatMap { it.values }.toSet() }
             val plan = ExEquipPlan.build(record.state, current, alive)
+            val note = if (plan.missing.isEmpty()) "" else "（跳过 ${plan.missing.size} 件已不存在的装备）"
             if (plan.isEmpty) {
-                val extra = if (plan.missing.isEmpty()) "" else "（${plan.missing.size} 件装备已不存在，跳过）"
-                return Result.Ok("已经和记录一致，无需还原$extra")
+                // ★2026-11-14（用户）：就算"没变更"也核对一遍 —— 之前只凭 plan 为空就说"已一致"，
+                //   一旦解析/判据有偏差，日志会给出假的"无需还原"。
+                val diffs = diffOf(record.state, current, alive)
+                return if (diffs.isEmpty()) {
+                    Result.Ok("已经和记录一致，无需还原$note")
+                } else {
+                    Result.Err("没有需要提交的变更，但核对有 ${diffs.size} 处不一致：${diffs.summary()}")
+                }
             }
 
             // ① 先卸（被占用的槽）② 再装
@@ -140,9 +148,76 @@ object ExEquipService {
                     is Result.Ok -> Unit
                 }
             }
-            val note = if (plan.missing.isEmpty()) "" else "（跳过 ${plan.missing.size} 件已不存在的装备）"
-            return Result.Ok("已还原：装上 ${plan.apply.size} 个槽位、卸下 ${plan.remove.size} 个$note")
+
+            // ★2026-11-14（用户："还原之后检测一下，看和保存的是不是一样"）：
+            //   push 成功只代表服务器收下了请求，**不代表状态真的对**（顶号/并发/字段没落库都可能）。
+            //   这里回读 `load/index` 逐槽位比对快照；有差异先等 400ms 再确认一次
+            //   （避免服务器瞬时状态造成误报），仍不一致就把差异写清楚并返回 Err。
+            val diffs = verifyRestore(session, record.state, alive)
+                ?: return Result.Err("已提交还原，但回读失败（网络/登录/解析）→ 无法确认是否还原成功")
+            return if (diffs.isEmpty()) {
+                Result.Ok("已还原并核对一致：装上 ${plan.apply.size} 个槽位、卸下 ${plan.remove.size} 个$note")
+            } else {
+                Result.Err("已提交还原，但核对有 ${diffs.size} 处不一致：${diffs.summary()}$note")
+            }
     }
+
+    /**
+     * 还原后回读比对（2026-11-14 用户要求）：返回差异描述；`null` = 这次回读失败（读不到数据）。
+     * 只比快照覆盖到的槽位，`alive` 里没有的装备按"已不存在"跳过。
+     */
+    private suspend fun verifyRestore(
+        session: BilibiliGameSession,
+        target: ExEquipSnapshot,
+        alive: Set<Int>,
+    ): List<String>? {
+        var diffs = readAndDiff(session, target, alive) ?: return null
+        if (diffs.isEmpty()) return diffs
+        // 有差异 ⇒ 可能只是还没落库，等一拍再确认一次
+        delay(400)
+        val again = readAndDiff(session, target, alive) ?: return diffs
+        return again
+    }
+
+    /** 读一次当前状态并比对；`null` = 读取/解析失败 */
+    private suspend fun readAndDiff(
+        session: BilibiliGameSession,
+        target: ExEquipSnapshot,
+        alive: Set<Int>,
+    ): List<String>? {
+        val data = when (val r = session.request(LOAD, linkedMapOf("carrier" to "OPPO"))) {
+            is GameSessionResult.Success -> r.data
+            is GameSessionResult.Rejected,
+            is GameSessionResult.NetworkFailure,
+            is GameSessionResult.ProtocolFailure -> return null
+        }
+        val current = parseSnapshot(data)
+        if (current.isEmpty()) return null
+        val aliveNow = aliveSerialIds(data).ifEmpty { alive }
+        return diffOf(target, current, aliveNow)
+    }
+
+    /** 逐槽位比对，产出可读差异（`角色:槽位 期望 x 实际 y`） */
+    private fun diffOf(
+        target: ExEquipSnapshot,
+        current: ExEquipSnapshot,
+        alive: Set<Int>,
+    ): List<String> {
+        val out = ArrayList<String>()
+        for ((uid, slots) in target.toSortedMap()) {
+            for ((slot, want) in slots.toSortedMap()) {
+                if (want <= 0) continue
+                if (want !in alive) continue          // 这件装备已不存在（被炼/卖），不算差异
+                val got = (current[uid]?.get(slot) ?: 0)
+                if (got != want) out.add("$uid:$slot 期望 $want 实际 $got")
+            }
+        }
+        return out
+    }
+
+    /** 差异列表 → 一行（最多 8 条，超出用 … 省略） */
+    private fun List<String>.summary(): String =
+        take(8).joinToString("；") + if (size > 8) "；…共 $size 处" else ""
 
     // ────────────────────────── 内部 ──────────────────────────
 
