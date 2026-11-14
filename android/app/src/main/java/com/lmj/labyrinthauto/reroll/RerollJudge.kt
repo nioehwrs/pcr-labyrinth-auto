@@ -19,6 +19,9 @@ data class JudgeResult(
     val ok: Boolean,
     val fail: List<String>,
     val bossByArea: Map<Int, Int>,
+    /** ★每区 Boss 的**实战 questId**（2026-11-14）：模型认的是这套编号（`labyrinth_boss.json` 那套不认），
+     *  三选一的"多目标加权"要用它。与 [bossByArea]（unitId）一一对应。 */
+    val bossQuestByArea: Map<Int, Int> = emptyMap(),
     val routePerArea: Map<Int, List<Int>>,
     val actual: Int,
     val theory: Int,
@@ -31,6 +34,7 @@ object RerollJudge {
         val panels = nodes.map { toPanel(it) }
 
         val bossByArea = mutableMapOf<Int, Int>()
+        val bossQuestByArea = mutableMapOf<Int, Int>()
         val bossDiag = mutableListOf<String>()
         for (p in panels) {
             if (p.optInt("blockType") == 8) {
@@ -39,6 +43,9 @@ object RerollJudge {
                 val uid = PartyPlan.bossOf(q)
                 bossDiag += "block_type=8 area=$area questId=$q → unitId=$uid"
                 if (uid != null) bossByArea[area] = uid
+                // ★这里的 questId 是**实战编号**（如 770531901），正是模型词表里那套；
+                //   `labyrinth_boss.json` 的 key 是另一套（模型不认），别混用。
+                q.toIntOrNull()?.takeIf { it > 0 }?.let { bossQuestByArea[area] = it }
             }
         }
         if (bossDiag.isNotEmpty()) {
@@ -104,7 +111,16 @@ object RerollJudge {
             summary = "价值=$actual/$theory"
         }
 
-        return JudgeResult(ok, fail, bossByArea, routePerArea, actual, theory, summary)
+        return JudgeResult(
+            ok = ok,
+            fail = fail,
+            bossByArea = bossByArea,
+            bossQuestByArea = bossQuestByArea,
+            routePerArea = routePerArea,
+            actual = actual,
+            theory = theory,
+            summary = summary,
+        )
     }
 
     private fun toPanel(node: LabyrinthMapNode): JSONObject = JSONObject().apply {
