@@ -3657,7 +3657,9 @@ object MazeLoop {
             //   原来这里只"等它关掉"，而主循环的通用弹窗白名单在本页被 ownPage 跳过 ⇒ 两边互相等，
             //   日志刷到 90s+，直到用户手动点。改成：先主动点掉挡路的通用弹窗。
             if (baseTop.startsWith("DialogCommon")) {
-                if (tapDialogConfirm(input, baseTop.removeSuffix("(Clone)"), "shop")) {
+                // ★tag 带上 $what：熔断签名是 `tag|按钮名@坐标`，用固定 "shop" 会让
+                //   "连续买好几件、每件都弹同一颗按钮"的**成功**点击也累加到 8 次 → 误熔断。
+                if (tapDialogConfirm(input, baseTop.removeSuffix("(Clone)"), "shop|$what")) {
                     AppState.addLog("[!] 商店：$what 前顶层「$baseTop」挡路 → 先点掉它再继续")
                     return false
                 }
