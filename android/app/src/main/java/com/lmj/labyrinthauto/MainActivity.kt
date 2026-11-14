@@ -59,9 +59,8 @@ class MainActivity : ComponentActivity() {
         //   → 把当前页 DialogArea 节点树落到 files/tree_<tag>.json（服务不导出，只能从 Activity 进）
         maybeDumpTree(intent)
 
-        // ★模型探针（2026-11-14）：策略页接「推理模型」之前，先确认模拟器能加载 onnx、
-        //   一次前向多久。模型文件缺失时静默跳过，失败只打日志，不影响任何功能。
-        com.lmj.labyrinthauto.labmodel.LabModelProbe.runOnce(applicationContext)
+        // ★模型组件不再在这里探测（2026-11-14）：下载/校验/加载已统一由 ComponentPrep 负责，
+        //   失败即"组件未就绪"，不需要额外的启动自检（原来那套每次启动白跑约 2 秒并刷日志）。
 
         setContent {
             // ★深色为主、日间浅色可切（2026-10-17 用户选的方向）：状态由这里持有，

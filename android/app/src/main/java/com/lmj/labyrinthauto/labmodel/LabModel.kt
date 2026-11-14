@@ -158,35 +158,7 @@ object LabModel {
     /** quest 是否在模型词表里（不在就说明这关模型没学过，直接回规则版）。 */
     fun supportsQuest(questId: Int): Boolean = questIndex.containsKey(questId)
 
-    /**
-     * 反查「某个区、某个首领」在**模型词表里**的关卡 id（2026-11-14）。
-     *
-     * 为什么不用 `labyrinth_boss.json` 的 questId：那里的编号（如 770530201）**不在模型词表**里，
-     * 直接拿去问模型会被过滤掉，多目标就退化成单目标。这里改成用模型自己的
-     * `critic_enemies`（每个关卡的 5 个敌人）+ `layers`（层数）反查，拿到的 id 一定是它认的。
-     */
-    fun bossQuestOf(area: Int, unitId: Int): Int? {
-        if (!ready) return null
-        for (q in questIndex.keys) {
-            val ci = criticIndex[q] ?: continue
-            if ((layers.getOrNull(ci) ?: 0) != area) continue
-            val es = enemies.getOrNull(ci) ?: continue
-            if (es.contains(unitId)) return q
-        }
-        return null
-    }
 
-    /**
-     * 给**指定的几支队伍**打分（对拍用）：同一套 critic、同一关卡，直接比 win/goal/seconds。
-     * 用来验证"我们选的队"和"桌面版选的队"到底谁被模型认为更强。
-     */
-    fun evalTeams(questId: Int, teams: List<List<Int>>, questType: Int = 2): List<String> {
-        if (!ready || teams.isEmpty()) return emptyList()
-        val seconds = if (questType == 3) 90 else 30
-        return score(questId, teams, seconds).map {
-            "team=${it.team} win=%.4f goal=%.4f sec=%.1f".format(it.win, it.goal, it.seconds)
-        }
-    }
 
     // ────────────────────────── 编队主入口 ──────────────────────────
 
@@ -300,17 +272,6 @@ object LabModel {
         return if (bestIdx >= 0) bestIdx else null
     }
 
-    /**
-     * EX 目标关卡与权重（2026-11-14，取自决策系统 `config/labyrinth.json` 的
-     * `policies.unit_choice_targets.ex_weights`，只保留权重非零的 4 个）。
-     * 区号 = `questId / 100000 % 10`，按"当前区及以后"过滤。
-     */
-    val EX_TARGET_WEIGHTS: List<Pair<Int, Double>> = listOf(
-        770120101 to 2.0,   // 幽灵领主
-        770120201 to 4.0,   // 好朋友X
-        770421301 to 3.0,   // 岛屿
-        770421401 to 3.0,   // 反物质兽
-    )
 
     /**
      * C++ `Engine::ranked` 的比较器（原样照抄）：

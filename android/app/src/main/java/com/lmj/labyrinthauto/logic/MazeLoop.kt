@@ -4084,6 +4084,20 @@ object MazeLoop {
             if (n == 1) {
                 AppState.addLog("[!] $kind 页「决定」坐标 ($dx,$dy) 在屏外（大概在滑动动画中）→ 等下一轮重读")
             }
+            // ★诊断（2026-11-14）：判断到底是"页面还没落位"还是"读到的数据一直没变"。
+            //   每 15 轮打一次 ptr（卡片对象指针）+ 坐标 + 卡片 id：ptr 不变 ⇒ agent 侧返回了旧对象；
+            //   ptr 在变但坐标不变 ⇒ 页面本身如此。
+            if (n == 1 || n % 15 == 0) {
+                // 打印**每张卡**自己的「决定」坐标 —— 判断是不是"只有目标这张读错"，
+                // 还是三张都错（布局问题）。3 个按钮必然同一行，同 y。
+                val detail = cards.joinToString(" ｜ ") {
+                    val u = (it.opt("unitId") as? Number)?.toInt() ?: 0
+                    val x = it.optInt("decideX")
+                    val y = it.optInt("decideY")
+                    "$u@($x,$y)${if (y in 0 until scrH) "" else "✗"}"
+                }
+                AppState.addLog("[诊断] $kind 屏外 #$n：屏=${scrW}x${scrH} → $detail")
+            }
             // 阈值 15 轮：必须超过 agent 的 SEL_TTL_MS=1s 读缓存，否则重读拿到的还是旧的屏外坐标
             if (n <= 15) return
             AppState.addLog("[!] $kind 页坐标 $n 轮仍在屏外 → 改用节点树找「选择」按钮")

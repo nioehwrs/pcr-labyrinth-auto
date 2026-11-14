@@ -45,9 +45,13 @@ class CharaPick(
     private val byModel: Boolean = false,
 ) {
 
-    /** 模型版选人的缓存（同一组卡 + 同一池 + 同一目标 ⇒ 结果复用，别每轮重算 4 秒） */
+    /**
+     * 模型版选人的缓存（同一组卡 + 同一池 + 同一目标 ⇒ 结果复用，别每轮重算 4 秒）。
+     * ★**只存下标，不能存整条结果**：结果里带着 cards[idx] 的 JSON 快照，缓存它会让后续每轮都用
+     * "卡片还在滑入动画中"的旧坐标（实测 decideY=1187 在屏外，卡死 300+ 轮）。
+     */
     private var modelKey: String? = null
-    private var modelPick: LabPickResult? = null
+    private var modelIdx: Int = -1
 
     /**
      * ★2026-11-12（用户）：点过「去邀请」后，**必定**弹一个「收到角色」框（和买印记的到账框同款）。
@@ -210,10 +214,11 @@ class CharaPick(
             //   key = 三张卡 + 持有池 + 目标关卡，任一变化就重算。
             val key = ids.joinToString(",") + "|" + ctx.own.sorted().hashCode() + "|" +
                 targets.joinToString(",") { it.first.toString() } + "|" + questId
-            val cached = modelPick
-            if (key == modelKey && cached != null) {
-                AppState.addLog("选角色：模型版（命中缓存）→ 第 ${cached.index + 1} 张")
-                return cached
+            if (key == modelKey && modelIdx in cards.indices) {
+                // ★用**当前这轮**的卡片对象（坐标是新的），只复用下标
+                val i = modelIdx
+                AppState.addLog("选角色：模型版（命中缓存）→ 第 ${i + 1} 张")
+                return LabPickResult(cards[i], i, "模型：胜率增益最高", 0, 0)
             }
             val qs = targets.ifEmpty {
                 if (questId > 0) listOf(questId to 1.0) else emptyList()
@@ -225,10 +230,9 @@ class CharaPick(
                     "选角色：模型版 ${SystemClock.elapsedRealtime() - t0}ms（${qs.size} 个目标）" +
                         " → 第 ${idx + 1} 张（unitId=${ids[idx]}）",
                 )
-                val pick = LabPickResult(cards[idx], idx, "模型：胜率增益最高", 0, 0)
                 modelKey = key
-                modelPick = pick
-                return pick
+                modelIdx = idx
+                return LabPickResult(cards[idx], idx, "模型：胜率增益最高", 0, 0)
             }
         }
         val tankTag = TagIds.T["tank"]!!; val mtankTag = TagIds.T["mtank"]!!
