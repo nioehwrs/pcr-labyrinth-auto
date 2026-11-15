@@ -429,7 +429,14 @@ class AutoForegroundService : Service() {
                             // ★记下这局（成绩 + 奖励），供整轮结束汇总
                             MazeSummary.add(RunRecord(idx, MazeLoop.lastScore, MazeLoop.lastRewards))
                             AppState.addLog("════ 第 $idx 局完成 ✓（累计成功 $done 次）════")
-                            bringAssistantToFront()        // 正常退出 ⇒ 退回自动化工具（下一局会再顶起游戏）
+                            // ★2026-11-15：局内刷开局模式下，第1局结束**不**把游戏推后台——
+                            // 局内刷依赖游戏内"进行中迷宫局"的 client 状态（黎明界 top 的"挑战中"标志），
+                            // 一旦推后台，模拟器回收进程 / B 服超时回收进行中迷宫局会让该会话断裂，
+                            // 下一局顶回时 259 顶层标志已失效、误判"登错号"终止（小鹿日志 20261115_130256）。
+                            // API 刷每局从服务器重新 enter，不依赖 client 会话，保持原样推后台。
+                            if (RerollSettings.loadRerollMode(applicationContext) != RerollSettings.REROLL_IN_GAME) {
+                                bringAssistantToFront()    // 正常退出 ⇒ 退回自动化工具（下一局会再顶起游戏）
+                            }
                         }
                     } catch (ce: kotlinx.coroutines.CancellationException) {
                         throw ce                            // 「停止」是正常取消，不算异常
