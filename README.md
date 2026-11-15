@@ -109,13 +109,7 @@ cd android
 ./gradlew assembleRelease        # 产物：app/build/outputs/apk/release/app-release.apk
 ```
 
-需要签名：放 `android/keystore.properties` + `android/keystore/release.keystore`（与 CI/发版一致）。运行组件、注入桥、模型组件在首次启动后由 `ComponentPrep` 从 Gitee 公开仓库按需下载，无需在仓库内带二进制。
-
-发版走一键脚本（构建 → 生成 `latest.json` → 传 Gitee 公开仓库 Release）：
-
-```bash
-python tools/release.py --version 0.7.4 --code 52 --upload
-```
+需要签名：放 `android/keystore.properties` + `android/keystore/release.keystore`。运行组件、注入桥、模型组件在首次启动后由 `ComponentPrep` 从 Gitee 公开仓库按需下载，无需在仓库内带二进制。
 
 ---
 
