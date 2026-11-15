@@ -214,9 +214,13 @@ object Navigator {
             // ★2026-11-12（用户："25s 没到下个页面就直接重启进程"）：
             //   同一页面停留超过 [PAGE_STUCK_RESTART_MS] ⇒ 直接 kill（注入器会重新拉起+注入），
             //   不再靠"点别的位置"去猜 —— 停在标题页/加载页本身就是游戏侧卡住。
-            if (pageSince > 0L && SystemClock.elapsedRealtime() - pageSince >= PAGE_STUCK_RESTART_MS) {
+            // ★2026-11-15（用户反馈 00）：点屏幕中心的登录/标题页多给 [CENTER_VIEW_EXTRA_MS] ——
+            //   登录加载慢不是卡死，别 25s 就杀进程把整局干掉；其它页面仍按原上限。
+            val stuckLimitMs = PAGE_STUCK_RESTART_MS +
+                if (vid in TAP_CENTER_VIEWS) CENTER_VIEW_EXTRA_MS else 0L
+            if (pageSince > 0L && SystemClock.elapsedRealtime() - pageSince >= stuckLimitMs) {
                 AppState.addLog(
-                    "停手：${viewLabel(vid)} 停留 ${PAGE_STUCK_RESTART_MS / 1000}s 没推进 → 重启游戏进程",
+                    "停手：${viewLabel(vid)} 停留 ${stuckLimitMs / 1000}s 没推进 → 重启游戏进程",
                 )
                 GameProcess.kill()
                 // ★2026-11-13：总闸没开时注入循环在待命，没人把游戏拉回来（ACTION_GOTO_LAB
@@ -531,6 +535,14 @@ object Navigator {
      *   以前会无限点下去（0.6.14 实机：TITLE 页点了 1 分 40 秒）。25s 足够覆盖正常冷启动+登录。
      */
     private const val PAGE_STUCK_RESTART_MS = 25_000L
+
+    /**
+     * ★2026-11-15（用户反馈 00：登录慢被误判成运行结束）：**点屏幕中心推进的页**
+     *   （[TAP_CENTER_VIEWS]：SPLASH/TITLE/新角色介绍）额外多等这么久再判卡死。
+     *   这类页本身就是"点一下推进一段"，登录加载慢/网络慢 ≠ 游戏卡死；25s 容易在慢机器上
+     *   一刀切杀掉重开、把整局干掉。多给 10s，其它页面仍按 [PAGE_STUCK_RESTART_MS]。
+     */
+    private const val CENTER_VIEW_EXTRA_MS = 10_000L
 
     /**
      * ★旧：点「出发」前固定等 500ms（等 259 切屏动画）。
