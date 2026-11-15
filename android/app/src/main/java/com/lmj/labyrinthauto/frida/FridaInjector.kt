@@ -1025,16 +1025,15 @@ object FridaInjector {
      */
     private suspend fun verifyMainPid(pid: Int, pkg: String): Boolean? {
         if (pid <= 0) return false
-        val r = RootShell.exec("cat /proc/$pid/cmdline", 4_000L)
-        val arg0 = r.out.substringBefore('\u0000').trim().substringAfterLast('/')
-        if (arg0.isEmpty()) {
-            // ★2026-11-13：cmdline 读不到 ≠ 健康。僵尸 / T 状态进程的 cmdline 就是空的，
-            //   旧逻辑乐观放行 ⇒ 对着它白等 15s 映射。补一次状态判定（只在读不到时才有这次开销）。
-            val stat = RootShell.exec("cat /proc/$pid/stat", 3_000L).out.trim()
-            val state = stat.substringAfterLast(')').trim().split(' ').firstOrNull().orEmpty()
-            return if (state.isEmpty() || state in setOf("Z", "T", "D", "t", "X")) false else null
-        }
-        return arg0 == pkg
+        // ★★2026-11-15（用户）：**只信 `pidof`，不再读 `/proc/<pid>/cmdline`**。
+        //   `pidof <包名>` 精确匹配进程名 ⇒ 只回主进程（子进程是 `包名:xxx`，匹配不上）。
+        //   实测：游戏刚启动那几秒整机卡顿（前台 dumpsys 读不到、网络 15s 超时），连**活进程**的
+        //   `/proc` 读也会超时，反过来把常驻 root shell 拖垮（日志「常驻 root shell 没回应」）。
+        //   读 cmdline 只是为了排除子进程，pidof 已经能排除，没必要再碰 /proc。
+        val cur = RootShell.exec("pidof $pkg", 2_000L)
+        if (cur.exit == -1) return null          // pidof 自己超时（系统卡）⇒ 不确定，别当死处理
+        val pids = Regex("\\d+").findAll(cur.out).map { it.value.toInt() }.toSet()
+        return pid in pids
     }
 
     /** 轻量版：只跑一次 `pidof`（不碰 frida-server）。给"等进程消失"这种高频判定用。 */
