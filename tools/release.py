@@ -25,6 +25,7 @@ python tools/release.py --frida-only --upload
 python tools/release.py --local --no-build      # 复用已有 release 产物
 python tools/release.py --upload --dry-run      # 打印要发什么，不动线上
 python tools/release.py --latest-only           # 只推 update/latest.json（放占位，免得 App 检查 404）
+python tools/release.py --gh-components         # 把 App 要下载的组件（frida / 模型）同步到 GitHub 固定 tag
 ```
 
 需要什么
@@ -73,6 +74,8 @@ GH_TOKEN_FILE = os.path.join(ROOT, "tools", ".github_token")
 GH_OWNER = "nioehwrs"
 GH_REPO = "pcr-labyrinth-auto"
 GH_API = "https://api.github.com"
+# ★附件上传必须走 uploads.github.com（打 api.github.com/.../assets 会 404，2026-11-15 实测）
+GH_UPLOAD = "https://uploads.github.com"
 
 FRIDA_VERSION = "17.16.4"
 FRIDA_ABIS = ["x86_64"]
@@ -237,7 +240,7 @@ def gh_upload(rid, path):
     name = os.path.basename(path)
     with open(path, "rb") as f:
         content = f.read()
-    url = GH_API + "/repos/%s/%s/releases/%s/assets?name=%s" % (
+    url = GH_UPLOAD + "/repos/%s/%s/releases/%s/assets?name=%s" % (
         GH_OWNER, GH_REPO, rid, urllib.parse.quote(name))
     req = urllib.request.Request(url, data=content, headers={
         "User-Agent": "lmj-release",
@@ -342,7 +345,7 @@ def main():
     args = sys.argv[1:]
     version = code = None
     do_build = True
-    upload = local_only = dry = frida_only = latest_only = False
+    upload = local_only = dry = frida_only = latest_only = gh_components = False
     pack = False
     i = 0
     while i < len(args):
@@ -363,6 +366,8 @@ def main():
             frida_only = True
         elif a == "--latest-only":
             latest_only = True
+        elif a == "--gh-components":
+            gh_components = True
         elif a == "--pack-frida":
             pack = True
         elif a in ("-h", "--help"):
@@ -370,6 +375,9 @@ def main():
         else:
             raise SystemExit("未知参数：%s（--help 看用法）" % a)
         i += 1
+
+    if gh_components:
+        return gh_sync_components(dry)
 
     cur_code, cur_name = gradle_versions()
     if version or code:
@@ -509,6 +517,54 @@ def _upload_frida(files, dry):
         api_upload(rid, f)
         say("已上传：%s" % name)
     say("\n下载地址示例：%s" % (DL % (tag, os.path.basename(files[0]))))
+    return 0
+
+
+def gh_sync_components(dry=False):
+    """把 App「首次运行要下载的组件」也同步到 GitHub 固定 tag（frida / labmodel）。
+
+    组件在 Gitee 上本来就有（App 的下载地址写死 Gitee）；这里只是给 GitHub 用户/镜像
+    补一份同样的附件。tag 与 Gitee 保持一致：`frida-<版本>`、`labmodel-<版本>`，
+    附件按文件名去重，已存在的跳过。
+    """
+    if not gh_token():
+        say("（未配 GitHub token，跳过组件同步；写 tools/.github_token 或设 GITHUB_TOKEN）")
+        return 0
+    # ① frida：huabanxie-server（改名版 frida-server）+ libfrida_bridge
+    gz = sorted(glob.glob(os.path.join(FRIDA_DIR, "huabanxie-server-%s-*.gz" % FRIDA_VERSION)))
+    bridge = sorted(glob.glob(os.path.join(DIST, "libfrida_bridge-%s*.so.gz" % FRIDA_VERSION)))
+    if gz or bridge:
+        tag = "frida-%s" % FRIDA_VERSION
+        rid, assets = gh_ensure_release(
+            tag, "huabanxie-server %s" % FRIDA_VERSION,
+            "改名版 frida-server + libfrida_bridge（App 首次运行时下载，固定 tag）")
+        for f in gz + bridge:
+            n = os.path.basename(f)
+            if n in assets:
+                say("GitHub 已存在，跳过：%s" % n)
+            elif dry:
+                say("[dry-run] 会传 GitHub：%s（%.1fMB）" % (n, os.path.getsize(f) / 1048576))
+            else:
+                gh_upload(rid, f)
+                say("已上传 GitHub：%s" % n)
+    # ② 模型组件（取 dist 里最新的那份 labmodel-*.zip）
+    zips = sorted(glob.glob(os.path.join(DIST, "labmodel-*.zip")))
+    if zips:
+        z = zips[-1]
+        ver = os.path.basename(z)[len("labmodel-"):-len(".zip")]
+        tag = "labmodel-%s" % ver
+        rid, assets = gh_ensure_release(
+            tag, "编队模型组件 %s" % ver,
+            "编队模型（context/decoder/critic + metadata），App 首次运行时下载，固定 tag")
+        n = os.path.basename(z)
+        if n in assets:
+            say("GitHub 已存在，跳过：%s" % n)
+        elif dry:
+            say("[dry-run] 会传 GitHub：%s（%.1fMB）" % (n, os.path.getsize(z) / 1048576))
+        else:
+            gh_upload(rid, z)
+            say("已上传 GitHub：%s" % n)
+    say("\nGitHub 组件同步完成")
     return 0
 
 
