@@ -122,8 +122,8 @@ object OverlayWindow {
             val screenLong = maxOf(dm.widthPixels, dm.heightPixels)
             chipRun = makeChip(c, C_RUN)
             chipFloor = makeChip(c, C_FLOOR)
-            // 编队名最长：给状态气泡一个上限（约 70% 长边），超出末尾省略，避免把整条撑爆
-            chipState = makeChip(c, C_STATE).apply { maxWidth = (screenLong * 0.70f).toInt() }
+            // ★状态格（第 3 格）宽度按布局模式在下面定，这里只建好
+            chipState = makeChip(c, C_STATE)
             placeholder = TextView(c).apply {
                 text = "…"
                 textSize = 13f
@@ -142,27 +142,137 @@ object OverlayWindow {
                 }
             }
 
-            val bar = LinearLayout(c).apply {
+            // ★★★ 动态单行 / 两行（2026-11-15 用户）：
+            // 默认单行（色点+局数+节点+状态 横排紧凑），只有三格加起来单行放不下(超屏)时，
+            // 才把状态格挪到第二行独占整行 —— 平时保持单行紧凑，窄屏/长状态才折行不被裁。
+            // 框1/框2 始终 WRAP_CONTENT 完整；状态格上限 94% 长边（单行富余时完整，两行时铺满整行）。
+            chipState?.maxWidth = (screenLong * 0.94f).toInt()
+
+            // 第一行：单行时含状态，两行时只含前三格
+            val row1 = LinearLayout(c).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                )
+                addView(dot)
+                addView(chipRun)
+                addView(chipFloor)
+                addView(chipState)   // 默认单行：状态在同一行
+                addView(placeholder)
+            }
+            // 第二行容器：默认 GONE，两行时状态格移入这里
+            val stateRow = LinearLayout(c).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                visibility = View.GONE
+            }
+            val bar = LinearLayout(c).apply {
+                orientation = LinearLayout.VERTICAL
                 setPadding(14, 10, 14, 10)
-                // ★大圆角 ⇒ 两端自然收成半圆（胶囊条）；底色半透明，气泡更跳
                 background = GradientDrawable().apply {
                     shape = GradientDrawable.RECTANGLE
                     cornerRadius = 100f
                     setColor(0xFF0E1116.toInt())
                     setStroke(1, 0x33FFFFFF)
                 }
-                addView(dot)
-                addView(chipRun)
-                addView(chipFloor)
-                addView(chipState)
-                addView(placeholder)
+                addView(row1)
+                addView(stateRow)
             }
 
-            // ★用透明根容器包住胶囊：窗口宽度固定为屏幕长边的 80%（手机 900x1600 跑游戏横屏成
-            //   1600x900 ⇒ 按 1600 算 ⇒ 窗口 1280，居中）；胶囊本身仍 WRAP_CONTENT + 水平居中，
-            //   ⇒ 内容短时紧凑、内容长时最多铺到窗口 80% 上限，绝不竖排换行撑成大块。
+            // ★单行/两行动态切换：状态无内容→单行；有内容且单行总宽≤屏宽→单行，否则折第二行。
+            // 切换只是把 chipState 在 row1/stateRow 间移动，singleMode 防抖避免重复 layout。
+            var singleMode = true
+            var lastLayoutKey: String? = null   // 状态组合没变就不重排，避免两行态下每帧搬 view 闪烁
+            fun setSingle() {
+                if (singleMode) return
+                stateRow.visibility = View.GONE
+                // ★必须先 remove 旧 parent 再 add：Android 的 addView 遇到已有 parent 的 child 会抛异常
+                chipState?.let { (it.parent as? android.view.ViewGroup)?.removeView(it); row1.addView(it) }
+                chipState?.layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                ).apply { setMargins(6, 0, 6, 0) }
+                singleMode = true
+            }
+            fun setDouble() {
+                if (!singleMode) return
+                chipState?.let { (it.parent as? android.view.ViewGroup)?.removeView(it); stateRow.addView(it) }
+                chipState?.layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                ).apply { topMargin = 6 }
+                stateRow.visibility = View.VISIBLE
+                singleMode = false
+            }
+            // ★单行上限 = 屏宽（不再固定 70%）：单行时整条最多屏宽，框3 占剩余(超长省略)；
+            //   仅当完整内容超屏宽才折两行，第二行框3 完整显示。
+            //   测量时必须让 row1 为 WRAP、chipState 为无限宽，才能量出"若单行"的完整所需宽 need。
+            fun relayout() {
+                val st = chipState ?: return
+                if (st.visibility != View.VISIBLE) {
+                    row1.layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                    )
+                    setSingle(); return
+                }
+                val wasDouble = !singleMode
+                if (wasDouble) setSingle()   // 临时把 chipState 移回 row1
+                row1.layoutParams = LinearLayout.LayoutParams(   // 测前确保 row1 不限制宽，否则量不准
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                )
+                val oldMax = st.maxWidth
+                st.maxWidth = Int.MAX_VALUE
+                bar.measure(
+                    android.view.View.MeasureSpec.makeMeasureSpec(0, android.view.View.MeasureSpec.UNSPECIFIED),
+                    android.view.View.MeasureSpec.makeMeasureSpec(0, android.view.View.MeasureSpec.UNSPECIFIED),
+                )
+                st.maxWidth = oldMax
+                val need = bar.measuredWidth
+                val cap = screenLong   // ★整条上限 = 屏宽（去掉固定70%）
+                android.util.Log.d("OverlayDbg", "relayout need=$need cap=$cap fold=${need > cap}")
+                if (need <= cap) {
+                    // 单行：整条 = 内容真实宽(WRAP)，框1框2 完整、框3 完整显示；
+                    //   只有 need>cap(超屏宽) 才会走 else 折两行，故此处无需再压框3。
+                    st.maxWidth = screenLong
+                    row1.layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                    )
+                    setSingle()
+                } else {
+                    // 两行：第一行(局数+节点)按内容，第二行框3 完整显示(上限 94% 长边)
+                    st.maxWidth = (screenLong * 0.94f).toInt()
+                    row1.layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                    )
+                    setDouble()
+                }
+                // ★显式把窗口宽度设为内容所需宽：避免 WindowManager 的 WRAP 自适应在内容变宽时
+                //   不重测窗口 ⇒ 整条被旧窗口宽(≈440)卡住、第三格只剩几十 px。
+                val targetW = if (need <= cap) minOf(need, cap) else (cap * 0.94f).toInt()
+                lp?.let { l ->
+                    if (l.width != targetW) {
+                        l.width = targetW
+                        container?.let { wm?.updateViewLayout(it, l) }
+                    }
+                }
+                // ★真实布局后复核实际渲染宽度（你想看的"真实显示后测长度"）
+                bar.post {
+                    android.util.Log.d(
+                        "OverlayDbg",
+                        "after-layout barW=${bar.width} row1W=${row1.width} chipW=${st.width} " +
+                            "chipMax=${st.maxWidth} chipMeas=${st.measuredWidth} txtLen=${st.text?.length} " +
+                            "contW=${container?.width} mode=${if (singleMode) "single" else "double"}",
+                    )
+                }
+            }
+
+            // ★透明根容器包住胶囊；WRAP_CONTENT（宽由内容决定，单行时紧凑、两行时取两行较宽者）
             val root = FrameLayout(c).apply {
                 addView(
                     bar,
@@ -244,6 +354,14 @@ object OverlayWindow {
                         if (s.attention) STROKE_WARN else STROKE,
                     )
                     placeholder?.visibility = View.GONE
+                    // ★动态单行/两行：状态格有内容且单行放不下(超屏)才折到第二行，否则单行紧凑显示。
+                    //   仅当 局数/节点/状态 三者组合变化时才重排，稳定后不再搬动 view。
+                    val layoutKey = "${s.run}|${s.floor}|${s.state}"
+                    if (layoutKey != lastLayoutKey) {
+                        lastLayoutKey = layoutKey
+                        android.util.Log.d("OverlayDbg", "state-change run=[${s.run}] floor=[${s.floor}] state=[${s.state}] vis=${chipState?.visibility}")
+                        relayout()
+                    }
                     // ★内容变长 => 窗口宽度变（WRAP_CONTENT）=> 按**中心点**重算左缘，
                     //   保持居中、放不下才贴边（2026-10-20 用户：拖到最左后运行中会不会超出）
                     if (posCenter != null) recenter()

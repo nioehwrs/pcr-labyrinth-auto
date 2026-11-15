@@ -1723,7 +1723,7 @@ private fun TeamSettingsCard(context: Context) {
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         MethodRow(
-            title = "计算方法",
+            title = "编队计算方法",
             desc = "混合（默认）：这个节点第一次打用推理模型，打不过就切旧版规则（规则版会补坦克，更稳）；" +
                 "也可以固定只用其中一种。",
             options = listOf(
@@ -1791,7 +1791,7 @@ private fun PickSettingsCard(context: Context) {
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         MethodRow(
-            title = "计算方法",
+            title = "战后三选一计算方法",
             desc = "战后三选一用哪套逻辑：推理模型看「这张卡对后续首领战的帮助」，旧版按角色评分排序。",
             options = listOf("rule" to "旧版规则", "model" to "推理模型"),
             selected = if (byModel) "model" else "rule",
