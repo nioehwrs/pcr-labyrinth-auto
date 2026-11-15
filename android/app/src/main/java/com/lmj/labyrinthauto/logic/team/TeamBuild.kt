@@ -327,11 +327,21 @@ class TeamBuild(private val tables: Tables) {
         s
     }
 
-    /** PC 版 `_rng`(575)：站位（攻击范围）；缺失按 9999 */
-    private fun rng(uid: String): Int = tables.unit(uid)?.optInt("range", 9999) ?: 9999
+    /** PC 版 `_rng`(575)：站位（攻击范围）；缺失按 9999。
+     *  ★2026-11-15（用户）：按 [C.STAND_ADJUST] 修正（若菜兼职坦克 -420 ⇒ 535→115）。
+     *  只用于**站位计算**（排序 / 1 号位 / 跨度 / 换人约束），日志里显示的仍是原始 range。 */
+    private fun rng(uid: String): Int {
+        val base = tables.unit(uid)?.optInt("range", 9999) ?: 9999
+        val adj = C.STAND_ADJUST[uid] ?: 0
+        return (base + adj).coerceAtLeast(0)
+    }
 
-    /** 对外：攻击范围（站位）。编队页"移除角色"要按它从大到小移（见 PartyPlan）。 */
-    fun attackRange(uid: String): Int = rng(uid)
+    /**
+     * 对外：**真实**攻击范围（编队页“移除角色”按它从大到小移，见 PartyPlan）。
+     * ★2026-11-15（用户）：这里**不吃** [C.STAND_ADJUST] 修正 —— 若菜是“召唤物当坦克”，
+     *   站位 -420 只用于组队算法的前排判断；编队页显示/撤人顺序必须按游戏里的真实 range。
+     */
+    fun attackRange(uid: String): Int = rangeOrNull(uid) ?: 9999
 
     /** PC 版 `range_spread`(581)：站位跨度 = max(range) − min(range)（<2 人算 0） */
     private fun rangeSpread(team: List<String>): Int {
@@ -972,6 +982,8 @@ class TeamBuild(private val tables: Tables) {
         n: Int,
         atk: String,
         pf: Map<String, Any?>,
+        /** ★2026-11-15：幽灵方案1/2/3/4 的 1 号位硬性人选（涅比亚/抽蓝/坦克/前排） */
+        force: String? = null,
     ): BurstTeamResult {
         var w = C.W["burst"]!!
         val boss = (pf["key"] as? String ?: "").startsWith("Boss_")
@@ -1054,7 +1066,11 @@ class TeamBuild(private val tables: Tables) {
                 else warns.add("⚠ 关卡要求 定向输出|核心群体输出，但池里都没有")
             }
         }
-        if (truthy(pf["ghost"])) {
+        // ★2026-11-15（用户）：幽灵的 1 号位硬性人选由外层方案决定（涅比亚/抽蓝/坦克/前排）；
+        //   没传 force 时保持旧行为（有涅比亚就带她）。
+        if (force != null && force in cands && force !in picked) {
+            add(force)
+        } else if (truthy(pf["ghost"]) && force == null) {
             val ny = cands.filter { "u_fix_ghost" in rules.tagsOf(it) }
             if (ny.isNotEmpty()) add(ny[0])                        // 方案1：涅比亚必上
         }
@@ -1074,7 +1090,7 @@ class TeamBuild(private val tables: Tables) {
             val tk = fixed.firstOrNull {
                 val ts = rules.tagsOf(it); TagIds.T["tank"] in ts || TagIds.T["mtank"] in ts
             }
-            val tkRng = tk?.let { rangeOrNull(it) }
+            val tkRng = tk?.let { rng(it) }
             if (tkRng != null) {
                 val front = order.filter { rng(it) > tkRng }
                 val rest = order.filter { it !in front }
@@ -1119,41 +1135,7 @@ class TeamBuild(private val tables: Tables) {
         return BurstTeamResult(picked, warns, fixed)
     }
 
-    /**
-     * PC 版 `_ghost_plan3`(1288)：幽灵 方案3 —— **前卫坦克(range≤300) + 后卫(range 尽量 ≥600)**。
-     * 站位是游戏按 range 升序自排的 ⇒ 坦克必须是全队 range 最小的那个，所以只挑 range > 坦克 的当后卫。
-     *
-     * @return (picked, tank, gap) 或 null（池里没有 range≤300 的坦克 / 坦克占不到 1 号位）
-     */
-    private fun ghostPlan3(cands: List<String>, weak: List<String>, n: Int, atk: String): Triple<List<String>, String, Int>? {
-        val w = C.W["burst"]!!
-        fun sc(u: String): Double = burstScore(u, atk, w, false, false, false)   // ★PC 这里没传 boss/no_type
-        val tanks = cands.filter { TagIds.T["tank"] in rules.tagsOf(it) && rng(it) <= 300 }
-        var bestKey: List<Double>? = null
-        var bestPicked: List<String>? = null
-        var bestTk = ""
-        var bestGap = 0
-        for (tk in tanks.sortedWith(descByDoubleVal { sc(it) })) {
-            val others = (cands + weak).filter { it != tk && rng(it) > rng(tk) }
-            if (others.size < n - 1) continue                  // 这个坦克太靠后，占不到 1 号位
-            val far = others.filter { rng(it) >= 600 }.sortedWith(descByDoubleVal { sc(it) })
-            val farSet = far.toSet()
-            val near = others.filter { it !in farSet }.sortedWith(descByInt { rng(it) })  // 兜底：range 大的先
-            val picked = mutableListOf(tk)
-            picked.addAll(far.take(n - 1))
-            if (picked.size < n) picked.addAll(near.take(n - picked.size))
-            val gap = if (picked.size > 1) picked.drop(1).minOf { rng(it) } - rng(tk) else 0
-            val key = listOf(gap.toDouble(), picked.sumOf { sc(it) })
-            val bk = bestKey
-            if (bk == null || compareKeys(key, bk) > 0) {
-                bestKey = key; bestPicked = picked; bestTk = tk; bestGap = gap
-            }
-        }
-        val p = bestPicked ?: return null
-        return Triple(p, bestTk, bestGap)
-    }
-
-    /** PC 版 `_algo_burst`(1318)：单体爆发（差异全在 profile 参数里）。 */
+    /** PC 版 `_algo_burst`(1318)：单体爆发入口（2026-11-15：幽灵关先按方案1→2→3→4→普通回退）。 */
     private fun algoBurst(
         pf: Map<String, Any?>,
         cands: MutableList<String>,
@@ -1161,6 +1143,139 @@ class TeamBuild(private val tables: Tables) {
         n: Int,
         relicsSkill: Int,
         res: Res,
+    ) {
+        if (truthy(pf["ghost"])) {
+            algoBurstGhost(pf, cands, weak, n, relicsSkill, res)
+            return
+        }
+        algoBurstImpl(pf, cands, weak, n, relicsSkill, res)
+    }
+
+    /** 幽灵方案试算：plan=1..4；force=1 号位；rest=过滤后的池（null=用原池）；front=方案3/4 的 1 号位 */
+    private class GhostTrial(
+        val plan: Int,
+        val force: String,
+        val rest: List<String>?,
+        val front: String?,
+    )
+
+    /**
+     * 幽灵领主四方案（用户 2026-11-15 定）：
+     *  1) 有涅比亚 → 涅比亚硬性必上 + 正常规则（**无额外加分**），方案1内部比较；
+     *  2) 无涅比亚、有抽蓝 → **每个抽蓝都试**，方案2内部比最优；
+     *  3) 无涅比亚/抽蓝 → 坦克（真/兼职不分）+ 其余 4 人，1 号位与其余人最小间隔 ≥420；
+     *  4) 方案3 凑不出 → 任意“站位最靠前”的角色 + 其余 4 人，同样间隔 ≥420；
+     *  5) 都不成立 → 完全按普通规则。
+     */
+    private fun algoBurstGhost(
+        pf: Map<String, Any?>,
+        cands: MutableList<String>,
+        weak: List<String>,
+        n: Int,
+        relicsSkill: Int,
+        res: Res,
+    ) {
+        val gap = 420
+        fun rngOf(u: String): Int = rng(u)            // ★站位修正（若菜 -420）同样生效
+        val trials = mutableListOf<GhostTrial>()
+        val ny = cands.filter { "u_fix_ghost" in rules.tagsOf(it) }
+        if (ny.isNotEmpty()) {
+            trials.add(GhostTrial(1, ny[0], null, null))
+        } else {
+            // ★抽蓝用规范化后的标签（TagIds.T["drain"] = u_tp_drain）
+            val drains = cands.filter { TagIds.T["drain"] in rules.tagsOf(it) }
+            if (drains.isNotEmpty()) {
+                drains.forEach { trials.add(GhostTrial(2, it, null, null)) }
+            } else {
+                val tks = cands.filter {
+                    val ts = rules.tagsOf(it)
+                    TagIds.T["tank"] in ts || TagIds.T["mtank"] in ts
+                }
+                for (tk in tks) {
+                    val rest = (cands + weak).filter { it != tk && rngOf(it) >= rngOf(tk) + gap }
+                    if (rest.size >= n - 1) trials.add(GhostTrial(3, tk, rest, tk))
+                }
+                if (trials.isEmpty()) {
+                    for (f in cands.sortedBy { rngOf(it) }) {
+                        val rest = (cands + weak).filter { it != f && rngOf(it) >= rngOf(f) + gap }
+                        if (rest.size >= n - 1) trials.add(GhostTrial(4, f, rest, f))
+                    }
+                }
+            }
+        }
+        if (trials.isEmpty()) {
+            algoBurstImpl(pf, cands, weak, n, relicsSkill, res)
+            res.log.add("幽灵：方案1/2/3/4 都不成立 → 按普通规则组队")
+            return
+        }
+        var best: Res? = null
+        var bestScore = Double.NEGATIVE_INFINITY
+        for (t in trials) {
+            val base = cloneForTrial(res)
+            if (t.rest != null) {
+                algoBurstImpl(
+                    pf, (listOf(t.force) + t.rest).toMutableList(), t.rest, n, relicsSkill, base,
+                    force = t.force, front = t.front, gap = gap, plan = t.plan,
+                )
+            } else {
+                algoBurstImpl(
+                    pf, cands, weak, n, relicsSkill, base,
+                    force = t.force, plan = t.plan,
+                )
+            }
+            if (base.picked.isEmpty()) continue
+            val sc = base.score ?: 0.0
+            if (sc > bestScore) {
+                bestScore = sc
+                best = base
+            }
+        }
+        if (best == null) {
+            algoBurstImpl(pf, cands, weak, n, relicsSkill, res)
+            res.log.add("幽灵：方案候选都凑不出有效队伍 → 按普通规则组队")
+            return
+        }
+        copyTrialInto(res, best)
+    }
+
+    /** 方案试算用：复制一份初始 res（log 带上进入本函数前的内容；picked/reasons/warn 清空） */
+    private fun cloneForTrial(src: Res): Res {
+        val r = Res(
+            src.stage, src.algo, src.cands.toMutableList(), src.weak.toMutableList(),
+            src.drop.toMutableList(), src.attrlimUnits.toMutableList(), src.todo,
+            src.forceAttr, src.floorRule, src.failed,
+        )
+        r.maxField = src.maxField
+        r.forceTp = src.forceTp
+        r.log.addAll(src.log)
+        return r
+    }
+
+    /** 把选中的方案结果写回原 res */
+    private fun copyTrialInto(dst: Res, src: Res) {
+        dst.picked.clear(); dst.picked.addAll(src.picked)
+        dst.reasons.clear(); dst.reasons.putAll(src.reasons)
+        dst.log.clear(); dst.log.addAll(src.log)
+        dst.warn.clear(); dst.warn.addAll(src.warn)
+        dst.swaps.clear(); dst.swaps.addAll(src.swaps)
+        dst.score = src.score
+        dst.atk = src.atk
+        dst.spread = src.spread
+    }
+
+    private fun algoBurstImpl(
+        pf: Map<String, Any?>,
+        cands: MutableList<String>,
+        weak: List<String>,
+        n: Int,
+        relicsSkill: Int,
+        res: Res,
+        /** 幽灵 1 号位硬性人选（涅比亚/抽蓝/坦克/前排） */
+        force: String? = null,
+        /** 方案3/4 的 1 号位（换人时用来卡 420 间隔） */
+        front: String? = null,
+        gap: Int = 0,
+        plan: Int = 0,
     ) {
         val w = C.W["burst"]!!
         val wt = C.W["burst_team"]!!
@@ -1181,7 +1296,7 @@ class TeamBuild(private val tables: Tables) {
         val branch = mutableListOf<Pair<String, Double>>()
 
         for (atk in opts) {
-            val bt = burstTeam(cands, weak, n, atk, pf)
+            val bt = burstTeam(cands, weak, n, atk, pf, force)
             val picked = bt.picked
             // ★注意：PC 这里（和 _scb / ghost_plan3）**都没有**把 boss 传进 _burst_score
             fun sc(u: String): Double = burstScore(u, atk, w, truthy(pf["no_type"]), truthy(pf["no_break"]), false)
@@ -1215,13 +1330,8 @@ class TeamBuild(private val tables: Tables) {
                     prot.add(dr[0])
                 }
             }
-            if (ghost) {
-                val gh = picked.filter { "u_fix_ghost" in rules.tagsOf(it) }
-                if (gh.isNotEmpty()) {
-                    total += 8.0                                      // 方案1 成立
-                    prot.add(gh[0])
-                }
-            }
+            // ★2026-11-15（用户）：幽灵方案1/2 **不再给额外加分** —— 方案是硬性规则，
+            //   只在本方案内部比较（系别/加速/输出/同属性）。锁定位已在 burstTeam 进 fixed。
             branch.add(atk to round1(total))
             val bt0 = bestTotal
             if (bt0 == null || total > bt0) {
@@ -1256,7 +1366,10 @@ class TeamBuild(private val tables: Tables) {
             res.reasons[u] = when {
                 u == tankSlot ->
                     if (TagIds.T["tank"] in ts) "坦克（关卡要求）" else "兼职坦克（顶关卡要求的坦克位）"
-                ghost && "u_fix_ghost" in ts -> "对策·幽灵领主（方案1）"
+                plan == 1 && u == force -> "对策·幽灵领主（方案1）"
+                plan == 2 && u == force -> "方案2·抽蓝（必上）"
+                plan == 3 && u == front -> "方案3·前卫坦克（与其余人最小间隔≥$gap）"
+                plan == 4 && u == front -> "方案4·前排（与其余人最小间隔≥$gap）"
                 TagIds.T["tank"] in ts && pf["need_tank"] != null -> "坦克（关卡要求）"
                 TagIds.T["heal"] in ts && truthy(pf["need_heal"]) -> "治疗（关卡要求）"
                 truthy(pf["need_cc"]) && (TagIds.T["cc"] in ts || TagIds.T["taunt"] in ts) -> "嘲讽/控制（关卡要求）"
@@ -1305,36 +1418,7 @@ class TeamBuild(private val tables: Tables) {
             }
         }
 
-        // 幽灵：没有涅比亚才走方案3，否则方案4
-        if (ghost && res.picked.none { "u_fix_ghost" in rules.tagsOf(it) }) {
-            val p3 = ghostPlan3(cands, weak, n, atk)
-            if (p3 != null) {
-                val (picked3, tk, gap) = p3
-                res.picked.clear()
-                res.picked.addAll(picked3)
-                res.reasons.clear()
-                for (u in res.picked) {
-                    res.reasons[u] = if (u == tk) {
-                        "方案3·前卫坦克（range≤300）"
-                    } else {
-                        "方案3·后卫（与 1 号位拉开 $gap 躲 AOE）"
-                    }
-                }
-                val minRng = res.picked.filter { it != tk }.minOfOrNull { rangeOrNull(it) ?: 0 } ?: 0
-                res.log.add(
-                    "无涅比亚 → 走**方案3**：前卫坦克 ${name(tk)}(range=${pyStr(rangeOrNull(tk))}) + " +
-                        "后卫（最小 range=$minRng，拉开 $gap）",
-                )
-                if (gap < 200) {
-                    res.warn.add(
-                        "⚠ 池里缺少 range≥600 的后卫 → 只拉开 $gap（躲 AOE 效果差，" +
-                            "1 号位坦克=${name(tk)} range=${pyStr(rangeOrNull(tk))}）",
-                    )
-                }
-            } else {
-                res.log.add("无涅比亚、也凑不出方案3（前卫≤300 + 后卫拉开）→ 退到方案4：纯单体输出")
-            }
-        }
+        // ★2026-11-15：方案3/4 已上移到 [algoBurstGhost]（按 1→2→3→4→普通 顺序回退），这里不再处理。
 
         val scen = if ((res.stage ?: "").startsWith("Boss_")) "boss" else "all"
         fun scb(u: String): Double = burstScore(u, atk, w, truthy(pf["no_type"]), truthy(pf["no_break"]), false)
@@ -1348,14 +1432,27 @@ class TeamBuild(private val tables: Tables) {
                 if (u in prot) {
                     val ts = rules.tagsOf(u)
                     if (TagIds.T["tank"] in ts || TagIds.T["mtank"] in ts) {
-                        tkRng = rangeOrNull(u)
+                        tkRng = rng(u)
                         break
                     }
                 }
             }
         }
+        // ★2026-11-15（用户）：幽灵方案3/4 —— 同属性优化/换人**也不能把站进 1 号位 420 以内的人换进来**
+        //   （1 号位本身在结构位 prot 里，不会被换掉）。
+        var gapNeed = 0
+        if (front != null && gap > 0) {
+            tkRng = rng(front)
+            gapNeed = gap
+        }
         val tkr = tkRng
-        val okFront: (String) -> Boolean = { u -> if (tkr == null) true else rng(u) > tkr }
+        val okFront: (String) -> Boolean = { u ->
+            when {
+                tkr == null -> true
+                gapNeed > 0 -> rng(u) >= tkr + gapNeed
+                else -> rng(u) > tkr
+            }
+        }
         if (atk == "mixed") {
             attrPack(res, cands, protect = prot, scen = scen, ok = okFront, scfn = { scb(it) }, teampen = teampen)
         } else {
@@ -1544,7 +1641,7 @@ class TeamBuild(private val tables: Tables) {
                     .filter { it !in picked && TagIds.T["jiasu"] !in rules.tagsOf(it) }
                     .sortedWith(Comparator { a, b -> fk(b).compareTo(fk(a)) })   // 稳定降序
                 if (tk != null) {
-                    val tkRng = rangeOrNull(tk)
+                    val tkRng = rng(tk)
                     if (tkRng != null) {
                         val front = order.filter { rng(it) > tkRng }
                         val rest = order.filter { it !in front }
@@ -1630,7 +1727,7 @@ class TeamBuild(private val tables: Tables) {
         var tkRng2: Int? = null
         for (u in res.picked) {
             if (u in keep && (TagIds.T["tank"] in rules.tagsOf(u) || TagIds.T["mtank"] in rules.tagsOf(u))) {
-                tkRng2 = rangeOrNull(u)
+                tkRng2 = rng(u)
                 break
             }
         }

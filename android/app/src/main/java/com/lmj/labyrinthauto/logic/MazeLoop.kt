@@ -401,6 +401,7 @@ object MazeLoop {
         evSnapId = null                              // 事件效果快照（跨局必须清，见 [settleEventDiff]）
         relicChoiceTries.clear()
         partyScroll.clear()                     // 编队页"滚动找缺员"的每页状态（本局重来）
+        partyScrollNodeKey = null               // ★2026-11-15：换局 ⇒ 滑动方向/减速状态从头算
         partyTeams.clear()                      // 多分队：本进程已确认过的各队
         partyFillSaid.clear()                   // 多分队：编队策略日志去重
         partyCleaned.clear()                    // Boss 页"腾空继承队"标记
@@ -1123,10 +1124,8 @@ object MazeLoop {
     /** 帧计数轮询间隔（`gameTick` 是 T_FAST 导出，1s 一次足够；别每 100ms 去问） */
     private const val GAME_FRAME_POLL_MS = 1_000L
 
-    /** 角色一览一次滚**几行**（用户 2026-10-16 实测：2 行会把某些角色卡**滚出可见区**、反而要多滚回来）。
-     *  ★**1.7 → 1.5**（同日二次实测）：按 1.7 求距离时实际会**滑过头**（惯性多走一点），
-     *   收敛到 1.5 行后落点更接近"正好 1.7 行"。与 PC `PARTY_SCROLL_ROWS` 同一个数（两侧同步改）。 */
-    private const val SCROLL_ROWS = 1.5
+    // ★2026-11-15：原 `SCROLL_ROWS = 1.5` 常量已废弃 —— 每次滚几行改由
+    //   [PartyScrollSettings]（默认 1.5、范围 1.0~2.0）决定，并按本节点"方向反复"次数逐次 -0.1。
 
     /** 页面停了这么久、但游戏帧还在涨 ⇒ 打一次现场取证（**不重启**：只说明 handler 没动作） */
     private const val STALL_DIAG_MS = 60_000L
@@ -1658,9 +1657,17 @@ object MazeLoop {
         var lastVis: List<Int>? = null                 // 上次滚完"屏上图标集合"（用来判滚没滚动）
         var still = 0                                  // 连续几次滚完屏上没变化
         val noScroll = HashSet<Int>()                  // 滚多少次都翻不出来的缺员（不再白滚）
+        // ★2026-11-15（用户）：同一关里来回滑（相邻两次方向相反）⇒ 每 2 次把本节点滑动比例调小 0.1，
+        //   减少"滚过头 → 反向滚 → 又过头"的死循环。离开本节点即失效（见 [partyScrollTag]）。
+        var lastDir: String? = null                    // 上次实际滚动的方向（up/down）
+        var reverseCount = 0                           // "相邻两次方向相反"的累计次数
+        var slowSteps = 0                              // 已减速次数（每 2 次反向 +1，每次 -0.1 行）
     }
 
     private val partyScroll = HashMap<String, PartyScroll>()
+
+    /** ★2026-11-15（用户）：当前编队页所属**节点**（area/blockId）—— 换节点（离开这一关）时清空 [partyScroll] */
+    private var partyScrollNodeKey: String? = null
 
     /** PC `_PARTY_TEAMS`(2509)：本节点"**本进程已确认过的各队**"（(area/blockId) → 各队 unitId）——
      *  既用于"这一队还要不要编"的判据（`already`），也是 `partyDic` 读不到时的缩池兜底。 */
@@ -4927,6 +4934,13 @@ object MazeLoop {
     private suspend fun partyEditRound(input: InputBackend, st: JSONObject, tag: String): Int {
         // ★策略=等待接手：本节点失败 3 次后由用户自己组队 → 这里什么都不做（也不点「决定」）
         val nk0 = nodeKey(st)
+        // ★2026-11-15（用户）：**离开这一关（area/blockId 变）⇒ 滑动方向/减速状态清零**，
+        //   新节点从头算，不会把上一节点"来回滑 → 减速"带到下一关。
+        //   注：tag 里含状态/顶框，页面内弹窗也会让它变；这里用节点钥匙，只在真的换节点时清。
+        if (nk0 != partyScrollNodeKey) {
+            partyScrollNodeKey = nk0
+            partyScroll.clear()
+        }
         if (nk0 in manualTeamNodes) {
             if (manualSaid.add(nk0)) {
                 AppState.addLog("[手动] 节点 ${jStr(st, "blockId")}：等待你组队/开战（本节点自动组队已关闭）")
@@ -5409,8 +5423,21 @@ object MazeLoop {
                 }
                 off.isNotEmpty() -> {
                     val dir = if (off.any { it.dir == "down" }) "down" else "up"
-                    if (scrollPartyList(input, pt, dir)) {
+                    if (scrollPartyList(input, pt, dir, ps.slowSteps)) {
                         ps.count++
+                        // ★2026-11-15（用户）：同一关来回滑（相邻两次方向相反）⇒ **每 2 次把滑动比例调小 0.1**，
+                        //   让来回摆动的幅度逐次收敛，别在两端反复弹。离开本节点时随 [partyScroll] 一起消失。
+                        if (ps.lastDir != null && ps.lastDir != dir) {
+                            ps.reverseCount++
+                            if (ps.reverseCount % 2 == 0) {
+                                ps.slowSteps++
+                                AppState.addLog(
+                                    "编队：本节点来回滑动 ${ps.reverseCount} 次（方向反复）→ 滑动比例 -0.1" +
+                                        "（累计 -${"%.1f".format(0.1f * ps.slowSteps)} 行，本节点生效）",
+                                )
+                            }
+                        }
+                        ps.lastDir = dir
                         if (ps.count <= 2 || ps.count % 10 == 0) {
                             AppState.addLog(
                                 "编队：滚动角色一览找缺员（第 ${ps.count} 次，方向=${if (dir == "down") "下" else "上"}，" +
@@ -6197,7 +6224,13 @@ object MazeLoop {
      *   · 每次滑动的"行距/想要几行/实际几行"都打进日志，方便对账。
      * @return true = 滑动手势已真下发（调用方据此计数）
      */
-    private suspend fun scrollPartyList(input: InputBackend, pt: JSONObject, dir: String): Boolean {
+    private suspend fun scrollPartyList(
+        input: InputBackend,
+        pt: JSONObject,
+        dir: String,
+        /** ★2026-11-15：本节点已累计的减速次数（每 2 次方向反复 +1，每次 -0.1 行） */
+        slowSteps: Int = 0,
+    ): Boolean {
         val icons = ArrayList<Pair<Int, Int>>()
         val a = pt.optJSONArray("scrollIcons")
         for (i in 0 until (a?.length() ?: 0)) {
@@ -6275,8 +6308,10 @@ object MazeLoop {
         //   从边缘起手，两行的距离才放得进带内；起点仍在带内（留 40px 边）⇒ 手指一定落在列表上。
         // ★终点**不再夹在裁剪带内**（用户 2026-10-16 实测：终点出带没有任何影响）——
         //   只保留"别滑出屏幕"这一道（留 60px），保证"两行"的距离**永远给足**。
-        // ★2026-11-15：每次滑动滚几行改为可配置（[PartyScrollSettings]，默认 1.5，范围 1.0~2.0）
-        val rows = (appCtx?.let { PartyScrollSettings.loadRows(it) } ?: 1.5f).toDouble()
+        // ★2026-11-15：每次滑动滚几行改为可配置（[PartyScrollSettings]，默认 1.5，范围 1.0~2.0）；
+        //   ★同一关来回滑时按 [slowSteps] 每次 -0.1（下限 1.0），收敛摆动幅度、别滚过头。
+        val baseRows = (appCtx?.let { PartyScrollSettings.loadRows(it) } ?: 1.5f)
+        val rows = (baseRows - 0.1f * slowSteps).coerceAtLeast(1.0f).toDouble()
         val want = rows * rh                                           // ★一次滚几行 × 行距
         val sy: Double
         val ey: Double
@@ -6295,7 +6330,7 @@ object MazeLoop {
         AppState.addLog(
             "编队：滚动（${if (dir == "down") "下" else "上"}）行距=${rh.toInt()}px ｜ " +
                 "swipe(${cx.toInt()},${sy.toInt()})→(${cx.toInt()},${ey.toInt()})" +
-                "＝${got.toInt()}px（约 ${"%.1f".format(got / rh)} 行；目标 ${"%.1f".format(SCROLL_ROWS)} 行＝${want.toInt()}px）" +
+                "＝${got.toInt()}px（约 ${"%.1f".format(got / rh)} 行；目标 ${"%.1f".format(rows)} 行＝${want.toInt()}px）" +
                 "，时长 ${ms}ms" +
                 if (got < want - 1.0) "　⚠ 屏幕边距拦住，没给够" else "",
         )
