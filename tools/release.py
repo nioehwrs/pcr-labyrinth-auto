@@ -30,6 +30,8 @@ python tools/release.py --latest-only           # 只推 update/latest.json（�
 需要什么
 --------
 * `tools/.gitee_token`（一行 token）或环境变量 `GITEE_TOKEN`，权限勾 `projects` 即可；
+* `tools/.github_token`（一行 token）或环境变量 `GITHUB_TOKEN`，权限勾 `repo`（可选，
+  配了就在 `nioehwrs/pcr-labyrinth-auto` 同步发一份 Release，方便 GitHub 用户；不配只发 Gitee，App 更新不受影响）；
 * `android/keystore.properties` + `keystore/release.keystore`（本来就有）；
 * `dist/frida/huabanxie-server-<ver>-<abi>.gz`（本脚本也能自己压：`--pack-frida`）。
 """
@@ -66,6 +68,12 @@ API = "https://gitee.com/api/v5"
 RAW = "https://gitee.com/%s/%s/raw/%s/%%s" % (OWNER, REPO, BRANCH)
 DL = "https://gitee.com/%s/%s/releases/download/%%s/%%s" % (OWNER, REPO)
 
+# GitHub（可选：配了 token 就同时发，不发也不影响 App 更新——App 只读 Gitee）
+GH_TOKEN_FILE = os.path.join(ROOT, "tools", ".github_token")
+GH_OWNER = "nioehwrs"
+GH_REPO = "pcr-labyrinth-auto"
+GH_API = "https://api.github.com"
+
 FRIDA_VERSION = "17.16.4"
 FRIDA_ABIS = ["x86_64"]
 
@@ -89,6 +97,18 @@ def token():
         return t
     if os.path.exists(TOKEN_FILE):
         with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+            t = f.read().strip()
+        if t:
+            return t
+    return ""
+
+
+def gh_token():
+    t = os.environ.get("GITHUB_TOKEN", "").strip()
+    if t:
+        return t
+    if os.path.exists(GH_TOKEN_FILE):
+        with open(GH_TOKEN_FILE, "r", encoding="utf-8") as f:
             t = f.read().strip()
         if t:
             return t
@@ -178,6 +198,58 @@ def api_upload(release_id, path):
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:400]
         raise SystemExit("上传附件失败（HTTP %d）：%s\n文件：%s" % (e.code, detail, path))
+
+
+# ────────────────────────── GitHub API（只用标准库） ──────────────────────────
+def gh_api(method, path, data=None):
+    url = GH_API + path
+    headers = {"User-Agent": "lmj-release",
+               "Authorization": "Bearer %s" % gh_token()}
+    body = None
+    if data is not None:
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=180) as r:
+            raw = r.read().decode("utf-8", "replace")
+            return json.loads(raw) if raw.strip() else {}
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:500]
+        raise SystemExit("GitHub API %s %s 失败：HTTP %d %s" % (method, path, e.code, detail))
+
+
+def gh_ensure_release(tag, name, notes):
+    rels = gh_api("GET", "/repos/%s/%s/releases?per_page=100" % (GH_OWNER, GH_REPO))
+    for r in rels:
+        if r.get("tag_name") == tag:
+            assets = {a.get("name") for a in (r.get("assets") or [])}
+            say("GitHub Release 已存在：%s（附件 %d 个）" % (tag, len(assets)))
+            return r.get("id"), assets
+    r = gh_api("POST", "/repos/%s/%s/releases" % (GH_OWNER, GH_REPO), data={
+        "tag_name": tag, "name": name, "body": notes, "prerelease": False,
+    })
+    say("已新建 GitHub Release：%s（id=%s）" % (tag, r.get("id")))
+    return r.get("id"), set()
+
+
+def gh_upload(rid, path):
+    name = os.path.basename(path)
+    with open(path, "rb") as f:
+        content = f.read()
+    url = GH_API + "/repos/%s/%s/releases/%s/assets?name=%s" % (
+        GH_OWNER, GH_REPO, rid, urllib.parse.quote(name))
+    req = urllib.request.Request(url, data=content, headers={
+        "User-Agent": "lmj-release",
+        "Authorization": "Bearer %s" % gh_token(),
+        "Content-Type": "application/octet-stream",
+    }, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=1800) as r:
+            return json.loads(r.read().decode("utf-8", "replace") or "{}")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:500]
+        raise SystemExit("GitHub 上传附件失败（HTTP %d）：%s\n文件：%s" % (e.code, detail, path))
 
 
 def ensure_release(tag, name, notes, dry):
@@ -391,6 +463,8 @@ def main():
     # ④ 上传 APK Release
     if dry:
         say("\n[dry-run] 跳过所有上传")
+        if gh_token():
+            say("[dry-run] 若执行，会同时发到 GitHub Release：%s" % tag)
         return 0
     if not token():
         raise SystemExit("没有 token：写 tools/.gitee_token 或设环境变量 GITEE_TOKEN（权限勾 projects）")
@@ -403,7 +477,18 @@ def main():
         say("已上传 APK：%s" % os.path.basename(apk))
     put_file("update/latest.json", json.dumps(latest, ensure_ascii=False, indent=2),
              "更新记录 %s（versionCode %d）" % (cur_name, cur_code), dry=False)
-    say("\n发布完成：%s" % (RAW % "update/latest.json"))
+    # ④-b GitHub Release（可选：配了 token 才发；纯给 GitHub 用户看，不影响 App 更新）
+    if gh_token():
+        say("\n— 上传 GitHub Release %s —" % tag)
+        grid, gassets = gh_ensure_release(tag, "labyrinth-auto %s" % cur_name, notes)
+        if os.path.basename(apk) in gassets:
+            say("GitHub 附件已存在，跳过：%s" % os.path.basename(apk))
+        else:
+            gh_upload(grid, apk)
+            say("已上传 APK 到 GitHub：%s" % os.path.basename(apk))
+    else:
+        say("（未配 GitHub token，跳过 GitHub Release；写 tools/.github_token 或设 GITHUB_TOKEN 即可双发）")
+    say("\n发布完成：Gitee %s" % (RAW % "update/latest.json"))
     return 0
 
 

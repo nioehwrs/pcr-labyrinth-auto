@@ -33,6 +33,8 @@ android/app/src/main/assets/huabanxie-server-*
 #   用通配：还可能有 .gitee_token_issue（专门提 issue 的账号）等派生的份
 tools/.gitee_token
 tools/.gitee_token*
+tools/.github_token
+tools/.github_token*
 
 # Python 工具产出的缓存（tools/*.py 会生成）
 __pycache__/
