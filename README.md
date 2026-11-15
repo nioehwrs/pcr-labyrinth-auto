@@ -121,7 +121,7 @@ python tools/release.py --version 0.7.4 --code 52 --upload
 
 ## 许可
 
-本软件基于 **AGPLv3** 发布。它包含 / 派生自 [`PCR_Labyrinth_Decision_System`](https://github.com/nioehwrs/pcr-labyrinth-auto)（AGPLv3）的代码与模型，因此整体以 **GNU Affero General Public License v3 或更高版本** 许可。
+本软件基于 **AGPLv3** 发布。它包含 / 派生自 [`PCR_Labyrinth_Decision_System`](https://github.com/Lanly109/PCR_Labyrinth_Decision_System)（AGPLv3）的代码与模型，因此整体以 **GNU Affero General Public License v3 或更高版本** 许可。
 
 - 源码：见仓库根 `LICENSE`。
 - 自动更新与运行组件发布在 Gitee 公开仓库 `labyrinth-auto-release`。
