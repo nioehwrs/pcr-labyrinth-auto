@@ -717,6 +717,9 @@ class AutoForegroundService : Service() {
             // ★显式进程操作窗口：局内刷里 `AbiRepair.ensure`（重装会杀游戏）和 InGameReroll 的
             //   三处 launch 都由业务层独占；注入循环这段照常注入/读页，只是不抢发 am start。
             GameProcess.beginExternalOp()
+            // ★2026-11-15：标记"是否已交给 MazeLoop"。局内刷阶段（还没进迷宫主循环）失败/中断时，
+            //   finally 会清掉第二格「刷开局 第N轮」、第三格「不合格：…」这些阶段信息。
+            var inMaze = false
             return try {
                 // ★架构闸门（2026-10-30 用户："局内模式也要修，杀进程不是硬限制"）：
                 //   局内一般不需要杀进程，但**架构不对时注入根本连不上**，不修这一步也没法跑。
@@ -741,8 +744,17 @@ class AutoForegroundService : Service() {
                     // 极少见（刷完却不在迷宫地图上）→ 按老路再进一次
                     if (!enterMazeWithRetry(input)) return false
                 }
+                inMaze = true
                 MazeLoop.run(input, applicationContext)
             } finally {
+                // ★2026-11-15（用户）：局内刷开局阶段（还没交给 MazeLoop）失败/中断时，
+                //   清掉第二格「刷开局 第N轮」、第三格「不合格：…」这些阶段信息 —— 否则运行结束
+                //   （endedByStop=true 时外层不再清）会让它们一直残留、把「运行结束」挡在后面看不清。
+                //   （迷宫里切屏中断时 MazeLoop 自己会收尾清；这条是给「进迷宫之前」补上。）
+                if (!inMaze) {
+                    OverlayStatus.setFloor("")
+                    OverlayStatus.setState("")
+                }
                 GameProcess.resetExternalOps()
                 FridaInjector.autoRecover = false
             }

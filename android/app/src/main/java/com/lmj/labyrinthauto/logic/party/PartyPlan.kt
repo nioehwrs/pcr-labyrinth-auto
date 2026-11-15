@@ -101,7 +101,7 @@ object PartyPlan {
         //   模型分支根本没机会执行（真机上"组队：模型版"出现 0 次就是这个原因）。
         //   这里必须走同一套"模型优先、算不出再规则"的逻辑。
         val modelTeam = modelTeamOf(stage, st, pool, failed)
-        val res = if (modelTeam != null) {
+        var res = if (modelTeam != null) {
             Res(
                 stage = stage, algo = "model", cands = mutableListOf(), weak = mutableListOf(),
                 drop = mutableListOf(), attrlimUnits = mutableListOf(), todo = null,
@@ -112,6 +112,16 @@ object PartyPlan {
                 stage, pool.map { it.toString() }, relicsSkill = ctx.sk, floor = floor,
                 size = LAB_PARTY_SIZE, failed = failed,
                 tpUp = ctx.tpUp, initTp = ctx.sk,
+            )
+        }
+        // ★2026-11-15（用户）：模型给不出组队时**降级旧版规则再试一次** —— 规则版 buildBest 若也空，
+        //   用「放宽属性限定」的旧版 build 兜底，不要把空队写进缓存：否则 partyPlan 命中空缓存会
+        //   跳过它自己的兜底分支，直接走"连续 5 轮算不出 → 转人工/高亮接管"。
+        if (res.team.isNullOrEmpty()) {
+            AppState.addLog("[降级] 提前算：模型与规则版都给不出 → 旧版规则（放宽属性限定）再试")
+            res = tb.build(
+                stage, pool.map { it.toString() }, relicsSkill = ctx.sk, floor = floor,
+                size = LAB_PARTY_SIZE, failed = failed, allowAttrlim = true,
             )
         }
         rememberBuild(BuildKey(stage, floor, failed, ctx.sk, pool), res)
@@ -677,15 +687,20 @@ object PartyPlan {
                 //   两者都打会让人误以为"模型算完又用规则重算了一遍"（用户就因此以为模型没生效）。
                 AppState.addLog("组队算法 ${SystemClock.elapsedRealtime() - t0}ms（实算，池 ${pool.size} 个）")
             }
-            if (tb.team.isNullOrEmpty()) {
-                // ★空队兜底（2026-10-19 用户）：放宽属性限定重编一次——过滤链（前3图屏蔽/attrlim 剔除/
-                //   tier 门槛）可能把薄池筛空（实测 4-2 HARD：池 32 个算不出目标 → 编组页死等 33 分钟）
-                tb = teamBuild!!.build(
-                    stage, pool.map { it.toString() }, relicsSkill = ctx.sk, floor = floor,
-                    size = LAB_PARTY_SIZE, failed = failed, allowAttrlim = true,
-                )
-            }
             rememberBuild(bkey, tb)
+        }
+        // ★★2026-11-15（用户）：空队兜底**提到缓存分支之外** —— 原来只在"缓存未命中"时补一次
+        //   （放宽属性限定），若 [precompute] 已把空队写进缓存 ⇒ 这里命中后直接跳过兜底 → 判空 →
+        //   连续 5 轮转人工/高亮接管。现在无论模型给不出、还是规则版被薄池筛空，命中缓存也再降级
+        //   用旧版规则（allowAttrlim=true）试一次，实在不行才走失败策略。
+        if (tb.team.isNullOrEmpty()) {
+            AppState.addLog("[降级] 编队页：目标队为空 → 旧版规则（放宽属性限定）再试一次" +
+                "（stage=$stage 池 ${pool.size} 个）")
+            tb = teamBuild!!.build(
+                stage, pool.map { it.toString() }, relicsSkill = ctx.sk, floor = floor,
+                size = LAB_PARTY_SIZE, failed = failed, allowAttrlim = true,
+            )
+            rememberBuild(bkey, tb)                  // ★兜底结果回写缓存，避免下一轮又空转
         }
         val target = tb.team?.mapNotNull { it.toIntOrNull() } ?: emptyList()
         if (target.isEmpty()) {
