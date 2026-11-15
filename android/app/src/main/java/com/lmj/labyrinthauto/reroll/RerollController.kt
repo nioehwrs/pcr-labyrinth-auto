@@ -142,26 +142,27 @@ bossQuestByArea = j.bossQuestByArea,
                     //   刷太快时服务端会回「发生了错误。回到标题界面。」，退避几秒通常就能恢复；
                     //   只要有一次 enter 成功就清零（见下面 `errStreak = 0`），从头算。
                     //   总次数上限仍由 maxCount 控制（<=0 = 不限次数，沿用用户定的口径）。
-                    //   退避序列：2s、4s、8s、16s、32s、60s（封顶）。
-                    val backoffMs = (2_000L shl (errStreak - 1).coerceAtMost(5)).coerceAtMost(60_000L)
-                    // ★退避到 16s 及以后（16/32/60s）**每次等待前都重新登录**（2026-11-14 用户；
-                    //   原来是"每条失败链只重登一次"）。会话被挤掉/过期时光退避永远等不回来；
-                    //   重登成功 ⇒ 换新 api、退避链从头算（不额外等待）；失败 ⇒ 按原退避继续。
-                    if (backoffMs >= 16_000L && onRelogin != null) {
+                    //   退避序列：2s、4s、8s、16s、32s、64s、128s、256s…封顶 300s（5 分钟）。
+                    val backoffMs = (2_000L shl (errStreak - 1).coerceAtMost(8)).coerceAtMost(300_000L)
+                    // ★失败即重登清旧局（不再等 16s）：重登清掉挡路的旧迷宫局，新 enter 才能成功
+                    //   （2026-11-15 用户：重登清旧局才是真正管用的，2s 这一步就该重登，不用傻等升到 16s）。
+                    //   每次失败先等对应档位（2s 起递增）再重登——给偶发错误一点缓冲，又不拖到 16s+。
+                    //   重登后**保留 errStreak**（不复位），真持续失败才升到分钟级冷却，不卡小循环。
+                    if (onRelogin != null) {
                         onProgress(
                             RerollProgress(
                                 attempt, nMax,
-                                "enter 连续 $errStreak 次失败 → 重新登录（${backoffMs / 1000}s 档）",
+                                "enter 连续 $errStreak 次失败 → 等 ${backoffMs / 1000}s 后重新登录清旧局并重刷",
                                 null,
                             ),
                         )
+                        delay(backoffMs)
                         val newApi = onRelogin.invoke()
                         if (newApi != null) {
                             api = newApi
-                            errStreak = 0
                             onProgress(RerollProgress(attempt, nMax, "重新登录成功 → 继续刷开局", null))
-                            continue
                         }
+                        continue
                     }
                     onProgress(
                         RerollProgress(

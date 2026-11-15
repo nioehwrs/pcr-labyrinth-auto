@@ -130,7 +130,7 @@ object RerollUseCase {
         }
         AppState.setRerollStatus(if (acct.isChannel) "刷开局重试：重新登录渠道服…" else "刷开局重试：重新登录 B 站…")
         client = LabyrinthLoginClient(context, acct)
-        return when (val r = client!!.login()) {
+        val api = when (val r = client!!.login()) {
             is LoginOutcome.Session -> {
                 session = r.session
                 AppState.addLog("刷开局重试：重新登录成功 → 继续刷开局")
@@ -138,14 +138,36 @@ object RerollUseCase {
             }
             is LoginOutcome.Failure -> {
                 AppState.addLog("刷开局重试：重新登录失败（${r.message}）")
-                null
+                return null
             }
             is LoginOutcome.CaptchaNeeded -> {
                 // 自动流程没人解验证码；不挂起干等，按退避继续（下一次 enter 可能已经恢复）
                 AppState.addLog("刷开局重试：重新登录触发验证码（自动流程无人解）→ 继续退避重试")
-                null
+                return null
             }
         }
+        // ★重登后清理服务端可能挂起的旧迷宫会话：上一次登录 enter 成功、但刚好在频率限制
+        //   边界没 retire 掉的局。一个账号同时只能有一个进行中的迷宫局，旧局不清掉，
+        //   新 enter 会被「已有未结束的局」挡成 REJECTED「发生错误。回到标题界面。」；
+        //   这也正是「停止-重启」30s 内能恢复的原因——完整 reroll 会重新 top()+retire 旧局。
+        runCatching {
+            when (val t = api.top()) {
+                is LabyrinthOperationResult.Success -> {
+                    val eid = t.value.enterId
+                    if (eid != null) {
+                        when (val ret = api.retire(eid)) {
+                            is LabyrinthOperationResult.Success ->
+                                AppState.addLog("刷开局重试：清理挂起的旧局 enterId=$eid")
+                            is LabyrinthOperationResult.Failure ->
+                                AppState.addLog("刷开局重试：清理旧局失败（${ret.message}）→ 下一轮重登再试")
+                        }
+                    }
+                }
+                is LabyrinthOperationResult.Failure ->
+                    AppState.addLog("刷开局重试：读顶部失败（${t.message}）→ 跳过旧局清理")
+            }
+        }.onFailure { AppState.addLog("刷开局重试：旧局清理异常（${it.message}）") }
+        return api
     }
 
     /**
