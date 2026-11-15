@@ -30,7 +30,7 @@ AutoForegroundService（常驻前台服务，承载连跑主循环）
 
 - **frida 是命门**：没 root → server 起不来 → 注入失败 → 读不到页面 → 整个自动化无法工作。
 - **两条通信通道**：游戏**内部状态**走 frida agent 的本地 socket（`:27183`）；**刷开局 / 登录**走 `net` 的游戏服私有协议（B 站 SDK）。
-- **决策分流**：编队 / 选人优先端侧 ONNX 模型，模型不可用或该关未收录时静默回落规则版。
+- **决策系统有两套**：① **端侧 ONNX 模型**（`labmodel`，编队/选人推理，对应 PC `inference.cpp`/`team.cpp`）；② **规则版**（`logic/team/` 与 `CharaPick`/`RelicPick`/`ShopPlan`/`EventPick` 等，移植自 PC 规则与评分）。策略页「计算方法」可切「旧版规则 / 推理模型 / 混合」，**默认混合＝模型优先、不可用时静默回落规则版**。刷开局优先 **net 接口刷**（快），无凭证可用 **局内刷**。
 
 ---
 
@@ -77,7 +77,8 @@ AutoForegroundService（常驻前台服务，承载连跑主循环）
 一局迷宫的完整状态机与主循环、导航、编组、遗物、商店、队、事件、Boss 三队、撤退、汇总。
 - `MazeLoop.kt`（核心）：每局 `run(input, ctx)`，每 `POLL_MS=100ms` 经 `AgentApi` 拿迷宫快照，按 `statusType`(0..9) 分派到各 handler（事件 / 编队 / 商店 / 遗物 / 战斗 / 撤退）。依赖 `Foreground` 闸门、`OverlayStatus`、`LabBtnStore` 节点路径缓存。含「凹分模式」。
 - `Navigator.kt`：点到黎明界各界面，按钮按**节点名**定位（分辨率无关），`VIEW_NAMES` 照抄 PC 版。
-- `party/PartyPlan.kt`、`relic/RelicPick.kt`、`shop/ShopPlan.kt`（精确 DP 走 `GameData.shopDp`）、`team/`（规则版编队与评分，模型兜底）、`CharaPick.kt` / `EventPick.kt` / `BossChain.kt` / `MazeRetreat.kt` / `MazeSummary.kt` 等。
+- **规则版决策系统（第二套）就在此模块**：`team/TeamBuild.kt` / `TeamScore.kt` / `Rules.kt` / `TeamTuning.kt` 等负责编队与评分（模型不可用 / 未学该关时的兜底，也可在策略页单独选「旧版规则」）；`CharaPick.kt`（战后三选一多目标加权）、`RelicPick.kt`（遗物决策）、`ShopPlan.kt`（精确 DP 走 `GameData.shopDp`）、`EventPick.kt` 等承担各场景的规则决策。
+- `party/PartyPlan.kt`、`BossChain.kt` / `MazeRetreat.kt` / `MazeSummary.kt` 等：编队计划、Boss 连链、撤退、整轮汇总。
 
 ### `net` —— 后端通信
 与游戏服 / 决策服务器通信（刷开局 API、B 站 SDK 登录、私有协议、验证码/自动打码）。
