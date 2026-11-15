@@ -18,16 +18,16 @@ object TagIds {   // PC: T
         "aoe" to "u_aoe",                 // 群体输出
         // 注：单体/群体用的都是现成标签（tag_defs.json）：
         //   `u_burst` = 单体输出、`u_aoe` = 群体输出、`u_dps` = 输出核心。
-        //   （`t1791357917170` 是「魔法破甲」，跟攻击范围无关，别再拿它当单体。）
+        //   （`u_magic_break` 是「魔法破甲」，跟攻击范围无关，别再拿它当单体。）
         "dps" to "u_dps",                 // 输出核心
         "burst" to "u_burst",             // 单体输出
         "pbreak" to "u_break",            // 物理破甲
-        "mbreak" to "t1791357917170",     // 魔法破甲
+        "mbreak" to "u_magic_break",     // 魔法破甲
         "pbuff" to "u_buff",              // 物理buff
-        "mbuff" to "t1791367420540",      // 魔法buff
+        "mbuff" to "u_magic_buff",      // 魔法buff
         "tp" to "u_tp",                   // 群充
         "heal" to "u_heal",               // 治疗
-        "jiasu" to "t1791357742634",      // 加速（减少待机时间）
+        "jiasu" to "u_haste",      // 加速（减少待机时间）
         "first" to "u_first_tp",          // 首动群充（速通关键角色）
         // ★2026-11-12：**物理**首动群充（目前只有「望（解放者）」）——只惠及物理角色，
         //   与上面泛用的 `u_first_tp` 分开，避免把物理速通队带进魔法速通的判断。
@@ -35,18 +35,18 @@ object TagIds {   // PC: T
         "dbreak" to "u_dbreak",           // 双破甲
         "dbreakq" to "u_dbreak_eq",       // 等效双破甲（霸瞳皇帝，加分项）
         "both" to "u_both",               // 物法通用
-        "field" to "t1791380357831",      // 领域（领域 buff 不叠加：非速通队硬限最多 1 个）
-        "rev" to "t1791384412603",        // 类型反转（视为相反类型）
-        "attrlim" to "t1791380776914",    // 属性限定
-        "p3" to "t1791358032871",         // 前3图
+        "field" to "u_field",      // 领域（领域 buff 不叠加：非速通队硬限最多 1 个）
+        "rev" to "u_type_reverse",        // 类型反转（视为相反类型）
+        "attrlim" to "u_attr_limit",    // 属性限定
+        "p3" to "u_first3_maps",         // 前3图
         "tank" to "u_tank",
         "mtank" to "u_magetank",
-        "drain" to "t1791358447882",      // 抽蓝
+        "drain" to "u_tp_drain",      // 抽蓝
         "cc" to "u_cc",                   // 控制
-        "taunt" to "t1791358891825",      // 嘲讽
-        "knock" to "t1791358546995",      // 强击退（选人策略要用：第一个必拿）
+        "taunt" to "u_taunt",      // 嘲讽
+        "knock" to "u_knockback",      // 强击退（选人策略要用：第一个必拿）
         // 单体效果低（负面标签）：只有 4 个角色带，全是输出向 → 可在评分里无差别扣分
-        "weaksingle" to "t1791369642591",
+        "weaksingle" to "u_single_low_eff",
         // 定向输出 = 标签 u_fix_relic（2026-10-13 起叫「对策·美空」）—— 只给美空那关（EX_770121401）用，
         //   **别当成通用的"打遗物"**去套别的关
         "fixrelic" to "u_fix_relic",
@@ -58,13 +58,13 @@ object TagIds {   // PC: T
         //   （[C.MULTI_BOSS_STAGES]），其他地方编队时**当不存在**（直接剔除，不是扣分）
         "fixmulti" to "u_fix_multi",
         // 对boss弱（2026-10-13 加）：非速通场景扣分，权重 = C.BOSSWEAK
-        "bossweak" to "t1791857432869",
+        "bossweak" to "u_boss_weak",
     )
 
     /** dot 种类（细标签）；`dot` 只表示"有 dot" */
     val DOT_KINDS: List<String> = listOf(
-        "t1791358691734", "t1791358700885", "t1791358706735",
-        "t1791358710590", "t1791358716756", "t1791358726369",
+        "u_poison", "u_deadly_poison", "u_curse",
+        "u_hex", "u_fire_dmg", "u_dot_other",
     )   // 毒 猛毒 诅咒 恶咒 火伤 其他dot
 
     /** 对策标签（tag → 名字）：选人策略里"缺该对策就优先拿"用得到 */
@@ -75,8 +75,8 @@ object TagIds {   // PC: T
         "u_fix_multi" to "多目标boss",
     )
 
-    const val T_DOT = "t1791358674360"          // dot（泛化）
-    const val T_DOT_SUP = "t1791358736683"      // dot抑制（负面：种类计数 ×½）
+    const val T_DOT = "u_dot"          // dot（泛化）
+    const val T_DOT_SUP = "u_dot_suppress"      // dot抑制（负面：种类计数 ×½）
 }
 
 /** 全局参数（PC 版 `class C`，127~193 行）—— 改这里就行 */

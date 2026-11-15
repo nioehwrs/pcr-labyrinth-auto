@@ -129,56 +129,56 @@
     {
       "color": "#888888",
       "group": "能力",
-      "id": "t1791357742634",
+      "id": "u_haste",
       "name": "加速",
       "scope": "unit"
     },
     {
       "color": "#888888",
       "group": "能力",
-      "id": "t1791357843971",
+      "id": "u_atk_down",
       "name": "减攻击",
       "scope": "unit"
     },
     {
       "color": "#d35400",
       "group": "能力",
-      "id": "t1791357917170",
+      "id": "u_magic_break",
       "name": "魔法破甲",
       "scope": "unit"
     },
     {
       "color": "#888888",
       "group": "用法",
-      "id": "t1791358032871",
+      "id": "u_first3_maps",
       "name": "前3图",
       "scope": "unit"
     },
     {
       "color": "#c24ca3",
       "group": "能力",
-      "id": "t1791358112291",
+      "id": "u_charm",
       "name": "魅惑",
       "scope": "unit"
     },
     {
       "color": "#3a97df",
       "group": "能力",
-      "id": "t1791358447882",
+      "id": "u_tp_drain",
       "name": "抽蓝",
       "scope": "unit"
     },
     {
       "color": "#41c85c",
       "group": "能力",
-      "id": "t1791358546995",
+      "id": "u_knockback",
       "name": "强击退",
       "scope": "unit"
     },
     {
       "color": "#bc01d5",
       "group": "能力",
-      "id": "t1791358674360",
+      "id": "u_dot",
       "name": "dot",
       "scope": "unit",
       "single": false
@@ -186,98 +186,98 @@
     {
       "color": "#00cc4e",
       "group": "能力",
-      "id": "t1791358691734",
+      "id": "u_poison",
       "name": "毒",
       "scope": "unit"
     },
     {
       "color": "#04b701",
       "group": "能力",
-      "id": "t1791358700885",
+      "id": "u_deadly_poison",
       "name": "猛毒",
       "scope": "unit"
     },
     {
       "color": "#e100ff",
       "group": "能力",
-      "id": "t1791358706735",
+      "id": "u_curse",
       "name": "诅咒",
       "scope": "unit"
     },
     {
       "color": "#b900d1",
       "group": "能力",
-      "id": "t1791358710590",
+      "id": "u_hex",
       "name": "恶咒",
       "scope": "unit"
     },
     {
       "color": "#f03d3d",
       "group": "能力",
-      "id": "t1791358716756",
+      "id": "u_fire_dmg",
       "name": "火伤",
       "scope": "unit"
     },
     {
       "color": "#b801d0",
       "group": "能力",
-      "id": "t1791358726369",
+      "id": "u_dot_other",
       "name": "其他dot",
       "scope": "unit"
     },
     {
       "color": "#737373",
       "group": "能力",
-      "id": "t1791358736683",
+      "id": "u_dot_suppress",
       "name": "dot抑制",
       "scope": "unit"
     },
     {
       "color": "#b4cc00",
       "group": "能力",
-      "id": "t1791358891825",
+      "id": "u_taunt",
       "name": "嘲讽",
       "scope": "unit"
     },
     {
       "color": "#16a085",
       "group": "能力",
-      "id": "t1791367420540",
+      "id": "u_magic_buff",
       "name": "魔法buff",
       "scope": "unit"
     },
     {
       "color": "#888888",
       "group": "用法",
-      "id": "t1791367928106",
+      "id": "u_npc_usable",
       "name": "NPC可用",
       "scope": "unit"
     },
     {
       "color": "#888888",
       "group": "用法",
-      "id": "t1791369642591",
+      "id": "u_single_low_eff",
       "name": "单体效果低",
       "scope": "unit"
     },
     {
       "color": "#cdd016",
       "group": "能力",
-      "id": "t1791380357831",
+      "id": "u_field",
       "name": "领域",
       "scope": "unit"
     },
     {
       "color": "#0a9962",
       "group": "用法",
-      "id": "t1791380776914",
+      "id": "u_attr_limit",
       "name": "属性限定",
       "scope": "unit"
     },
     {
       "color": "#888888",
       "group": "未分组",
-      "id": "t1791384412603",
+      "id": "u_type_reverse",
       "name": "类型反转",
       "scope": "unit"
     },
@@ -354,7 +354,7 @@
     {
       "color": "#888888",
       "group": "用法",
-      "id": "t1791857432869",
+      "id": "u_boss_weak",
       "name": "对boss弱",
       "scope": "unit"
     },

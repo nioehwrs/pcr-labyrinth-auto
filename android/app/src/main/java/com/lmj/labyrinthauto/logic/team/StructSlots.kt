@@ -77,7 +77,7 @@ object StructSlots {
         ),
         Slot(
             key = "break", cn = "破甲",
-            tags = listOf(tag("pbreak", "u_break"), tag("mbreak", "t1791357917170"), tag("dbreak", "u_dbreak")),
+            tags = listOf(tag("pbreak", "u_break"), tag("mbreak", "u_magic_break"), tag("dbreak", "u_dbreak")),
             minCount = 1, maxCount = 2,
             pick = "max(sc)；优先双破甲，其次「同系群攻 + 单破甲」",
             required = { pf -> !has(pf, "no_break") },
@@ -91,14 +91,14 @@ object StructSlots {
         ),
         Slot(
             key = "knock", cn = "强击退",
-            tags = listOf(tag("knock", "t1791358546995")),
+            tags = listOf(tag("knock", "u_knockback")),
             minCount = 1, maxCount = 1,
             pick = "直接 take（第一个满足的）",
             required = { pf -> has(pf, "need_knock") },
         ),
         Slot(
             key = "cc", cn = "控制",
-            tags = listOf(tag("cc", "u_cc"), tag("taunt", "t1791358891825")),
+            tags = listOf(tag("cc", "u_cc"), tag("taunt", "u_taunt")),
             minCount = 1, maxCount = 1,
             pick = "直接 take",
             required = { pf -> has(pf, "need_cc") },
@@ -119,7 +119,7 @@ object StructSlots {
         ),
         Slot(
             key = "jiasu", cn = "加速",
-            tags = listOf(tag("jiasu", "t1791357742634")),
+            tags = listOf(tag("jiasu", "u_haste")),
             minCount = 0, maxCount = 1,
             pick = "burst/aoe 只枚举 top2（variantBest）",
             required = { pf -> has(pf, "force_jiasu") },
@@ -134,7 +134,7 @@ object StructSlots {
         ),
         Slot(
             key = "field", cn = "领域",
-            tags = listOf(tag("field", "t1791380357831")),
+            tags = listOf(tag("field", "u_field")),
             minCount = 0, maxCount = 1,
             pick = "只在 take 处拦截（burst/aoe 有绕过路径）",
             required = { false },
