@@ -1923,6 +1923,15 @@ object MazeLoop {
     private var appCtx: android.content.Context? = null
 
     /**
+     * 编队「一行宽度（px）」整局缓存（2026-11-15）。
+     * 第一次滚动反推出合理行距后存这里，之后所有滚动复用，不再每拍现取 ——
+     * 否则向上滚时可见卡片分布变化，会把"隔行差(2×行距)"当"相邻差(1×行距)"，
+     * 反推出约 2 倍行距（小鹿 1280×720：向下 rh≈144、向上 rh≈257 ⇒ 一次想滑 385px 撞边距、还滚过头）。
+     * 每次 [run] 新建实例 ⇒ 自然清零，换分辨率/布局后下一局会重新反推。
+     */
+    private var partyRowHCache = 0.0
+
+    /**
      * ★2026-10-27「点击学延迟」的探针（用户方案：一次点早了，下次同样的按钮就稍微晚点）。
      *
      * 机制：`tap(..., learnKey = ...)` 点下去时记下当时"现场指纹"，**下一轮**主循环重新算出 tag 后比对：
@@ -6203,8 +6212,16 @@ object MazeLoop {
             return false
         }
         // ── 行高反推（PC `_party_row_height`(3185)）──
+        // ★2026-11-15：整局缓存「一行宽度」。第一次反推出合理值后存进 [partyRowHCache]，
+        //   之后所有滚动**复用**，不再每拍现取 —— 否则向上滚时可见卡片分布变了，
+        //   会把"隔行差(2×行距)"当成"相邻差(1×行距)"反推出约 2 倍行距
+        //   （小鹿 1280×720：向下 rh≈144、向上 rh≈257 ⇒ 一次想滑 385px 撞屏幕边距、还滚过头）。
+        //   取"所有相邻坐标差里的最小桶"（用户：取坐标差最小的数值，要求 >20），
+        //   而非"高频最小"——隔行差必为相邻差的整数倍、只会更大，最小桶恒等于真行距。
         var rh = 0.0
-        if (icons.size >= 2) {
+        if (partyRowHCache > 20.0) {
+            rh = partyRowHCache
+        } else if (icons.size >= 2) {
             val cols = HashMap<Int, MutableList<Int>>()
             for ((x, y) in icons) cols.getOrPut(Math.round(x / 60f) * 60) { mutableListOf() }.add(y)
             val gaps = ArrayList<Int>()
@@ -6212,7 +6229,7 @@ object MazeLoop {
                 val s = ys.toSortedSet().toList()
                 for (i in 0 until s.size - 1) {
                     val g = kotlin.math.abs(s[i + 1] - s[i])
-                    if (g in 40..400) gaps.add(g)                     // 合理行高区间，过滤瞬态/异常
+                    if (g in 20..400) gaps.add(g)                     // 合理行高区间（下限放宽到 20）
                 }
             }
             if (gaps.isNotEmpty()) {
@@ -6221,17 +6238,8 @@ object MazeLoop {
                     val k = Math.round(g / 8f) * 8                    // 量化到 8px 桶，容忍几像素噪声
                     buckets[k] = (buckets[k] ?: 0) + 1
                 }
-                // ★真行距 = **反复出现的间距里"最小"的那个**（2026-10-16 修）：
-                //   同一列相邻两张卡的行距必然是行距的整数倍（相邻是 1×；中间缺一行就是 2×），
-                //   所以"最小的高频间距"恒等于真行距 —— 偶尔缺一行也不会把行距算成 2×。
-                //   ⚠原来是"取众数 + >200px 就折半"的安全网：本游戏卡片大、行距实测 ≈217px，
-                //   217 > 200 ⇒ 被折半成 108 ⇒ 下面 `2*rh` 恰好只走**一行**
-                //   （用户 2026-10-16："说是一次两行，实际只有一行"）。
-                val maxCnt = buckets.values.maxOrNull() ?: 0
-                val cand = buckets.entries
-                    .filter { it.value >= maxOf(2, maxCnt / 3) }      // 高频：出现 ≥2 次且不少于最多的 1/3
-                    .minByOrNull { it.key }
-                rh = (cand?.key ?: buckets.maxByOrNull { it.value }?.key ?: 0).toDouble()
+                // ★取"最小桶"（不再要求高频）：相邻行的真实间距必然最小，隔行差是其整数倍、只会更大
+                rh = (buckets.keys.minOrNull() ?: 0).toDouble()
             }
         }
         val band = pt.optJSONObject("band")
@@ -6242,6 +6250,7 @@ object MazeLoop {
         }
         if (rh <= 0.0) rh = 140.0                                      // 极端兜底（正常走不到：至少该有图标）
         rh = minOf(400.0, maxOf(50.0, rh))                             // 只夹异常值（上限放到 400：本游戏行距 ≈217）
+        if (rh > 20.0) partyRowHCache = rh                            // ★缓存，整局复用
 
         // ── 拖动几何：全在裁剪带内（PC 3250~3259）──
         var lo: Double
@@ -6266,7 +6275,9 @@ object MazeLoop {
         //   从边缘起手，两行的距离才放得进带内；起点仍在带内（留 40px 边）⇒ 手指一定落在列表上。
         // ★终点**不再夹在裁剪带内**（用户 2026-10-16 实测：终点出带没有任何影响）——
         //   只保留"别滑出屏幕"这一道（留 60px），保证"两行"的距离**永远给足**。
-        val want = SCROLL_ROWS * rh                                    // ★一次滚几行（见 [SCROLL_ROWS]）
+        // ★2026-11-15：每次滑动滚几行改为可配置（[PartyScrollSettings]，默认 1.5，范围 1.0~2.0）
+        val rows = (appCtx?.let { PartyScrollSettings.loadRows(it) } ?: 1.5f).toDouble()
+        val want = rows * rh                                           // ★一次滚几行 × 行距
         val sy: Double
         val ey: Double
         if (dir == "down") {                                           // 手指由下往上滑 → 内容下移、露出列表后面

@@ -64,6 +64,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
+import com.lmj.labyrinthauto.logic.PartyScrollSettings
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
@@ -1037,6 +1038,35 @@ private fun OtherTab() {
             }
         }
         item { ExEquipCard() }
+        item {
+            Card(
+                Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+            ) {
+                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SectionTitle("编队滚动")
+                    var rows by remember { mutableStateOf(PartyScrollSettings.loadRows(ctx)) }
+                    Text(
+                        "每次滑动滚几行：${"%.1f".format(rows)} 行",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Slider(
+                        value = rows,
+                        onValueChange = {
+                            rows = kotlin.math.round(it * 10f) / 10f   // 步进 0.1
+                            PartyScrollSettings.saveRows(ctx, rows)
+                        },
+                        valueRange = 1.0f..2.0f,
+                        steps = 9,
+                    )
+                    Text(
+                        "遇到反复滑动仍点不到角色时，把此值调小。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
     }
 }
 
