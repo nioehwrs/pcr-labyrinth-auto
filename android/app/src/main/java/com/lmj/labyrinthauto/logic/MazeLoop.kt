@@ -1124,8 +1124,7 @@ object MazeLoop {
     /** 帧计数轮询间隔（`gameTick` 是 T_FAST 导出，1s 一次足够；别每 100ms 去问） */
     private const val GAME_FRAME_POLL_MS = 1_000L
 
-    // ★2026-11-15：原 `SCROLL_ROWS = 1.5` 常量已废弃 —— 每次滚几行改由
-    //   [PartyScrollSettings]（默认 1.5、范围 1.0~2.0）决定，并按本节点"方向反复"次数逐次 -0.1。
+    // ★2026-11-16：滚几行固定 1.5（设置项已移除），按本节点"方向反复"次数逐次 -0.1。
 
     /** 页面停了这么久、但游戏帧还在涨 ⇒ 打一次现场取证（**不重启**：只说明 handler 没动作） */
     private const val STALL_DIAG_MS = 60_000L
@@ -6312,9 +6311,9 @@ object MazeLoop {
         //   从边缘起手，两行的距离才放得进带内；起点仍在带内（留 40px 边）⇒ 手指一定落在列表上。
         // ★终点**不再夹在裁剪带内**（用户 2026-10-16 实测：终点出带没有任何影响）——
         //   只保留"别滑出屏幕"这一道（留 60px），保证"两行"的距离**永远给足**。
-        // ★2026-11-15：每次滑动滚几行改为可配置（[PartyScrollSettings]，默认 1.5，范围 1.0~2.0）；
-        //   ★同一关来回滑时按 [slowSteps] 每次 -0.1（下限 1.0），收敛摆动幅度、别滚过头。
-        val baseRows = (appCtx?.let { PartyScrollSettings.loadRows(it) } ?: 1.5f)
+        // ★2026-11-16（用户）：设置页的「编队滚动行数」已移除 —— 固定 1.5 行；
+        //   同一关来回滑时按 [slowSteps] 每次 -0.1（下限 1.0），自动收敛摆动幅度、别滚过头。
+        val baseRows = 1.5f
         val rows = (baseRows - 0.1f * slowSteps).coerceAtLeast(1.0f).toDouble()
         val want = rows * rh                                           // ★一次滚几行 × 行距
         val sy: Double

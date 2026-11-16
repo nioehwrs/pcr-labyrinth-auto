@@ -546,21 +546,28 @@ object RerollSettings {
      * 在"知道打不过"之后更稳）。理由：模型不一定比原来的策略好，别一条道走到黑。
      *
      * 不管哪种模式，模型算不出（未加载 / 关卡不在词表 / 角色不足 5 人）都会静默回落规则版。
+     *
+     * ★2026-11-16（用户）：**默认改回「旧版规则」** —— 模型不一定比规则好，先按规则稳定跑。
+     *   这里只动**默认值**：用户自己已经选过（SharedPreferences 里有值）的照旧读取，不受影响。
      */
     fun loadTeamMode(context: Context): String =
         context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
-            .getString("teamMode", TEAM_MIXED)
+            .getString("teamMode", TEAM_RULE)
             ?.takeIf { it == TEAM_RULE || it == TEAM_MODEL || it == TEAM_MIXED }
-            ?: TEAM_MIXED
+            ?: TEAM_RULE
 
     fun saveTeamMode(context: Context, mode: String) {
         context.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()
             .putString("teamMode", mode).apply()
     }
 
-    /** ★战后角色三选一方法（2026-11-14 用户）：true = 推理模型，false = 旧版规则。**默认模型**。 */
+    /**
+     * ★战后角色三选一方法（2026-11-14 用户）：true = 推理模型，false = 旧版规则。
+     * ★2026-11-16（用户）：**默认改回「旧版规则」**（原来默认模型）。只动默认值，
+     *   用户已经选过的（SharedPreferences 里有值）照旧。
+     */
     fun loadPickByModel(context: Context): Boolean =
-        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getBoolean("pickByModel", true)
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getBoolean("pickByModel", false)
 
     fun savePickByModel(context: Context, on: Boolean) {
         context.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()

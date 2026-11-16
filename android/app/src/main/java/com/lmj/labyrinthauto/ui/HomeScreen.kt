@@ -64,7 +64,6 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
-import com.lmj.labyrinthauto.logic.PartyScrollSettings
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
@@ -1038,35 +1037,6 @@ private fun OtherTab() {
             }
         }
         item { ExEquipCard() }
-        item {
-            Card(
-                Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-            ) {
-                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    SectionTitle("编队滚动")
-                    var rows by remember { mutableStateOf(PartyScrollSettings.loadRows(ctx)) }
-                    Text(
-                        "每次滑动滚几行：${"%.1f".format(rows)} 行",
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
-                    Slider(
-                        value = rows,
-                        onValueChange = {
-                            rows = kotlin.math.round(it * 10f) / 10f   // 步进 0.1
-                            PartyScrollSettings.saveRows(ctx, rows)
-                        },
-                        valueRange = 1.0f..2.0f,
-                        steps = 9,
-                    )
-                    Text(
-                        "遇到反复滑动仍点不到角色时，把此值调小。",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            }
-        }
     }
 }
 
@@ -1754,8 +1724,8 @@ private fun TeamSettingsCard(context: Context) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         MethodRow(
             title = "编队计算方法",
-            desc = "混合（默认）：这个节点第一次打用推理模型，打不过就切旧版规则（规则版会补坦克，更稳）；" +
-                "也可以固定只用其中一种。",
+            desc = "旧版规则（默认）：按关卡档的规则表算（会补坦克/破甲/治疗）；" +
+                "也可以改用推理模型，或混合（第一次模型、打不过切规则）。",
             options = listOf(
                 RerollSettings.TEAM_RULE to "旧版规则",
                 RerollSettings.TEAM_MODEL to "推理模型",
@@ -1822,7 +1792,7 @@ private fun PickSettingsCard(context: Context) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         MethodRow(
             title = "战后三选一计算方法",
-            desc = "战后三选一用哪套逻辑：推理模型看「这张卡对后续首领战的帮助」，旧版按角色评分排序。",
+            desc = "战后三选一用哪套逻辑：旧版规则（默认）按角色评分排序；推理模型会看「这张卡对后续首领战的帮助」。",
             options = listOf("rule" to "旧版规则", "model" to "推理模型"),
             selected = if (byModel) "model" else "rule",
         ) {
