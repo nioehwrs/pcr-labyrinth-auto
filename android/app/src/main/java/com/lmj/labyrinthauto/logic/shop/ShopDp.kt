@@ -36,6 +36,14 @@ object ShopDp {
 
     private const val EPS = 1e-9
 
+    /**
+     * ★2026-11-16：**同价值判定容差**（"省钱的 tie-break"专用）。
+     *   曲线值是 4 位小数打包的，精度 ~5e-5 ⇒ 用 1e-9 会把"本应相等"的两条路径判成严格不等，
+     *   tie-break 就失效了（实测 2400 例里有 2 例两边因此选得不一样）。分数是整数，真差值最小 1 分，
+     *   所以 1e-3 既覆盖舍入误差、又不会把"真的更优"误判成 tie。
+     */
+    private const val TIE_EPS = 1e-3
+
     /** 一段阶梯曲线：`xs` 严格递增（单位=**实付金币**），`ys` 对应期望分 */
     class Curve(val xs: IntArray, val ys: DoubleArray) {
 
@@ -161,7 +169,14 @@ object ShopDp {
                 val rest = money - cost - fee
                 val after = if (remaining >= 2) model.hAt(discPct, rest) else model.gAt(discPct, rest)
                 val v = scores[mask] + after
-                if (v > best.value + EPS) best = Decision(mask, cost, scores[mask], true, v)
+                // ★2026-11-16（用户）：**同为“买完刷新”的方案**、期望分又一样时，选**花费更少**的
+                //   （剩余金币多 = 弱支配：钱多不会让后续更差）。
+                //   曲线 hAt/gAt 是按金币分桶的阶梯，同一桶内取值相同 ⇒ 会出现"期望一样但一个更费钱"的 tie；
+                //   原逻辑只判严格更优，tie 时保留先遍历到的（mask 小的），不保证省钱。
+                //   ⚠只在 best 也是刷新方案时启用 —— 不能拿它替换"不刷新"（那会白花刷新费换同样的分）。
+                val better = v > best.value + TIE_EPS ||
+                    (best.refresh && kotlin.math.abs(v - best.value) <= TIE_EPS && cost < best.cost)
+                if (better) best = Decision(mask, cost, scores[mask], true, v)
             }
         }
         return best
