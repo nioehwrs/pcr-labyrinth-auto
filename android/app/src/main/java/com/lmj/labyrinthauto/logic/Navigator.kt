@@ -328,7 +328,8 @@ object Navigator {
                 // ★屏幕中心是慢页（登录/标题/过场）：探测间隔 = 挡位 ×2（用户 2026-11-17）
                 tapUntilChange(
                     input, cw / 2, ch / 2, "屏幕中心", vid,
-                    settleMs = 300L, probe = 1,
+                    probe = 1,
+                    // 屏幕中心 = 推后一挡：probe = 默认×2 ⇒ settle 自动 = 默认×4（更慢、更稳）
                     probeMs = com.lmj.labyrinthauto.logic.TapCheck.currentProbeMs() * 2,
                 )
             } else {
@@ -689,7 +690,7 @@ object Navigator {
      */
     private suspend fun tapUntilChange(
         input: InputBackend, x: Int, y: Int, what: String, fromVid: Int,
-        settleMs: Long = 150L, probe: Int = 4, probeMs: Long = com.lmj.labyrinthauto.logic.TapCheck.currentProbeMs(),
+        settleMs: Long = 0L, probe: Int = 4, probeMs: Long = com.lmj.labyrinthauto.logic.TapCheck.currentProbeMs(),
         reRead: (suspend () -> Pair<Int, Int>?)? = null,   // ★2026-11-17：点前现取坐标（轻读，取不到这拍不点）
     ): Boolean {
         val from = locSig(fromVid)
