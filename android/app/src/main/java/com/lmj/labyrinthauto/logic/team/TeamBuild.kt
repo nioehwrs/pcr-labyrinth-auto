@@ -948,11 +948,20 @@ class TeamBuild(private val tables: Tables) {
             if (TagIds.T["dps"] in ts && burst && !aoe && !fix) s += nd
         }
         if (!noBreak) {
-            if (TagIds.T["pbreak"] in ts) {
-                s += if (mixed || atk == "物理") w["bp_break"]!! else w["gauge_break"]!!
-            }
-            if (TagIds.T["mbreak"] in ts) {
-                s += if (mixed || atk == "魔法") w["bp_break"]!! else w["gauge_break"]!!
+            // ★2026-11-17（用户）：破甲的物理/魔法是**成对标签**，双向破甲（pbreak+mbreak 都有）
+            //   在任一系队里都能破甲 ⇒ **不该被"不匹配"扣分**（原来 pbreak 在魔法队会 -3、mbreak +6，
+            //   双向角色只净 +3，等于把双向破甲当成单向惩罚）。
+            //   只有"单向且与队伍系别不符"才扣（魔法队里**只有**物理破甲 / 物理队里**只有**魔法破甲）。
+            val hasPb = TagIds.T["pbreak"] in ts
+            val hasMb = TagIds.T["mbreak"] in ts
+            if (mixed) {
+                // 混编：两系都打得到 ⇒ 有哪个加哪个（保持原行为）
+                if (hasPb) s += w["bp_break"]!!
+                if (hasMb) s += w["bp_break"]!!
+            } else {
+                val hit = (atk == "物理" && hasPb) || (atk == "魔法" && hasMb)
+                if (hit) s += w["bp_break"]!!
+                else if (hasPb != hasMb) s += w["gauge_break"]!!   // 只有单向且不匹配才扣
             }
         }
         if (TagIds.T["pbuff"] in ts && (mixed || atk == "物理")) s += w["bp_buff"]!!
@@ -1175,7 +1184,8 @@ class TeamBuild(private val tables: Tables) {
         relicsSkill: Int,
         res: Res,
     ) {
-        val gap = 420
+        // ★2026-11-17（用户实测）：420 → 360。之前对站位间隔的理解有误（实测不是 420）。
+        val gap = 360
         fun rngOf(u: String): Int = rng(u)            // ★站位修正（若菜 -420）同样生效
         val trials = mutableListOf<GhostTrial>()
         val ny = cands.filter { "u_fix_ghost" in rules.tagsOf(it) }

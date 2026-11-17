@@ -1037,6 +1037,18 @@ private fun OtherTab() {
             }
         }
         item { ExEquipCard() }
+        // ★「点击节奏」（2026-11-17 用户）：从策略页挪来（不是游戏内决策，属于通用手感设置）
+        item {
+            Card(
+                Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+            ) {
+                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    SectionTitle("点击节奏")
+                    TapProbeCard(ctx)
+                }
+            }
+        }
     }
 }
 
@@ -1085,12 +1097,6 @@ private fun StrategyTab() {
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
-            }
-        }
-        // ★「点击节奏」（2026-11-17 用户）：tapAndCheck 点完后的探测间隔挡位
-        item {
-            StrategyCard("点击节奏") {
-                TapProbeCard(context)
             }
         }
         // ★「角色选择」（2026-11-13 用户）：属性印记顺序 + 不使用 NPC；默认折叠，放在「遗物选择」上面
@@ -1720,20 +1726,19 @@ private fun MethodRow(
     }
 }
 
-/** ★策略页「点击节奏」（2026-11-17 用户）：tapAndCheck 点完探"页面变了没"的间隔挡位。 */
+/** ★「点击节奏」（2026-11-17 用户）：tapAndCheck 探测间隔挡位（只显示档位名、不显示毫秒数）。 */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun TapProbeCard(context: Context) {
     var ms by remember { mutableIntStateOf(RerollSettings.loadTapProbeMs(context)) }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("探测间隔", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
         Text(
-            "点一下后多久探一次「页面变了没」：变小更快进入下一步、但点击更密；" +
-                "变大更省、但每步多等一点。默认 150ms。登录/标题等慢页固定按此值的 2 倍。",
+            "探测间隔不等于点击间隔，选一个自己合适的探测档位即可。",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            RerollSettings.TAP_PROBE_STEPS.forEach { step ->
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            RerollSettings.TAP_PROBE_STEPS.forEachIndexed { i, step ->
                 FilterChip(
                     selected = ms == step,
                     onClick = {
@@ -1741,7 +1746,7 @@ private fun TapProbeCard(context: Context) {
                         RerollSettings.saveTapProbeMs(context, step)
                         com.lmj.labyrinthauto.logic.TapCheck.setProbeMs(step.toLong())
                     },
-                    label = { Text("${step}ms", style = MaterialTheme.typography.labelSmall) },
+                    label = { Text(RerollSettings.TAP_PROBE_LABELS[i], style = MaterialTheme.typography.labelSmall) },
                 )
             }
         }

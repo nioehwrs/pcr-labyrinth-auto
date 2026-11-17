@@ -438,6 +438,10 @@ object RerollSettings {
      *  · 各调用的 settleMs（点完第一次探之前的等待）**不受影响**（那些值是逐个坑调出来的）。
      */
     val TAP_PROBE_STEPS: List<Int> = listOf(150, 200, 250, 300, 350)
+
+    /** 挡位显示名（由快到慢），与 [TAP_PROBE_STEPS] 一一对应；UI 不显示具体毫秒数 */
+    val TAP_PROBE_LABELS: List<String> = listOf("最快", "快", "较快", "普通", "较慢")
+
     const val TAP_PROBE_DEFAULT = 150
 
     fun loadTapProbeMs(context: Context): Int {
