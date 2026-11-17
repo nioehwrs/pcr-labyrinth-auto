@@ -6933,6 +6933,9 @@ object MazeLoop {
             input, fail.optInt("x"), fail.optInt("y"), "重新挑战",
             xyAt = { battleResultXY(wantWin = false) },
             from = setOf("DialogBackKeyCapture", "DialogLabyrinthExResult", "DialogQuestFailed"),
+            // ★同样用安全间隔（probeMs×2.5，防连点把 input 拖死 → lmkd），"等页面切换"交给 probe 次数
+            settleMs = TapCheck.safetySettleMs(),
+            probe = 8,
             retries = 12,
             expect = setOf(PAGE_QUEST_DETAIL),
         )
@@ -7797,6 +7800,9 @@ object MazeLoop {
                 input, fail.optInt("x"), fail.optInt("y"), "重新挑战",
                 xyAt = { battleResultXY(wantWin = false) },
                 from = setOf("DialogBackKeyCapture", "DialogLabyrinthExResult", "DialogQuestFailed"),
+                // ★同样用安全间隔（probeMs×2.5，防连点把 input 拖死 → lmkd）
+                settleMs = TapCheck.safetySettleMs(),
+                probe = 8,
                 retries = 12,
                 // 阶段2：重新挑战回到**预览页**（敌人信息展示，编组页之前那页）
                 expect = setOf(PAGE_QUEST_DETAIL),
@@ -7833,7 +7839,14 @@ object MazeLoop {
                 //   日志 00:38:58~59 在 1.4s 内连点 7 次「下一步」（每次都是 root `input tap`），
                 //   紧接着 00:39:01 系统 `device is not responding` 触发 lmkd 杀进程 —— 点击太密会把
                 //   input/系统拖到无响应。400ms/次（含 tap ~110ms）≈ 2 次/秒，够推进又不会打满。
-                // 结算页按钮落位不稳（2026-11-07）：25 次 × (probeMs×2 + 探测) ≈ 10 秒窗口
+                // ★★2026-11-17 回归修复：这条**不能跟随统一口径**——实测 18:19:27 又出现
+                //   1s 内连点 6 次「下一步」，18:19:31 lmkd 以 "device is not responding" 杀进程
+                //   （和 11-13 那次一模一样）。这里用 [TapCheck.safetySettleMs] = probeMs×2.5
+                //   （默认 375ms ≈ 原 400ms，约 2.7 次/秒）；"等页面切换"改用 probe 次数
+                //   （8×150≈1.2s 窗口），探到离开就停 ⇒ 正常只点 1 次，不会连点。
+                settleMs = TapCheck.safetySettleMs(),
+                probe = 8,
+                // 结算页按钮落位不稳（2026-11-07）：25 次 × (400ms + 探测) ≈ 10 秒窗口
                 retries = 25,
                 // 阶段2：普通战 → 选人/选遗物（Selection）；**最终 Boss(50801) → 直接进迷宫结算**
                 //   （实测 17:41:39 顶框=DialogLabyrinthResult）⇒ 两个都要认，否则会白等 6 秒
