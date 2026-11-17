@@ -10,7 +10,9 @@ import java.io.OutputStreamWriter
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 
 /**
  * 日志落盘（2026-10-17 用户要求："把完整跑完的日志保存下来方便查看，以后就知道完整跑完日志在哪里，
@@ -52,9 +54,16 @@ object LogFile {
     private val nameFmt = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
     private val dayFmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
 
-    private val io = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "lmj-logfile").apply { isDaemon = true }
-    }
+    /** 写盘队列上限 + 背压（2026-11-17）：原 single-thread 无界队列，日志风暴时生产快于落盘会无限堆积
+     *  （每行要 flush 两份 sink），是助手 rss 膨胀的可疑源。改为有界 + CallerRunsPolicy：
+     *  队列满时由 addLog 的调用线程同步落盘 ⇒ 不丢日志、队列不无限涨、生产自然降速。 */
+    private const val QUEUE_CAP = 4096
+    private val io = ThreadPoolExecutor(
+        1, 1, 0L, TimeUnit.MILLISECONDS,
+        LinkedBlockingQueue<Runnable>(QUEUE_CAP),
+        { r -> Thread(r, "lmj-logfile").apply { isDaemon = true } },
+        ThreadPoolExecutor.CallerRunsPolicy(),
+    )
     private val lock = Any()
 
     /** 一份正在写的文件（每个目录一份，内容相同） */

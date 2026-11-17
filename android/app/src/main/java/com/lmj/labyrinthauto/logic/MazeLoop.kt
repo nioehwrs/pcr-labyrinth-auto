@@ -437,6 +437,7 @@ object MazeLoop {
         shopCoinBadKey = null; shopCoinBadAt = 0L
         shopRelicCtx = null
         SampleLog.reset()                        // ★本局随机信息采样：去重表清零（同一节点每局都可再记）
+        ShopSampleLog.reset()                    // ★商店采样去重表：每局清零，否则 seen 跨局单调增长（文件有轮转、内存 set 没有）
         // 刷开局产物（reroll）注入：开局前就已知 3/5 区 Boss 与每区最优路线，
         // 消除"开局读不到 3 区 Boss / 完整地图"的差异（PLAN §0.6 原定不碰，本次已实现）。
         val reroll = RerollState.result
