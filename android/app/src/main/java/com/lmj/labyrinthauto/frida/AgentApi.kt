@@ -238,6 +238,16 @@ object AgentApi {
         obj("labPartyLite", timeoutMs = timeoutMs)
 
     /**
+     * ★2026-11-17：只判「编组页实例在不在」——**零坐标投影、零字段读**（agent 侧缓存命中时只做一次
+     * 指针校验，微秒级）。给"点前复查"（检测与点击紧邻）用，比 `labPartyLite` 轻一个数量级。
+     * @return true=在屏；false=不在；null=读不到（调用方应保守处理）
+     */
+    suspend fun labPartyPresent(timeoutMs: Long = 1_000L): Boolean? {
+        val o = obj("labPartyPresent", timeoutMs = timeoutMs) ?: return null
+        return o.optBoolean("ok", false)
+    }
+
+    /**
      * ★编组页顶部页签（`tabCand` 候选 + `partyTabs` 队伍1/2/3 坐标）。
      * 以前每轮都从 `labParty` 里带 40 个候选回来 ⇒ 现在只在"Boss 页切队腾空"时单独调。
      */

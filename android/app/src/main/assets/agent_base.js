@@ -4968,6 +4968,34 @@ function labPartyFind() {
 }
 
 /**
+ * ★2026-11-17（用户）：**只判「编组页实例在不在」**——给"点前复查"用的极轻接口。
+ *
+ * 为什么不用 `labPartyLite`：那个虽然叫"轻量"，仍要读整份决策快照（5 个槽位 + 21 个一览
+ * 共 **26 次坐标投影** + 一堆字段）⇒ 百毫秒级。而复查只需要一个布尔值。
+ * 这里：缓存命中时只做 `_partyDlgValid`（读 klass + 2 个指针，微秒级）；
+ * 缓存失效才走一次 `labPartyFind`（扫 DialogArea 子树，几十 ms，只在刚打开/关闭时发生）。
+ *
+ * @return `{ ok, via, top, ms }`；via = cache | find | none
+ */
+function labPartyPresentSnapshot() {
+  const t0 = Date.now();
+  const out = { ok: false, via: "none", top: "", ms: 0 };
+  try {
+    try { out.top = _normWindowName(_topDialogName() || ""); } catch (e) {}
+    let d = null;
+    try { if (g_partyDlg && !g_partyDlg.isNull() && _partyDlgValid(g_partyDlg)) d = g_partyDlg; } catch (e) {}
+    if (d && !d.isNull()) { out.ok = true; out.via = "cache"; }
+    else {
+      const f = labPartyFind();
+      if (f && f.ok) { out.ok = true; out.via = "find"; }
+      else out.err = (f && f.err) || "no-party";
+    }
+  } catch (e) { out.err = String(e); }
+  out.ms = Date.now() - t0;
+  return out;
+}
+
+/**
  * @param diag   诊断模式（多打一些字段）
  * @param skipXY **跳过「队伍那一排」每个 icon 的坐标投影**（2026-11-07）：
  *               槽位坐标只在**点撤人**时要用 ⇒ 改成点击前调 `labPartyIconPos(uid, "槽位")` 现取（~20ms）。
@@ -8076,6 +8104,8 @@ rpc.exports = {
   //   **不返回**页签候选与诊断字段 ⇒ 每轮省掉一大坨序列化+传输+解析。
   //   字段名与 `labParty` 一致 ⇒ Kotlin 侧不用改。
   labPartyLite: _rpcSafe(function () { try { return labPartyLiteSnapshot(); } catch (e) { return null; } }),
+  // ★2026-11-17：**极轻**「编组页在不在」（零投影、零字段读；给"点前复查"用，比 labPartyLite 轻一个数量级）
+  labPartyPresent: _rpcSafe(function () { try { return labPartyPresentSnapshot(); } catch (e) { return null; } }),
   // ★编组页顶部页签（切队伍腾空用；以前每轮都从 labParty 里带 40 个候选回来）
   labPartyTabs: _rpcSafe(function () { try { return labPartyTabsSnapshot(); } catch (e) { return null; } }),
   // ★★**极简分派读**（2026-11-08）：只读分派要的字段（全是内存读）⇒ ~10ms；

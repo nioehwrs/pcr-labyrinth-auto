@@ -22,6 +22,7 @@ import com.lmj.labyrinthauto.data.Tables
  */
 class TeamBuild(private val tables: Tables) {
 
+
     val rules = Rules(tables)
 
     /** 单位中文名（PC 里等价 `U[uid]["name"]`）—— 组队记录（[TeamRunLog]）写人名用 */
@@ -1193,7 +1194,13 @@ class TeamBuild(private val tables: Tables) {
             trials.add(GhostTrial(1, ny[0], null, null))
         } else {
             // ★抽蓝用规范化后的标签（TagIds.T["drain"] = u_tp_drain）
-            val drains = cands.filter { TagIds.T["drain"] in rules.tagsOf(it) }
+            // ★2026-11-17（用户）：**本节点失败过 ⇒ 跳过方案2（抽蓝流）**，直接退到 3/4/普通。
+            //   复用现成的 `res.failed`（= 本节点失败过：MazeLoop 按 nodeFailed 传入、并参与 BuildKey 缓存键）。
+            val hasDrain = cands.any { TagIds.T["drain"] in rules.tagsOf(it) }
+            val drains = if (res.failed) emptyList() else cands.filter { TagIds.T["drain"] in rules.tagsOf(it) }
+            if (res.failed && hasDrain) {
+                res.log.add("幽灵：本节点失败过 → 跳过方案2（抽蓝流），改走坦克/前排方案")
+            }
             if (drains.isNotEmpty()) {
                 drains.forEach { trials.add(GhostTrial(2, it, null, null)) }
             } else {

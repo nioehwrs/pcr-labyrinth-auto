@@ -5281,6 +5281,26 @@ object MazeLoop {
                     AppState.addLog(
                         "编队：撤人 ${todo.size} 个（坐标一次算好，按从左往右依次点，中途不读）",
                     )
+                    // ★2026-11-17 诊断（用户要求）：编队前把快照里的坐标来源打进日志，
+                    //   定位"点歪 / 点完顶框突变 / 误开战"——icons=下排槽位，scroll=角色一览，btn=按钮坐标。
+                    runCatching {
+                        fun dumpArr(a: org.json.JSONArray?): String {
+                            if (a == null) return "-"
+                            val sb = StringBuilder()
+                            for (k in 0 until a.length()) {
+                                val o = a.opt(k) as? JSONObject ?: continue
+                                sb.append("${o.optInt("unitId")}@${o.opt("x")},${o.opt("y")}")
+                                if (o.has("vis")) sb.append("/v${o.opt("vis")}")
+                                sb.append(' ')
+                            }
+                            return sb.toString().trim()
+                        }
+                        AppState.addLog(
+                            "  [dbg] scr=${scrW}x${scrH}｜icons=[${dumpArr(snap.optJSONArray("icons"))}]" +
+                                "｜scroll=[${dumpArr(snap.optJSONArray("scrollIcons"))}]" +
+                                "｜btn=${snap.optJSONObject("buttons")?.toString() ?: "null"}",
+                        )
+                    }
                     for ((op, c) in todo) {
                         tap(input, c.first, c.second, "编队：remove ${op.unit}")
                         // ★2026-11-07：不再死等 350ms ⇒ **等这个人真的出队**就立刻点下一个。
@@ -6477,7 +6497,8 @@ object MazeLoop {
             val plan = runCatching { AgentApi.labPartyPlan(timeoutMs = 700L) }.getOrNull()
             if (plan == null || plan.top != "DialogCommonPartyEdit") {
                 AppState.addLog(
-                    "编队[$label] 等 $unit ${if (want) "进队" else "出队"}：读不到编组页（第${n}轮）→ 放弃",
+                    "编队[$label] 等 $unit ${if (want) "进队" else "出队"}：读不到编组页（第${n}轮）→ 放弃" +
+                        "｜当前顶框=${plan?.top ?: "读取失败"}",   // ★2026-11-17 诊断：区分"读失败"还是"顶框被切走"
                 )
                 return false
             }
@@ -6562,7 +6583,10 @@ object MazeLoop {
      *   y=731"）—— 只认 `vis` 不为 false 的卡；都没有就返回 null（交给下一轮的滚动/重算）。
      */
     private fun findUnitCoord(pt: JSONObject, unit: Int, via: String? = null): Pair<Int, Int>? {
-        val order = if (via == "槽位") listOf("icons", "scrollIcons") else listOf("scrollIcons", "icons")
+        // ★2026-11-17（用户）：撤人（via="槽位"）**只认下排槽位数组 icons**，绝不退回角色一览
+        //   scrollIcons —— 点一览里同 id 的卡不会撤人，反而会误触别的元素（本次实测就退到一览坐标
+        //   (618,434) 点下去直接开战）。找不到就返回 null，交给下一轮/滚动分支。
+        val order = if (via == "槽位") listOf("icons") else listOf("scrollIcons", "icons")
         for (arrName in order) {
             val arr = pt.optJSONArray(arrName) ?: continue
             for (i in 0 until arr.length()) {
@@ -6574,7 +6598,11 @@ object MazeLoop {
                 }
                 val x = c.opt("x"); val y = c.opt("y")
                 if (x != null && x !== JSONObject.NULL && y != null && y !== JSONObject.NULL) {
-                    return c.optInt("x") to c.optInt("y")
+                    val xi = c.optInt("x")
+                    val yi = c.optInt("y")
+                    // ★屏内校验：挡掉"未布局 / 投影到屏幕外"的垃圾坐标（快：纯数值比较）
+                    if (xi !in 0 until scrW || yi !in 0 until scrH) continue
+                    return xi to yi
                 }
             }
         }
@@ -6752,16 +6780,34 @@ object MazeLoop {
             }
             tapAndCheck(
                 input, pFinal.first, pFinal.second, "预览·开打（进编组，questId=${jStr(st, "questId")}）",
-                // ★2026-11-17（用户）：点前现取「挑战」坐标（首次是子树/缓存兜底链；这里取同款最轻的一步：
-                //   先 dialog 子树 findText、再 findNode；取不到就返回 null → 这一拍不点）。
+                // ★2026-11-17（用户）：**检测与点击必须紧邻**——每次点前现场复查（不再现算坐标）：
+                //   ① 顶框已不是预览页 ⇒ 这拍不点；
+                //   ② 编组页已在屏（哪怕顶框还残留预览页）⇒ 这拍不点 —— 那坐标在编组页里正好是
+                //      「战斗开始」（半路接管"点出发→预览页闪一下→直接落编组页"就会被骗，实测误开战）。
+                //   复审通过才用上面算好的 pFinal 点（坐标不动）。全程只有两次轻读，
+                //   不再有原来每拍 findText/findNode 的 ~1s 延迟（那正是"检测→点击隔 3 秒"的一半）。
                 xyAt = {
-                    val d = AgentApi.findText(BATTLE_START_BTN, "dialog")
-                    val fp = if (d != null && d.has("x") && d.has("y")) {
-                        d.optInt("x") to d.optInt("y")
+                    val t = runCatching { AgentApi.labTop(800L) }.getOrNull() ?: ""
+                    if (!t.startsWith("DialogQuestDetail")) {
+                        if (tries.getOrPut("QD_PRE_TOP", { 0 }) == 0) {
+                            tries["QD_PRE_TOP"] = 1
+                            AppState.addLog("… 点前复查：顶框=「$t」不是预览页 → 这拍不点「$BATTLE_START_BTN」")
+                        }
+                        null
                     } else {
-                        findNode(BATTLE_START_BTN)
+                        // ★2026-11-17：改用极轻的 labPartyPresent（零投影，微秒~几十 ms）。
+                        //   true=编组页在屏 / null=读不到 ⇒ **两种情况都保守不点**（误开战=用错队伍打 Boss，
+                        //   代价远大于多等一拍）；只有明确 false（确认不在）才点。
+                        val present = runCatching { AgentApi.labPartyPresent(1_000L) }.getOrNull()
+                        if (present != false) {
+                            if (tries.getOrPut("QD_PRE_PARTY", { 0 }) == 0) {
+                                tries["QD_PRE_PARTY"] = 1
+                                val why = if (present == true) "编组页已在屏" else "编组页状态读不到（保守）"
+                                AppState.addLog("… 点前复查：$why → 这拍不点「$BATTLE_START_BTN」")
+                            }
+                            null
+                        } else pFinal
                     }
-                    fp
                 },
                 from = setOf("DialogQuestDetail"),
                 retries = 8,
