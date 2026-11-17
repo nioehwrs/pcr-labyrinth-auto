@@ -429,6 +429,29 @@ object RerollSettings {
         else -> "scoreChaseRules"
     }
 
+    // ────────────────────────── 点击探测间隔（2026-11-17 用户）──────────────────────────
+    /**
+     * ★tapAndCheck「点完探页面变了没」的间隔挡位，默认 150ms。
+     *  · 只作用于**用默认 probeMs 的调用点**（商店关框 / 关闭收到 / 三选一 / 遗物 / 战斗开始 /
+     *    EX 装备 / 结算下一步 / 预览开打 / 局内刷开局 / 导航）；
+     *  · 屏幕中心慢页 = 本值 ×2（见 Navigator）；
+     *  · 各调用的 settleMs（点完第一次探之前的等待）**不受影响**（那些值是逐个坑调出来的）。
+     */
+    val TAP_PROBE_STEPS: List<Int> = listOf(150, 200, 250, 300, 350)
+    const val TAP_PROBE_DEFAULT = 150
+
+    fun loadTapProbeMs(context: Context): Int {
+        val v = context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+            .getInt("tapProbeMs", TAP_PROBE_DEFAULT)
+        return if (v in TAP_PROBE_STEPS) v else TAP_PROBE_DEFAULT
+    }
+
+    fun saveTapProbeMs(context: Context, ms: Int) {
+        val v = if (ms in TAP_PROBE_STEPS) ms else TAP_PROBE_DEFAULT
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()
+            .putInt("tapProbeMs", v).apply()
+    }
+
     fun loadCredentials(context: Context): Pair<String, String> {
         val sp = context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
         // 老版本的明文在这里会被 SecureStore 原地升级成密文

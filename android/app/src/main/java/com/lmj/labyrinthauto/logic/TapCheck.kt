@@ -41,6 +41,22 @@ import kotlinx.coroutines.delay
 object TapCheck {
 
     /**
+     * ★探测间隔挡位（2026-11-17 用户）：点完探"页面变没变"的间隔，默认 150ms。
+     *  取值范围见 [com.lmj.labyrinthauto.reroll.RerollSettings.TAP_PROBE_STEPS]（150/200/250/300/350）。
+     *  · 由 [com.lmj.labyrinthauto.LmjApp] 启动时 + 策略页改动时从设置注入（这里不直接读 Context，
+     *    避免逻辑层依赖 Android）；所有**用默认 probeMs 的调用点**自动跟随。
+     *  · 屏幕中心慢页 = 本值 ×2（见 Navigator）；各 settleMs 不受影响（那些是逐个坑调出来的）。
+     */
+    @Volatile
+    private var probeMsValue = 150L
+
+    fun setProbeMs(ms: Long) {
+        probeMsValue = ms.coerceIn(150L, 350L)
+    }
+
+    fun currentProbeMs(): Long = probeMsValue
+
+    /**
      * 一次 probe 的结果。
      *
      * ★`top` 和 `left` **必须来自同一次内存快照**：先读 labTop、再另读一次关闭态，
@@ -68,7 +84,7 @@ object TapCheck {
         unknownTop: String = "",
         xyAt: (suspend () -> Pair<Int, Int>?)? = null,
         probe: Int = 0,
-        probeMs: Long = 150L,
+        probeMs: Long = currentProbeMs(),
         reached: (suspend (String) -> Boolean)? = null,
         /** ★给了它就**只调它一次**（同一次快照同时给 top + 判据），不再读 readTop / reached。 */
         probeState: (suspend () -> Probe)? = null,

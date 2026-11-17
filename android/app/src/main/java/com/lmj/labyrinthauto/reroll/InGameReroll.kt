@@ -628,7 +628,6 @@ bossQuestByArea = j.bossQuestByArea,
             //   命中路径不受影响（第 1~2 拍就停手）。
             settleMs = 150L,
             probe = 3,
-            probeMs = 150L,
             retries = retries,
             expectTimeoutMs = expectTimeoutMs,
             readTop = { Navigator.currentViewId().toString() },

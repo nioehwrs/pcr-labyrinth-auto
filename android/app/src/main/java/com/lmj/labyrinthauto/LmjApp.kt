@@ -36,6 +36,12 @@ class LmjApp : Application() {
         // ★崩溃兜底（2026-10-26）：必须**最先**装 —— 之后任何一行代码崩了都要能留下死因，
         //   否则"游戏和工具一起消失"这类问题查起来是空白的（详见 CrashGuard 顶部）。
         runCatching { CrashGuard.install(this) }
+        // ★点击探测间隔挡位（2026-11-17）：启动时注入给 TapCheck（逻辑层不碰 Context）
+        runCatching {
+            com.lmj.labyrinthauto.logic.TapCheck.setProbeMs(
+                com.lmj.labyrinthauto.reroll.RerollSettings.loadTapProbeMs(this).toLong(),
+            )
+        }
         runCatching { LogFile.init(this) }
         // ★组队记录（2026-10-24）：每次编队一行 JSON → logs/team_runs.jsonl（PC 组队记录页可直接读）
         runCatching { TeamRunLog.init(this) }

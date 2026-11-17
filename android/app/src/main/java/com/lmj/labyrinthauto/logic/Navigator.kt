@@ -252,7 +252,8 @@ object Navigator {
                 // 迷宫子菜单 → 点它的返回按钮回 259（找不到就本轮不点，等它自己变）
                 val p = findNode("btn_back")
                 if (p != null) {
-                    tapUntilChange(input, p.first, p.second, "迷宫菜单返回（${viewLabel(vid)}）", vid)
+                    tapUntilChange(input, p.first, p.second, "迷宫菜单返回（${viewLabel(vid)}）", vid,
+                        reRead = { findNode("btn_back") })
                     return@repeat
                 }
             }
@@ -275,7 +276,8 @@ object Navigator {
                     }
                 } else {
                     // ★点完**探到对话框没了**就往下走（不再固定 delay 700）
-                    tapUntilChange(input, dlg.second, dlg.third, "对话框「${dlg.first}」", vid)
+                    tapUntilChange(input, dlg.second, dlg.third, "对话框「${dlg.first}」", vid,
+                        reRead = { dialogConfirmButton()?.let { it.second to it.third } })
                     return@repeat
                 }
             }
@@ -287,7 +289,8 @@ object Navigator {
                 val p = if (vid in NO_HEAVY_VIEWS) null else findNode(btnName)
                 if (p != null) {
                     // ★点完**探到换页**就走（原来固定 delay 900ms）
-                    tapUntilChange(input, p.first, p.second, btnName, vid)
+                    tapUntilChange(input, p.first, p.second, btnName, vid,
+                        reRead = { findNode(btnName) })
                     return@repeat
                 }
                 AppState.addLog("这一页没有节点「$btnName」（${viewLabel(vid)}），下一轮再看")
@@ -322,7 +325,12 @@ object Navigator {
                 // ★2026-11-12（用户："不要猜着点，25s 没到下个页面就重启进程"）：
                 //   不再试点底部（那是猜坐标）；只在卡住时 dump 一次现场，重启由下面的
                 //   [PAGE_STUCK_RESTART_MS] 统一兜底。
-                tapUntilChange(input, cw / 2, ch / 2, "屏幕中心", vid, settleMs = 300L, probe = 1, probeMs = 300L)
+                // ★屏幕中心是慢页（登录/标题/过场）：探测间隔 = 挡位 ×2（用户 2026-11-17）
+                tapUntilChange(
+                    input, cw / 2, ch / 2, "屏幕中心", vid,
+                    settleMs = 300L, probe = 1,
+                    probeMs = com.lmj.labyrinthauto.logic.TapCheck.currentProbeMs() * 2,
+                )
             } else {
                 // ★未知页面（2026-10-19 用户定的**通用策略**）：活动页之类的没有通用确认按钮可点时，
                 //   只要**底部有导航栏**就直接点「冒险」（ButtonQuest，同名多个时 findNode 取最靠下的
@@ -334,7 +342,8 @@ object Navigator {
                         lastUnknownVid = vid
                         AppState.addLog("未知页面 ${viewLabel(vid)} 有底部导航 → 点「冒险」回正常线")
                     }
-                    tapUntilChange(input, q.first, q.second, "底部导航「冒险」", vid)
+                    tapUntilChange(input, q.first, q.second, "底部导航「冒险」", vid,
+                        reRead = { findNode("ButtonQuest") })
                     return@repeat
                 }
                 // 真·异常页：不猜着点，但**不立刻失败** —— 冷启动/换页会经过 0(NONE) 这类瞬态，
@@ -680,13 +689,15 @@ object Navigator {
      */
     private suspend fun tapUntilChange(
         input: InputBackend, x: Int, y: Int, what: String, fromVid: Int,
-        settleMs: Long = 150L, probe: Int = 4, probeMs: Long = 150L,
+        settleMs: Long = 150L, probe: Int = 4, probeMs: Long = com.lmj.labyrinthauto.logic.TapCheck.currentProbeMs(),
+        reRead: (suspend () -> Pair<Int, Int>?)? = null,   // ★2026-11-17：点前现取坐标（轻读，取不到这拍不点）
     ): Boolean {
         val from = locSig(fromVid)
         if (from == "!read") return false        // 连"现在在哪"都读不到 ⇒ 不点（跟主循环同口径）
         return TapCheck.run(
             tapFn = { tx, ty, tw -> tap(input, tx, ty, tw) },
             x = x, y = y, what = what,
+            xyAt = reRead,
             from = setOf(from),
             readTop = { locSig(currentViewId()) },
             unknownTop = "!read",

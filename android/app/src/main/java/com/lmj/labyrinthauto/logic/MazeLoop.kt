@@ -3557,7 +3557,7 @@ object MazeLoop {
             //   接受偶尔多点一下（比等 1.2s 值得）。间隔 = settle 120ms + 6×60ms 探测 ≈ 500ms，
             //   最多 [SHOP_ANIM_TAP_MAX] 次；框一消失立刻走，不会真的点满。
             probe = 6,
-            probeMs = SHOP_ANIM_POLL_MS,
+            // ★probeMs 跟随设置挡位（默认 150；TapCheck.run 默认值即配置值）
             skipFirstHits = skipHits,
             xyAt = xyAt@{
                 val b = dlgBoxNow() ?: return@xyAt null
@@ -4196,12 +4196,30 @@ object MazeLoop {
                 }
                 left = tapAndCheck(
                     input, pb.optInt("x"), pb.optInt("y"), "$kind：选 $cid（树·选择）",
+                    // ★2026-11-17（用户）：点前现取坐标——和首次同一读法（findSelButtons → 按 dx 最近），
+                    //   按钮从屏外滑入时每拍坐标会变，取不到/屏外则这一拍不点。
+                    xyAt = {
+                        val arr = findSelButtons(12)
+                        var best: JSONObject? = null
+                        if (arr != null) {
+                            for (i in 0 until arr.length()) {
+                                val o = arr.opt(i) as? JSONObject ?: continue
+                                val xx = (o.opt("x") as? Number)?.toInt() ?: continue
+                                val yy = (o.opt("y") as? Number)?.toInt() ?: continue
+                                if (xx !in 0 until scrW || yy !in 0 until scrH) continue
+                                if (best == null || kotlin.math.abs(xx - dx) < kotlin.math.abs(best!!.optInt("x") - dx)) {
+                                    best = o
+                                }
+                            }
+                        }
+                        best?.let { it.optInt("x") to it.optInt("y") }
+                    },
                     from = setOf("DialogLabyrinthSelection"),
                     expect = selExpect(kind),
                     // ★不猜设备速度（见下面 xyAt 分支的说明）
                     // ★probe=2：实测三选一页没有退出 tween 可读（tw 全程 0/0），真正切换在 ~1s 后
                     //   ⇒ 多探只是把"判没点到"往后推，没有收益；探 2 次就重试，多点无害。
-                    retries = 8, settleMs = 200L, probe = 2, probeMs = 150L,
+                    retries = 8, settleMs = 200L, probe = 2,
                     probeState = { selProbe("DialogLabyrinthSelection") },
                 )
             } else {
@@ -4220,7 +4238,7 @@ object MazeLoop {
                     //   ★probe=2（+350/500ms）：实测三选一页**没有**退出 tween（tw 全程 0/0），
                     //     真正切换在 ~1s 后（选卡动画）⇒ 多探几次只是把"判没点到"推迟 1s，没有收益
                     //     （"时间太长的 probe 就失去即时性价值"）⇒ 探 2 次就重试，多点无害。
-                    retries = 8, settleMs = 200L, probe = 2, probeMs = 150L,
+                    retries = 8, settleMs = 200L, probe = 2,
                     // ★每一下**现取坐标**（按钮还在滑入 ⇒ 旧坐标会点空；屏外则这一下不点）
                     // ★★兜底（2026-11-08 事故）：重读失败就退回**决策时那个坐标**（外层刚判过它在屏内）。
                     //   宁可点一下"稍微旧一点的坐标"（这页多点同一张卡没关系），也不要
@@ -4848,7 +4866,7 @@ object MazeLoop {
             unknownTop = "!read",          // 读不到 ⇒ 当成"还没离开"（绝不误判成生效）
             // 不传 expect：离开遗物框就算完成（后面是确认框还是地图，交给状态机）
             // ★不猜设备速度（同选人页）：密集点 + 点完立刻探，页面一变就停
-            retries = 8, settleMs = 200L, probe = 2, probeMs = 150L,
+            retries = 8, settleMs = 200L, probe = 2,
             xyAt = {
                 // ★每一下都重读**这张卡**的坐标（按钮在滑入 ⇒ 旧坐标会点空）；
                 //   重读失败就退回本轮算好的坐标（外层刚判过它在屏内）
@@ -5672,6 +5690,10 @@ object MazeLoop {
                         //     所以宁可多探也别多点。
                         tapAndCheck(
                             input, dec.optInt("x"), dec.optInt("y"), "战斗开始",
+                            // ★不重读坐标（2026-11-17 用户）：生效判据是**状态**（from 带 "@battle"、
+                            //   expect = @battle），进战斗即算成功。若真点进去了却还在重试，重读
+                            //   ButtonDecide 会读到战斗结算页的「继续/Next」——那说明这一下早成功了，
+                            //   重读反而会误点。所以这里坚持用首次快照坐标 + 多探，绝不重读。
                             // ★★from 里带 "@battle"：**进战斗了也算"离开"** ——
                             //   进战斗时编组页对话框可能还在（labTop 不变）⇒ 只看窗口名判不出生效
                             //   ⇒ 会连点（实测 10:39:55 连点 6 下，5 下是点在战斗视图里，纯浪费）。
@@ -5679,7 +5701,6 @@ object MazeLoop {
                             settleMs = 200L,
                             retries = 6,
                             probe = PROBE_N,
-                            probeMs = PROBE_MS,
                             // 阶段2 等"进入战斗"（无对话框，用 inBattle 判）
                             expect = setOf("@battle"),
                         )
@@ -5843,7 +5864,6 @@ object MazeLoop {
                 // ★★点完**探**几次（不是"等一下就重试"）—— 页面动画没走完时签名不会变，
                 //   探到"变了"就停；探完还没变才判"真没生效"（那时按钮已静止，再点才点得准）。
                 probe = PROBE_N,
-                probeMs = PROBE_MS,
                 // ★2026-11-12（用户实测：点「全部」行后面的选择框几乎每次都点早、要重复一次）：
                 //   刚进 setting 页时这一行还在入场动画里 ⇒ **首点前先只读不点跳 2 拍**
                 //   （2×60ms，不做长固定延迟），下一拍 xyAt 重新取落位后的坐标再点。
@@ -6752,6 +6772,17 @@ object MazeLoop {
             }
             tapAndCheck(
                 input, pFinal.first, pFinal.second, "预览·开打（进编组，questId=${jStr(st, "questId")}）",
+                // ★2026-11-17（用户）：点前现取「挑战」坐标（首次是子树/缓存兜底链；这里取同款最轻的一步：
+                //   先 dialog 子树 findText、再 findNode；取不到就返回 null → 这一拍不点）。
+                xyAt = {
+                    val d = AgentApi.findText(BATTLE_START_BTN, "dialog")
+                    val fp = if (d != null && d.has("x") && d.has("y")) {
+                        d.optInt("x") to d.optInt("y")
+                    } else {
+                        findNode(BATTLE_START_BTN)
+                    }
+                    fp
+                },
                 from = setOf("DialogQuestDetail"),
                 settleMs = 600L,
                 retries = 8,
@@ -7707,6 +7738,21 @@ object MazeLoop {
             //   同样是短停 200ms + 多点几次：结算/奖励页本身要连点好几下，多戳几下正好。
             tapAndCheck(
                 input, win.optInt("x"), win.optInt("y"), "下一步",
+                // ★2026-11-17（用户）：点前现取坐标——结算「下一步」按钮落位会变（两页结算各有一次），
+                //   每拍用字段读 Newton 节点重取最靠下那颗（与首次 pickResultButton 同源、轻量）。
+                xyAt = {
+                    val half = (scrH * 0.5).toInt()
+                    val lst = AgentApi.findTextIn(LAB_RESULT_NEXT_RE, "top", 6, half)
+                    var best: JSONObject? = null
+                    if (lst != null) {
+                        for (i in 0 until lst.length()) {
+                            val o = lst.opt(i) as? JSONObject ?: continue
+                            if (!o.has("x") || !o.has("y")) continue
+                            if (best == null || o.optInt("y") > best!!.optInt("y")) best = o
+                        }
+                    }
+                    best?.let { it.optInt("x") to it.optInt("y") }
+                },
                 from = setOf("DialogBackKeyCapture", "DialogLabyrinthExResult", "DialogQuestResultWin"),
                 // ★2026-11-13（用户："走了几个节点之后闪退"）：200ms → **400ms**。
                 //   日志 00:38:58~59 在 1.4s 内连点 7 次「下一步」（每次都是 root `input tap`），
@@ -8313,7 +8359,7 @@ object MazeLoop {
             input, bigXY.first, bigXY.second, "门票：关闭收到印记(Big)",
             from = setOf("DialogCommonBig"),
             expect = setOf("DialogCommonMiddle"),
-            settleMs = SEL_TICK_MS, probe = 5, probeMs = 70L, retries = 3,
+            settleMs = SEL_TICK_MS, probe = 5, retries = 3,
             xyAt = { dlgReadyToTap("DialogCommonBig", bigXY) },
             probeState = { dlgProbe("DialogCommonBig") },
         )
@@ -8366,7 +8412,7 @@ object MazeLoop {
             from = setOf("DialogCommonMiddle"),
             expect = setOf(""),
             expectTimeoutMs = 2_000L,
-            settleMs = SEL_TICK_MS, probe = 5, probeMs = 70L, retries = 3,
+            settleMs = SEL_TICK_MS, probe = 5, retries = 3,
             xyAt = { dlgReadyToTap("DialogCommonMiddle", xy) },
             probeState = { dlgProbe("DialogCommonMiddle") },
         )
@@ -8426,7 +8472,7 @@ object MazeLoop {
             //   不能只判"离开 Big" ⇒ 否则误触出来的 DialogCommonSmall 会被当成已回地图。
             expect = if (fromBattleNode) setOf("DialogLabyrinthSelection") else setOf(""),
             expectTimeoutMs = 3_000L,
-            settleMs = SEL_TICK_MS, probe = 5, probeMs = 70L, retries = 3,
+            settleMs = SEL_TICK_MS, probe = 5, retries = 3,
             xyAt = { dlgReadyToTap("DialogCommonBig", xy) },
             probeState = { dlgProbe("DialogCommonBig") },
         )
