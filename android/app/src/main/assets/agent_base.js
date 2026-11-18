@@ -8269,7 +8269,12 @@ function labUnitsSnapshot() {
 //   labTop 说最上层已是 setting，而查找还在读下面那层仍 active 的旧页 ⇒ 签名永不变化 ⇒ 多点 ⇒ 点错）。
 function _topDialogTr() {
   try {
-    const t = _topDialogGo();
+    // ★★2026-11-18（商店买印记实测踩到）：**"索引最大" ≠ "视觉最上层"** ——
+    //   `DialogLabyrinthShop` 是长驻底层页、索引反而**更大**（实测商店 dlg[10]、弹出的
+    //   `DialogCommonMiddle` dlg[8]）⇒ 不带 preferOverlay 时 `top` 一直返回商店，
+    //   屏幕上那个框的按钮永远取不到（`root:top` 的条目全部 miss）。
+    //   这里统一走 preferOverlay=true（与 `_findExTopPart` 同一判定，理由见 _topDialogGo 的 2026-11-11 注释）。
+    const t = _topDialogGo(true);
     if (!t || !t.go) return null;
     const tr = _inv(t.go, "get_transform");
     return (tr && !tr.isNull()) ? tr : null;
@@ -10305,6 +10310,41 @@ const LAB_PATHS = {
   "EndConfirm|ThreeButtonLeft": { dlg: "DialogCommonSmall", root: "top", path: [0, 2, 4], name: "ThreeButtonLeft" },
   "EndConfirm|ThreeButtonCenter": { dlg: "DialogCommonSmall", root: "top", path: [0, 2, 5], name: "ThreeButtonCenter" },  // ★无报酬
   "EndConfirm|ThreeButtonRight": { dlg: "DialogCommonSmall", root: "top", path: [0, 2, 6], name: "ThreeButtonRight" },
+  // ── 商店（`DialogLabyrinthShop`）──
+  //   ★★2026-11-18 真机**全流程验证**（买了两件）：
+  //     · r0c0 `12004 破守帽退散` 1170：金币 9415→8245，`isSold=1` 并移到末位。
+  //     · r1c0 `31004000 减益型职能的随机印记` 780：金币 8245→7465，`isSold=1`。
+  //   ★★**屏外（被裁剪区挡住）的购买按钮照样能点**（2026-11-18 实测）：r1c0 的按钮 y=604，
+  //     而 UIPanel 裁剪区 bottom=579 ⇒ 肉眼看第二排是"看不见"的，直调 `EventDelegate.Execute`
+  //     仍然正常弹购买确认框。⇒ **不需要为了买下排先去滑动列表**（决策层照旧，执行层直接调）。
+  //   ★**印记类比遗物多一个框**：`DialogCommonMiddle` 的单白按钮（`firstItemNameLabel` = 抽到的角色名），
+  //     那个框不点就不结算（实测 `coin`/`isSold` 到那时才变）。三个框各自的 key 见本区块下方。
+  //   ★购买按钮按 **(page, idx) 结构定位**，不靠坐标排序/滚动换算：
+  //     `items[page][idx]`（labShop 返回的 page/idx）→ 第 page 个 `PartsLabyrinthShopPlates`
+  //     → `ShopPlate_{idx+1}` → `PurchaseButton`。滚动只移位置、节点不变 ⇒ 屏外也能定位。
+  //   ★同卡另有 InformationButton(`...1`)、RelicMarkInfoButton(`...8,0,1`，仅第一页三张有)。
+  //   ★关闭/刷新**不用路径**：`DialogLabyrinthShop+0x110/+0x130` 字段直取（labShop 的 closeBtn/rerollBtn）。
+  "ShopBuy|Buy0_0": { dlg: "DialogLabyrinthShop", root: "top", path: [0, 1, 0, 0, 0, 0, 0, 5], name: "PurchaseButton" },
+  "ShopBuy|Buy0_1": { dlg: "DialogLabyrinthShop", root: "top", path: [0, 1, 0, 0, 0, 0, 1, 5], name: "PurchaseButton" },
+  "ShopBuy|Buy0_2": { dlg: "DialogLabyrinthShop", root: "top", path: [0, 1, 0, 0, 0, 0, 2, 5], name: "PurchaseButton" },
+  "ShopBuy|Buy1_0": { dlg: "DialogLabyrinthShop", root: "top", path: [0, 1, 0, 0, 0, 1, 0, 5], name: "PurchaseButton" },
+  "ShopBuy|Buy1_1": { dlg: "DialogLabyrinthShop", root: "top", path: [0, 1, 0, 0, 0, 1, 1, 5], name: "PurchaseButton" },
+  "ShopBuy|Buy1_2": { dlg: "DialogLabyrinthShop", root: "top", path: [0, 1, 0, 0, 0, 1, 2, 5], name: "PurchaseButton" },
+  // ── 购买确认框（`DialogCommonMiddle` 的**两按钮**版，2026-11-18 实测）──
+  //   ★★和 `SelectConfirm|OneButtonWhite`（同为 Middle 的 `[0,2,3]`）**不是同一颗**：这里按钮在
+  //     ButtonGroup[0,2] 下的 **1/2**，而 `[0,2,3]` 是个**隐藏的** OneButtonWhite ——
+  //     名字校验能过、`EventDelegate.Execute` 返回 `ex=0x0`，但页面纹丝不动（那次"点了却没买成"就是它）。
+  //     ⇒ 这就是 `_pathBtnNow` 新增 **active 校验** 的直接原因。
+  "ShopBuyConfirm|TwoButtonRight": { dlg: "DialogCommonMiddle", root: "top", path: [0, 2, 2], name: "TwoButtonRight" },   // 「确认」
+  "ShopBuyConfirm|TwoButtonLeft": { dlg: "DialogCommonMiddle", root: "top", path: [0, 2, 1], name: "TwoButtonLeft" },     // 「取消」
+  // ── 「购买完毕」到账提示（`DialogCommonSmall`，**蓝色**单按钮，2026-11-18 实测）──
+  //   `LeftLabel` = 扣前金币、`RightLabel` = 扣后金币；点掉即回商店（这也是"买到了"的铁证）。
+  "ShopBuyDone|OneButtonBlue": { dlg: "DialogCommonSmall", root: "top", path: [0, 2, 0], name: "OneButtonBlue" },
+  // ── 「获得同伴」（**印记类**专有，`DialogCommonMiddle` 单白按钮，2026-11-18 实测）──
+  //   `firstItemNameLabel` = 抽到的角色名（实测「莫妮卡（咖啡厅）」）、`WhiteBtnLabel` = 「关闭」。
+  //   ★这一下不点就不结算（实测 `coin` 与 `isSold` 到这时才变）。
+  //   ★`top` 会被 `DialogLabyrinthShop`（索引更大）占住 ⇒ 这类框一律用 `dlg:` 根。
+  "ShopSummonDone|OneButtonWhite": { dlg: "DialogCommonMiddle", path: [0, 2, 3], name: "OneButtonWhite" },   // 「关闭」
 };
 
 /** 查固定路径表：给 key（找不到再退 name 匹配）→ { root, path, name } | null */
@@ -10536,6 +10576,11 @@ function _pathBtnNow(rootKind, pathArr, name, probe, deep) {
       if (!ptrOk(g2)) { tried.push(k + "=无GameObject"); continue; }
       const n2 = _str(_inv(g2, "get_name"));
       if (name && n2 !== name) { tried.push(k + "=" + n2); continue; }
+      // ★★2026-11-18（商店购买实测踩到）：**名字对 ≠ 能点**。同一个 `DialogCommonMiddle` 里
+      //   `[0,2,3]` 是个**隐藏的** `OneButtonWhite`（购买确认框真正的按钮是 `TwoButtonRight` [0,2,2]）
+      //   ⇒ 名字校验过、`EventDelegate.Execute` 也返回 `ex=0x0`，但页面**纹丝不动**
+      //   （表现为"点成功了却没买成"）。⇒ 必须再验 `GameObject.activeSelf`，未激活算这个候选不命中。
+      if (_goActive(g2) !== true) { tried.push(k + "=" + n2 + "(未激活)"); continue; }
       tr = t2; usedKind = k; break;
     }
     if (!tr) {
