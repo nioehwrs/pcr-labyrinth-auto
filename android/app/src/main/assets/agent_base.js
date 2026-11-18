@@ -10237,6 +10237,14 @@ const LAB_PATHS = {
   //   实测真实链：[0,4,1,0,11,0,3,0]（尾部也变了：预览页是 [0,2,0,1,0]、编组页是 [0,3,0]）。
   //   改用 **top 根相对链** = 最上层对话框（此页即 DialogCommonPartyEdit），实测命中 @ (1134,605)。
   "PartyDecide|ButtonDecide": { dlg: "DialogCommonPartyEdit", root: "top", path: [0, 3, 0], name: "ButtonDecide" },
+  // ── 「队伍1/2/3」预设队伍切换（`DialogCommonPartyEdit`，2026-11-18 实测）──
+  //   ★★这是 **BOSS 编组页**与普通战斗的**主要 UI 差异**（用户 2026-11-18 指出）：
+  //     普通战斗编组页没有顶部这一排；`ButtonExEquip`/`ButtonCancel`/`ButtonDecide` 两边都有，不算差异。
+  //   三颗都挂在 `[0,4,0]` 下、文字在同一节点内（`PartySelectLabel`），坐标 x=130/288/446、y=120。
+  //   ★`ButtonDecide` 仍在 `[0,3,0]`（1134,605）不受影响 ⇒ BOSS 战可直接复用编组页逻辑。
+  "PartyEdit|Party1": { dlg: "DialogCommonPartyEdit", root: "top", path: [0, 4, 0, 0], name: "PartsPartySelectButton1" },
+  "PartyEdit|Party2": { dlg: "DialogCommonPartyEdit", root: "top", path: [0, 4, 0, 1], name: "PartsPartySelectButton2" },
+  "PartyEdit|Party3": { dlg: "DialogCommonPartyEdit", root: "top", path: [0, 4, 0, 2], name: "PartsPartySelectButton3" },
   // ── 胜利结算页「下一步」（`DialogQuestResultWin`）──
   //   ★★2026-11-18 真机：**直调不推进**！`onClick = OnClickNext`（target `PartsQuestResultFormer`），
   //     `EventDelegate.Execute` 连调 3 次都返回 `ok:true / ex:0x0`，但对话框栈与页面**毫无变化**；
