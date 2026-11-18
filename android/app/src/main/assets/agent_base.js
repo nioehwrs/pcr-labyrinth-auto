@@ -4428,9 +4428,27 @@ function labSelectionSnapshot(diag, force) {
 const PARTY_ICON_INNER = { UnitIcon: [], UnitIconGauge: [0xB0], UnitIconTravel: [0x38],
                            UnitIconSupportQuest: [0x38], UnitIconSupport: [0x40, 0xB0] };
 
+/** ★类指针 → {cls, path}：原来每个 icon 都要 `class_get_name().readUtf8String()`
+ *  （建一次 16 格的 uid 映射要读 16 次类名字符串，是预热里最贵的一块）。类不会卸载 ⇒ 缓存安全。 */
+const g_picInfoByKlass = Object.create(null);
+function _picInfoOf(icon) {
+  let k = null;
+  try { k = g_il2cpp.object_get_class(icon); } catch (e) { return { cls: "err", path: null }; }
+  if (!k || k.isNull()) return { cls: "no-class", path: null };
+  const key = String(k);
+  let v = g_picInfoByKlass[key];
+  if (v === undefined) {
+    let cls = "?";
+    try { cls = klassNameOf(icon); } catch (e) {}
+    v = { cls: cls, path: PARTY_ICON_INNER[cls] || null };
+    g_picInfoByKlass[key] = v;
+  }
+  return v;
+}
+
 function partyUnitIdOfIcon(icon) {
-  const cls = klassNameOf(icon);
-  const path = PARTY_ICON_INNER[cls];
+  const info = _picInfoOf(icon);
+  const cls = info.cls, path = info.path;
   let p = icon, inner = false;
   if (path && path.length) {
     inner = true;
@@ -5890,12 +5908,36 @@ function _partyFindPoolIcon(abs, uid) {
   return null;
 }
 
+/**
+ * ★队伍区（`plate+0xC8`）按 uid 找图标 —— **撤人专用**（2026-11-18 实测）。
+ *
+ * 为什么撤人不走池子：`useUnitIconList` 是**虚拟列表**（一屏 8 个对象、滑走换内容），
+ * 目标没被滚进池子 List 就没有 UnitIcon 可定位；而队伍区那 5 个槽位**始终可见**且
+ * 数组常驻。实测把队伍区 icon 直接传给 `Plate.onClickUnitIcon` 可正常撤人
+ * （ex=0x0、队伍 5→4）⇒ 撤人从此**不依赖翻页/滚动**，也无须关心池子状态。
+ */
+function _partyFindSlotIcon(abs, uid) {
+  const n = _partySlotCount(abs);
+  for (let i = 0; i < n; i++) {
+    const ic = _partySlotIcon(abs, i);
+    if (!ptrOk(ic)) continue;
+    let u = 0; try { u = partyUnitIdOfIcon(ic).unitId; } catch (e) {}
+    if (u === uid) return { ic: ic, i: i };
+  }
+  return null;
+}
+
 /** 打一发：kind='add' → ScrollController；'remove' → Plate */
-function _partyPressIcon(ic, kind, out) {
-  const a = _partyAbs();
-  if (a.err) { out.err = a.err; return out; }
+function _partyPressIcon(ic, kind, out, absOpt) {
+  // ★`absOpt`：批量时由调用方传进来，省掉每件一次 `_partyAbs()`（= 重扫 DialogArea 子树 ~15ms/件）
+  let abs = absOpt || null;
+  if (!abs) {
+    const a = _partyAbs();
+    if (a.err) { out.err = a.err; return out; }
+    abs = a.abs;
+  }
   const tgtOff = (kind === "remove") ? 0x68 : 0x70;
-  const target = a.abs.add(tgtOff).readPointer();
+  const target = abs.add(tgtOff).readPointer();
   if (!ptrOk(target)) { out.err = "目标对象为空"; return out; }
   const kls = g_il2cpp.object_get_class(target);
   const m = _findMethodNP(kls, "onClickUnitIcon", 1);
@@ -5910,6 +5952,48 @@ function _partyPressIcon(ic, kind, out) {
   out.ok = exv.isNull();
   if (!out.ok) out.err = "调用抛异常";
   return out;
+}
+
+/**
+ * ★预热（只在**第一件**任务里做一次）：把 `labPartyFind` 子树扫描后的缓存、目标对象的
+ * `onClickUnitIcon` 方法查找、池子数组读全部打热。
+ *
+ * 为什么放在**游戏线程的任务里**而不是 RPC 里先跑：`labPartyFind` 内部要 `runtime_invoke`
+ * （get_childCount / GetChild / GetComponentInChildren），非游戏线程直调有 ART 断言风险
+ * —— 所以预热也只能在派发队列里做，顺路搭第一件的车（不额外占一帧）。
+ */
+function _partyWarm(abs, kind, out, want) {
+  const map = Object.create(null);
+  const t0 = Date.now();
+  try {
+    const tgt = abs.add(kind === "remove" ? 0x68 : 0x70).readPointer();
+    if (ptrOk(tgt)) {
+      const k = g_il2cpp.object_get_class(tgt);
+      out.warm = !!_findMethodNP(k, "onClickUnitIcon", 1);
+    }
+    // ★add 从**池子**找（必须先滚进虚拟 List）；remove 从**队伍区**找（plate+0xC8，5 格常驻、
+    //   不依赖滚动）。两者都是"目标 uid 凑齐就停"，没凑齐的由任务里的对应 Find 兜底全扫。
+    const isRm = (kind === "remove");
+    const n = isRm ? _partySlotCount(abs) : _partyPoolCount(abs);
+    let need = 0;
+    if (want) { for (const kk in want) need++; }
+    let got = 0;
+    for (let i = 0; i < n; i++) {
+      const ic = isRm ? _partySlotIcon(abs, i) : _partyPoolIcon(abs, i);
+      if (!ptrOk(ic)) continue;
+      let u = 0; try { u = partyUnitIdOfIcon(ic).unitId; } catch (e) {}
+      if (!u || map[u]) continue;
+      map[u] = { ic: ic, i: i };
+      if (want && want[u]) {
+        got++;
+        if (need && got >= need) { out.scan = i + 1; break; }
+      }
+    }
+    out.listN = n;
+    out.mapN = Object.keys(map).length;
+  } catch (e) { out.warmErr = "" + e; }
+  out.msWarm = Date.now() - t0;
+  return map;   // 批次内 uid → {ic,i}（池子/队伍区数据数组在这轮增删里不动）
 }
 
 /**
@@ -7082,7 +7166,7 @@ function labExEquipTop() {
 // ── 选角色页（SUMMON_UNIT=1 且 pageTop 是对话框）：初始编成 / 门票召唤（★只读）──
 // ★构建号：改过读逻辑就 +1。attach 时 pcr_auto 会打出来（rpc jsBuild）——用来确认
 //   "正在跑的到底是哪一版脚本"，免得拿旧输出讨论半天（2026-10-10 踩过）。
-const JS_BUILD = "cs103";    // ★cs103（2026-11-18）：**特别装备三连页直调** —— `labExPress(key)` 按页内语义定位后压 `CustomUIButton.onClick`/无参 `OnClick()`（③页排序项是 `PartsUnitSortTypeToggle`，走后者）；`labExBtn` 的按钮对象新增 `btnPtr`（组件指针）；新增 `labPartyBtn(decide|cancel|exequip)`。★cs102（2026-11-18）：编组页**加/减角色直调**（`labPartySlots` 轻读 + `labPartyPress`）—— 加 → `PartsPartyEditScrollController.onClickUnitIcon(UnitIcon)`，减 → `PartsPartyEditPlate.onClickUnitIcon(UnitIcon)`；全程按 unitId 定位、参数必须是 UnitIcon、定位在游戏线程内做；已选状态读 `CheckIcon(+0x88).active`。★cs101（2026-11-16）：地图节点改为**按 BlockId 直调**（`pressPanelStart`/`panelLocate`，复用 `_moveLocate` 定位，UIButton.onClick 优先、`onPanelButtonClick` 兜底）。★cs100（2026-11-15 · feat/direct-trigger）：新增 `pressNodeStart/pressNodePoll/pressState` —— **直调按钮**（常驻派发钩子挂 UICamera.Update + onClick→EventDelegate.Execute，两段式 RPC，替代 root 点击的第一步，尚未接入 MazeLoop）。★cs99（2026-11-12）：`labStartBtn` 取 Transform 改走 `Component.m_GameObject(+0x10)` → `GameObject.get_transform`（直接 `Component.get_transform` 实测 no-tr），并回传 btnCls/goCls/trCls 诊断。★cs98（2026-11-12）：新增 `labStartBtn` —— 259「出发」按钮字段直取（`ViewLabyrinthTop.challengeButton +0xE8` → 坐标，零遍历、零学习）。★cs97（2026-11-12）：新增 `_subtreeRoot("footer")` —— 底部导航层 `UI Root/ViewsArea/PartsFooter(Clone)`（HOME 的 `ButtonQuest` 父链实测），导航不再走整树兜底。★cs96（2026-11-12）：`findListPath` 支持**无根**（从 DialogArea 一路 get_parent 到 UI 顶）—— 用来定位"不在 view/layer/dialog/top 里"的按钮（HOME 的 `ButtonQuest` 各根全 0）。★cs95（2026-11-11）：`initIl2Cpp` 以 **domain 可用**（`il2cpp_domain_get()` 非空）作为就绪判据 —— 映射≠初始化完成；配合注入侧去掉固定 6s 静置，改由 agent 轮询就绪（Kotlin 最多等 30s）。★cs94（2026-11-11）：商店 slots **收全部** PurchaseButton（不再只收 onscreen）——屏外/半露按钮被丢会令槽位序号错位，`vis` 改按面板裁剪区判定。★cs93（2026-11-11）：`_topDialogGo(preferOverlay)` —— 商店链优先取叠加在 `DialogLabyrinthShop` 之上的确认框（商店节点索引反而更大，会把「购买完毕/角色加入」盖掉）。★cs92（2026-11-11）：新增 `labShopItems` —— 只读货架 lineup 字段（rewardId/price/isSold/availability，3~5ms），给「买完链内确认已售」用。★cs91（2026-11-11）：新增 `labDlgKids` —— 只读 DialogArea 全部直接子节点名+active，排查「角色加入」框为何不被 `_topDialogGo` 识别。★cs90（2026-11-11）：labShop 增 `resetCount` —— 读 LabyrinthTempData.ShopResetCount(+0x128)，判断本店**已刷几次**（get_resettableNum 刷新后不减，更像"上限"）。★cs89（2026-11-10）：新增 `labDlgBox` —— 弹窗箱体轻读（指针 + 关闭/出现 tween + 7 个按钮槽位，~5~8ms），给商店「新框出现 → 点确认 → 开始消失 → 下一个框」动画链用。★cs88（2026-11-10）：商店读取**不再用跨轮实例缓存** —— 每拍从当前最上层对话框现取 `_compSelf/_compInChildren`（刷新后不再读到刷新前的货架）；顶层是商店但 lineup 未填 ⇒ 直接回未就绪、不回退旧实例。★cs87（2026-11-10）：新增 `labDlgPair` —— 通用确认框**出现**轻读（`_topDialogGo` 的 GameObject 指针 + TwoButtonLeft/Right，2~4ms），给"点地图节点 → 是否前往"两步确认用。★cs86（2026-11-09）：`labGuildCards` 增加 `W`/`H`（屏幕宽高）—— 上层据此过滤**右越界**的卡（实测拉比林斯 x=2447 > 1920 被当成可见 ⇒ 点出去白等 1.8s）。★cs85（2026-11-09）：`labGuildCards` 不再用 `_ndXY.onscreen` 丢坐标 —— 半露卡（最左那张）的 departureButton 会投影到 x<0，之前被当成"不在可见区"⇒ 白拖一屏再拖回来；现在照给坐标 + `on` 标记，由 Kotlin 侧决定。★cs84（2026-11-09）：`dbgGuildCards` 转正为 **`labGuildCards`** —— 公会选择页卡列表字段直取（ViewManager→ViewLabyrinthGuildSetting+0xD0→scroll+0x20→wrap+0x30→mChildren+0x58），真机实测 **9ms**（原 findList 500~916ms），并带每卡 guildNameLabel 文本，可按名字选公会而不是"第 N 张"。★cs83（2026-11-09）【调试用·测试完请删除】：`dbgGuildCards` 修正 —— 上一版 `klassNameOf(GameObject)` 恒为 "GameObject"，改成读**节点名**；卡组件先 `_compSelf` 再 `_compInChildren`；新增 `cardKlassFound` 便于判断是不是类名找错了。★cs82（2026-11-09）【调试用·测试完请删除】：新增 `dbgGuildCards` —— 公会选择页（263）卡列表结构探针：ViewManager→ViewLabyrinthGuildSetting(+0xD0 controller→+0x20 scroll→+0x30 wrap→+0x58 mChildren)，每卡读 guildNameLabel(+0x40)/departureButton(+0x50)/clearedDifficultyObject(+0x20)，外加 LabyrinthTempData(+0xF0) 的 GuildId/Difficulty/SelectDifficulty。为了把 `findList("DepartureButton")`（~800ms 全树遍历）换成字段直取。★cs81（2026-11-09）：三选一探针改为**并进 probeState**（probe 按 150ms 节奏跑、每次读取顺带带回 proc/tween/selNum，不再同步阻塞采样）；三选一探针 RPC 由 `debugSelTrace` 转正为 `labSelState`（含 started/factor/closing）。★cs80（2026-11-09）：`labDlgClosing` 取组件改为 **DialogCommonAbstract 优先、DialogBase 兜底** —— `DialogLabyrinthSelection`（三选一页）是 DialogBase 直接子类，原先只按 DialogCommonAbstract 找会整个漏掉，读不到它的退出 tween/isProcess。配套 `debugSelTrace` 补 proc/tw。★cs79（2026-11-09）【已于 cs81 转正为 labSelState】：新增三选一页采样 `PartsLabyrinthSelectionItemView.selectionNum@0x38`、卡片列表长度、游戏显示的剩余数文本(+0x138)、剩余数 UI 是否显示(+0x130)、每卡 unitChoiceIndex(+0x98)，用来确定 selectionNum 是"已选数量"还是"选中下标"及其响应速度。★cs78（2026-11-09）：`labDlgClosing` 失败时标 `path=err`（调用方据此区分"读失败"与"窗口没了"，读失败绝不当成"已离开"）；`tapAndCheck` 阶段 1 改为**单次快照探针** `probeState`（top 与判据同源，少一次 RPC，也避免两次读之间的状态错位）。★cs77（2026-11-09）：新增 `labDlgClosing` —— 通用弹窗「关闭已启动」轻读（退出 tween 的 mStarted/factor，零 hook、3~6ms），替代"等窗口消失"当"这一下点生效了"；实测整页到 +800ms 才消失、退出 tween +200~300ms 就启动。★cs74（2026-11-09）：新增 `labDlgBtn` —— 通用弹窗按钮按 `DialogCommonAbstract +0x118` **字段直取**（零遍历，30ms 级），替代 `dialog()` 的 DialogArea 子树遍历（冷 0.5~0.6s / 大页 3~3.9s）；门票三选一两连弹改用它现取坐标。★cs73（2026-11-08）：`labStatusLite` / `labSnapshot` 补 `guildId`（`LabyrinthTempData+0x1C`）—— 局内刷"已在迷宫里要不要沿用"要核对公会，否则手动开着 A 公会的局、配置是 B 公会时会直接沿用、跑完当成 B 公会的成绩。cs72（2026-11-08）：**"最上层"只剩一个实现 + 根没了不再扫全树** —— ①`_topDialogTr`（`findList(...,"top")` 的根）改为复用 `_topDialogGo`，不再自己写一遍判据（原来有 3 份实现，正是 EX 三连页多点/点错的根源）；②`_rootWalkNodes` 的遍历缓存**加校验"根是不是同一个"**（原来只看 key ⇒ `"top"` 这个根会变，1.5s 内会把上一个对话框的子树当成当前的返回）；③新增 `_walkForRoot`：**显式给了根却取不到（如当前没有对话框）⇒ 返回空，不再退化成全树**（`findList(…,"top")` 实测 2633ms → 3ms；而且全树会捞到别处的同名节点）。cs71：**读取全面"按需"** —— ①新增 `labExBtn(key)`：EX 三连页只读**要点的那个按钮** + 当前签名（不再读整包：整包会把 setting 的 4 行文字/复选框、sort 的 11 个 toggle 文字都过一遍，纯浪费）；②新增 `labExtra()`：非分派字段（eventId/questId/eventResultId/effectNum/curChoice/remainChoice + LTD choices）拆成独立读，handler 要时才调；③`labStatusLite` 补 `next`（移动分支用，一次内存读）。cs70：**EX 整包读的按钮改按字段取**（DialogFundationObject：twoLeft 0x48 / twoRight 0x58 / threeLeft 0x70 / threeCenter 0x80 / threeRight 0x98，经对话框组件 +0x118 foundationObject），**不再遍历整棵子树**（①页遍历要 350ms+）。cs69：labExEquip(full, only) 只投影要点的那个；cs68：**"当前最上层"统一成一个实现**（_topDialogGo）—— ①_exeqFind 只查**最上层那一层**、**绝不往回退**（回退会永远读到下面那层仍 active 的①页 ⇒ 签名不变 ⇒ 误判"没生效"⇒多点⇒点错按钮）；②签名里带**最上层容器名**（"页面切了"能立刻看见）。cs67：去掉 agent 侧坐标"稳定化"（Thread.sleep 堵死单通道）；cs64：_findExTopPart 组件查找缓存；cs63：labExEquipSig 轻量签名读
+const JS_BUILD = "cs107";    // ★cs107（2026-11-19）：编组页**滚动预热** `labPartyScrollPrime`（进页面后 SetScrollBarValue 0.5→0.9，把虚拟池格子累积创建出来，之后 add 任意角色不用再滚）。★cs106（2026-11-18）：**撤人改从队伍区（`plate+0xC8`）取 UnitIcon** —— 不依赖虚拟角色池是否滚到目标，5 人常驻可见；`_partyWarm` 按 kind 分别扫队伍区/池子。★cs105（2026-11-18）：编组页批量直调**去掉每件固定开销** —— `partyUnitIdOfIcon` 类名按类指针缓存、`_partyPressIcon` 复用批次 abs（不再每件 `_partyAbs` 重扫子树）、预热凑齐目标即停、`wasChecked` 改为 `opts.checked` 才回读；日志加 `msAbs/msWarm/msPick/msPress`。★cs104（2026-11-18）：编组页加/减角色改**串行链 + 帧级间隔（`job.notBefore`）+ 预热 + 批次内 abs/uid 复用**（`labPartyPress`，5 人 200~300ms、无重复）；`pressNodePoll` 尊重队列自标的 `pending`；`_findMethodNP` 记忆化。★cs103（2026-11-18）：**特别装备三连页直调** —— `labExPress(key)` 按页内语义定位后压 `CustomUIButton.onClick`/无参 `OnClick()`（③页排序项是 `PartsUnitSortTypeToggle`，走后者）；`labExBtn` 的按钮对象新增 `btnPtr`（组件指针）；新增 `labPartyBtn(decide|cancel|exequip)`。★cs102（2026-11-18）：编组页**加/减角色直调**（`labPartySlots` 轻读 + `labPartyPress`）—— 加 → `PartsPartyEditScrollController.onClickUnitIcon(UnitIcon)`，减 → `PartsPartyEditPlate.onClickUnitIcon(UnitIcon)`；全程按 unitId 定位、参数必须是 UnitIcon、定位在游戏线程内做；已选状态读 `CheckIcon(+0x88).active`。★cs101（2026-11-16）：地图节点改为**按 BlockId 直调**（`pressPanelStart`/`panelLocate`，复用 `_moveLocate` 定位，UIButton.onClick 优先、`onPanelButtonClick` 兜底）。★cs100（2026-11-15 · feat/direct-trigger）：新增 `pressNodeStart/pressNodePoll/pressState` —— **直调按钮**（常驻派发钩子挂 UICamera.Update + onClick→EventDelegate.Execute，两段式 RPC，替代 root 点击的第一步，尚未接入 MazeLoop）。★cs99（2026-11-12）：`labStartBtn` 取 Transform 改走 `Component.m_GameObject(+0x10)` → `GameObject.get_transform`（直接 `Component.get_transform` 实测 no-tr），并回传 btnCls/goCls/trCls 诊断。★cs98（2026-11-12）：新增 `labStartBtn` —— 259「出发」按钮字段直取（`ViewLabyrinthTop.challengeButton +0xE8` → 坐标，零遍历、零学习）。★cs97（2026-11-12）：新增 `_subtreeRoot("footer")` —— 底部导航层 `UI Root/ViewsArea/PartsFooter(Clone)`（HOME 的 `ButtonQuest` 父链实测），导航不再走整树兜底。★cs96（2026-11-12）：`findListPath` 支持**无根**（从 DialogArea 一路 get_parent 到 UI 顶）—— 用来定位"不在 view/layer/dialog/top 里"的按钮（HOME 的 `ButtonQuest` 各根全 0）。★cs95（2026-11-11）：`initIl2Cpp` 以 **domain 可用**（`il2cpp_domain_get()` 非空）作为就绪判据 —— 映射≠初始化完成；配合注入侧去掉固定 6s 静置，改由 agent 轮询就绪（Kotlin 最多等 30s）。★cs94（2026-11-11）：商店 slots **收全部** PurchaseButton（不再只收 onscreen）——屏外/半露按钮被丢会令槽位序号错位，`vis` 改按面板裁剪区判定。★cs93（2026-11-11）：`_topDialogGo(preferOverlay)` —— 商店链优先取叠加在 `DialogLabyrinthShop` 之上的确认框（商店节点索引反而更大，会把「购买完毕/角色加入」盖掉）。★cs92（2026-11-11）：新增 `labShopItems` —— 只读货架 lineup 字段（rewardId/price/isSold/availability，3~5ms），给「买完链内确认已售」用。★cs91（2026-11-11）：新增 `labDlgKids` —— 只读 DialogArea 全部直接子节点名+active，排查「角色加入」框为何不被 `_topDialogGo` 识别。★cs90（2026-11-11）：labShop 增 `resetCount` —— 读 LabyrinthTempData.ShopResetCount(+0x128)，判断本店**已刷几次**（get_resettableNum 刷新后不减，更像"上限"）。★cs89（2026-11-10）：新增 `labDlgBox` —— 弹窗箱体轻读（指针 + 关闭/出现 tween + 7 个按钮槽位，~5~8ms），给商店「新框出现 → 点确认 → 开始消失 → 下一个框」动画链用。★cs88（2026-11-10）：商店读取**不再用跨轮实例缓存** —— 每拍从当前最上层对话框现取 `_compSelf/_compInChildren`（刷新后不再读到刷新前的货架）；顶层是商店但 lineup 未填 ⇒ 直接回未就绪、不回退旧实例。★cs87（2026-11-10）：新增 `labDlgPair` —— 通用确认框**出现**轻读（`_topDialogGo` 的 GameObject 指针 + TwoButtonLeft/Right，2~4ms），给"点地图节点 → 是否前往"两步确认用。★cs86（2026-11-09）：`labGuildCards` 增加 `W`/`H`（屏幕宽高）—— 上层据此过滤**右越界**的卡（实测拉比林斯 x=2447 > 1920 被当成可见 ⇒ 点出去白等 1.8s）。★cs85（2026-11-09）：`labGuildCards` 不再用 `_ndXY.onscreen` 丢坐标 —— 半露卡（最左那张）的 departureButton 会投影到 x<0，之前被当成"不在可见区"⇒ 白拖一屏再拖回来；现在照给坐标 + `on` 标记，由 Kotlin 侧决定。★cs84（2026-11-09）：`dbgGuildCards` 转正为 **`labGuildCards`** —— 公会选择页卡列表字段直取（ViewManager→ViewLabyrinthGuildSetting+0xD0→scroll+0x20→wrap+0x30→mChildren+0x58），真机实测 **9ms**（原 findList 500~916ms），并带每卡 guildNameLabel 文本，可按名字选公会而不是"第 N 张"。★cs83（2026-11-09）【调试用·测试完请删除】：`dbgGuildCards` 修正 —— 上一版 `klassNameOf(GameObject)` 恒为 "GameObject"，改成读**节点名**；卡组件先 `_compSelf` 再 `_compInChildren`；新增 `cardKlassFound` 便于判断是不是类名找错了。★cs82（2026-11-09）【调试用·测试完请删除】：新增 `dbgGuildCards` —— 公会选择页（263）卡列表结构探针：ViewManager→ViewLabyrinthGuildSetting(+0xD0 controller→+0x20 scroll→+0x30 wrap→+0x58 mChildren)，每卡读 guildNameLabel(+0x40)/departureButton(+0x50)/clearedDifficultyObject(+0x20)，外加 LabyrinthTempData(+0xF0) 的 GuildId/Difficulty/SelectDifficulty。为了把 `findList("DepartureButton")`（~800ms 全树遍历）换成字段直取。★cs81（2026-11-09）：三选一探针改为**并进 probeState**（probe 按 150ms 节奏跑、每次读取顺带带回 proc/tween/selNum，不再同步阻塞采样）；三选一探针 RPC 由 `debugSelTrace` 转正为 `labSelState`（含 started/factor/closing）。★cs80（2026-11-09）：`labDlgClosing` 取组件改为 **DialogCommonAbstract 优先、DialogBase 兜底** —— `DialogLabyrinthSelection`（三选一页）是 DialogBase 直接子类，原先只按 DialogCommonAbstract 找会整个漏掉，读不到它的退出 tween/isProcess。配套 `debugSelTrace` 补 proc/tw。★cs79（2026-11-09）【已于 cs81 转正为 labSelState】：新增三选一页采样 `PartsLabyrinthSelectionItemView.selectionNum@0x38`、卡片列表长度、游戏显示的剩余数文本(+0x138)、剩余数 UI 是否显示(+0x130)、每卡 unitChoiceIndex(+0x98)，用来确定 selectionNum 是"已选数量"还是"选中下标"及其响应速度。★cs78（2026-11-09）：`labDlgClosing` 失败时标 `path=err`（调用方据此区分"读失败"与"窗口没了"，读失败绝不当成"已离开"）；`tapAndCheck` 阶段 1 改为**单次快照探针** `probeState`（top 与判据同源，少一次 RPC，也避免两次读之间的状态错位）。★cs77（2026-11-09）：新增 `labDlgClosing` —— 通用弹窗「关闭已启动」轻读（退出 tween 的 mStarted/factor，零 hook、3~6ms），替代"等窗口消失"当"这一下点生效了"；实测整页到 +800ms 才消失、退出 tween +200~300ms 就启动。★cs74（2026-11-09）：新增 `labDlgBtn` —— 通用弹窗按钮按 `DialogCommonAbstract +0x118` **字段直取**（零遍历，30ms 级），替代 `dialog()` 的 DialogArea 子树遍历（冷 0.5~0.6s / 大页 3~3.9s）；门票三选一两连弹改用它现取坐标。★cs73（2026-11-08）：`labStatusLite` / `labSnapshot` 补 `guildId`（`LabyrinthTempData+0x1C`）—— 局内刷"已在迷宫里要不要沿用"要核对公会，否则手动开着 A 公会的局、配置是 B 公会时会直接沿用、跑完当成 B 公会的成绩。cs72（2026-11-08）：**"最上层"只剩一个实现 + 根没了不再扫全树** —— ①`_topDialogTr`（`findList(...,"top")` 的根）改为复用 `_topDialogGo`，不再自己写一遍判据（原来有 3 份实现，正是 EX 三连页多点/点错的根源）；②`_rootWalkNodes` 的遍历缓存**加校验"根是不是同一个"**（原来只看 key ⇒ `"top"` 这个根会变，1.5s 内会把上一个对话框的子树当成当前的返回）；③新增 `_walkForRoot`：**显式给了根却取不到（如当前没有对话框）⇒ 返回空，不再退化成全树**（`findList(…,"top")` 实测 2633ms → 3ms；而且全树会捞到别处的同名节点）。cs71：**读取全面"按需"** —— ①新增 `labExBtn(key)`：EX 三连页只读**要点的那个按钮** + 当前签名（不再读整包：整包会把 setting 的 4 行文字/复选框、sort 的 11 个 toggle 文字都过一遍，纯浪费）；②新增 `labExtra()`：非分派字段（eventId/questId/eventResultId/effectNum/curChoice/remainChoice + LTD choices）拆成独立读，handler 要时才调；③`labStatusLite` 补 `next`（移动分支用，一次内存读）。cs70：**EX 整包读的按钮改按字段取**（DialogFundationObject：twoLeft 0x48 / twoRight 0x58 / threeLeft 0x70 / threeCenter 0x80 / threeRight 0x98，经对话框组件 +0x118 foundationObject），**不再遍历整棵子树**（①页遍历要 350ms+）。cs69：labExEquip(full, only) 只投影要点的那个；cs68：**"当前最上层"统一成一个实现**（_topDialogGo）—— ①_exeqFind 只查**最上层那一层**、**绝不往回退**（回退会永远读到下面那层仍 active 的①页 ⇒ 签名不变 ⇒ 误判"没生效"⇒多点⇒点错按钮）；②签名里带**最上层容器名**（"页面切了"能立刻看见）。cs67：去掉 agent 侧坐标"稳定化"（Thread.sleep 堵死单通道）；cs64：_findExTopPart 组件查找缓存；cs63：labExEquipSig 轻量签名读
 // ★cs62（2026-10-22）：新增 battleSettingsStart/Poll（战斗设定只读；getter 是 IFix 模板 ⇒ 投递游戏线程执行）
 // ★JS 侧详细日志开关（2026-10-11 加）：默认关。
 //   关掉的是"每次调用都会打、但正常情况没信息量"的那几条（如 findMap 的"跳过堆扫描"、
@@ -8446,6 +8530,11 @@ let g_pressSeq = 0;
 function _dispDrain() {
   g_disp.frames++;
   if (!g_dispQ.length) return;
+  // ★`job.notBefore` = 任务自己要求的**最早执行时刻**（`labPartyPress` 的 50ms 间隔靠它）。
+  //   为什么用时间戳而不是 `setTimeout`：QJS 的 timer 粒度实测 ~100ms ⇒ `setTimeout(50)`
+  //   实际 110ms 才到；改成"每帧检查"后间隔精确到 50ms(+ ≤1 帧)。
+  const head = g_dispQ[0];
+  if (head && head.notBefore && head.notBefore > Date.now()) return;
   const job = g_dispQ.shift();
   g_disp.jobs++;
   try { job(); } catch (e) { console.log("[press] 任务异常: " + e); }
@@ -8515,7 +8604,13 @@ function _paramCount(m) {
  * ★为什么不能直接用 findMethodAny：`EventDelegate.Execute` 有多个重载，`OnClick` 也可能带参，
  *   拿错重载就会用错误的参数布局调进去（＝直接崩）。nParams<0 表示"个数未知，不过滤"。
  */
+/** ★按 (klass,name,nParams) 记忆化：类元数据在进程里是静态的（类不会卸载）⇒ 命中后 O(1)。
+ *  之前每件派发任务都要重扫一遍方法表（几十~几百项 + 读名字符串），是批量直调里最大的一块固定开销。 */
+const g_methNP = Object.create(null);
 function _findMethodNP(klass, name, nParams) {
+  const key = String(klass) + "/" + name + "/" + nParams;
+  const hit = g_methNP[key];
+  if (hit !== undefined) return hit;
   let c = klass, d = 0;
   while (c && !c.isNull() && d < 12) {
     const it = Memory.alloc(Process.pointerSize); it.writePointer(ptr(0));
@@ -8524,11 +8619,12 @@ function _findMethodNP(klass, name, nParams) {
       if (!m || m.isNull()) break;
       let nm = ""; try { nm = g_il2cpp.method_get_name(m).readUtf8String(); } catch (e) {}
       if (nm !== name) continue;
-      if (nParams < 0) return m;
-      if (_paramCount(m) === nParams) return m;
+      if (nParams < 0) { g_methNP[key] = m; return m; }
+      if (_paramCount(m) === nParams) { g_methNP[key] = m; return m; }
     }
     c = g_il2cpp.class_get_parent(c); d++;
   }
+  g_methNP[key] = null;
   return null;
 }
 
@@ -9155,7 +9251,9 @@ rpc.exports = {
     if (!g_pressRes) return { pending: true, frames: g_disp.frames, queuedCount: g_dispQ.length };
     const out = {};
     for (const k in g_pressRes) out[k] = g_pressRes[k];
-    out.pending = false;
+    // ★★2026-11-18：队列自己标的 `pending:true`（`labPartyPress` 串行的中间态）**不能**被这里抹掉 ——
+    //   否则调用方（`AgentApi.labPartyPress` 每 120ms 轮询）会在第一件完成时就拿到"完成"。
+    if (out.pending !== true) out.pending = false;
     out.hook = g_disp.where;
     out.frames = g_disp.frames;
     return out;
@@ -9367,46 +9465,185 @@ rpc.exports = {
 
   // ★★编组页加/减角色的**轻读**：已选（槽位顺序）+ 可选（池子各格 unitId/已选状态）
   labPartySlots: _rpcSafe(function () { try { return labPartySlotsSnapshot(); } catch (e) { return { ok: false, err: String(e) }; } }),
+
+  // ★★编组页**滚动预热**（2026-11-19）：进页面后调一次，顺序 SetScrollBarValue(0.5) → (0.9)，
+  //   把虚拟角色池的格子累积创建出来 ⇒ 之后 add 直调任意角色都不用再滚（结果见 pressNodePoll）。
+  //   ★原理：`useUnitIconList` 一屏 8 个、滑走换内容，但格子对象是**累积扩容**的（实测滚到底
+  //     List 16→24、滚过的角色不会被踢出）；SetScrollBarValue 自带 clamp + 自动回调更新 List，
+  //     不需要 ForceItemUpdate。0.9 而非 1.0：露出半行就够建对象。
+  //   ★顺序必须 0.5→0.9（最后停底部）：反着来滚回中段可能回收底部对象。
+  labPartyScrollPrime: _rpcSafe(function (opts) {
+    const out = { queued: false, err: null, ms: 0 };
+    try {
+      if (!_dispInstall()) { out.err = "派发钩子装不上"; return out; }
+      const gap = (opts && opts.gap != null) ? Math.max(0, opts.gap | 0) : 100;
+      const t0 = Date.now();
+      const log = [];
+      g_pressRes = { pending: true, kind: "scrollPrime", steps: log, t0: t0 };
+
+      // 在派发队列里设滚动条（runtime_invoke 必须在游戏线程）
+      const pushSet = function (v, atMs) {
+        const job = function () {
+          const o = { op: "set", v: v, ok: false, ex: null, err: null, ms: Date.now() - t0 };
+          try {
+            const a = _partyAbs();
+            if (a.err) { o.err = a.err; }
+            else {
+              const sc = a.abs.add(0x70).readPointer();
+              if (!ptrOk(sc)) { o.err = "scrollController 为空"; }
+              else {
+                const m = _findMethodNP(g_il2cpp.object_get_class(sc), "SetScrollBarValue", 1);
+                if (!m) { o.err = "没找到 SetScrollBarValue(1)"; }
+                else {
+                  const val = Memory.alloc(16); val.writeFloat(v);
+                  const args = Memory.alloc(8); args.writePointer(val);
+                  const ex = Memory.alloc(8); ex.writePointer(ptr(0));
+                  g_il2cpp.runtime_invoke(m, sc, args, ex);
+                  o.ex = String(ex.readPointer());
+                  o.ok = ex.readPointer().isNull();
+                  if (!o.ok) o.err = "调用抛异常";
+                }
+              }
+            }
+          } catch (e) { o.err = "" + e; }
+          log.push(o);
+        };
+        job.notBefore = t0 + atMs;
+        g_dispQ.push(job);
+      };
+      pushSet(0.5, 0);
+      pushSet(0.9, gap);
+
+      // 最后读回 poolN / scrollDataMax / bar，确认 List 已扩容
+      const finish = function () {
+        const o = { op: "done", ok: false, err: null, ms: Date.now() - t0 };
+        try {
+          const a = _partyAbs();
+          if (a.err) { o.err = a.err; }
+          else {
+            const sc = a.abs.add(0x70).readPointer();
+            o.poolN = _partyPoolCount(a.abs);
+            if (ptrOk(sc)) {
+              try { o.scrollDataMax = sc.add(0x84).readS32(); } catch (e) {}
+              const m = _findMethodNP(g_il2cpp.object_get_class(sc), "GetScrollBarValue", 0);
+              if (m) {
+                const ex = Memory.alloc(8); ex.writePointer(ptr(0));
+                const rv = g_il2cpp.runtime_invoke(m, sc, ptr(0), ex);
+                if (ptrOk(rv)) { o.bar = rv.add(0x10).readFloat(); }
+              }
+            }
+            o.ok = o.poolN > 0;
+          }
+        } catch (e) { o.err = "" + e; }
+        log.push(o);
+        g_pressRes = { pending: false, kind: "scrollPrime", steps: log, ok: !!o.ok,
+                       poolN: o.poolN, scrollDataMax: o.scrollDataMax, bar: o.bar,
+                       err: o.err, ms: Date.now() - t0 };
+      };
+      const fin = function () { finish(); };
+      fin.notBefore = t0 + gap * 2;
+      g_dispQ.push(fin);
+
+      out.queued = true;
+      return out;
+    } catch (e) { out.err = "" + e; return out; }
+  }),
   // ★★编组页加/减角色的**直调**（两段式）：kind='add'|'remove'，uids=[...]
   //   加 → ScrollController.onClickUnitIcon(UnitIcon)；减 → Plate.onClickUnitIcon(UnitIcon)
   //   每件任务在**游戏线程**重新按 uid 定位（上一次点击会改队伍）⇒ 结果见 pressNodePoll()。
   //   ⚠ 改完不会刷新视图（池子会留白）⇒ 改完重开编组页，或直接 decide。
-  labPartyPress: _rpcSafe(function (kind, uids) {
-    const out = { queued: false, kind: String(kind), n: 0, err: null };
+  labPartyPress: _rpcSafe(function (kind, uids, opts) {
+    const out = { queued: false, kind: String(kind), n: 0, gap: 0, err: null };
     try {
       if (kind !== "add" && kind !== "remove") { out.err = "kind 必须是 add / remove"; return out; }
       const list = (uids && uids.length) ? uids : [];
       if (!list.length) { out.err = "uids 为空"; return out; }
       if (!_dispInstall()) { out.err = "派发钩子装不上"; return out; }
+      // ★★2026-11-18 实测（用户：一次给队伍加 5 个）：**一次 push 5 件会重复添加** ——
+      //   游戏侧"已选"状态的刷新比派发队列慢，`_dispDrain` 只是一帧一件，于是后面几件
+      //   仍按旧视图去找、点到同一个格子。⇒ 改成**串行链**：上一件**做完** → 隔 gap 再投下一件。
+      //   ★间隔不用 `setTimeout`（QJS timer 粒度 ~100ms，50ms 会被放大成 110ms），
+      //     改用 `job.notBefore` 时间戳，由 `_dispDrain` 每帧检查 ⇒ 间隔 = gap + ≤1 帧。
+      //   ★实测（2026-11-18，MuMu/8608）5 件总耗时：gap=50 → 400~450ms；gap=20 → 300~380ms
+      //     （帧对齐会把 20 放大成 40~60）；**gap=0 → 200~290ms，连续 5 轮 add/remove 全 5/5 无重复**。
+      //     ⇒ 默认 0：串行链本身就是同步点（上一件**执行完**才 push 下一件），件间天然隔 ≥1 帧；
+      //       而定位是"按 uid 遍历池子数据数组"，不依赖已选视图是否刷新 ⇒ 不会再点重。
+      //     `opts.gap` 仍可加大（老版本"一次 push 5 件"就是靠 300ms 延时掩盖这个问题的）。
+      const gap = (opts && opts.gap != null) ? Math.max(0, opts.gap | 0) : 0;
+      out.gap = gap;
+      // `opts.checked=true` 才回读每件的 `wasChecked`（一次 get_gameObject + activeInHierarchy 的
+      // runtime_invoke）；默认跳过 —— 批量提速靠的就是"每件只做一次 onClickUnitIcon"。
+      const wantChecked = !!(opts && opts.checked);
       const log = [];
-      g_pressRes = { pending: true, kind: String(kind), done: 0, total: list.length, log: log };
-      for (let k = 0; k < list.length; k++) {
-        (function (uid) {
-          g_dispQ.push(function () {
-            const o = { uid: uid, ok: false, via: null, err: null, ex: null };
-            try {
+      const total = list.length;
+      const want = Object.create(null);
+      for (let wi = 0; wi < total; wi++) want[list[wi]] = true;
+      const t0 = Date.now();
+      g_pressRes = { pending: true, kind: String(kind), done: 0, total: total, gap: gap, log: log, t0: t0 };
+      let i = 0;
+      let absCache = null;      // ★批次内复用：`labPartyFind` 每次都要重扫 DialogArea 子树（~15ms/件）
+      let uidMap = null;        // ★预热时建的 uid → {ic,i}
+      const step = function (waitMs) {
+        if (i >= total) return;
+        const uid = list[i++];
+        const warm = (i === 1);            // 第一件顺路预热（见 `_partyWarm`）
+        const job = function () {
+          const o = { uid: uid, ok: false, via: null, err: null, ex: null };
+          try {
+            let abs = null;
+            // ★复用上一件的 abs：同一批次（<1s）页面不会换，重扫子树纯属浪费。
+            //   校验用一次数组读（读不到就回退全扫），不碰可能悬空的组件指针。
+            if (absCache) {
+              try { if (_partyPoolCount(absCache) >= 0) abs = absCache; } catch (e2) { absCache = null; }
+            }
+            if (!abs) {
+              const tA = Date.now();
               const a = _partyAbs();
+              o.msAbs = Date.now() - tA;
               if (a.err) { o.err = a.err; }
-              else {
-                const hit = _partyFindPoolIcon(a.abs, uid);
-                if (!hit) { o.err = "池里没有 " + uid; }
-                else {
-                  o.idx = hit.i;
-                  o.wasChecked = _partyIconChecked(hit.ic);
-                  _partyPressIcon(hit.ic, String(kind), o);
-                }
+              else { abs = a.abs; absCache = abs; }
+            }
+            if (abs) {
+              if (warm) { uidMap = _partyWarm(abs, kind, o, want); }
+              const tPick = Date.now();
+              let hit = null;
+              if (uidMap && uidMap[uid]) {
+                // 复核一次（点击理论上不重建 icon，但不拿悬空指针去 runtime_invoke）
+                const c = uidMap[uid];
+                let u = 0; try { u = partyUnitIdOfIcon(c.ic).unitId; } catch (e) {}
+                if (u === uid) hit = c;
               }
-            } catch (e) { o.err = "" + e; }
-            log.push(o);
-            // ★只有**最后一件**做完才置 pending=false：否则轮询会在第 1 件完成时就返回，
-            //   后面的任务还在派发队列里没跑（实测 remove 两个 → done=1/total=2 就返回了）。
-            g_pressRes = { pending: log.length < list.length, kind: String(kind), done: log.length,
-                           total: list.length, log: log, last: o };
-          });
-        })(list[k]);
-      }
+              if (!hit) {
+                // ★撤人从队伍区找、加人从池子找（见 `_partyFindSlotIcon` / `_partyWarm` 注释）
+                hit = (kind === "remove") ? _partyFindSlotIcon(abs, uid) : _partyFindPoolIcon(abs, uid);
+              }
+              o.msPick = Date.now() - tPick;
+              if (!hit) { o.err = ((kind === "remove") ? "队伍里没有 " : "池里没有 ") + uid; }
+              else {
+                o.idx = hit.i;
+                if (wantChecked) { o.wasChecked = _partyIconChecked(hit.ic); }
+                const tP = Date.now();
+                _partyPressIcon(hit.ic, String(kind), o, abs);
+                o.msPress = Date.now() - tP;
+              }
+            }
+          } catch (e) { o.err = "" + e; }
+          o.ms = Date.now() - t0;
+          log.push(o);
+          // ★只有**最后一件**做完才置 pending=false：中间态必须留 `pending:true`，
+          //   否则 120ms 一次的 `pressNodePoll` 会在第 1 件完成时就返回（删两个 → done=1/total=2）。
+          const last = (log.length >= total);
+          g_pressRes = { pending: !last, kind: String(kind), done: log.length, total: total,
+                         gap: gap, log: log, last: o, ms: Date.now() - t0 };
+          if (last) { g_pressRes.msTotal = Date.now() - t0; }
+          else { step(gap); }        // ★走 `job.notBefore`（`_dispDrain` 每帧检查），不用 setTimeout
+        };
+        if (waitMs > 0) job.notBefore = Date.now() + waitMs;
+        g_dispQ.push(job);
+      };
+      step(0);
       out.queued = true;
-      out.n = list.length;
+      out.n = total;
       return out;
     } catch (e) { out.err = "" + e; return out; }
   }),
@@ -10236,6 +10473,9 @@ const LAB_PATHS = {
   //   预览页 dlg[10]、编组页 dlg[11] ⇒ 原 canvas 链 [0,4,1,0,10,0,2,0] 落到 `contents`）。
   //   实测真实链：[0,4,1,0,11,0,3,0]（尾部也变了：预览页是 [0,2,0,1,0]、编组页是 [0,3,0]）。
   //   改用 **top 根相对链** = 最上层对话框（此页即 DialogCommonPartyEdit），实测命中 @ (1134,605)。
+  // ★★2026-11-18（截图实测）：BOSS 战是**三队依次确认** —— 同一颗 `ButtonDecide` 的文字会变：
+  //   队伍1 时显示「队伍2」、队伍2 时显示「队伍3」、队伍3 时才显示「战斗开始」。
+  //   ⇒ 判"是不是最后一队"别靠按钮文字，用 `labPartyIdx.idx == 2`（或 `partyDic` 哪队还空）。
   "PartyDecide|ButtonDecide": { dlg: "DialogCommonPartyEdit", root: "top", path: [0, 3, 0], name: "ButtonDecide" },
   // ── 「队伍1/2/3」预设队伍切换（`DialogCommonPartyEdit`，2026-11-18 实测）──
   //   ★★这是 **BOSS 编组页**与普通战斗的**主要 UI 差异**（用户 2026-11-18 指出）：

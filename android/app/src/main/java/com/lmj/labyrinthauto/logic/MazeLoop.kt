@@ -5382,8 +5382,11 @@ object MazeLoop {
                 //   右边的人**不动**（空位出现在左边）⇒ 一批坐标可以一直用到最后一个。
                 //   （"从左往右"正是这个前提的由来；反着撤就会越撤越偏。）
                 // ★★2026-11-18 直调优先（分支 `feat/direct-trigger`）：`PartsPartyEditPlate.onClickUnitIcon(UnitIcon)`。
-                //   按 unitId 定位 ⇒ **不投坐标、不看可见区**，也就不存在"撤掉左边的人、
-                //   右边补位把坐标挪偏"的问题 —— 上面那套"从左往右"的顺序约束对直调部分不再需要。
+                //   按 unitId 定位 ⇒ **不投坐标**，也就不存在"撤掉左边的人、右边补位把坐标挪偏"
+                //   的问题 —— 上面那套"从左往右"的顺序约束对直调部分不再需要。
+                //   ★cs106：撤人 icon 已从**队伍区** `plate+0xC8`（5 格常驻可见）取，不依赖角色池的
+                //     虚拟滚动状态；实测直接传给 Plate.onClickUnitIcon 生效（ex=0x0）。
+                //   加人则从虚拟角色池取，目标必须先滚进 List（见 agent `labPartyScrollPrime`）。
                 //   直调没生效的（或整条链路不可用）才退回下面的 tap 兜底。
                 val rmWant = removes.map { it.unit }.filter { it in nowIds }.distinct()
                 val rmDone = partyDirectPress("remove", rmWant)
@@ -6617,7 +6620,8 @@ object MazeLoop {
      * ★编组页加/减角色的**直调**（2026-11-18，不点屏幕）：返回**确实生效**的 unitId 集合。
      *
      * 走 [AgentApi.labPartyPress]：加 → `PartsPartyEditScrollController.onClickUnitIcon`，
-     * 减 → `PartsPartyEditPlate.onClickUnitIcon`。按 uid 定位，不投坐标、不看可见区。
+     * 减 → `PartsPartyEditPlate.onClickUnitIcon`。按 uid 定位、不投坐标；加人 icon 取自虚拟角色池
+     * （目标需先滚进 List，见 agent `labPartyScrollPrime`），撤人 icon 取队伍区 `plate+0xC8` 常驻可见。
      *
      * ★`ok=true` 只代表"没抛异常" ⇒ 这里**必须回读队伍复核**（`labPartyPlan`），
      *   否则会把"点了没生效"当成功，后面的整批核对全乱。

@@ -321,10 +321,23 @@ object AgentApi {
      *
      * @param kind `"add"` / `"remove"`
      * @param uids 目标 unitId 列表（顺序无关，每件任务在游戏线程重新按 uid 定位）
-     * @return `{pending:false, done, total, log:[{uid, ok, via, ex, err, idx, wasChecked}]}`；超时/未连接返回 null
+     * ★2026-11-18 提速（agent cs104/105）：整批改**串行链**（上一件执行完才投下一件，`job.notBefore`
+     *   帧级间隔，默认 0），批次内复用 abs / uid→icon 映射，每件只做一次 `onClickUnitIcon`。
+     *   热态 5 人（同一 script 实例的第 2 次起）：add/remove 均 ~100~125ms；**首次调用**因
+     *   `_partyAbs()` 冷扫 DialogArea 多 ~75ms —— 与 add/remove 无关，也不是重排开销。
+     *   `wasChecked` 改为可选：只有传 `opts.checked=true` 才回读（默认省两次 runtime_invoke/件）。
+     *
+     * @param opts 可选第三参 `JSONObject({"gap":<ms>,"checked":<bool>})`，不传 = gap 0 / 不回读 wasChecked
+     * @return `{pending:false, done, total, gap, msTotal, log:[{uid, ok, via, ex, err, idx, ms, msPick, msPress}]}`；超时/未连接返回 null
      */
-    suspend fun labPartyPress(kind: String, uids: List<Int>, timeoutMs: Long = 6_000L): JSONObject? {
-        val st = obj("labPartyPress", listOf(kind, uids), T_FAST) ?: return null
+    suspend fun labPartyPress(
+        kind: String,
+        uids: List<Int>,
+        opts: JSONObject? = null,
+        timeoutMs: Long = 6_000L,
+    ): JSONObject? {
+        val args = if (opts == null) listOf(kind, uids) else listOf(kind, uids, opts)
+        val st = obj("labPartyPress", args, T_FAST) ?: return null
         if (!st.optBoolean("queued", false)) return st        // 投递失败（钩子装不上等）→ 直接回错误对象
         val t0 = SystemClock.elapsedRealtime()
         while (SystemClock.elapsedRealtime() - t0 < timeoutMs) {
