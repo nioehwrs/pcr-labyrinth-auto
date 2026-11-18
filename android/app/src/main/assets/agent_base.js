@@ -4830,15 +4830,25 @@ function _dlgRootByName(clsName) {
     }
     if (!g_dialogArea || g_dialogArea.isNull()) return null;
     const cc = _childCountOf(g_dialogArea);
+    let fallback = null;
     for (let i = cc - 1; i >= 0; i--) {                    // 倒序 = 最上层优先
       const ch = _inv1i(g_dialogArea, "GetChild", i);
       if (!ch || ch.isNull()) continue;
       const go = _inv(ch, "get_gameObject");
       if (!go || go.isNull()) continue;
       const nm = _str(_inv(go, "get_name"));
-      if (nm === clsName || nm.indexOf(clsName) === 0) return ch;   // 兼容 "...(Clone)"
+      if (nm === clsName || nm.indexOf(clsName) === 0) {   // 兼容 "...(Clone)"
+        // ★2026-11-18 实测：DialogArea 下会**同时存在两份**同名壳（上一场结算页没销毁、
+        //   只是 inactive）。倒序第一份可能就是残留壳 ⇒ 在其下 `_descendFixed` 会找到
+        //   inactive 的旧 NextButton，点了毫无反应（连点 5 次无效的根因之一）。
+        //   这里只认**激活**的那份；全都不激活时才退回第一份（保持原行为，给诊断用）。
+        let actv = true;
+        try { actv = (_inv(go, "get_activeInHierarchy") === true); } catch (e2) { actv = true; }
+        if (actv) return ch;
+        if (!fallback) fallback = ch;
+      }
     }
-    return null;
+    return fallback;
   } catch (e) { return null; }
 }
 
@@ -4871,6 +4881,15 @@ function _resPathOne(spec) {
     } else if (!_resLabelMatch(spec.kind, label)) {
       out.err = "label:" + label; return out;
     }
+    // ★2026-11-18 实测：节点必须**真在激活层级**。结算第二页（PartsQuestResultLater）显示时，
+    //   第一页（PartsQuestResultFormer）的 NextButton 仍挂在层级里、只是 inactive ⇒
+    //   不校验就会每次都点到那颗"看不见的旧按钮"（连点 5 次毫无反应，comp 指针一直不变）。
+    try {
+      const goA = _inv(btnTr, "get_gameObject");
+      if (ptrOk(goA) && _inv(goA, "get_activeInHierarchy") !== true) {
+        out.err = "node-inactive"; return out;
+      }
+    } catch (eA) {}
     out.ok = true; out.x = x; out.y = y; out.label = label;
     // ★直调用（2026-11-18）：把**按钮组件**一起带出去 —— 坐标给坐标点击用，组件指针给直调用。
     //   取法同 `_pressNow`：本构建没有 `GetComponent(Type)` ⇒ 走 `_compSelfTry`（先查自己再查子节点）。
@@ -4891,6 +4910,73 @@ function _resPathOne(spec) {
 }
 
 /**
+ * ★2026-11-18：结算**第二页**（`PartsQuestResultLater`）的**只读**定位。
+ *
+ * 它和第一页不是同一个 prefab（按钮叫 `NextButtonLarge`，方法 `onClickNext`），
+ * 固定下标链读不到 ⇒ 只能在结算壳内按名字找（当前页同名节点只有 1 个，matches=1 已验证）。
+ * 走这条时 `stage="later"`，app 侧据此知道"这一下是第二页的「下一步」"。
+ *
+ * @return `{ok,kind:"win",stage:"later",x,y,label,comp,compCls}` / `{ok:false,err}`
+ */
+function _resBtnScan(cls, kind) {
+  const out = { ok: false, kind: kind, stage: "scan", label: null, node: null, err: null };
+  try {
+    const base = _dlgRootByName(cls);
+    if (!base) { out.err = "no-dialog:" + cls; return out; }
+    // ★不能把类名当 rootName 传给 `_findNodeP`：`_subtreeRoot` 只认 battle/view/footer/
+    //   top/dialog/layer/result 这些 kind，传类名直接返回 null（err 就是「根…不存在」）。
+    //   这里在**已拿到的壳**里遍历，范围小、代价可控。
+    const list = _walkForRoot("resScan_" + cls, base);
+    if (!list) { out.err = "walk-fail"; return out; }
+    const re = /^(NextButton(Large)?|UIButton_Next)$/;
+    let nd = null;
+    for (let li = 0; li < list.length; li++) {
+      const it = list[li];
+      if (it.active !== true) continue;                 // ★关键：只认激活的那颗
+      if (!re.test(it.name || "")) continue;
+      nd = it; break;
+    }
+    if (!nd || !ptrOk(nd.tr)) { out.err = "no-node"; return out; }
+    out.node = nd.name;
+    try {
+      const env = _camEnv();
+      const p = env ? _ndXY(nd, env) : null;
+      if (p) { out.x = p.x; out.y = p.y; }
+    } catch (e2) {}
+    // label 再校验一次：别把「重新挑战」当「下一步」点了
+    let label = "";
+    try {
+      const go0 = _inv(nd.tr, "get_gameObject");
+      const uk = findClass("CustomUILabel");
+      const lb = (uk && !uk.isNull() && ptrOk(go0)) ? _compInChildren(go0, uk) : ptr(0);
+      label = ptrOk(lb) ? (_str1(_inv(lb, "get_text")) || "") : "";
+    } catch (e4) {}
+    out.label = label;
+    if (kind === "win" ? !_resLabelMatch("win", label) : !_resLabelMatch("fail", label)) {
+      out.err = "label:" + label;
+      return out;
+    }
+    try {
+      const go = _inv(nd.tr, "get_gameObject");
+      if (ptrOk(go)) {
+        const cand = ["CustomUIButton", "UIButton"];
+        for (let ci = 0; ci < cand.length; ci++) {
+          const k = findClass(cand[ci]);
+          if (!k || k.isNull()) continue;
+          const c = _compSelfTry(go, k);
+          if (ptrOk(c)) { out.comp = String(c); out.compCls = cand[ci]; break; }
+        }
+      }
+    } catch (e3) {}
+    out.ok = true;
+    return out;
+  } catch (e) { out.err = String(e); return out; }
+}
+
+/** 兼容旧调用点：第二页 = 结算壳内扫描到的那颗激活按钮 */
+function _resLaterOne() { return _resBtnScan("DialogQuestResultWin", "win"); }
+
+/**
  * ★2026-11-18：结算按钮的**固定层级路径**（主路径）——失败页 → 普通胜利页 → BOSS/EX 胜利页。
  * @return `{ok,kind:"fail"|"win"|"exwin",x,y,label,ms}` / `{ok:false,err,ms}`
  */
@@ -4901,7 +4987,20 @@ function battleResultPathBtn() {
   if (b.ok) return b;
   const c = _resPathOne(RES_BOSS_SUB);
   if (c.ok) return c;
-  return { ok: false, err: a.err + " / " + b.err + " / " + c.err };
+  // ★第二页（PartsQuestResultLater）：第一页的节点此时 inactive、会被上面挡掉，
+  //   这里补上"结算第二页"的识别，否则 app 会误判成"不在结算页"而卡住。
+  // ★固定路径失效（版本改了层级深度：实测真实 `NextButton` 在 d=13，而旧路径只有 8 层，
+  //   中途落到另一套 inactive 节点上 ⇒ 点了没反应）⇒ 退到"壳内按 active 扫描"。
+  //   一次覆盖第一页 `NextButton`、第二页 `NextButtonLarge`、失败页 `UIButton_Next`。
+  const d = _resBtnScan("DialogQuestResultWin", "win");
+  if (d.ok) return d;
+  const e = _resBtnScan("DialogQuestFailed", "fail");
+  if (e.ok) return e;
+  const f = _resBtnScan("DialogLabyrinthExResult", "win");
+  if (f.ok) return f;
+  const g = _resBtnScan("DialogLabyrinthExResult", "fail");
+  if (g.ok) return g;
+  return { ok: false, err: a.err + " / " + b.err + " / " + c.err + " / " + d.err + " / " + e.err + " / " + f.err + " / " + g.err };
 }
 
 /**
@@ -4916,16 +5015,14 @@ function battleResultPathBtn() {
  * @return `{queued, kind:"fail"|"win"|"exwin", label, compCls, err}`；未投递则是错误对象
  */
 function battleResultPress() {
-  const out = { queued: false, kind: null, label: null, compCls: null, err: null };
+  const out = { queued: false, kind: null, label: null, compCls: null, node: null, stage: null, err: null };
   try {
-    let hit = null;
-    const specs = [RES_FAIL_SUB, RES_WIN_SUB, RES_BOSS_SUB];
-    for (let i = 0; i < specs.length; i++) {
-      const r = _resPathOne(specs[i]);
-      if (r.ok) { hit = r; break; }
-    }
-    if (!hit) { out.err = "三条固定路径都没命中（当前不在结算页）"; return out; }
+    // ★定位统一交给 `battleResultPathBtn`（固定路径 → 壳内 active 扫描兜底），
+    //   本函数只负责"投递到游戏线程直调"，避免两处各写一套找按钮逻辑、口径不一致。
+    const hit = battleResultPathBtn();
+    if (!hit || !hit.ok) { out.err = "结算按钮没找到：" + (hit ? hit.err : "null"); return out; }
     out.kind = hit.kind; out.label = hit.label; out.compCls = hit.compCls || null;
+    out.node = hit.node || null; out.stage = hit.stage || "path";
     if (!hit.comp) { out.err = "按钮组件指针缺失"; return out; }
     const comp = ptr(hit.comp);
     if (!ptrOk(comp)) { out.err = "按钮组件指针无效"; return out; }

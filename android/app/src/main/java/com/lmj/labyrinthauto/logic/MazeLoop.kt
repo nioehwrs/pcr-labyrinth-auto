@@ -4309,7 +4309,18 @@ object MazeLoop {
                     // ★★兜底（2026-11-08 事故）：重读失败就退回**决策时那个坐标**（外层刚判过它在屏内）。
                     //   宁可点一下"稍微旧一点的坐标"（这页多点同一张卡没关系），也不要
                     //   "取不到坐标 ⇒ 一次都不点 ⇒ 空转"。
-                    xyAt = {
+                    // ★★直调（2026-11-18 真机验证）：三选一/门票卡直接走 `LAB_PATHS` 固定路径，不投坐标。
+                    //   三方对齐已核实：列表 `i`(0-based) ↔ `Role0/1/2` ↔ 读取的 decideX 270/640/1010。
+                    //   ⚠`choiceIndex` 是 **1-based**（1/2/3），绝不能拿来拼路径 —— 会整体错一位选错人。
+                    pressFn = press@{
+                        val cidx = res.index
+                        val pkey = (if (kind == "门票") "SelectTicket|Ticket" else "SelectRole|Role") + cidx
+                        val pr = runCatching { AgentApi.labPathPress(pkey) }.getOrNull()
+                        if (pr?.optBoolean("ok") == true) return@press true
+                        // 直调不可用（表外 / 投递失败）⇒ 退回**原逻辑**：现取坐标再点
+                        AppState.addLog(
+                            "$kind：路径直调失败（$pkey / ${pr?.optString("err").orEmpty().ifEmpty { "无回包" }}）→ 退回坐标点击",
+                        )
                         val xy = selDecideXY(
                             // ★与**决策**同一个读法：门票页走 labChoices，选人页走 labSelection
                             reread = {
@@ -4320,7 +4331,8 @@ object MazeLoop {
                             idx = res.index,
                         ) ?: if (dx in 0 until scrW && dy in 0 until scrH) dx to dy else null
                         if (xy != null) xyOk++ else xyNull++
-                        xy
+                        if (xy == null) return@press null
+                        tap(input, xy.first, xy.second, "$kind：选 $cid")
                     },
                     probeState = { selProbe("DialogLabyrinthSelection") },
                 )

@@ -26,10 +26,14 @@ def main() -> int:
     ap.add_argument('--timeout', type=float, default=30.0)
     ap.add_argument('--port', type=int, default=PORT)
     ap.add_argument('--quit', action='store_true', help='让 daemon 退出（同样不 attach 游戏）')
+    ap.add_argument('--reload', action='store_true',
+                    help='★同 session 内重载 agent_base.js（unload + 重新 load，不 detach）')
     a = ap.parse_args()
 
     req = {'fn': a.fn, 'args': json.loads(a.args or '[]'),
            'poll': a.poll, 'timeout': a.timeout}
+    if a.reload:
+        req = {'fn': '__reload', 'args': [], 'timeout': 180}
     if a.quit:
         req = {'fn': 'ready', 'args': [], 'timeout': 5}
 

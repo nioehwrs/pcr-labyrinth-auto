@@ -68,26 +68,35 @@ def main() -> int:
         except Exception:
             pass
 
-    src = Path(BASE).read_text(encoding='utf-8') + BOOT
+    def load_script(sess):
+        """把 agent_base.js 装进已 attach 的 session，并等到 il2cpp 就绪。
+
+        ★2026-11-18：抽成函数是为了**同 session 内热重载**（见主循环的 `__reload`）——
+          实测这个游戏 detach/attach 一轮往往就把进程送走了（webview 沙箱先死），
+          改完 agent 想生效只能靠 unload + 重新 create_script，不能重连。
+        """
+        src = Path(BASE).read_text(encoding='utf-8') + BOOT
+        sc = sess.create_script(src, name='lmj-daemon', runtime='qjs')
+        sc.on('message', lambda m, d: None)      # 别刷屏；要诊断就临时打开
+        sc.load()
+        ok = False
+        for _ in range(120):
+            try:
+                if sc.exports_sync.ready():
+                    ok = True
+                    break
+            except Exception:
+                pass
+            try:
+                sc.exports_sync.bootInit()
+            except Exception:
+                pass
+            time.sleep(0.5)
+        return sc, ok
+
     dev = frida.get_device_manager().add_remote_device(a.remote)
     sess = dev.attach(a.pid)
-    script = sess.create_script(src, name='lmj-daemon', runtime='qjs')
-    script.on('message', lambda m, d: None)      # 别刷屏；要诊断就临时打开
-    script.load()
-
-    ready = False
-    for _ in range(120):
-        try:
-            if script.exports_sync.ready():
-                ready = True
-                break
-        except Exception:
-            pass
-        try:
-            script.exports_sync.bootInit()
-        except Exception:
-            pass
-        time.sleep(0.5)
+    script, ready = load_script(sess)
     log('pid=%d ready=%s build=%s' % (a.pid, ready, script.exports_sync.jsBuild()))
 
     q: "queue.Queue" = queue.Queue()
@@ -139,6 +148,20 @@ def main() -> int:
         req, box, ev = q.get()
         fn = req.get('fn') or ''
         args = req.get('args') or []
+        if fn == '__reload':
+            # 同 session 内热重载：不 detach，进程就不会被这一轮"送走"
+            try:
+                try:
+                    script.unload()
+                except Exception:
+                    pass
+                script, ok = load_script(sess)
+                box['r'] = {'reloaded': True, 'ready': ok, 'build': script.exports_sync.jsBuild()}
+                log('reload ready=%s' % ok)
+            except Exception as e:
+                box['r'] = {'error': 'reload 失败: %s' % e}
+            ev.set()
+            continue
         try:
             f = getattr(script.exports_sync, fn)
             r = f(*args) if isinstance(args, list) else f(**args)

@@ -71,6 +71,9 @@ tools/.github_token*
 tools/_tmp_*.py
 tools/tree_t*.json
 
-# 根目录的排查产物（截图 / adb 重定向输出）
+# 根目录的排查产物（截图 / adb 重定向输出 / daemon 手动运行时产生的输出）
 /shot*.png
 /ex_flow.err
+/daemon.out
+/daemon.err
+/daemon.log
