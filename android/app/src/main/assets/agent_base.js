@@ -9221,6 +9221,11 @@ rpc.exports = {
     const paths = _pathFindAll(r.tr, String(name), max || 8);
     return { root: rootKind, name: String(name), paths: paths, ms: Date.now() - t0 };
   }),
+  // ★2026-11-18：路径回溯诊断（`LAB_PATHS` 失效时用它反推真实的索引链）
+  //   用法：`pathTrace("DecideButton", "canvas")` → `{root,hits:[{name,path,x,y}]}`
+  pathTrace: _rpcSafe(function (re, kind) {
+    try { return pathTrace(re, kind); } catch (e) { return { err: String(e) }; }
+  }),
   labPathPress: _rpcSafe(function (rootKind, pathArr, name, probe, deep, key) {
     // ★支持只给 key（走 `LAB_PATHS` 固定路径表）：没有 root/path 就从表里取，不学习
     if ((!rootKind || !pathArr || !pathArr.length) && key) {
@@ -10221,9 +10226,12 @@ const LAB_PATHS = {
   //   ★与"战后选人"**同一个 prefab、不同层级**：战后选人在 dlg[5,...]，门票页在 dlg[6,...]
   //     ⇒ 用 `SelectRole|Role*` 在门票页会"路径无效"，必须用这一组。
   //   卡面内容是「水/光/风属性的随机印记×3」（unitId=null，不是角色）。
-  "SelectTicket|Ticket0": { root: "canvas", path: [0, 4, 1, 0, 6, 0, 1, 1, 0, 0, 6], name: "DecideButton" },
-  "SelectTicket|Ticket1": { root: "canvas", path: [0, 4, 1, 0, 6, 0, 1, 1, 1, 0, 6], name: "DecideButton" },
-  "SelectTicket|Ticket2": { root: "canvas", path: [0, 4, 1, 0, 6, 0, 1, 1, 2, 0, 6], name: "DecideButton" },
+  // ★2026-11-18 实测修正：门票页结构已经和选角页一致（第 5 段 = 5，原来记的 6 是旧版本取证）。
+  //   用 `pathTrace("^DecideButton$","canvas")` 从现场反推确认：三条都是 [0,4,1,0,5,0,1,1,{i},0,6]。
+  //   ⇒ 以后路径再失效，别靠猜，直接跑 pathTrace 重建。
+  "SelectTicket|Ticket0": { root: "canvas", path: [0, 4, 1, 0, 5, 0, 1, 1, 0, 0, 6], name: "DecideButton" },
+  "SelectTicket|Ticket1": { root: "canvas", path: [0, 4, 1, 0, 5, 0, 1, 1, 1, 0, 6], name: "DecideButton" },
+  "SelectTicket|Ticket2": { root: "canvas", path: [0, 4, 1, 0, 5, 0, 1, 1, 2, 0, 6], name: "DecideButton" },
   // ── 遗物三选一（`DialogLabyrinthSelection` + statusType=9 RELIC_CHOICE，2026-11-18 实测）──
   //   ★与**门票页同层**（dlg[6,...]），只是按钮 y 从 591 变 **619**；与战后选人（dlg[5,...]）不同层。
   //   卡面：topText=遗物名、bottomText=效果（unitId=null）。
@@ -10284,6 +10292,66 @@ function _pathRoots() {
   } catch (e) {}
   try { const d = _dialogAreaTr(); if (ptrOk(d)) roots.push({ kind: "dlg", tr: d }); } catch (e) {}
   return roots;
+}
+
+/**
+ * ★2026-11-18：**路径回溯诊断** —— 给一个节点，反推它相对某个根的索引链。
+ *
+ * 为什么需要：`LAB_PATHS` 是"取证时写死"的下标链，页面结构一变就整条失效
+ * （实测门票页 `SelectTicket|Ticket*` 现在三条全报"路径无效"，而现场确实有 3 个
+ * `DecideButton`）。靠人肉逐层 dump 很慢，且下次变了又得重来。
+ * ⇒ 直接拿现场节点回溯：`GetChild` 逐个比对指针，得到 idx 链，用来重建/修正路径表。
+ *
+ * @returns `{root, hits:[{name, path, x, y}], err}`；`path` 是相对根的索引链
+ */
+function _idxOfChildP(parent, child) {
+  try {
+    const n = _childCountOf(parent);
+    const want = "" + child;
+    for (let i = 0; i < n; i++) {
+      const c = _inv1i(parent, "GetChild", i);
+      if (c && !c.isNull() && ("" + c) === want) return i;
+    }
+  } catch (e) {}
+  return -1;
+}
+
+function _pathOfTr(rootTr, tr) {
+  const idx = [];
+  let cur = tr, guard = 0;
+  while (cur && !cur.isNull() && ("" + cur) !== ("" + rootTr) && guard++ < 40) {
+    let p = null;
+    try { p = _inv(cur, "get_parent"); } catch (e) {}
+    if (!p || p.isNull() || !ptrOk(p)) return null;
+    const i = _idxOfChildP(p, cur);
+    if (i < 0) return null;
+    idx.unshift(i);
+    cur = p;
+  }
+  if (guard >= 40) return null;
+  return idx;
+}
+
+function pathTrace(re, kind) {
+  const out = { root: kind || "canvas", hits: [], err: null };
+  try {
+    const want = kind || "canvas";
+    let rt = null;
+    for (const r of _pathRoots()) { if (r.kind === want) { rt = r.tr; break; } }
+    if (!rt) { out.err = "根不存在:" + want; return out; }
+    const list = _rootWalkNodes(rt, "trace_" + want);
+    if (!list) { out.err = "遍历失败"; return out; }
+    const rx = new RegExp(re);
+    const env = _camEnv();
+    for (const nd of list) {
+      if (nd.active !== true) continue;
+      if (!rx.test(nd.name || "")) continue;
+      let x = null, y = null;
+      try { const q = env ? _ndXY(nd, env) : null; if (q) { x = q.x; y = q.y; } } catch (e) {}
+      out.hits.push({ name: nd.name, path: _pathOfTr(rt, nd.tr), x: x, y: y });
+    }
+  } catch (e) { out.err = String(e); }
+  return out;
 }
 
 /** `EventDelegate.Execute` 的方法指针缓存（全局一次查找；脱离 _pressPanelNow 的每轮 findClass） */
