@@ -626,9 +626,7 @@ bossQuestByArea = j.bossQuestByArea,
             // ★2026-11-09：重试节奏收紧 —— 原来 200×4=0.8s 才补点，用户实测"第二次点击明显慢"。
             //   现在 150/300/450ms 三拍没反应就补点（≈0.45s，用户要的 0.5s 量级）；
             //   命中路径不受影响（第 1~2 拍就停手）。
-            settleMs = 150L,
             probe = 3,
-            probeMs = 150L,
             retries = retries,
             expectTimeoutMs = expectTimeoutMs,
             readTop = { Navigator.currentViewId().toString() },

@@ -238,6 +238,7 @@ object AgentBridge {
             }
         } catch (t: Throwable) {
             pending.remove(id)
+            pendingInfo.remove(id)              // ★写超时也要清：否则连接异常反复发生时 pendingInfo 只增不减
             if (t is TimeoutException || t is InterruptedException) {
                 if (gen == currentConnectionId) {
                     AppState.addLog("[agent] 写请求超时（$fn）→ 断开连接，让 agent 重连")

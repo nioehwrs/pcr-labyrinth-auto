@@ -41,6 +41,22 @@ import kotlinx.coroutines.delay
 object TapCheck {
 
     /**
+     * ★探测间隔挡位（2026-11-17 用户）：点完探"页面变没变"的间隔，默认 150ms。
+     *  取值范围见 [com.lmj.labyrinthauto.reroll.RerollSettings.TAP_PROBE_STEPS]（150/200/250/300/350）。
+     *  · 由 [com.lmj.labyrinthauto.LmjApp] 启动时 + 策略页改动时从设置注入（这里不直接读 Context，
+     *    避免逻辑层依赖 Android）；所有**用默认 probeMs 的调用点**自动跟随。
+     *  · 屏幕中心慢页 = 本值 ×2（见 Navigator）；各 settleMs 不受影响（那些是逐个坑调出来的）。
+     */
+    @Volatile
+    private var probeMsValue = 150L
+
+    fun setProbeMs(ms: Long) {
+        probeMsValue = ms.coerceIn(150L, 350L)
+    }
+
+    fun currentProbeMs(): Long = probeMsValue
+
+    /**
      * 一次 probe 的结果。
      *
      * ★`top` 和 `left` **必须来自同一次内存快照**：先读 labTop、再另读一次关闭态，
@@ -60,7 +76,9 @@ object TapCheck {
         y: Int,
         what: String,
         from: Set<String>,
-        settleMs: Long = 150L,
+        /** 点完**第一次**探测前等多久。0（默认）= 自动取 [probeMs]（2026-11-17 用户：效率优先，
+         *  连点由 [probe] 次数兜住——探到离开就停，不会形成点击洪水）。 */
+        settleMs: Long = 0L,
         retries: Int = 1,
         expect: Set<String> = emptySet(),
         expectTimeoutMs: Long = 6_000L,
@@ -68,18 +86,20 @@ object TapCheck {
         unknownTop: String = "",
         xyAt: (suspend () -> Pair<Int, Int>?)? = null,
         probe: Int = 0,
-        probeMs: Long = 150L,
+        probeMs: Long = currentProbeMs(),
         reached: (suspend (String) -> Boolean)? = null,
         /** ★给了它就**只调它一次**（同一次快照同时给 top + 判据），不再读 readTop / reached。 */
         probeState: (suspend () -> Probe)? = null,
         skipMax: Int = 6,
-        skipDelayMs: Long = 60L,
-        /** ★首点前先「只读不点」几拍（新页入场动画期间按钮坐标还在动，第一下必空）；每拍 [skipDelayMs] */
-        skipFirstHits: Int = 0,
+        /** 跳拍 / xyAt 取不到时的间隔。默认 = [probeMs]（2026-11-17 用户：跟挡位联动，不再写死 60）。 */
+        skipDelayMs: Long = probeMs,
+        /** ★首点前先「只读不点」几拍（新页入场动画期间按钮坐标还在动，第一下必空）；每拍 [skipDelayMs]。
+         *  2026-11-17 用户：默认 1 拍（= 1×probeMs）先试试，抑制"第一下点空"。 */
+        skipFirstHits: Int = 1,
         /**
          * ★★**直调执行器**（2026-11-18）：给了它就**代替** [tapFn]（[x] / [y] / [xyAt] 全部忽略）。
          *
-         * 为什么复用本模型而不是另写一套：重试、探针节奏、到达目标页的判据全都一样，
+         * 复用本模型而不是另写一套：重试、探针节奏、到达目标页的判据全都一样，
          * 直调只是**换一个触发方式** —— 不投屏幕坐标 ⇒ 不受前台/遮挡/叠层影响，也省掉 `input tap` 的 ~110ms。
          *
          * @return `true` = 已投递到游戏线程；`false` = 投递失败（直接收工）；
@@ -89,6 +109,9 @@ object TapCheck {
         verbose: Boolean = true,
     ): Boolean {
         // ── 阶段 1：反复点，直到**离开 from**（证明这一下生效了）──
+        // ★settleMs 未显式给（0）⇒ 统一取 probeMs（2026-11-17 用户：sl 只是"点完后多久开始确认"，
+        //   不该拖慢首探；治"第一下点早"是 skipFirstHits/skipDelayMs 的事，不是 settleMs）
+        val effSettle = if (settleMs > 0L) settleMs else probeMs
         var attempt = 0
         var skip = 0                        // "这一刻不该点"的次数（不消耗 retries，但要有上限防死循环）
         var firstSkip = 0                   // 首点前已经跳过的拍数
@@ -143,7 +166,7 @@ object TapCheck {
             // ── 点完**探**一下"页面变没变" ──
             var probed = 0
             while (probed < maxProbe) {
-                delay(if (probed == 0) settleMs else probeMs)
+                delay(if (probed == 0) effSettle else probeMs)
                 probed++
                 val tRead0 = android.os.SystemClock.elapsedRealtime()
                 var ps: Probe? = null

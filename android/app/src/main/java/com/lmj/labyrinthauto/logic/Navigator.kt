@@ -214,9 +214,13 @@ object Navigator {
             // ★2026-11-12（用户："25s 没到下个页面就直接重启进程"）：
             //   同一页面停留超过 [PAGE_STUCK_RESTART_MS] ⇒ 直接 kill（注入器会重新拉起+注入），
             //   不再靠"点别的位置"去猜 —— 停在标题页/加载页本身就是游戏侧卡住。
-            if (pageSince > 0L && SystemClock.elapsedRealtime() - pageSince >= PAGE_STUCK_RESTART_MS) {
+            // ★2026-11-15（用户反馈 00）：点屏幕中心的登录/标题页多给 [CENTER_VIEW_EXTRA_MS] ——
+            //   登录加载慢不是卡死，别 25s 就杀进程把整局干掉；其它页面仍按原上限。
+            val stuckLimitMs = PAGE_STUCK_RESTART_MS +
+                if (vid in TAP_CENTER_VIEWS) CENTER_VIEW_EXTRA_MS else 0L
+            if (pageSince > 0L && SystemClock.elapsedRealtime() - pageSince >= stuckLimitMs) {
                 AppState.addLog(
-                    "停手：${viewLabel(vid)} 停留 ${PAGE_STUCK_RESTART_MS / 1000}s 没推进 → 重启游戏进程",
+                    "停手：${viewLabel(vid)} 停留 ${stuckLimitMs / 1000}s 没推进 → 重启游戏进程",
                 )
                 GameProcess.kill()
                 // ★2026-11-13：总闸没开时注入循环在待命，没人把游戏拉回来（ACTION_GOTO_LAB
@@ -248,7 +252,8 @@ object Navigator {
                 // 迷宫子菜单 → 点它的返回按钮回 259（找不到就本轮不点，等它自己变）
                 val p = findNode("btn_back")
                 if (p != null) {
-                    tapUntilChange(input, p.first, p.second, "迷宫菜单返回（${viewLabel(vid)}）", vid)
+                    tapUntilChange(input, p.first, p.second, "迷宫菜单返回（${viewLabel(vid)}）", vid,
+                        reRead = { findNode("btn_back") })
                     return@repeat
                 }
             }
@@ -271,7 +276,8 @@ object Navigator {
                     }
                 } else {
                     // ★点完**探到对话框没了**就往下走（不再固定 delay 700）
-                    tapUntilChange(input, dlg.second, dlg.third, "对话框「${dlg.first}」", vid)
+                    tapUntilChange(input, dlg.second, dlg.third, "对话框「${dlg.first}」", vid,
+                        reRead = { dialogConfirmButton()?.let { it.second to it.third } })
                     return@repeat
                 }
             }
@@ -283,7 +289,8 @@ object Navigator {
                 val p = if (vid in NO_HEAVY_VIEWS) null else findNode(btnName)
                 if (p != null) {
                     // ★点完**探到换页**就走（原来固定 delay 900ms）
-                    tapUntilChange(input, p.first, p.second, btnName, vid)
+                    tapUntilChange(input, p.first, p.second, btnName, vid,
+                        reRead = { findNode(btnName) })
                     return@repeat
                 }
                 AppState.addLog("这一页没有节点「$btnName」（${viewLabel(vid)}），下一轮再看")
@@ -318,7 +325,13 @@ object Navigator {
                 // ★2026-11-12（用户："不要猜着点，25s 没到下个页面就重启进程"）：
                 //   不再试点底部（那是猜坐标）；只在卡住时 dump 一次现场，重启由下面的
                 //   [PAGE_STUCK_RESTART_MS] 统一兜底。
-                tapUntilChange(input, cw / 2, ch / 2, "屏幕中心", vid, settleMs = 300L, probe = 1, probeMs = 300L)
+                // ★屏幕中心是慢页（登录/标题/过场）：探测间隔 = 挡位 ×2（用户 2026-11-17）
+                tapUntilChange(
+                    input, cw / 2, ch / 2, "屏幕中心", vid,
+                    probe = 1,
+                    // 屏幕中心 = 推后一挡：probe = 默认×2 ⇒ settle 自动 = 默认×4（更慢、更稳）
+                    probeMs = com.lmj.labyrinthauto.logic.TapCheck.currentProbeMs() * 2,
+                )
             } else {
                 // ★未知页面（2026-10-19 用户定的**通用策略**）：活动页之类的没有通用确认按钮可点时，
                 //   只要**底部有导航栏**就直接点「冒险」（ButtonQuest，同名多个时 findNode 取最靠下的
@@ -330,7 +343,8 @@ object Navigator {
                         lastUnknownVid = vid
                         AppState.addLog("未知页面 ${viewLabel(vid)} 有底部导航 → 点「冒险」回正常线")
                     }
-                    tapUntilChange(input, q.first, q.second, "底部导航「冒险」", vid)
+                    tapUntilChange(input, q.first, q.second, "底部导航「冒险」", vid,
+                        reRead = { findNode("ButtonQuest") })
                     return@repeat
                 }
                 // 真·异常页：不猜着点，但**不立刻失败** —— 冷启动/换页会经过 0(NONE) 这类瞬态，
@@ -533,6 +547,14 @@ object Navigator {
     private const val PAGE_STUCK_RESTART_MS = 25_000L
 
     /**
+     * ★2026-11-15（用户反馈 00：登录慢被误判成运行结束）：**点屏幕中心推进的页**
+     *   （[TAP_CENTER_VIEWS]：SPLASH/TITLE/新角色介绍）额外多等这么久再判卡死。
+     *   这类页本身就是"点一下推进一段"，登录加载慢/网络慢 ≠ 游戏卡死；25s 容易在慢机器上
+     *   一刀切杀掉重开、把整局干掉。多给 10s，其它页面仍按 [PAGE_STUCK_RESTART_MS]。
+     */
+    private const val CENTER_VIEW_EXTRA_MS = 10_000L
+
+    /**
      * ★旧：点「出发」前固定等 500ms（等 259 切屏动画）。
      * ★2026-11-12 停用：改为「坐标学一次 + 直点 + 点两次没进再重学」——不再靠时间等待，
      *   也不再每次 `findNode` 遍历 view 子树。
@@ -668,13 +690,15 @@ object Navigator {
      */
     private suspend fun tapUntilChange(
         input: InputBackend, x: Int, y: Int, what: String, fromVid: Int,
-        settleMs: Long = 150L, probe: Int = 4, probeMs: Long = 150L,
+        settleMs: Long = 0L, probe: Int = 4, probeMs: Long = com.lmj.labyrinthauto.logic.TapCheck.currentProbeMs(),
+        reRead: (suspend () -> Pair<Int, Int>?)? = null,   // ★2026-11-17：点前现取坐标（轻读，取不到这拍不点）
     ): Boolean {
         val from = locSig(fromVid)
         if (from == "!read") return false        // 连"现在在哪"都读不到 ⇒ 不点（跟主循环同口径）
         return TapCheck.run(
             tapFn = { tx, ty, tw -> tap(input, tx, ty, tw) },
             x = x, y = y, what = what,
+            xyAt = reRead,
             from = setOf(from),
             readTop = { locSig(currentViewId()) },
             unknownTop = "!read",

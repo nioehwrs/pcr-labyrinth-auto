@@ -10,7 +10,9 @@ import java.io.OutputStreamWriter
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 
 /**
  * 日志落盘（2026-10-17 用户要求："把完整跑完的日志保存下来方便查看，以后就知道完整跑完日志在哪里，
@@ -52,13 +54,32 @@ object LogFile {
     private val nameFmt = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
     private val dayFmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
 
-    private val io = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "lmj-logfile").apply { isDaemon = true }
-    }
+    /** 写盘队列上限 + 背压（2026-11-17）：原 single-thread 无界队列，日志风暴时生产快于落盘会无限堆积
+     *  （每行要 flush 两份 sink），是助手 rss 膨胀的可疑源。改为有界 + CallerRunsPolicy：
+     *  队列满时由 addLog 的调用线程同步落盘 ⇒ 不丢日志、队列不无限涨、生产自然降速。 */
+    private const val QUEUE_CAP = 4096
+    private val io = ThreadPoolExecutor(
+        1, 1, 0L, TimeUnit.MILLISECONDS,
+        LinkedBlockingQueue<Runnable>(QUEUE_CAP),
+        { r -> Thread(r, "lmj-logfile").apply { isDaemon = true } },
+        ThreadPoolExecutor.CallerRunsPolicy(),
+    )
     private val lock = Any()
 
+    /**
+     * ★批量 flush 阈值（2026-11-17）：原来**每行都 `flush()` 两份文件** ⇒ 战斗中日志几十行/秒时
+     *   每秒上百次 write 系统调用，在 CPU/IO 紧张时会把系统拖到 lmkd 判定 "device is not responding"。
+     *   现在攒够 [FLUSH_BYTES] 或距上次满 [FLUSH_MS] 才 flush。
+     *   ⚠代价：进程被 SIGKILL（LMK/用户强杀）时最多丢最后这 ~0.5s/8KB 的日志。
+     */
+    private const val FLUSH_BYTES = 8 * 1024
+    private const val FLUSH_MS = 500L
+
     /** 一份正在写的文件（每个目录一份，内容相同） */
-    private class Sink(val f: File, val w: BufferedWriter, var bytes: Long = 0L)
+    private class Sink(val f: File, val w: BufferedWriter, var bytes: Long = 0L) {
+        var pending = 0L                       // 自上次 flush 以来写入的字节
+        var lastFlush = System.currentTimeMillis()
+    }
 
     private var dirs: List<File> = emptyList()
     @Volatile private var ready = false
@@ -661,9 +682,20 @@ object LogFile {
     }
 
     private fun writeAll(sinks: List<Sink>, line: String) {
+        val now = System.currentTimeMillis()
         for (s in sinks) {
             if (s.bytes >= MAX_BYTES) continue
-            runCatching { s.w.write(line); s.w.flush(); s.bytes += line.length }
+            runCatching {
+                s.w.write(line)
+                s.bytes += line.length
+                s.pending += line.length
+                // ★攒够字节数或时间才落盘（见 FLUSH_BYTES/FLUSH_MS 注释）
+                if (s.pending >= FLUSH_BYTES || now - s.lastFlush >= FLUSH_MS) {
+                    s.w.flush()
+                    s.pending = 0
+                    s.lastFlush = now
+                }
+            }
         }
     }
 

@@ -260,7 +260,7 @@ object FridaInjector {
         job = null
         scope.launch {
             if (pf != null && pf.exists()) {
-                RootShell.exec(killInjectorCmd(pf), 8_000L)
+                RootShell.exec(killInjectorCmd(pf), 8_000L, direct = true)
             }
         }
         firstSeen.clear()
@@ -838,7 +838,7 @@ object FridaInjector {
         runCatching {
             val alive = gamePid()
             parts.add("pidof=$alive" + if (alive == pid) "（同 pid）" else "（≠$pid）")
-            val state = RootShell.exec("awk '/^State:/{print \$2}' /proc/$pid/status", 3_000L).out.trim()
+            val state = RootShell.exec("awk '/^State:/{print \$2}' /proc/$pid/status", 3_000L, direct = true).out.trim()
             parts.add("state=${state.ifBlank { "已退出" }}")
             val abi = RootShell.exec("dumpsys package ${GameProcess.pkg()} | grep -m1 primaryCpuAbi", 8_000L)
                 .out.substringAfter("primaryCpuAbi=", "").trim()
@@ -894,7 +894,7 @@ object FridaInjector {
             val dt = SystemClock.elapsedRealtime() - t0
             // ★2026-11-12（用户："优先用状态判定，而不是延迟"）：等**可执行段**（`r-xp`）而不是文件头段（`r--p`）——
             //   `r--p` 出现时 linker 还在重定位，此时注入会把游戏带走（实测 0s 注入后 1s 崩）。
-            val r = RootShell.exec("grep -m1 'r-xp.*$KEY_SO' /proc/$pid/maps", 8_000L)
+            val r = RootShell.exec("grep -m1 'r-xp.*$KEY_SO' /proc/$pid/maps", 8_000L, direct = true)
             if (r.out.contains(KEY_SO)) {
                 // ★2026-11-13（用户："现在为什么这么容易闪退"）：`r-xp` 只代表**代码段映射完**，
                 //   linker 重定位 / `il2cpp_init` 未必完成 —— 冷启动 0s 就注入正是之前把游戏带崩的场景。
@@ -902,7 +902,7 @@ object FridaInjector {
                 //   最多等 6s；等不到也放行（个别包 metadata 打包在 so 里/名字不同，不能因此卡死）。
                 val md0 = SystemClock.elapsedRealtime()
                 while (SystemClock.elapsedRealtime() - md0 < 6_000L) {
-                    val md = RootShell.exec("grep -m1 'global-metadata.dat' /proc/$pid/maps", 3_000L)
+                    val md = RootShell.exec("grep -m1 'global-metadata.dat' /proc/$pid/maps", 3_000L, direct = true)
                     if (md.out.contains("global-metadata.dat")) {
                         AppState.addLog(
                             "…$KEY_SO 已映射 + global-metadata 已加载" +
@@ -920,7 +920,7 @@ object FridaInjector {
             }
             // 兜底：so 已映射、却一直等不到 `r-xp`（个别 ROM 段标志不同）⇒ 5s 后按已加载处理，不卡死
             if (mappedAt == 0L && dt > 1_000L) {
-                val any = RootShell.exec("grep -m1 $KEY_SO /proc/$pid/maps", 3_000L)
+                val any = RootShell.exec("grep -m1 $KEY_SO /proc/$pid/maps", 3_000L, direct = true)
                 if (any.out.contains(KEY_SO)) mappedAt = SystemClock.elapsedRealtime()
             }
             if (mappedAt > 0L && SystemClock.elapsedRealtime() - mappedAt > 5_000L) {
@@ -931,7 +931,7 @@ object FridaInjector {
             //   （2026-10-21 uuz 实测：attach 写内存失败后进程卡 T 状态，maps 停在注入前，
             //    傻等映射要 120s 超时 —— 早发现早杀游戏重开）
             if (dt > 3_000) {
-                val st = RootShell.exec("awk '{print \$3}' /proc/$pid/stat", 3_000L)
+                val st = RootShell.exec("awk '{print \$3}' /proc/$pid/stat", 3_000L, direct = true)
                 val state = st.out.trim()
                 if (state.isEmpty()) return "进程提前退出（pid $pid 的 /proc 没了）"
                 if (state == "T" || state == "D" || state == "t" || state == "Z" || state == "X") {
@@ -1025,16 +1025,15 @@ object FridaInjector {
      */
     private suspend fun verifyMainPid(pid: Int, pkg: String): Boolean? {
         if (pid <= 0) return false
-        val r = RootShell.exec("cat /proc/$pid/cmdline", 4_000L)
-        val arg0 = r.out.substringBefore('\u0000').trim().substringAfterLast('/')
-        if (arg0.isEmpty()) {
-            // ★2026-11-13：cmdline 读不到 ≠ 健康。僵尸 / T 状态进程的 cmdline 就是空的，
-            //   旧逻辑乐观放行 ⇒ 对着它白等 15s 映射。补一次状态判定（只在读不到时才有这次开销）。
-            val stat = RootShell.exec("cat /proc/$pid/stat", 3_000L).out.trim()
-            val state = stat.substringAfterLast(')').trim().split(' ').firstOrNull().orEmpty()
-            return if (state.isEmpty() || state in setOf("Z", "T", "D", "t", "X")) false else null
-        }
-        return arg0 == pkg
+        // ★★2026-11-15（用户）：**只信 `pidof`，不再读 `/proc/<pid>/cmdline`**。
+        //   `pidof <包名>` 精确匹配进程名 ⇒ 只回主进程（子进程是 `包名:xxx`，匹配不上）。
+        //   实测：游戏刚启动那几秒整机卡顿（前台 dumpsys 读不到、网络 15s 超时），连**活进程**的
+        //   `/proc` 读也会超时，反过来把常驻 root shell 拖垮（日志「常驻 root shell 没回应」）。
+        //   读 cmdline 只是为了排除子进程，pidof 已经能排除，没必要再碰 /proc。
+        val cur = RootShell.exec("pidof $pkg", 2_000L)
+        if (cur.exit == -1) return null          // pidof 自己超时（系统卡）⇒ 不确定，别当死处理
+        val pids = Regex("\\d+").findAll(cur.out).map { it.value.toInt() }.toSet()
+        return pid in pids
     }
 
     /** 轻量版：只跑一次 `pidof`（不碰 frida-server）。给"等进程消失"这种高频判定用。 */
@@ -1096,7 +1095,7 @@ object FridaInjector {
 
             val pf = File(ctx.filesDir, "inject.pid")
             pidFile = pf
-            RootShell.exec(killInjectorCmd(pf), 8_000L)
+            RootShell.exec(killInjectorCmd(pf), 8_000L, direct = true)
 
             val gamePid = RootShell.exec("pidof ${GameProcess.pkg()}", 8_000L).out.trim()
             if (gamePid.isEmpty()) {

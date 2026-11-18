@@ -401,6 +401,7 @@ object MazeLoop {
         evSnapId = null                              // 事件效果快照（跨局必须清，见 [settleEventDiff]）
         relicChoiceTries.clear()
         partyScroll.clear()                     // 编队页"滚动找缺员"的每页状态（本局重来）
+        partyScrollNodeKey = null               // ★2026-11-15：换局 ⇒ 滑动方向/减速状态从头算
         partyTeams.clear()                      // 多分队：本进程已确认过的各队
         partyFillSaid.clear()                   // 多分队：编队策略日志去重
         partyCleaned.clear()                    // Boss 页"腾空继承队"标记
@@ -436,6 +437,7 @@ object MazeLoop {
         shopCoinBadKey = null; shopCoinBadAt = 0L
         shopRelicCtx = null
         SampleLog.reset()                        // ★本局随机信息采样：去重表清零（同一节点每局都可再记）
+        ShopSampleLog.reset()                    // ★商店采样去重表：每局清零，否则 seen 跨局单调增长（文件有轮转、内存 set 没有）
         // 刷开局产物（reroll）注入：开局前就已知 3/5 区 Boss 与每区最优路线，
         // 消除"开局读不到 3 区 Boss / 完整地图"的差异（PLAN §0.6 原定不碰，本次已实现）。
         val reroll = RerollState.result
@@ -570,8 +572,44 @@ object MazeLoop {
             // ★安全闸门（同 Navigator，2026-11-02 对齐）：**读到别的包** ⇒ 立刻停手；
             //   **读不到**只说明"这一刻没有焦点窗口"（进战斗/场景切换时窗口重建，实测 21:27:35）
             //   ⇒ 本轮不点、等下一轮，连挂 [FRONT_NULL_MAX] 轮才停手。
-            // ★force：主循环每轮必须"现查"，切走检测不能依赖 tap 里那个 2s 缓存
-            val frontPkg = Foreground.packageName(force = true)
+            // ★★2026-11-17（查清 ANR 根因后改）：这里原来每轮 `force = true` ——
+            //   主循环 100ms 一轮 ⇒ **每 100ms 一次 `su dumpsys input`**（每次 1~2 个 fork，
+            //   实测每秒 8~9 个）。`dumpsys` 要 system_server 序列化整个服务状态（几百 ms），
+            //   每秒十次 dump 直接把 system_server 拖到 ANR ⇒ lmkd 以
+            //   "device is not responding" 连环杀进程（实测内存 4.2GB 可用、助手 CPU 仅 2.5%
+            //   仍被杀，21:23 与 22:31 两次都如此）。
+            //   现在改走 **2s TTL 缓存**：`AutoForegroundService.watchLoop` 本身每 2s force 刷新
+            //   （切屏锁存 `noteFocus` 也是它写的），这里命中缓存即可。
+            //   ⇒ dumpsys 从 ~10 次/秒 降到 ~0.5 次/秒；切屏最坏延迟 2s，且此时游戏在后台、
+            //     点击本就无效，风险远小于把系统拖死。
+            // ★★2026-11-17：**前台判定改用 Unity `Application.isFocused`**（零 shell、微秒级）。
+            //   原来每轮 `dumpsys input` ⇒ 每秒十次 dump 把 system_server 拖到 ANR ⇒
+            //   lmkd 以 "device is not responding" 连环杀进程（实测内存 4.2GB 可用也照杀）。
+            //   语义也精确：切走=false；游戏卡死/加载/演出=true（**不是**用帧计数——帧不涨分不清
+            //   "卡死"和"切屏"，那个归帧看门狗管）。
+            //   · true  ⇒ 直接当"前台就是游戏"，**一次 dumpsys 都不发**；
+            //   · false ⇒ 用 dumpsys 复核一次（切屏很罕见，代价可忽略），以防 isFocused 失灵误停；
+            //   · null  ⇒ 读不到（agent 未就绪）⇒ 回退原来的 dumpsys 缓存。
+            val focusNow = SystemClock.elapsedRealtime()
+            val focused = gameForeground(focusNow)
+            val frontPkg = when (focused) {
+                true -> GameProcess.pkg()
+                false -> {
+                    val real = Foreground.packageName(force = true)
+                    if (real == GameProcess.pkg()) {
+                        if (!focusMismatchSaid) {
+                            focusMismatchSaid = true
+                            AppState.addLog(
+                                "… isFocused 报失焦但前台仍是游戏（不一致）→ 以 dumpsys 为准",
+                            )
+                        }
+                        GameProcess.pkg()
+                    } else {
+                        real ?: "@失焦"
+                    }
+                }
+                null -> Foreground.packageName()
+            }
             if (frontPkg != null && frontPkg != GameProcess.pkg()) {
                 // ★2026-11-12（用户："不用限制时间，规定运行到某个阶段才开始算"）：
                 //   切屏判定只在**本局进过迷宫之后**才生效（见下面的 `switchArmed` 置位）。
@@ -853,6 +891,7 @@ object MazeLoop {
                         return
                     }
                     idle = 0
+                    // ★2026-11-17（用户：效率优先）：保持 100ms —— 实测降到 200ms 会拖慢结算页发现。
                     delay(POLL_MS)
                     continue
                 }
@@ -1123,10 +1162,7 @@ object MazeLoop {
     /** 帧计数轮询间隔（`gameTick` 是 T_FAST 导出，1s 一次足够；别每 100ms 去问） */
     private const val GAME_FRAME_POLL_MS = 1_000L
 
-    /** 角色一览一次滚**几行**（用户 2026-10-16 实测：2 行会把某些角色卡**滚出可见区**、反而要多滚回来）。
-     *  ★**1.7 → 1.5**（同日二次实测）：按 1.7 求距离时实际会**滑过头**（惯性多走一点），
-     *   收敛到 1.5 行后落点更接近"正好 1.7 行"。与 PC `PARTY_SCROLL_ROWS` 同一个数（两侧同步改）。 */
-    private const val SCROLL_ROWS = 1.5
+    // ★2026-11-16：滚几行固定 1.5（设置项已移除），按本节点"方向反复"次数逐次 -0.1。
 
     /** 页面停了这么久、但游戏帧还在涨 ⇒ 打一次现场取证（**不重启**：只说明 handler 没动作） */
     private const val STALL_DIAG_MS = 60_000L
@@ -1243,6 +1279,13 @@ object MazeLoop {
             stt == 5 || stt == 6 -> "前往节点${jStr(st, "blockId")}"
             else -> "地图"
         }
+        // ★★2026-11-18（用户报的 bug）：**等待接手期间必须一直显示醒目提示** —— 否则这里每轮
+        //   都把红提示覆盖成"地图 / 编队 / 战斗失败"，用户根本看不到"已经停了、要你处理"。
+        //   （实测 10:29 连续失败 3 次转人工后，悬浮窗上仍显示"战斗失败"，没有任何红色提示。）
+        if (manualTeamNodes.isNotEmpty()) {
+            OverlayStatus.setState("等待接手：请组队并开战", attention = true)
+            return
+        }
         if (candidate !in HIDDEN_OVERLAY_STATES) OverlayStatus.setState(candidate)
     }
 
@@ -1333,42 +1376,32 @@ object MazeLoop {
      *
      * 新设计（用户 2026-10-23："win/lose 是可以认出来的，认出来之前战斗中可以什么都不做"）：
      *   ① 战斗中每 [BATTLE_PAGE_POLL_MS] 只调一次 agent 的 `resPageKind`（几毫秒，**不做任何扫描**）；
-     *   ② 认出来（win/fail/ex）后先静置 [RESULT_SETTLE_MS]，再按 [BATTLE_READY_GAP_MS] 找按钮。
+     *   ② 认出来（win/fail/ex）后先静置 [RESULT_SETTLE_MS]（3000ms），再每 [RESULT_LIGHT_GAP_MS]（200ms）
+     *      轻读取探测「下一步/重新挑战」，覆盖按钮出现（约 3.5~4.5s 后才 active）。
+     *
+     * ★2026-11-17 用户：静置**恢复并改为 3000ms**、探测间隔 400→200ms。理由：按钮 3.5s 才出现，
+     *   先安静等 3s 避开页面切换的瞬间（状态切换 + 重读取叠加会让游戏崩），再 200ms 一探覆盖到 ~5s。
+     *   轻读取每拍只是一次 `battleResultBtn`（缓存校验，~100ms、零遍历）。
      */
     /** ★"只认页"的探测间隔：一次只要几毫秒 ⇒ 可以勤问；结算页出现后 ≤ 这个间隔就能发现 */
     private const val BATTLE_PAGE_POLL_MS = 300L
 
-    /**
-     * ★认出 win/lose（或拿到兜底信号）后**静置**这么久才开始找按钮（2026-10-23）。
-     *
-     * 结算页 prefab 刚 Instantiate 的那几秒里，按钮还在播动画、`active` 还没置真 ⇒ 此刻去找必然
-     * 全失败；更糟的是它正好撞上"战斗 view 销毁"的窗口 —— 10-22 22:58 那次卡死就是在这个时刻
-     * 连续重扫，把游戏主线程压到 0 帧的。
-     *
-     * ★实测（2026-10-23 六场）：`_resPageKind` 在**对话框实例刚 Instantiate** 时就能认出
-     *   （`GetComponentInChildren(includeInactive=true)`），而按钮真正 active 还要 **4~4.5s**。
-     *   静置 1s 时那次探测**全落空**（每次白烧 ~775ms）⇒ 先提到 3s（命中要 2 次轻量轮询），
-     *   再按用户口径提到 **3.5s**（让第一次轻量轮询就尽量落在按钮 active 之后）。
-     *   动画时长是 prefab 自带的、与设备性能无关，所以这个值是稳定的（用户："1s 确实不会出现"）。
-     */
-    // ★2026-11-07 用户：3500 → 2000 → **200ms**。
-    //   按钮什么时候落位并不稳定，靠"等"不如靠"多试"：留 200ms 只是给页面一个起始帧，
-    //   真正的容错交给「下一步」的 retries（见 handleBattleResult 的 tapAndCheck）。
-    private const val RESULT_SETTLE_MS = 200L
+    /** ★认出结算页后先静置这么久再开始找按钮（2026-11-17 用户：3000ms）。
+     *  按钮实测 3.5~4.5s 才 active，先安静等 3s 避开页面切换的瞬间（状态切换+重读取叠加会崩）。 */
+    private const val RESULT_SETTLE_MS = 3000L
 
     /**
-     * ★静置之后"**轻量轮询**"的次数上限（2026-10-23 用户："3s 等待 + 6 次，间隔 400ms"）。
+     * ★静置之后"**轻量轮询**"的次数上限（2026-11-17 用户：间隔 200ms）。
      *
      * 每次只调一次 `battleResultBtn`（缓存校验 / 学习，实测 ~100ms）—— **不重试、不读字段、不扫树**。
-     * `(400 + 100)ms × 6 ≈ 3s` ⇒ 3s 静置 + 这段正好覆盖到 ~6s（按钮实测在"认出"后
-     * 3.5~4.5s 才 active）。
+     * 3000ms 静置 + (200ms 间隔 × 10 拍) ⇒ 覆盖到 ~5s（按钮实测 3.5~4.5s active）。
      * **每次命中就清零**（胜利结算有两页，第二页的「下一步」同样享受轻量轮询）；
      * 用完仍未命中 ⇒ 升级到**全套**探测（[BATTLE_READY_GAP_MS] 1.2s 一次）继续找，绝不停。
      */
-    private const val RESULT_PROBE_FAST_MAX = 6
+    private const val RESULT_PROBE_FAST_MAX = 10
 
-    /** ★轻量轮询的间隔（用户 2026-10-23 指定 400ms；配合"单次 ~100ms"正好 500ms 一轮） */
-    private const val RESULT_LIGHT_GAP_MS = 400L
+    /** ★轻量轮询的间隔（2026-11-17 用户：200ms） */
+    private const val RESULT_LIGHT_GAP_MS = 200L
 
     /**
      * ★结算页的**顶框类名**（2026-10-23）：`resPageKind` 认不出来时（EX / 结构变化）的兜底信号。
@@ -1658,9 +1691,17 @@ object MazeLoop {
         var lastVis: List<Int>? = null                 // 上次滚完"屏上图标集合"（用来判滚没滚动）
         var still = 0                                  // 连续几次滚完屏上没变化
         val noScroll = HashSet<Int>()                  // 滚多少次都翻不出来的缺员（不再白滚）
+        // ★2026-11-15（用户）：同一关里来回滑（相邻两次方向相反）⇒ 每 2 次把本节点滑动比例调小 0.1，
+        //   减少"滚过头 → 反向滚 → 又过头"的死循环。离开本节点即失效（见 [partyScrollTag]）。
+        var lastDir: String? = null                    // 上次实际滚动的方向（up/down）
+        var reverseCount = 0                           // "相邻两次方向相反"的累计次数
+        var slowSteps = 0                              // 已减速次数（每 2 次反向 +1，每次 -0.1 行）
     }
 
     private val partyScroll = HashMap<String, PartyScroll>()
+
+    /** ★2026-11-15（用户）：当前编队页所属**节点**（area/blockId）—— 换节点（离开这一关）时清空 [partyScroll] */
+    private var partyScrollNodeKey: String? = null
 
     /** PC `_PARTY_TEAMS`(2509)：本节点"**本进程已确认过的各队**"（(area/blockId) → 各队 unitId）——
      *  既用于"这一队还要不要编"的判据（`already`），也是 `partyDic` 读不到时的缩池兜底。 */
@@ -1709,10 +1750,7 @@ object MazeLoop {
     private const val EXEQ_STALL_MAX = 3
     /** ★tapAndCheck 里"这一刻不该点"的连续上限（超了就返回 false，让外层换策略） */
     private const val EXEQ_SKIP_MAX = 6
-    private const val EXEQ_TAP_SETTLE_MS = 300L      // ★点完等一下再看"签名变了没"（等切页动画走一走）
-    //   ★★2026-11-08 用户定的口径："对于容易点错出问题的页面，可以把 settleMs 稍稍调大" ——
-    //     EX 三连页就是最容易点错的一页（②页的「确认」和①页的按钮挨着，点偏就点到别的），
-    //     所以这里 200ms → 300ms。探针制下"切走立刻停"，所以多等这 100ms 只在**没切走**时才付。
+    //   ★2026-11-17：settleMs 已统一为 probeMs×2（见 TapCheck.run），不再保留 EXEQ 专用常量。
     private const val EXEQ_BTN_MOVE_PX = 12         // ★同一个按钮两次读出的坐标差多少就算"在动"（页面在切）
     private const val EXEQ_STILL_MS = 140L        // ★双读之间的间隔（要跨帧，否则两次读必然一样）
     // ★★"点击后探测"的通用参数（2026-11-08）：点完不是"等固定时长再读一次"，而是**连探几次**。
@@ -1915,12 +1953,24 @@ object MazeLoop {
     /** 本场是否已"找到并点过"结算按钮（找到后就不再打"近失"取证，免得页面翻走后误报） */
     private var battleBtnSaid = false
 
+    /** 固定路径最近一次的失败原因（去重，避免每拍刷屏） */
+    private var lastPathErr = ""
+
     /** 战后选人页：本页算好的决策上下文（own 数据），按卡片签名缓存，避免每轮重打慢 RPC */
     private var lastCtxSig: String? = null
     private var lastCtx: CharaPick.LabSelCtx? = null
 
     /** ★app 上下文（[LabBtnStore] 按钮路径落盘/回喂用；[run] 开头赋值） */
     private var appCtx: android.content.Context? = null
+
+    /**
+     * 编队「一行宽度（px）」整局缓存（2026-11-15）。
+     * 第一次滚动反推出合理行距后存这里，之后所有滚动复用，不再每拍现取 ——
+     * 否则向上滚时可见卡片分布变化，会把"隔行差(2×行距)"当"相邻差(1×行距)"，
+     * 反推出约 2 倍行距（小鹿 1280×720：向下 rh≈144、向上 rh≈257 ⇒ 一次想滑 385px 撞边距、还滚过头）。
+     * 每次 [run] 新建实例 ⇒ 自然清零，换分辨率/布局后下一局会重新反推。
+     */
+    private var partyRowHCache = 0.0
 
     /**
      * ★2026-10-27「点击学延迟」的探针（用户方案：一次点早了，下次同样的按钮就稍微晚点）。
@@ -1996,6 +2046,41 @@ object MazeLoop {
     fun statusFresh(): Boolean = SystemClock.elapsedRealtime() - lastStatusAt < STATUS_FRESH_MS
 
     private const val STATUS_FRESH_MS = 2_000L
+
+    // ── ★2026-11-17：Unity `Application.isFocused`（零 shell 前台判定）────────────────
+    /** 上次查询 isFocused 的时刻 / 结果（[FOCUS_TTL_MS] 缓存） */
+    private var focusAt = 0L
+    private var focusVal: Boolean? = null
+    /** isFocused 与 dumpsys 不一致时只告警一次 */
+    private var focusMismatchSaid = false
+
+    /** 连续读到 null 的次数 / 放弃 isFocused 的截止时刻（读不到就别反复问） */
+    private var focusNullCount = 0
+    private var focusGiveUpUntil = 0L
+
+    /** 缓存有效期：0.5s 刷新一次（切屏检测 0.5s 足够，且比每轮 100ms 省 80% 的 RPC） */
+    private const val FOCUS_TTL_MS = 500L
+
+    /** 游戏窗口是否获得焦点（`UnityEngine.Application.isFocused`，微秒级，零 shell）。 */
+    private suspend fun gameForeground(now: Long): Boolean? {
+        if (now < focusGiveUpUntil) return null
+        if (now - focusAt >= FOCUS_TTL_MS) {
+            focusAt = now
+            val v = AgentApi.gameFocused()
+            focusVal = v
+            if (v == null) {
+                // ★连续读不到（老 agent 没这个导出 / 类找不到）⇒ 60s 内别再问，直接用 dumpsys
+                if (++focusNullCount >= 10) {
+                    focusNullCount = 0
+                    focusGiveUpUntil = now + 60_000L
+                    AppState.addLog("… isFocused 连续 10 次读不到 → 60s 内改用 dumpsys 判前台")
+                }
+            } else {
+                focusNullCount = 0
+            }
+        }
+        return focusVal
+    }
 
     // ── 游戏帧计数看门狗状态（[pollGameFrame]；每次 run 开始时 [resetFrameWatch]）─────────────
     /** 上次轮询 `gameTick` 的时刻 */
@@ -2147,7 +2232,7 @@ object MazeLoop {
             if (pickBoxBtn(b, keys) == null) { delay(120); continue }
             taps++
             AppState.addLog("选角后：收到角色 → 点掉（第 $taps 个框，$top）")
-            tapBoxButton(input, keys, "收到角色", skipHits = 2)
+            tapBoxButton(input, keys, "收到角色")
             delay(150)
         }
         AppState.addLog("选角后：收到角色处理结束（$taps 个框）")
@@ -3511,7 +3596,6 @@ object MazeLoop {
         input: InputBackend,
         keys: List<String>,
         what: String,
-        skipHits: Int = 1,
     ): Boolean {
         val base = dlgBoxNow() ?: return false
         val basePtr = base.optString("ptr")
@@ -3522,7 +3606,6 @@ object MazeLoop {
         return tapAndCheck(
             input, 0, 0, "商店：$what",
             from = setOf(basePtr),
-            settleMs = 120L,
             retries = SHOP_ANIM_TAP_MAX,
             readTop = {
                 val b = dlgBoxNow()
@@ -3541,8 +3624,7 @@ object MazeLoop {
             //   接受偶尔多点一下（比等 1.2s 值得）。间隔 = settle 120ms + 6×60ms 探测 ≈ 500ms，
             //   最多 [SHOP_ANIM_TAP_MAX] 次；框一消失立刻走，不会真的点满。
             probe = 6,
-            probeMs = SHOP_ANIM_POLL_MS,
-            skipFirstHits = skipHits,
+            // ★probeMs 跟随设置挡位；skipFirstHits 走默认 1（2026-11-17 用户统一）
             xyAt = xyAt@{
                 val b = dlgBoxNow() ?: return@xyAt null
                 if (b.optString("ptr") != basePtr) return@xyAt null   // 已经换框/关掉 ⇒ 不点
@@ -3605,7 +3687,7 @@ object MazeLoop {
             if (!isReceipt && !isRole) { delay(SHOP_ANIM_POLL_MS); continue }
             val step = if (isReceipt) "购买完毕" else "角色加入"
             lastPtr = ptr
-            if (tapBoxButton(input, keys, step, skipHits = 2)) {
+            if (tapBoxButton(input, keys, step)) {
                 if (isReceipt) sawReceipt = true else sawRole = true
             }
         }
@@ -3682,8 +3764,8 @@ object MazeLoop {
         }
         AppState.addLog("商店：$what → 确认框出现（${b.optString("top")}）")
         val confirmPtr = b.optString("ptr")
-        // ★购买确认框也放宽一拍（用户 2026-11-11）：之前 skip=1 时每件都会 #1 点空、#2 才中
-        if (!tapBoxButton(input, confirmKeys, "$what 确认", skipHits = 2)) {
+        // ★2026-11-17（用户）：统一走默认 skipFirstHits=1（1×probeMs=150ms ≥ 原先 2×60=120ms）
+        if (!tapBoxButton(input, confirmKeys, "$what 确认")) {
             AppState.addLog("[!] 商店：$what 确认框点了 ${SHOP_ANIM_TAP_MAX} 次仍没开始消失")
             return false
         }
@@ -4180,12 +4262,30 @@ object MazeLoop {
                 }
                 left = tapAndCheck(
                     input, pb.optInt("x"), pb.optInt("y"), "$kind：选 $cid（树·选择）",
+                    // ★2026-11-17（用户）：点前现取坐标——和首次同一读法（findSelButtons → 按 dx 最近），
+                    //   按钮从屏外滑入时每拍坐标会变，取不到/屏外则这一拍不点。
+                    xyAt = {
+                        val arr = findSelButtons(12)
+                        var best: JSONObject? = null
+                        if (arr != null) {
+                            for (i in 0 until arr.length()) {
+                                val o = arr.opt(i) as? JSONObject ?: continue
+                                val xx = (o.opt("x") as? Number)?.toInt() ?: continue
+                                val yy = (o.opt("y") as? Number)?.toInt() ?: continue
+                                if (xx !in 0 until scrW || yy !in 0 until scrH) continue
+                                if (best == null || kotlin.math.abs(xx - dx) < kotlin.math.abs(best!!.optInt("x") - dx)) {
+                                    best = o
+                                }
+                            }
+                        }
+                        best?.let { it.optInt("x") to it.optInt("y") }
+                    },
                     from = setOf("DialogLabyrinthSelection"),
                     expect = selExpect(kind),
                     // ★不猜设备速度（见下面 xyAt 分支的说明）
                     // ★probe=2：实测三选一页没有退出 tween 可读（tw 全程 0/0），真正切换在 ~1s 后
                     //   ⇒ 多探只是把"判没点到"往后推，没有收益；探 2 次就重试，多点无害。
-                    retries = 8, settleMs = 200L, probe = 2, probeMs = 150L,
+                    retries = 8, probe = 2,
                     probeState = { selProbe("DialogLabyrinthSelection") },
                 )
             } else {
@@ -4204,7 +4304,7 @@ object MazeLoop {
                     //   ★probe=2（+350/500ms）：实测三选一页**没有**退出 tween（tw 全程 0/0），
                     //     真正切换在 ~1s 后（选卡动画）⇒ 多探几次只是把"判没点到"推迟 1s，没有收益
                     //     （"时间太长的 probe 就失去即时性价值"）⇒ 探 2 次就重试，多点无害。
-                    retries = 8, settleMs = 200L, probe = 2, probeMs = 150L,
+                    retries = 8, probe = 2,
                     // ★每一下**现取坐标**（按钮还在滑入 ⇒ 旧坐标会点空；屏外则这一下不点）
                     // ★★兜底（2026-11-08 事故）：重读失败就退回**决策时那个坐标**（外层刚判过它在屏内）。
                     //   宁可点一下"稍微旧一点的坐标"（这页多点同一张卡没关系），也不要
@@ -4845,7 +4945,7 @@ object MazeLoop {
             unknownTop = "!read",          // 读不到 ⇒ 当成"还没离开"（绝不误判成生效）
             // 不传 expect：离开遗物框就算完成（后面是确认框还是地图，交给状态机）
             // ★不猜设备速度（同选人页）：密集点 + 点完立刻探，页面一变就停
-            retries = 8, settleMs = 200L, probe = 2, probeMs = 150L,
+            retries = 8, probe = 2,
             xyAt = {
                 // ★每一下都重读**这张卡**的坐标（按钮在滑入 ⇒ 旧坐标会点空）；
                 //   重读失败就退回本轮算好的坐标（外层刚判过它在屏内）
@@ -4931,6 +5031,13 @@ object MazeLoop {
     private suspend fun partyEditRound(input: InputBackend, st: JSONObject, tag: String): Int {
         // ★策略=等待接手：本节点失败 3 次后由用户自己组队 → 这里什么都不做（也不点「决定」）
         val nk0 = nodeKey(st)
+        // ★2026-11-15（用户）：**离开这一关（area/blockId 变）⇒ 滑动方向/减速状态清零**，
+        //   新节点从头算，不会把上一节点"来回滑 → 减速"带到下一关。
+        //   注：tag 里含状态/顶框，页面内弹窗也会让它变；这里用节点钥匙，只在真的换节点时清。
+        if (nk0 != partyScrollNodeKey) {
+            partyScrollNodeKey = nk0
+            partyScroll.clear()
+        }
         if (nk0 in manualTeamNodes) {
             if (manualSaid.add(nk0)) {
                 AppState.addLog("[手动] 节点 ${jStr(st, "blockId")}：等待你组队/开战（本节点自动组队已关闭）")
@@ -5106,6 +5213,11 @@ object MazeLoop {
                     RerollSettings.FAIL_WAIT -> {
                         AppState.addLog("[!] 编组页连续 $n 轮算不出目标 → 等待接手（本节点转人工）")
                         manualTeamNodes.add(nk)
+                        // ★2026-11-18（用户报的 bug）：这里原来只加节点、**没设悬浮提示** ⇒
+                        //   而主循环的「等待接手」全局闸门（manualTeamNodes 非空就 continue）会让
+                        //   `partyEditRound` 开头那段带红提示的代码**永远执行不到** ⇒ 用户只看到
+                        //   "不动了"、没有任何提示。所以必须在**添加节点的这一刻**就把红提示打上。
+                        OverlayStatus.setState("等待接手：算不出队伍，请手动组队/开战", attention = true)
                         return PARTY_STEP_DONE
                     }
                     else -> {
@@ -5284,6 +5396,26 @@ object MazeLoop {
                     AppState.addLog(
                         "编队：撤人 ${todo.size} 个（坐标一次算好，按从左往右依次点，中途不读）",
                     )
+                    // ★2026-11-17 诊断（用户要求）：编队前把快照里的坐标来源打进日志，
+                    //   定位"点歪 / 点完顶框突变 / 误开战"——icons=下排槽位，scroll=角色一览，btn=按钮坐标。
+                    runCatching {
+                        fun dumpArr(a: org.json.JSONArray?): String {
+                            if (a == null) return "-"
+                            val sb = StringBuilder()
+                            for (k in 0 until a.length()) {
+                                val o = a.opt(k) as? JSONObject ?: continue
+                                sb.append("${o.optInt("unitId")}@${o.opt("x")},${o.opt("y")}")
+                                if (o.has("vis")) sb.append("/v${o.opt("vis")}")
+                                sb.append(' ')
+                            }
+                            return sb.toString().trim()
+                        }
+                        AppState.addLog(
+                            "  [dbg] scr=${scrW}x${scrH}｜icons=[${dumpArr(snap.optJSONArray("icons"))}]" +
+                                "｜scroll=[${dumpArr(snap.optJSONArray("scrollIcons"))}]" +
+                                "｜btn=${snap.optJSONObject("buttons")?.toString() ?: "null"}",
+                        )
+                    }
                     for ((op, c) in todo) {
                         tap(input, c.first, c.second, "编队：remove ${op.unit}")
                         // ★2026-11-07：不再死等 350ms ⇒ **等这个人真的出队**就立刻点下一个。
@@ -5436,8 +5568,21 @@ object MazeLoop {
                 }
                 off.isNotEmpty() -> {
                     val dir = if (off.any { it.dir == "down" }) "down" else "up"
-                    if (scrollPartyList(input, pt, dir)) {
+                    if (scrollPartyList(input, pt, dir, ps.slowSteps)) {
                         ps.count++
+                        // ★2026-11-15（用户）：同一关来回滑（相邻两次方向相反）⇒ **每 2 次把滑动比例调小 0.1**，
+                        //   让来回摆动的幅度逐次收敛，别在两端反复弹。离开本节点时随 [partyScroll] 一起消失。
+                        if (ps.lastDir != null && ps.lastDir != dir) {
+                            ps.reverseCount++
+                            if (ps.reverseCount % 2 == 0) {
+                                ps.slowSteps++
+                                AppState.addLog(
+                                    "编队：本节点来回滑动 ${ps.reverseCount} 次（方向反复）→ 滑动比例 -0.1" +
+                                        "（累计 -${"%.1f".format(0.1f * ps.slowSteps)} 行，本节点生效）",
+                                )
+                            }
+                        }
+                        ps.lastDir = dir
                         if (ps.count <= 2 || ps.count % 10 == 0) {
                             AppState.addLog(
                                 "编队：滚动角色一览找缺员（第 ${ps.count} 次，方向=${if (dir == "down") "下" else "上"}，" +
@@ -5676,14 +5821,16 @@ object MazeLoop {
                         //     所以宁可多探也别多点。
                         tapAndCheck(
                             input, dec.optInt("x"), dec.optInt("y"), "战斗开始",
+                            // ★不重读坐标（2026-11-17 用户）：生效判据是**状态**（from 带 "@battle"、
+                            //   expect = @battle），进战斗即算成功。若真点进去了却还在重试，重读
+                            //   ButtonDecide 会读到战斗结算页的「继续/Next」——那说明这一下早成功了，
+                            //   重读反而会误点。所以这里坚持用首次快照坐标 + 多探，绝不重读。
                             // ★★from 里带 "@battle"：**进战斗了也算"离开"** ——
                             //   进战斗时编组页对话框可能还在（labTop 不变）⇒ 只看窗口名判不出生效
                             //   ⇒ 会连点（实测 10:39:55 连点 6 下，5 下是点在战斗视图里，纯浪费）。
                             from = setOf("DialogCommonPartyEdit", "@battle"),
-                            settleMs = 200L,
                             retries = 6,
                             probe = PROBE_N,
-                            probeMs = PROBE_MS,
                             // 阶段2 等"进入战斗"（无对话框，用 inBattle 判）
                             expect = setOf("@battle"),
                             // ★★直调（2026-11-18）：编组页「战斗开始」= `DialogCommonPartyEdit+0x110`
@@ -5837,11 +5984,14 @@ object MazeLoop {
             //   · ★读回来的签名必须与外层的轻量签名**一致**（不一致 ⇒ 页面正在切 ⇒ 这一轮不点）。
             //   · ★★方案 B：判据是**"到达目标页了没"**（不是"签名变了没"）：
             //     没到目标 ⇒ 这次没生效 ⇒ **重试同一个动作**（同一按钮实例），不重新决策点别的。
-            var cachedAct: ExeqAct? = null          // ★本轮的动作缓存（读按钮只做一次）
+            // ★★2026-11-16（用户）：**每次点击前都重读坐标**，不再复用本轮上一次的坐标。
+            //   实测（22:49 那次）：EX 页刚打开、入场动画未结束时读到的按钮坐标是过渡态的
+            //   （「自动装备」读到 y=760，正常 y≈934）⇒ 点在装备格上打开了「选择装备」页；
+            //   而重试又原样点了同一个错坐标，把一次误触放大成卡死 30 秒。
+            //   动画中的点击通常无效 —— 只要**下一次换新坐标**就好，所以每次 xyAt 都重新读。
             val ok = tapAndCheck(
                 input, 0, 0, rule.what,
                 from = setOf(sigNow),
-                settleMs = EXEQ_TAP_SETTLE_MS,
                 retries = EXEQ_TAP_TRIES,
                 readTop = { exeqSigNow() },
                 unknownTop = EXEQ_UNKNOWN,
@@ -5851,15 +6001,16 @@ object MazeLoop {
                 //   探到"变了"就停；探完还没变才判"真没生效"（那时按钮已静止，再点才点得准）。
                 probe = PROBE_N,
                 probeMs = PROBE_MS,
-                // ★2026-11-12（用户实测：点「全部」行后面的选择框几乎每次都点早、要重复一次）：
-                //   刚进 setting 页时这一行还在入场动画里 ⇒ **首点前先只读不点跳 2 拍**
-                //   （2×60ms，不做长固定延迟），下一拍 xyAt 重新取落位后的坐标再点。
-                skipFirstHits = if (rule.btnKey == "prio0") 2 else 0,
+                // ★2026-11-17（用户）：统一走默认 skipFirstHits=1（1×probeMs=150ms，已覆盖原先
+                //   prio0 的 2×60=120ms 需求）；不再按 btnKey 单独设。
+                // ★★改为直调（2026-11-18）：pressFn 顶替 xyAt —— 只换触发方式，
+                //   重试 / 探针节奏 / 落点判据全部复用，且不再受叠层与坐标漂移影响。
                 pressFn = press@{
                     // ① 页面已经切走？⇒ 这一次不点（外层循环会重新读页面状态）
                     if (exeqSigNow() != sigNow) return@press null
-                    // ② 拿动作：★**本轮只读一次那一个按钮**（按需读，~10ms），之后复用同一个坐标
-                    val act = cachedAct ?: run {
+                    // ② 拿动作：★**每次都重读那一个按钮**（按需读，~10ms）；
+                    //   只有读回来的签名与这一拍一致时才点，避免点到别的目标。
+                    val act = run {
                         val tFull = android.os.SystemClock.elapsedRealtime()
                         // ★★**按需读**（2026-11-08）：只要**这一步要点的那个按钮** + 当前签名，
                         //   不再读"整包"（整包会把页里其它控件也过一遍：setting 的 4 行文字/复选框、
@@ -5892,7 +6043,6 @@ object MazeLoop {
                             sess.tapBtnId = bid
                             sess.tapN = 0
                         }
-                        cachedAct = a
                         a
                     }
                     if (sess.tapN >= EXEQ_TAP_MAX) {
@@ -6252,7 +6402,13 @@ object MazeLoop {
      *   · 每次滑动的"行距/想要几行/实际几行"都打进日志，方便对账。
      * @return true = 滑动手势已真下发（调用方据此计数）
      */
-    private suspend fun scrollPartyList(input: InputBackend, pt: JSONObject, dir: String): Boolean {
+    private suspend fun scrollPartyList(
+        input: InputBackend,
+        pt: JSONObject,
+        dir: String,
+        /** ★2026-11-15：本节点已累计的减速次数（每 2 次方向反复 +1，每次 -0.1 行） */
+        slowSteps: Int = 0,
+    ): Boolean {
         val icons = ArrayList<Pair<Int, Int>>()
         val a = pt.optJSONArray("scrollIcons")
         for (i in 0 until (a?.length() ?: 0)) {
@@ -6267,8 +6423,16 @@ object MazeLoop {
             return false
         }
         // ── 行高反推（PC `_party_row_height`(3185)）──
+        // ★2026-11-15：整局缓存「一行宽度」。第一次反推出合理值后存进 [partyRowHCache]，
+        //   之后所有滚动**复用**，不再每拍现取 —— 否则向上滚时可见卡片分布变了，
+        //   会把"隔行差(2×行距)"当成"相邻差(1×行距)"反推出约 2 倍行距
+        //   （小鹿 1280×720：向下 rh≈144、向上 rh≈257 ⇒ 一次想滑 385px 撞屏幕边距、还滚过头）。
+        //   取"所有相邻坐标差里的最小桶"（用户：取坐标差最小的数值，要求 >20），
+        //   而非"高频最小"——隔行差必为相邻差的整数倍、只会更大，最小桶恒等于真行距。
         var rh = 0.0
-        if (icons.size >= 2) {
+        if (partyRowHCache > 20.0) {
+            rh = partyRowHCache
+        } else if (icons.size >= 2) {
             val cols = HashMap<Int, MutableList<Int>>()
             for ((x, y) in icons) cols.getOrPut(Math.round(x / 60f) * 60) { mutableListOf() }.add(y)
             val gaps = ArrayList<Int>()
@@ -6276,7 +6440,7 @@ object MazeLoop {
                 val s = ys.toSortedSet().toList()
                 for (i in 0 until s.size - 1) {
                     val g = kotlin.math.abs(s[i + 1] - s[i])
-                    if (g in 40..400) gaps.add(g)                     // 合理行高区间，过滤瞬态/异常
+                    if (g in 20..400) gaps.add(g)                     // 合理行高区间（下限放宽到 20）
                 }
             }
             if (gaps.isNotEmpty()) {
@@ -6285,17 +6449,8 @@ object MazeLoop {
                     val k = Math.round(g / 8f) * 8                    // 量化到 8px 桶，容忍几像素噪声
                     buckets[k] = (buckets[k] ?: 0) + 1
                 }
-                // ★真行距 = **反复出现的间距里"最小"的那个**（2026-10-16 修）：
-                //   同一列相邻两张卡的行距必然是行距的整数倍（相邻是 1×；中间缺一行就是 2×），
-                //   所以"最小的高频间距"恒等于真行距 —— 偶尔缺一行也不会把行距算成 2×。
-                //   ⚠原来是"取众数 + >200px 就折半"的安全网：本游戏卡片大、行距实测 ≈217px，
-                //   217 > 200 ⇒ 被折半成 108 ⇒ 下面 `2*rh` 恰好只走**一行**
-                //   （用户 2026-10-16："说是一次两行，实际只有一行"）。
-                val maxCnt = buckets.values.maxOrNull() ?: 0
-                val cand = buckets.entries
-                    .filter { it.value >= maxOf(2, maxCnt / 3) }      // 高频：出现 ≥2 次且不少于最多的 1/3
-                    .minByOrNull { it.key }
-                rh = (cand?.key ?: buckets.maxByOrNull { it.value }?.key ?: 0).toDouble()
+                // ★取"最小桶"（不再要求高频）：相邻行的真实间距必然最小，隔行差是其整数倍、只会更大
+                rh = (buckets.keys.minOrNull() ?: 0).toDouble()
             }
         }
         val band = pt.optJSONObject("band")
@@ -6306,6 +6461,7 @@ object MazeLoop {
         }
         if (rh <= 0.0) rh = 140.0                                      // 极端兜底（正常走不到：至少该有图标）
         rh = minOf(400.0, maxOf(50.0, rh))                             // 只夹异常值（上限放到 400：本游戏行距 ≈217）
+        if (rh > 20.0) partyRowHCache = rh                            // ★缓存，整局复用
 
         // ── 拖动几何：全在裁剪带内（PC 3250~3259）──
         var lo: Double
@@ -6330,7 +6486,11 @@ object MazeLoop {
         //   从边缘起手，两行的距离才放得进带内；起点仍在带内（留 40px 边）⇒ 手指一定落在列表上。
         // ★终点**不再夹在裁剪带内**（用户 2026-10-16 实测：终点出带没有任何影响）——
         //   只保留"别滑出屏幕"这一道（留 60px），保证"两行"的距离**永远给足**。
-        val want = SCROLL_ROWS * rh                                    // ★一次滚几行（见 [SCROLL_ROWS]）
+        // ★2026-11-16（用户）：设置页的「编队滚动行数」已移除 —— 固定 1.5 行；
+        //   同一关来回滑时按 [slowSteps] 每次 -0.1（下限 1.0），自动收敛摆动幅度、别滚过头。
+        val baseRows = 1.5f
+        val rows = (baseRows - 0.1f * slowSteps).coerceAtLeast(1.0f).toDouble()
+        val want = rows * rh                                           // ★一次滚几行 × 行距
         val sy: Double
         val ey: Double
         if (dir == "down") {                                           // 手指由下往上滑 → 内容下移、露出列表后面
@@ -6348,7 +6508,7 @@ object MazeLoop {
         AppState.addLog(
             "编队：滚动（${if (dir == "down") "下" else "上"}）行距=${rh.toInt()}px ｜ " +
                 "swipe(${cx.toInt()},${sy.toInt()})→(${cx.toInt()},${ey.toInt()})" +
-                "＝${got.toInt()}px（约 ${"%.1f".format(got / rh)} 行；目标 ${"%.1f".format(SCROLL_ROWS)} 行＝${want.toInt()}px）" +
+                "＝${got.toInt()}px（约 ${"%.1f".format(got / rh)} 行；目标 ${"%.1f".format(rows)} 行＝${want.toInt()}px）" +
                 "，时长 ${ms}ms" +
                 if (got < want - 1.0) "　⚠ 屏幕边距拦住，没给够" else "",
         )
@@ -6532,7 +6692,8 @@ object MazeLoop {
             val plan = runCatching { AgentApi.labPartyPlan(timeoutMs = 700L) }.getOrNull()
             if (plan == null || plan.top != "DialogCommonPartyEdit") {
                 AppState.addLog(
-                    "编队[$label] 等 $unit ${if (want) "进队" else "出队"}：读不到编组页（第${n}轮）→ 放弃",
+                    "编队[$label] 等 $unit ${if (want) "进队" else "出队"}：读不到编组页（第${n}轮）→ 放弃" +
+                        "｜当前顶框=${plan?.top ?: "读取失败"}",   // ★2026-11-17 诊断：区分"读失败"还是"顶框被切走"
                 )
                 return false
             }
@@ -6617,7 +6778,10 @@ object MazeLoop {
      *   y=731"）—— 只认 `vis` 不为 false 的卡；都没有就返回 null（交给下一轮的滚动/重算）。
      */
     private fun findUnitCoord(pt: JSONObject, unit: Int, via: String? = null): Pair<Int, Int>? {
-        val order = if (via == "槽位") listOf("icons", "scrollIcons") else listOf("scrollIcons", "icons")
+        // ★2026-11-17（用户）：撤人（via="槽位"）**只认下排槽位数组 icons**，绝不退回角色一览
+        //   scrollIcons —— 点一览里同 id 的卡不会撤人，反而会误触别的元素（本次实测就退到一览坐标
+        //   (618,434) 点下去直接开战）。找不到就返回 null，交给下一轮/滚动分支。
+        val order = if (via == "槽位") listOf("icons") else listOf("scrollIcons", "icons")
         for (arrName in order) {
             val arr = pt.optJSONArray(arrName) ?: continue
             for (i in 0 until arr.length()) {
@@ -6629,7 +6793,11 @@ object MazeLoop {
                 }
                 val x = c.opt("x"); val y = c.opt("y")
                 if (x != null && x !== JSONObject.NULL && y != null && y !== JSONObject.NULL) {
-                    return c.optInt("x") to c.optInt("y")
+                    val xi = c.optInt("x")
+                    val yi = c.optInt("y")
+                    // ★屏内校验：挡掉"未布局 / 投影到屏幕外"的垃圾坐标（快：纯数值比较）
+                    if (xi !in 0 until scrW || yi !in 0 until scrH) continue
+                    return xi to yi
                 }
             }
         }
@@ -6807,9 +6975,41 @@ object MazeLoop {
             }
             tapAndCheck(
                 input, pFinal.first, pFinal.second, "预览·开打（进编组，questId=${jStr(st, "questId")}）",
+                // ★2026-11-17（用户）：**检测与点击必须紧邻**——每次点前现场复查（不再现算坐标）：
+                //   ① 顶框已不是预览页 ⇒ 这拍不点；
+                //   ② 编组页已在屏（哪怕顶框还残留预览页）⇒ 这拍不点 —— 那坐标在编组页里正好是
+                //      「战斗开始」（半路接管"点出发→预览页闪一下→直接落编组页"就会被骗，实测误开战）。
+                //   复审通过才用上面算好的 pFinal 点（坐标不动）。全程只有两次轻读，
+                //   不再有原来每拍 findText/findNode 的 ~1s 延迟（那正是"检测→点击隔 3 秒"的一半）。
+                xyAt = {
+                    val t = runCatching { AgentApi.labTop(800L) }.getOrNull() ?: ""
+                    if (!t.startsWith("DialogQuestDetail")) {
+                        if (tries.getOrPut("QD_PRE_TOP", { 0 }) == 0) {
+                            tries["QD_PRE_TOP"] = 1
+                            AppState.addLog("… 点前复查：顶框=「$t」不是预览页 → 这拍不点「$BATTLE_START_BTN」")
+                        }
+                        null
+                    } else {
+                        // ★2026-11-17：改用极轻的 labPartyPresent（零投影，微秒~几十 ms）。
+                        //   true=编组页在屏 / null=读不到 ⇒ **两种情况都保守不点**（误开战=用错队伍打 Boss，
+                        //   代价远大于多等一拍）；只有明确 false（确认不在）才点。
+                        val present = runCatching { AgentApi.labPartyPresent(1_000L) }.getOrNull()
+                        if (present != false) {
+                            if (tries.getOrPut("QD_PRE_PARTY", { 0 }) == 0) {
+                                tries["QD_PRE_PARTY"] = 1
+                                val why = if (present == true) "编组页已在屏" else "编组页状态读不到（保守）"
+                                AppState.addLog("… 点前复查：$why → 这拍不点「$BATTLE_START_BTN」")
+                            }
+                            null
+                        } else pFinal
+                    }
+                },
                 from = setOf("DialogQuestDetail"),
-                settleMs = 600L,
                 retries = 8,
+                // ★2026-11-17（用户）：进编组页的过场约 400~600ms，原来 probe 未传（只探 1 次、等 150ms）
+                //   ⇒ 页面还没切完就判"没生效"，害得点两下。改成探 4 次（覆盖 4×probeMs，默认约 600ms），
+                //   页面早切完就早停、不死等。
+                probe = 4,
                 // ★「挑战」的语义**唯一**：就是进编组页（用户 2026-11-07："点挑战进 @battle 是有问题的吧"）。
                 //   之前这里加过 "@battle"（当时误以为"Boss 点挑战会直接进战斗"）⇒ 害处有两个：
                 //     ① 阶段2 会把"没进编组页"也判成成功 ⇒ 掩盖问题；
@@ -6914,7 +7114,13 @@ object MazeLoop {
                         "[手动] 同一节点已失败 $n 次 → 回编队页后**不自动组队/不自动开战**，等你操作" +
                             "（节点 ${jStr(st, "blockId")}）",
                     )
-                    tap(input, fail.optInt("x"), fail.optInt("y"), "重新挑战（回编队页）")
+                    tapAndCheck(
+                        input, fail.optInt("x"), fail.optInt("y"), "重新挑战（回编队页）",
+                        xyAt = { battleResultXY(wantWin = false) },
+                        from = setOf("DialogBackKeyCapture", "DialogLabyrinthExResult", "DialogQuestFailed"),
+                        retries = 12,
+                        expect = setOf(PAGE_QUEST_DETAIL),
+                    )
                     delay(1_500)
                     return
                 }
@@ -6926,7 +7132,15 @@ object MazeLoop {
                 }
             }
         }
-        tap(input, fail.optInt("x"), fail.optInt("y"), "重新挑战")
+        tapAndCheck(
+            input, fail.optInt("x"), fail.optInt("y"), "重新挑战",
+            xyAt = { battleResultXY(wantWin = false) },
+            from = setOf("DialogBackKeyCapture", "DialogLabyrinthExResult", "DialogQuestFailed"),
+            // ★settle 用默认 1×probeMs；连点由 probe=8（≈1.2s 窗口）兜住
+            probe = 8,
+            retries = 12,
+            expect = setOf(PAGE_QUEST_DETAIL),
+        )
         delay(1_500)
     }
 
@@ -7346,78 +7560,150 @@ object MazeLoop {
     }
 
     /**
-     * ★★结算按钮"**学一次、之后只校验**"（2026-10-16，用户："比偏移更稳？试一下"）。
+     * ★2026-11-17（用户）：结算按钮**固定路径 + 每次现读**的坐标来源（供 tapAndCheck 的 xyAt 复用）。
      *
-     * 为什么比偏移稳：胜利页那颗「下一步」**不在结算对话框字段里**（`PartsQuestResultFormer` 里只有
-     * `CustomUILabel` 文字 ✗）——它在**结算 prefab 的骨架**下（`TopParts/BottomParts/ButtonAnimator/
-     * Button/NextButton`），而这些节点**同一 session 内指针稳定**（实测两场战斗 `TopParts@0x7b9f7f8f7280`
-     * 完全一样 ✓）。所以"记住指针 + 每次校验（节点名 + 屏内）"既**零遍历**（约 3 次调用 ✓）
-     * 又天然**跟着版本走**（结构变了 ⇒ 校验失败 ⇒ agent 自动重学 ✓，不像偏移会"悄悄读歪" ✗）。
+     * 为什么不用缓存坐标 / 不做屏幕探索：
+     *  · 缓存坐标会过时、反过来变成干扰项；屏幕探索（findTextIn 半屏扫）会捞到同名干扰节点。
+     *  · 这里走 agent 的 `battleResultBtn`：记住结算按钮的 prefab 节点**路径**（同 session 指针稳定），
+     *    每次现读坐标 + 配对**标签文字**校验，零遍历（约 3 次调用），结构变了自动重学。
+     *    ⇒ 路径固定、读取轻量、不依赖会过时的坐标值。
      *
-     * 胜负判据仍是**同一份证据**：按钮的配对标签文字（「下一步」= 胜、「挑战/Retry」= 负 ✓）。
-     * @return null = 不可用（调用方继续走字段读/树遍历）
+     * @param wantWin true=只要能推进胜利页的「下一步/次へ/Next」；false=只要能推进失败页的「挑战/Retry」
+     * @return 屏内坐标；null = 这一拍读不到/标签对不上（TapCheck 会当"这拍不点"重试，绝不误点）
      */
-    private suspend fun battleResultBtnPick(bot: Int): Pair<JSONObject?, JSONObject?>? {
-        val r = AgentApi.battleResultBtn(bot) ?: return null
-        if (r.opt("ok") != true) return null
-        val lb = r.optString("label").trim()
-        if (lb.isEmpty()) return null                          // 无标签 ⇒ 判不了胜负 ⇒ 不认（不猜 ✓）
-        val x = r.optInt("x")
-        val y = r.optInt("y")
+    /** 从 `{x,y}` 取屏内坐标（越界/缺字段 → null） */
+    private fun btnXYOf(o: JSONObject?): Pair<Int, Int>? {
+        val x = (o?.opt("x") as? Number)?.toInt() ?: return null
+        val y = (o?.opt("y") as? Number)?.toInt() ?: return null
         if (x !in 0 until scrW || y !in 0 until scrH) return null
-        val o = JSONObject().put("x", x).put("y", y).put("text", lb)
-        lastBtnSrc = "结果按钮缓存(${r.optString("hit")})@${r.optString("name")}"
-        if (!battleBtnSaid) {
-            AppState.addLog(
-                "结算按钮来源：结果按钮缓存 「$lb」@($x,$y) ｜ ${r.optString("name")}" +
-                    "（${r.optString("hit")}${if (r.opt("cands") != null) "，候选 ${r.opt("cands")}" else ""}）",
-            )
-        }
-        return if (FAIL_LABELS.any { it in lb }) null to o else o to null
+        return x to y
     }
 
     /**
-     * ★战斗结算按钮的**字段读**（2026-10-16 定案，取代"全树遍历"的快路径）。
+     * **固定路径现读**结算按钮坐标（点击前复查）。
      *
-     * 来源：agent `battleResultMem()` = 从 DialogArea 拿结算对话框组件（零扫描 ✓）→ 在它的字段
-     * （找不到再下探一层 `Parts*` 零件）里找 `CustomUIButton` → 算坐标 + 读**配对标签文字**。
-     * 实测证据：`DialogQuestFailed+0x118 = CustomUIButton(1619,989)` = 「重新挑战」✓（与树遍历一致 ✓）。
-     *
-     * **胜负判据与树遍历完全同源**：配对 `CustomUILabel` 的文字 —— 「下一步/次へ/Next」= 胜、
-     * 「挑战/Retry」= 负 ✓（所以字段读同样能分辨成功/失败，且是"文字+坐标同源"）。
-     * 同一标签有多个候选时取**最右**那颗（实测两页的可用按钮都在右下 ✓，如 (1619,989)/(1664,984)）。
-     *
-     * @return null = 字段读不可用（调用方回退树遍历）
+     * ★2026-11-18（用户）：**点击和检测必须用同一条链路** —— 否则「检测靠 A 命中、点前复查用 B
+     *   读不到」就会一次都不点、卡死在结算页。这里和探测一样调 [battleResultPick]（=固定路径），
+     *   四类结算页（普通/EX/BOSS 胜负）都实测命中，4~16ms、零扫描。
+     *   取不到就返回 null（这拍不点、TapCheck 继续探），**不用任何缓存坐标兜底**。
      */
-    private suspend fun battleResultMemPick(bot: Int): Pair<JSONObject?, JSONObject?>? {
-        val m = AgentApi.battleResultMem() ?: return null
-        if (m.opt("ok") != true) return null
-        val arr = m.optJSONArray("cands") ?: return null
-        var win: JSONObject? = null
-        var fail: JSONObject? = null
-        var srcTag = ""
-        for (i in 0 until arr.length()) {
-            val c = arr.optJSONObject(i) ?: continue
-            val y = c.optInt("y")
-            if (y < bot) continue                                   // 与树遍历同口径：只看底部带
-            val x = c.optInt("x")
-            val lb = c.optString("label").trim()
-            if (lb.isEmpty()) continue                              // ★标签读不到 ⇒ 不认这颗（不猜 ✓）
-            val o = JSONObject().put("x", x).put("y", y).put("text", lb)
-            val isFail = FAIL_LABELS.any { it in lb }
-            val isWin = !isFail && WIN_LABELS.any { it in lb }
-            if (isFail && (fail == null || x > fail!!.optInt("x"))) { fail = o; srcTag = c.optString("src") }
-            if (isWin && (win == null || x > win!!.optInt("x"))) { win = o; srcTag = c.optString("src") }
+    private suspend fun battleResultXY(wantWin: Boolean): Pair<Int, Int>? {
+        // ★★2026-11-18（用户）：**点击和检测必须用同一条链路** —— 否则「检测靠 A 命中、点前复查用 B
+        //   读不到」就会一次都不点、卡死在结算页（11:19 胜利页实测：检测走"缓存/学习"命中 NextButton，
+        //   而点前只用字段读 ⇒ 读不到 ⇒ 卡 90s+）。
+        val bot = (scrH * 0.85).toInt()
+        val (w, f) = battleResultPick(bot) ?: return null
+        return btnXYOf(if (wantWin) w else f)
+    }
+
+    /**
+     * ★★**结算按钮直调**（2026-11-18）：失败「重新挑战」/ 胜利「下一步」/ BOSS·EX 双态按钮。
+     *
+     * 直调与检测走**同一条固定层级路径**（[AgentApi.battleResultPress] 内部就是 `battleResultPath`
+     * 那套 `_resPathOne`），所以"检测到的"和"点下去的"必然是同一颗按钮，不需要坐标二次确认。
+     *
+     * ★收益：结算页要连点十几下，坐标点击每次 ~110ms；历史上 1.4s 连点 7 下把系统 input
+     *   拖到无响应、随后 lmkd 杀进程。直调是进程内调用，一次 10ms 级，且不受入场动画/遮挡影响。
+     *
+     * @return `true` = 已发出；`null` = 这一刻不该点（页面在切 / 与期望胜负不符）⇒ 跳过重试
+     */
+    private suspend fun battleResultPressOrTap(
+        input: InputBackend,
+        wantWin: Boolean,
+        what: String,
+    ): Boolean? {
+        val pr = runCatching { AgentApi.battleResultPress() }.getOrNull()
+        if (pr?.optBoolean("queued") == true) {
+            val kind = pr.optString("kind")
+            // 直调命中的页与调用方期望不符（要胜利页却读到失败页）⇒ 这一拍不点，交回外层重新认页
+            if (wantWin && kind == "fail") {
+                AppState.addLog("$what：直调读到失败页（kind=fail）→ 与期望不符，本轮不点")
+                return null
+            }
+            if (!wantWin && kind != "fail") {
+                AppState.addLog("$what：直调读到胜利页（kind=$kind）→ 与期望不符，本轮不点")
+                return null
+            }
+            return true
         }
-        if (win == null && fail == null) return null
-        lastBtnSrc = "字段读@$srcTag"
+        val err = pr?.optString("err").orEmpty().ifEmpty { "无回包" }
+        // 直调不可用 ⇒ 退回"固定路径现读坐标再点"（同一套定位，只是投坐标）
+        val xy = battleResultXY(wantWin) ?: run {
+            AppState.addLog("$what：直调失败（$err），且固定路径也读不到坐标 → 本轮不点")
+            return null
+        }
+        AppState.addLog("$what：直调失败（$err）→ 退回坐标点击")
+        return tap(input, xy.first, xy.second, what)
+    }
+
+    /**
+     * 结算按钮的**唯一读取链路**（检测与点前现读共用；2026-11-18 用户要求）。
+     *
+     * ★2026-11-18（用户）：四类结算页（普通胜/负、EX、BOSS 胜/负）实测固定路径全命中后，
+     *   删掉了原 ②缓存档（battleResultBtn）与 ③字段读档（battleResultMem）—— 一整轮 20+ 次结算
+     *   零回落，两档已无作用。现在只剩 [battleResultPathPick] 固定层级路径（实测 4~16ms）。
+     *   读不到时由 [battleResultBtns] 的**树遍历**兜底（窄名单→宽名单），不动。
+     *
+     * @return (win, fail)；两者都 null = 这一刻读不到（调用方这拍不点、继续探）
+     */
+    private suspend fun battleResultPick(bot: Int): Pair<JSONObject?, JSONObject?>? =
+        battleResultPathPick(bot)
+
+    /**
+     * ★★2026-11-18（用户要求提为**主路径**）：失败页「重新挑战」的**固定层级路径**读数。
+     *
+     * `DialogQuestFailed → Main[0] → contents[0] → Anchor[4] → UIButton_Next[2]`（实测取证）
+     * ⇒ 约 50 次 il2cpp invoke ≈ 1~3ms，比字段读（先扫 72 槽找 Parts、再扫 60 槽找按钮）省一个数量级，
+     * 更比树遍历学习省两个数量级（且那条路对失败页根本学不到）。
+     *
+     * @return `(null, {x,y,text})` = 命中「重新挑战」；`null` = 这条路径不通（交给后面的档）
+     */
+    private suspend fun battleResultPathPick(bot: Int): Pair<JSONObject?, JSONObject?>? {
+        // ★2026-11-18：带上 errOut —— `obj()` 在"没连上/超时/agent 报错"时只返回 null，
+        //   不传 errOut 就完全静默（这轮日志里一条"固定路径"都没有，就是被这么吞掉的）。
+        var callErr = ""
+        val r = AgentApi.obj(
+            "battleResultPath",
+            timeoutMs = AgentApi.T_SLOW,
+            errOut = { callErr = it },
+        )
+        if (r == null) {
+            if (callErr.isNotEmpty() && callErr != lastPathErr) {
+                lastPathErr = callErr
+                AppState.addLog("… 固定路径调用失败：$callErr")
+            }
+            return null
+        }
+        if (r.opt("ok") != true) {
+            val why = r.optString("err").orEmpty()
+            if (why.isNotEmpty() && why != lastPathErr) {
+                lastPathErr = why
+                AppState.addLog("… 固定路径未命中（$why）→ 回落下一档")
+            }
+            return null
+        }
+        lastPathErr = ""
+        val kind = r.optString("kind")
+        val x = r.optInt("x")
+        val y = r.optInt("y")
+        val lb = r.optString("label").trim()
+        // ★2026-11-18：这两道校验原来是静默 return null（日志里连"固定路径"字样都没有，
+        //   固定路径命中后卡在哪完全无据可查）。补上去重诊断，把 agent 返回的原始值带出来。
+        if (x !in 0 until scrW || y !in 0 until scrH || y < bot || lb.isEmpty()) {
+            val why = "校验未过(kind=$kind xy=($x,$y) 屏=${scrW}x${scrH} bot=$bot label=[$lb])"
+            if (why != lastPathErr) {
+                lastPathErr = why
+                AppState.addLog("… 固定路径未命中（$why）→ 回落下一档")
+            }
+            return null
+        }
+        val o = JSONObject().put("x", x).put("y", y).put("text", lb)
+        val ms = r.optInt("ms")
+        lastBtnSrc = "固定路径($kind)@${ms}ms"
         if (!battleBtnSaid) {
-            AppState.addLog(
-                "结算按钮来源：字段读 「${(win ?: fail)!!.optString("text")}」" +
-                    "@(${(win ?: fail)!!.optInt("x")},${(win ?: fail)!!.optInt("y")}) ｜ ${srcTag}",
-            )
+            AppState.addLog("结算按钮来源：固定路径 $kind 「$lb」@($x,$y)（${ms}ms）")
         }
-        return win to fail
+        return if (kind == "fail") null to o else o to null
     }
 
     /**
@@ -7466,19 +7752,17 @@ object MazeLoop {
      */
     private suspend fun battleResultBtns(wide: Boolean, deep: Boolean): Pair<JSONObject?, JSONObject?> {
         val bot = (scrH * 0.85).toInt()
-        // ★★**第一优先：结算按钮"学一次、之后只校验"**（2026-10-16）：首次走一次只限 DialogArea 的遍历
-        //   学习并记住节点指针；之后每场只做"读指针 + 校验 + 算坐标"⇒ **零遍历**（胜利页那颗「下一步」
-        //   不在对话框字段里 ✗，只能这样记住它）。校验不过（换版本/页面结构变了）⇒ agent 自动重学 ✓。
-        // ★★直接读（学习缓存 / 字段读）**多重试几次**再降级到树遍历（2026-10-17 用户："直接读开关要
-        //   多读几次，避免一次没读到直接降级开始扫描"）：结算页刚出现的那一瞬，缓存/字段可能还没就绪
-        //   （一次 `ok=false`），以前当场退到树遍历（147~180ms/次；而"换页瞬间做遍历"正是卡死过的形状）。
-        //   现在同一轮里隔 200ms 重读 3 次（≈0.4s），任一次成功就用它 ✓（都失败才走下面的树）。
+        // ★★**第一优先：固定层级路径**（[battleResultPick] → [battleResultPathPick]，实测 4~16ms）。
+        //   2026-11-18 四类结算页全命中后已删掉原缓存/字段读两档，只剩这一条快路径。
+        // ★**多重试几次**再降级到树遍历：结算页刚出现那一瞬按钮还没落位（首拍常 offscreen），
+        //   以前当场退到树遍历（147~180ms/次；"换页瞬间做遍历"正是卡死过的形状）。
+        //   现在同一轮里隔 200ms 重读几次（≈0.4s），任一次成功就用它 ✓（都失败才走下面的树）。
         // ★用**时间预算**兜住次数上限（见 [RESULT_READ_BUDGET_MS]）：第一次之后就按已用时间决定
         //   还要不要重试，避免"结算动画期连续 3 次遍历 DialogArea"把游戏主线程读死。
         val readT0 = SystemClock.elapsedRealtime()
         for (i in 0 until RESULT_READ_TRIES) {
-            battleResultBtnPick(bot)?.let { return it }
-            battleResultMemPick(bot)?.let { return it }
+            // ★★2026-11-18：与点前现读**同一条链路**（[battleResultPick]）——检测与点击必须一致。
+            battleResultPick(bot)?.let { return it }
             if (i == RESULT_READ_TRIES - 1) break
             if (SystemClock.elapsedRealtime() - readT0 >= RESULT_READ_BUDGET_MS) break
             delay(RESULT_READ_GAP_MS)
@@ -7580,7 +7864,7 @@ object MazeLoop {
             if (kind != null) {
                 battleRes0 = now
                 AppState.addLog(
-                    "… 认出结算页（$kind）→ 静置 ${RESULT_SETTLE_MS}ms 等按钮落位，再开始找「下一步/重新挑战」",
+                    "… 认出结算页（$kind）→ 静置 ${RESULT_SETTLE_MS}ms 等按钮落位，再每 ${RESULT_LIGHT_GAP_MS}ms 探一次",
                 )
                 // ★标定用（2026-11-07）：把战斗结果的**原始字段**记下来，跑一胜一负就能确定
                 //   gameState 的枚举含义，从而不再靠"等按钮出现"判胜负。只记录，不参与判断。
@@ -7599,7 +7883,7 @@ object MazeLoop {
             battleRes0 = now
             AppState.addLog(
                 "… 认出结算页（兜底：${if (resultEnable) "IsResultEnable" else "顶框类名"}｜${top.ifEmpty { "无" }}" +
-                    "）→ 静置 ${RESULT_SETTLE_MS}ms 等按钮落位，再开始找",
+                    "）→ 静置 ${RESULT_SETTLE_MS}ms 后开始找",
             )
         }
         // ★久战兜底（见 [RESULT_TOP_FALLBACK_MS]）：认不出类名也不能干等到超时停手。
@@ -7608,16 +7892,15 @@ object MazeLoop {
         ) {
             battleRes0 = now
             AppState.addLog(
-                "… 战斗已 ${(now - battleT0) / 1000}s、顶框=${top}（没认出结算页类名）→ 按结算处理，静置后再试",
+                "… 战斗已 ${(now - battleT0) / 1000}s、顶框=${top}（没认出结算页类名）→ 按结算处理，开始找按钮",
             )
         }
         // ══ 层 2：认出来 + 静置够了，才去找按钮 ══════════════════════════════════════════════
         var win: JSONObject? = null
         var fail: JSONObject? = null
-        // ★2026-10-27 结算页是「明确很久」的例外：基础 3.5s + 学到的附加（一次 +600、上限 3000、超了清空）。
-        //   实测 3.5s 静置后仍会点空 2~3 次（12:13:41/43/46「下一步」同坐标连点），所以让它自己往后挪。
-        val settleExtra = appCtx?.let { TapDelayStore.extra(it, "settle|result") } ?: 0L
-        val settled = battleRes0 > 0L && now - battleRes0 >= RESULT_SETTLE_MS + settleExtra
+        // ★2026-11-17 用户：静置 3000ms（避开页面切换瞬间）后，再 200ms 一探轻读取找按钮
+        //   （按钮实测 3.5~4.5s 才 active ⇒ 3000ms 静置 + 10×200ms 覆盖到 ~5s）。
+        val settled = battleRes0 > 0L && now - battleRes0 >= RESULT_SETTLE_MS
         val bot = (scrH * 0.85).toInt()
         // ⚠必须尊重 `battleProbeAt`：胜利页点完会把它 +2.5s（防"同一页连点"；
         //   20:22 那场 2 秒点了 4 下就是这个没生效）。
@@ -7625,15 +7908,18 @@ object MazeLoop {
         //   还在加载，探测也可能撞上游戏自己的加载 ⇒ 三次卡死的共同形状。
         val gated = now >= sceneHoldUntil && now >= battleHoldUntil
 
-        // ── 2a：**轻量轮询**（2026-10-23 用户："6 次，间隔 400ms"）────────────────────────────
-        //   只做一次 `battleResultBtn`（缓存校验 / 学习，实测 100ms 级）—— **不重试、不读字段、不扫树**。
-        //   这样 400ms 的间隔才有意义（全套探测一次 ~780ms，间隔再密也只是被耗时撑开）。
-        //   实测按钮在"认出"后 3.5~4.5s 才 active ⇒ 3s 静置 + (400+100)ms × 6 ≈ 覆盖到 6s。
+        // ── 2a：**轻量轮询**（2026-11-17：静置 3000ms 后每 200ms 探一次，共 10 拍）──────────────
+        //   ★2026-11-18（用户："固定路径应该做成主要方法"）：这里原来只调 `battleResultBtnPick`
+        //   （缓存校验/学习）⇒ 胜利页缓存一命中就再也不会走固定路径，固定路径永远当不上主路径
+        //   （实测胜利页连一条固定路径日志都没有，就是因为被这一档短路了）。改走统一链路
+        //   [battleResultPick] = 固定路径（缓存/字段读两档已于 2026-11-18 删除）。
+        //   固定路径实测 4~16ms，不重试不扫树，200ms 间隔照旧成立。
+        //   实测按钮在"认出"后 3.5~4.5s 才 active ⇒ 3000ms 静置 + 200ms×10 ≈ 覆盖到 5s。
         if (settled && resultProbeN < RESULT_PROBE_FAST_MAX && gated &&
             now - battleProbeAt >= RESULT_LIGHT_GAP_MS
         ) {
             battleProbeAt = now
-            val p = battleResultBtnPick(bot)
+            val p = battleResultPick(bot)
             if (p == null) {
                 resultProbeN++
             } else {
@@ -7647,8 +7933,8 @@ object MazeLoop {
             }
         }
 
-        // ── 2b：轻量 6 次都没命中 ⇒ 升级到**全套**（缓存 + 字段读 + 窄名单树遍历），1.2s 一次 ──
-        //   到这里说明按钮不在 DialogArea 的常规位置（失败页/结构变化），或者轻量那条路失效了。
+        // ── 2b：轻量 10 次都没命中 ⇒ 升级到**全套**（固定路径 + 窄名单树遍历），1.2s 一次 ──
+        //   到这里说明固定路径没读到（按钮未落位/结构变化），才降级到树遍历兜底。
         if (settled && win == null && fail == null && resultProbeN >= RESULT_PROBE_FAST_MAX &&
             gated && now - battleProbeAt >= BATTLE_READY_GAP_MS
         ) {
@@ -7735,7 +8021,15 @@ object MazeLoop {
                             "[手动] 同一节点已失败 $n 次 → 回编队页后**不自动组队/不自动开战**，等你操作" +
                                 "（节点 ${jStr(st, "blockId")}）",
                         )
-                        tap(input, fail.optInt("x"), fail.optInt("y"), "重新挑战（回编队页）")
+                        // ★2026-11-18（用户）：转人工那一刻就要出现红色提示（不等下一轮刷新）
+                        OverlayStatus.setState("等待接手：请组队并开战", attention = true)
+                        tapAndCheck(
+                            input, fail.optInt("x"), fail.optInt("y"), "重新挑战（回编队页）",
+                            pressFn = { battleResultPressOrTap(input, wantWin = false, "重新挑战（回编队页）") },
+                            from = setOf("DialogBackKeyCapture", "DialogLabyrinthExResult", "DialogQuestFailed"),
+                                retries = 12,
+                            expect = setOf(PAGE_QUEST_DETAIL),
+                        )
                         battleProbeAt = now + 2_500
                         battleT0 = 0L
                         battleSaid = 0
@@ -7749,7 +8043,19 @@ object MazeLoop {
                     }
                 }
             }
-            tap(input, fail.optInt("x"), fail.optInt("y"), "重新挑战")
+            // ★2026-11-17（用户）：和胜利页对齐——tapAndCheck + 固定路径现读坐标（xyAt），
+            //   出口是**预览页（敌人信息 DialogQuestDetail，编组页之前的一个页面）**。
+            //   点空/动画未落位会自动重读坐标重试，不再"点一下就死等"。
+            tapAndCheck(
+                input, fail.optInt("x"), fail.optInt("y"), "重新挑战",
+                pressFn = { battleResultPressOrTap(input, wantWin = false, "重新挑战") },
+                from = setOf("DialogBackKeyCapture", "DialogLabyrinthExResult", "DialogQuestFailed"),
+                // ★settle 用默认 1×probeMs；连点由 probe=8（≈1.2s 窗口）兜住
+                probe = 8,
+                retries = 12,
+                // 阶段2：重新挑战回到**预览页**（敌人信息展示，编组页之前那页）
+                expect = setOf(PAGE_QUEST_DETAIL),
+            )
             battleProbeAt = now + 2_500                   // 刚点过 → 3.5s 内别再点
             battleT0 = 0L
             battleSaid = 0
@@ -7770,13 +8076,25 @@ object MazeLoop {
             //   同样是短停 200ms + 多点几次：结算/奖励页本身要连点好几下，多戳几下正好。
             tapAndCheck(
                 input, win.optInt("x"), win.optInt("y"), "下一步",
+                // ★2026-11-17（用户）：点前**固定路径现读**坐标——不缓存坐标值（坐标会过时成干扰项），
+                //   而是每拍走 agent 的 battleResultBtn（记住结算按钮的 prefab 节点路径，零遍历、
+                //   约 3 次调用、配对标签「下一步」校验，结构变了自动重学）。路径固定、读取轻量，
+                //   每次现取 ⇒ 既跟得上落位动画、又不依赖会过时的缓存坐标。
+                //   ⚠更早那版用 findTextIn(half=scrH/2,root=top) 探索 + 无标签校验 ⇒ 捞到干扰
+                //     节点 (1109,652) ⇒ 点空/抓不到。这里换成固定路径现读，见 [battleResultXY]。
+                xyAt = { battleResultXY(wantWin = true) },
                 from = setOf("DialogBackKeyCapture", "DialogLabyrinthExResult", "DialogQuestResultWin"),
                 // ★2026-11-13（用户："走了几个节点之后闪退"）：200ms → **400ms**。
                 //   日志 00:38:58~59 在 1.4s 内连点 7 次「下一步」（每次都是 root `input tap`），
                 //   紧接着 00:39:01 系统 `device is not responding` 触发 lmkd 杀进程 —— 点击太密会把
                 //   input/系统拖到无响应。400ms/次（含 tap ~110ms）≈ 2 次/秒，够推进又不会打满。
-                settleMs = 400L,
-                // 结算页按钮落位不稳（2026-11-07）：25 次 × 400ms ≈ 10 秒窗口
+                // ★2026-11-17（用户：效率优先）：settle 回到默认 **1×probeMs**（首探更快，不拖节奏）。
+                //   连点风险由 **probe=8** 兜住：点完连探 8 次（≈1.2s 窗口），探到页面变即停；
+                //   只有"8 次都没变"才点第 2 次 ⇒ 两次点击间隔 ≥1.2s，不会形成点击洪水。
+                //   （18:19 那次 1s 内 6 连点的根因是 settle 150ms 且**只探 1 次**。）
+
+                probe = 8,
+                // 结算页按钮落位不稳（2026-11-07）：25 次 × (400ms + 探测) ≈ 10 秒窗口
                 retries = 25,
                 // 阶段2：普通战 → 选人/选遗物（Selection）；**最终 Boss(50801) → 直接进迷宫结算**
                 //   （实测 17:41:39 顶框=DialogLabyrinthResult）⇒ 两个都要认，否则会白等 6 秒
@@ -7785,11 +8103,7 @@ object MazeLoop {
                 //   ★这处**最值得直调**：结算/奖励页要连点十几下，而坐标点击每次 ~110ms，
                 //   密集点击曾把系统 input 拖到无响应（实测 1.4s 内连点 7 下后 lmkd 杀进程）；
                 //   直调是进程内调用，没有这块开销，也不受按钮入场动画影响。
-                pressFn = press@{
-                    val pr = runCatching { AgentApi.labPathPress("ResultNext|NextButton") }.getOrNull()
-                    if (pr?.optBoolean("ok") == true) return@press true
-                    tap(input, win.optInt("x"), win.optInt("y"), "下一步")
-                },
+                pressFn = { battleResultPressOrTap(input, wantWin = true, "下一步") },
             )
         }
         if (!resultFail) {
@@ -8054,8 +8368,19 @@ object MazeLoop {
         //   （编组页一次点 6 个角色、EX 页连点），等它回到循环开头已经晚了好几秒。
         //   ⇒ 放到 [tap] 里：**每次点击前**都查一次。
         //     · [Foreground.packageName] 有 2s TTL 缓存 ⇒ **一个连点批次内几乎零成本**；
-        //       主循环每轮用 `force = true` 现查 ⇒ 切走照样下一轮就发现（见 [Foreground.TTL_MS] 注释）；
+        //       ★2026-11-17：主循环也改走 TTL 了（每 100ms 一次 force 的 `su dumpsys`
+        //       会把 system_server 拖到 ANR）；真实现查由 watchLoop 每 2s 负责；
         //     · **读不到(null) ≠ 切走** ⇒ 照点（与主循环口径一致，宁可不误停也别漏点）。
+        // ★2026-11-17：**优先复用主循环刚查到的 Unity `isFocused`**（0.5s 缓存）——
+        //   明确失焦时**零开销**拦截（同一个 handler 连点很多下也不会漏）；
+        //   其余情况仍走下面的 dumpsys TTL（一个连点批次内命中缓存，不再发命令）。
+        if (focusVal == false) {
+            if (lastFrontBlockPkg != "@失焦") {
+                lastFrontBlockPkg = "@失焦"
+                AppState.addLog("停手：游戏已失焦（isFocused=false）→ 这一下不点")
+            }
+            return false
+        }
         val fp = Foreground.packageName()
         if (fp != null && fp != GameProcess.pkg()) {
             if (lastFrontBlockPkg != fp) {
@@ -8216,7 +8541,7 @@ object MazeLoop {
         y: Int,
         what: String,
         from: Set<String>,
-        settleMs: Long = SEL_TICK_MS,
+        settleMs: Long = 0L,               // 0 = 自动 probeMs×2（2026-11-17 用户统一口径）
         retries: Int = 1,
         expect: Set<String> = emptySet(),
         expectTimeoutMs: Long = 6_000L,
@@ -8224,12 +8549,12 @@ object MazeLoop {
         unknownTop: String = "",
         xyAt: (suspend () -> Pair<Int, Int>?)? = null,
         probe: Int = 0,
-        probeMs: Long = 150L,
+        probeMs: Long = TapCheck.currentProbeMs(),
         reached: (suspend (String) -> Boolean)? = null,
         /** 一次快照探针（top + 判据 + 诊断同源）；给了它就不再读 readTop / reached。 */
         probeState: (suspend () -> TapCheck.Probe)? = null,
         /** ★首点前先「只读不点」几拍（新页入场动画期间按钮坐标还在动）；见 [TapCheck.run] */
-        skipFirstHits: Int = 0,
+        skipFirstHits: Int = 1,
         /** ★直调执行器（2026-11-18）：给了它就**代替坐标点击**，见 [TapCheck.run] */
         pressFn: (suspend () -> Boolean?)? = null,
     ): Boolean = TapCheck.run(
@@ -8240,9 +8565,8 @@ object MazeLoop {
         readTop = readTop, unknownTop = unknownTop,
         xyAt = xyAt, probe = probe, probeMs = probeMs, reached = reached,
         probeState = probeState,
-        // ★下面三个就是原来写死在本文件里的常量，值完全一致（别在这里改行为）
+        // ★2026-11-17：skipDelayMs 改由 TapCheck 默认（= probeMs，跟挡位联动），不再写死 60ms
         skipMax = EXEQ_SKIP_MAX,
-        skipDelayMs = EXEQ_POLL_MS,
         skipFirstHits = skipFirstHits,
         pressFn = pressFn,
         verbose = TRANS_VERBOSE,
@@ -8312,12 +8636,8 @@ object MazeLoop {
     private val TRANS_VERBOSE = true
 
     /**
-     * 选人页每次点击后**停多久再看一眼**（2026-11-07 用户）。
-     *
-     * 这里**没有"超时"概念**：不看"等它多久"，只看"点了几次"。停 150ms 读到没变就立刻
-     * 下一轮（重读卡片→重新决策→再点），最多 [SEL_RETRY_MAX] 次。
+     * 选人页每次点击后的等待统一为 probeMs×2（2026-11-17 用户），不再单独设 settleMs。
      */
-    private val SEL_TICK_MS = 150L
 
     /** 遗物选卡 → 顶框变成 `DialogCommonBig` 的最长等待：实测最长 3.9s（15:41:47→15:41:52）。
      *  探针是 3ms 的 [AgentApi.labTop]，100ms 一探 ⇒ 弹窗一出现就点，不是固定死等。 */
@@ -8436,7 +8756,7 @@ object MazeLoop {
             input, bigXY.first, bigXY.second, "门票：关闭收到印记(Big)",
             from = setOf("DialogCommonBig"),
             expect = setOf("DialogCommonMiddle"),
-            settleMs = SEL_TICK_MS, probe = 5, probeMs = 70L, retries = 3,
+            probe = 5, retries = 3,
             // ★★直调（2026-11-18）：Big 单按钮走 `LAB_PATHS` 的 `ResultBig|OneButtonWhite`
             //   （top 根相对链 [0,2,6]）。直调不可用才退回"等按钮落位再点坐标"。
             pressFn = press@{
@@ -8496,7 +8816,7 @@ object MazeLoop {
             from = setOf("DialogCommonMiddle"),
             expect = setOf(""),
             expectTimeoutMs = 2_000L,
-            settleMs = SEL_TICK_MS, probe = 5, probeMs = 70L, retries = 3,
+            probe = 5, retries = 3,
             // ★★直调（2026-11-18）：Middle 单按钮走 `LAB_PATHS` 的 `SelectConfirm|OneButtonWhite`
             //   （top 根相对链 [0,2,3]）。直调不可用（表外/投递失败）才退回"等按钮落位再点坐标"。
             pressFn = press@{
@@ -8563,7 +8883,7 @@ object MazeLoop {
             //   不能只判"离开 Big" ⇒ 否则误触出来的 DialogCommonSmall 会被当成已回地图。
             expect = if (fromBattleNode) setOf("DialogLabyrinthSelection") else setOf(""),
             expectTimeoutMs = 3_000L,
-            settleMs = SEL_TICK_MS, probe = 5, probeMs = 70L, retries = 3,
+            probe = 5, retries = 3,
             xyAt = { dlgReadyToTap("DialogCommonBig", xy) },
             probeState = { dlgProbe("DialogCommonBig") },
         )

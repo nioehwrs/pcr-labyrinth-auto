@@ -452,7 +452,14 @@ class AutoForegroundService : Service() {
                             // ★记下这局（成绩 + 奖励），供整轮结束汇总
                             MazeSummary.add(RunRecord(idx, MazeLoop.lastScore, MazeLoop.lastRewards))
                             AppState.addLog("════ 第 $idx 局完成 ✓（累计成功 $done 次）════")
-                            bringAssistantToFront()        // 正常退出 ⇒ 退回自动化工具（下一局会再顶起游戏）
+                            // ★2026-11-15：局内刷开局模式下，第1局结束**不**把游戏推后台——
+                            // 局内刷依赖游戏内"进行中迷宫局"的 client 状态（黎明界 top 的"挑战中"标志），
+                            // 一旦推后台，模拟器回收进程 / B 服超时回收进行中迷宫局会让该会话断裂，
+                            // 下一局顶回时 259 顶层标志已失效、误判"登错号"终止（小鹿日志 20261115_130256）。
+                            // API 刷每局从服务器重新 enter，不依赖 client 会话，保持原样推后台。
+                            if (RerollSettings.loadRerollMode(applicationContext) != RerollSettings.REROLL_IN_GAME) {
+                                bringAssistantToFront()    // 正常退出 ⇒ 退回自动化工具（下一局会再顶起游戏）
+                            }
                         }
                     } catch (ce: kotlinx.coroutines.CancellationException) {
                         throw ce                            // 「停止」是正常取消，不算异常
@@ -716,8 +723,9 @@ class AutoForegroundService : Service() {
     }
 
     /**
-     * ★**一局完整流程**（2026-10-17 用户："一次跑迷宫是从刷开局开始，到正常结算退出结束"）：
-     *   刷开局 → 杀进程重启同步开局 → 等 agent 重连 → 进迷宫 → 跑到**正常结算退出**。
+     * ★**一局完整流程**（2026-10-17 用户；2026-11-15 调顺序）：
+     *   **先杀上一局的游戏** → 接口刷开局（游戏不在，系统正好回收）→ 启动同步开局 →
+     *   等 agent 重连 → 进迷宫 → 跑到**正常结算退出**。
      *
      * @return true = 这一局完整跑完（连跑据此决定要不要开下一局）；false = 任一步失败/中断。
      */
@@ -733,6 +741,9 @@ class AutoForegroundService : Service() {
             // ★显式进程操作窗口：局内刷里 `AbiRepair.ensure`（重装会杀游戏）和 InGameReroll 的
             //   三处 launch 都由业务层独占；注入循环这段照常注入/读页，只是不抢发 am start。
             GameProcess.beginExternalOp()
+            // ★2026-11-15：标记"是否已交给 MazeLoop"。局内刷阶段（还没进迷宫主循环）失败/中断时，
+            //   finally 会清掉第二格「刷开局 第N轮」、第三格「不合格：…」这些阶段信息。
+            var inMaze = false
             return try {
                 // ★架构闸门（2026-10-30 用户："局内模式也要修，杀进程不是硬限制"）：
                 //   局内一般不需要杀进程，但**架构不对时注入根本连不上**，不修这一步也没法跑。
@@ -757,31 +768,36 @@ class AutoForegroundService : Service() {
                     // 极少见（刷完却不在迷宫地图上）→ 按老路再进一次
                     if (!enterMazeWithRetry(input)) return false
                 }
+                inMaze = true
                 MazeLoop.run(input, applicationContext)
             } finally {
+                // ★2026-11-15（用户）：局内刷开局阶段（还没交给 MazeLoop）失败/中断时，
+                //   清掉第二格「刷开局 第N轮」、第三格「不合格：…」这些阶段信息 —— 否则运行结束
+                //   （endedByStop=true 时外层不再清）会让它们一直残留、把「运行结束」挡在后面看不清。
+                //   （迷宫里切屏中断时 MazeLoop 自己会收尾清；这条是给「进迷宫之前」补上。）
+                if (!inMaze) {
+                    OverlayStatus.setFloor("")
+                    OverlayStatus.setState("")
+                }
                 GameProcess.resetExternalOps()
                 FridaInjector.autoRecover = false
             }
         }
 
-        // ① 刷开局（登录 → enter/retire 循环；验证码出现会自动挂起等用户在弹窗解完）
-        if (!RerollUseCase.reroll(applicationContext)) {
-            AppState.addLog("刷开局未成功（含验证码未过 / 未刷到合格开局）→ 本局不进入迷宫")
-            return false
-        }
-
-        // ★悬浮窗第二项：进迷宫阶段显示「进入迷宫中」
-        OverlayStatus.setFloor("进入迷宫中")
-        // ② 进入「自动黎明界」窗口（重启游戏 → 结算，**不含刷开局**）：这段开自愈总闸，
-        //    期间游戏崩了/卡死由本进程杀进程/重启；窗口一结束（含异常/提前返回）就关掉。
-        FridaInjector.autoRecover = true
-        // ★窗口从开闸这一刻就开始（覆盖下面的架构闸门）：`AbiRepair.ensure` 修 ABI 时
-        //   `pm install` 会杀游戏，注入循环若此时自主就会抢先 launch，随后又被下面的 kill 杀掉。
+        // ★★2026-11-15（用户）：顺序改为「**先杀游戏 → 再刷开局 → 启动同步**」。
+        //   理由：① 上一局刚结束，游戏空闲，正常杀掉比"刷完立刻杀"更稳；
+        //        ② 刷开局的十几秒正好让系统回收进程；这段时间不会有代码去读
+        //           **刚死进程**的 `/proc/<pid>/cmdline`（root shell 卡 4s 的那条路径）；
+        //        ③ 客户端不在线时 reroll 登录不会把 API 会话挤掉。
+        //   ⚠"刷"仍必须在"launch"之前（reroll 只改服务器状态，客户端要冷启动才能同步）。
+        OverlayStatus.setFloor("刷开局中")
+        // 杀之前先关自愈：否则注入循环会自己 am start，把"已杀"状态又拉起来。
+        FridaInjector.autoRecover = false
         GameProcess.beginExternalOp()
-        return try {
-            // ★架构闸门（2026-10-30）：下面马上就要 kill 游戏，这是**确定性**的修复窗口 ——
-            //   不再依赖注入循环里"恰好拍到 pid<=0"的时序（POLL_MS=1.5s，可能刚好错过）。
-            //   已是 x86_64 时这里只花一次 dumpsys；不是则本地重装（零下载、保存档、约 8s）。
+        val oldPid = FridaInjector.gamePid()
+        try {
+            // ★架构闸门提前：`AbiRepair.ensure` 重装时会杀游戏，放在刷开局前最安全
+            //   （原来放在刷之后，若在这里重装会把刚刷好的开局流程打断）。
             val abiFix = AbiRepair.ensure(GameProcess.pkg())
             if (!abiFix.ok) {
                 AppState.addLog("⚠ 游戏架构修复没成：${abiFix.detail}")
@@ -790,26 +806,37 @@ class AutoForegroundService : Service() {
                     return false
                 }
             }
-            // ②-a 刷完开局 → **显式杀进程 + 重启游戏一次**（= PC pcr_auto step_kill→step_launch）：
-            //   reroll 只改了**服务器**状态，客户端必须冷启动才会同步到这个合格开局
-            //   （PC keep_opening(sync=False) 注释：调用方自己的"杀进程→启动→attach"就是同步）。
-            AppState.addLog("刷开局完成 → 杀进程重启游戏以同步开局（PC 同款 step_kill→step_launch）")
-            // ★★2026-11-13：把「靠 4s 等待赌两个启动意图不打架」改成明确的重启窗口。
-            //   ① oldPid 排除 `am force-stop` 的残留进程（它还挂在 pidof 里，会被当成新游戏）；
-            //   ② 注入循环在本窗口内不自己 am start（其余照常：等就绪/注入/读页），启动意图归上层；
-            //   ③ [AgentBridge.noteStale] 主动断掉旧 agent 连接，否则 connected 滞后为 true 时，
-            //      注入循环会误判「进程还活着」而不自愈。
-            val oldPid = FridaInjector.gamePid()
-            GameProcess.kill()
-            // ★本次重启的代际：下面等的是「这一代游戏」的 agent 已就绪，不是任何一次 socket 连上
-            val restartGen = GameProcess.kills
-            AgentBridge.noteStale("刷开局完成，重启游戏进程")
-            val goneAt = android.os.SystemClock.elapsedRealtime()
-            while (android.os.SystemClock.elapsedRealtime() - goneAt < 4_000L) {
-                val p = FridaInjector.gamePid()
-                if (p <= 0 || (oldPid > 0 && p != oldPid)) break
-                delay(300)
+            if (oldPid > 0) {
+                AppState.addLog("上一局结束 → 先杀游戏进程（刷开局期间让系统回收）")
+                GameProcess.kill()
+                val goneAt = android.os.SystemClock.elapsedRealtime()
+                while (android.os.SystemClock.elapsedRealtime() - goneAt < 4_000L) {
+                    val p = FridaInjector.gamePid()
+                    if (p <= 0 || p != oldPid) break
+                    delay(300)
+                }
             }
+            // ★主动断旧 agent 连接：否则 connected 滞后为 true 时，注入循环会误判「进程还活着」
+            AgentBridge.noteStale("上一局结束，准备刷开局")
+        } finally {
+            GameProcess.endExternalOp()
+        }
+
+        // ① 刷开局（登录 → enter/retire 循环；验证码出现会自动挂起等用户在弹窗解完）
+        //    ★此时游戏不在，这十几秒正好让系统整理进程
+        if (!RerollUseCase.reroll(applicationContext)) {
+            AppState.addLog("刷开局未成功（含验证码未过 / 未刷到合格开局）→ 本局不进入迷宫")
+            return false
+        }
+
+        // ② 启动游戏同步新开局（冷启动才会读到刷好的局）→ 等 agent 就绪
+        OverlayStatus.setFloor("进入迷宫中")
+        FridaInjector.autoRecover = true
+        GameProcess.beginExternalOp()
+        return try {
+            // ★本次启动的代际：下面等的是「这一代游戏」的 agent 已就绪，不是任何一次 socket 连上
+            val restartGen = GameProcess.kills
+            AppState.addLog("刷开局完成 → 启动游戏进程同步开局")
             GameProcess.launch(applicationContext)
             val upAt = android.os.SystemClock.elapsedRealtime()
             while (android.os.SystemClock.elapsedRealtime() - upAt < 10_000L) {
@@ -966,7 +993,22 @@ class AutoForegroundService : Service() {
             // ★2026-11-10：心跳必须**现查**（不走 2s TTL 缓存）—— 它是"切屏锁存"最稳的
             //   实时来源。局内刷开局期间点击不走 MazeLoop.tap，光靠 frontOk() 的缓存读法，
             //   切走后又恰好被自愈顶回游戏就会漏判（雷电 9 实测）。
-            val pkg = Foreground.packageName(force = true)
+            // ★★2026-11-18：**改用 Unity `isFocused`（零 shell）** —— 原来这里每 2s 一次
+            //   `su dumpsys input`（30 次/分钟），是全机最后一条高频 dumpsys；`dumpsys` 要
+            //   system_server 序列化整个服务状态，长跑会把系统拖到 lmkd 的
+            //   "device is not responding" 连环杀（实测内存充裕也照杀）。
+            //   · true  ⇒ 前台就是游戏
+            //   · false ⇒ 游戏失焦 ⇒ 走锁存（等价于读到"别的包名"）
+            //   · null  ⇒ agent 还没连上（启动阶段）⇒ 才退回 dumpsys 现查一次
+            val focused = runCatching { com.lmj.labyrinthauto.frida.AgentApi.gameFocused() }.getOrNull()
+            val pkg: String? = when (focused) {
+                true -> com.lmj.labyrinthauto.frida.GameProcess.pkg()
+                false -> {
+                    Foreground.noteLostFocus()
+                    "（游戏失焦）"
+                }
+                null -> Foreground.packageName(force = true)
+            }
             if (pkg != lastPkg) {
                 lastPkg = pkg
                 AppState.addLog("前台切换 → ${pkg ?: "?"}")

@@ -1037,6 +1037,18 @@ private fun OtherTab() {
             }
         }
         item { ExEquipCard() }
+        // ★「点击节奏」（2026-11-17 用户）：从策略页挪来（不是游戏内决策，属于通用手感设置）
+        item {
+            Card(
+                Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+            ) {
+                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    SectionTitle("点击节奏")
+                    TapProbeCard(ctx)
+                }
+            }
+        }
     }
 }
 
@@ -1714,6 +1726,33 @@ private fun MethodRow(
     }
 }
 
+/** ★「点击节奏」（2026-11-17 用户）：tapAndCheck 探测间隔挡位（只显示档位名、不显示毫秒数）。 */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun TapProbeCard(context: Context) {
+    var ms by remember { mutableIntStateOf(RerollSettings.loadTapProbeMs(context)) }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            "探测间隔不等于点击间隔，选一个自己合适的探测档位即可。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            RerollSettings.TAP_PROBE_STEPS.forEachIndexed { i, step ->
+                FilterChip(
+                    selected = ms == step,
+                    onClick = {
+                        ms = step
+                        RerollSettings.saveTapProbeMs(context, step)
+                        com.lmj.labyrinthauto.logic.TapCheck.setProbeMs(step.toLong())
+                    },
+                    label = { Text(RerollSettings.TAP_PROBE_LABELS[i], style = MaterialTheme.typography.labelSmall) },
+                )
+            }
+        }
+    }
+}
+
 /** ★策略页「编队」（2026-11-14 用户）：编队方法 + 3 区首领编队数。 */
 @Composable
 private fun TeamSettingsCard(context: Context) {
@@ -1724,8 +1763,8 @@ private fun TeamSettingsCard(context: Context) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         MethodRow(
             title = "编队计算方法",
-            desc = "混合（默认）：这个节点第一次打用推理模型，打不过就切旧版规则（规则版会补坦克，更稳）；" +
-                "也可以固定只用其中一种。",
+            desc = "旧版规则（默认）：按关卡档的规则表算（会补坦克/破甲/治疗）；" +
+                "也可以改用推理模型，或混合（第一次模型、打不过切规则）。",
             options = listOf(
                 RerollSettings.TEAM_RULE to "旧版规则",
                 RerollSettings.TEAM_MODEL to "推理模型",
@@ -1792,7 +1831,7 @@ private fun PickSettingsCard(context: Context) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         MethodRow(
             title = "战后三选一计算方法",
-            desc = "战后三选一用哪套逻辑：推理模型看「这张卡对后续首领战的帮助」，旧版按角色评分排序。",
+            desc = "战后三选一用哪套逻辑：旧版规则（默认）按角色评分排序；推理模型会看「这张卡对后续首领战的帮助」。",
             options = listOf("rule" to "旧版规则", "model" to "推理模型"),
             selected = if (byModel) "model" else "rule",
         ) {

@@ -31,6 +31,9 @@ object RootShell {
     /** MuMu 12 的 su 客户端（世界可执行，虽然不是 setuid，但会走授权框 → root 守护进程） */
     private const val SU_BIN = "/system/bin/su"
 
+    /** runInShell 单条命令输出累积上限（2026-11-17）：刷屏命令不再无限 append 撑大内存 */
+    private const val OUT_CAP = 512 * 1024
+
     /**
      * ★su 的候选路径（2026-10-18 用户反馈："MuMu 15 有这个问题，MuMu 12 正常"）。
      *
@@ -144,12 +147,20 @@ object RootShell {
         return null
     }
 
-    /** 跑一条短命令（id / pidof / pkill 这类）。 */
-    suspend fun exec(cmd: String, timeoutMs: Long = 20_000L): Exec {
+    /**
+     * 跑一条短命令（id / pidof / pkill 这类）。
+     *
+     * @param direct 绕过常驻 shell、走独立 su（2026-11-17）。用于两类命令：
+     *   ① /proc/<pid>/maps|stat|status 探测——整机卡顿时读活进程 /proc 也会超时（就是 0.7.5 修
+     *      cmdline 那次的原因），一旦在常驻 shell 里超时就会被 [exec] 判"通道没回应"→ kill 重建重走
+     *      su；改成独立 su 后，超时只影响这一条探测，不连累共享通道；
+     *   ② 几十秒到几分钟的长命令（cp / pm install）——不占 shellLock，避免把其他命令堵住。
+     */
+    suspend fun exec(cmd: String, timeoutMs: Long = 20_000L, direct: Boolean = false): Exec {
         val f = cached ?: detect() ?: return Exec(-1, "", "没有可用的 su 写法（授权被拒或超时）")
         // ★2026-11-10：优先走**常驻 root shell**（见 [ShellSession]）。
         //   `pm install` 那种几十秒的长命令不占 shell 通道，仍走独立 su。
-        if (shellBroken || cmd.startsWith("pm install")) return runWith(f, cmd, timeoutMs)
+        if (direct || shellBroken || cmd.startsWith("pm install")) return runWith(f, cmd, timeoutMs)
         return withContext(Dispatchers.IO) {
             shellLock.withLock {
                 val s = ensureShell(f)
@@ -181,19 +192,27 @@ object RootShell {
      */
     private class ShellSession(val p: Process) {
         val writer = p.outputStream.bufferedWriter()
-        val lines = LinkedBlockingQueue<String>()
+        /** 有界（2026-11-17）：刷屏命令的输出若无限 put，队列会撑大内存且淹没结束标记。
+         *  满时丢最老一行、塞入最新 ⇒ 结束标记仍能进来，命令不会因标记丢失而空等超时。 */
+        val lines = LinkedBlockingQueue<String>(LINE_CAP)
         @Volatile var dead = false
+
+        private fun push(line: String) {
+            if (!lines.offer(line)) { lines.poll(); lines.offer(line) }
+        }
 
         init {
             Thread {
-                runCatching { p.inputStream.bufferedReader().forEachLine { lines.put(it) } }
+                runCatching { p.inputStream.bufferedReader().forEachLine { push(it) } }
                 dead = true
             }.apply { isDaemon = true }.start()
             // shell 自己的 stderr（每条命令的 stderr 已在命令里 `2>&1` 并进 stdout）
             Thread {
-                runCatching { p.errorStream.bufferedReader().forEachLine { lines.put(it) } }
+                runCatching { p.errorStream.bufferedReader().forEachLine { push(it) } }
             }.apply { isDaemon = true }.start()
         }
+
+        companion object { const val LINE_CAP = 2000 }
 
         fun kill() {
             dead = true
@@ -260,7 +279,7 @@ object RootShell {
                     done = Exec(code, out.toString(), "")
                     break
                 }
-                out.appendLine(line)
+                if (out.length < OUT_CAP) out.appendLine(line)   // 超上限丢弃后续输出，避免刷屏撑大内存
             }
             done
         } catch (t: Throwable) {

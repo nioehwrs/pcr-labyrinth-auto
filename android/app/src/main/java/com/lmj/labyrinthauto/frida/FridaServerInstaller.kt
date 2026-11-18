@@ -226,6 +226,7 @@ object FridaServerInstaller {
             val r = RootShell.exec(
                 "cp -f ${local.absolutePath} $DEVICE_PATH && chmod 755 $DEVICE_PATH && ls -l $DEVICE_PATH",
                 180_000L,
+                direct = true,   // 长命令不占常驻 shell 通道（否则 180s 内堵住所有 root 命令）
             )
             AppState.addLog("拷贝结果：${redact(r.text.take(160))}")
         }
@@ -273,7 +274,7 @@ object FridaServerInstaller {
     private suspend fun deviceHas(asset: Asset?): Boolean {
         if (asset == null) return false
         val text = runCatching {
-            RootShell.exec("ls -l $DEVICE_PATH; sha256sum $DEVICE_PATH 2>/dev/null", 30_000L).text
+            RootShell.exec("ls -l $DEVICE_PATH; sha256sum $DEVICE_PATH 2>/dev/null", 30_000L, direct = true).text
         }.getOrDefault("")
         if (text.contains("No such")) return false
         if (!text.contains(asset.rawBytes.toString())) return false

@@ -78,6 +78,17 @@ object Foreground {
     /** 本次运行是否曾切走；非 null = 切到的那个包名。 */
     fun switchedAway(): String? = switchedAwayPkg
 
+    /**
+     * ★2026-11-18：**用"游戏失焦"来锁存切屏**（代替 `su dumpsys` 读前台包名）。
+     *
+     * 心跳循环原来每 2s 跑一次 `dumpsys input`（30 次/分钟）来喂 [noteFocus]；而 agent 的
+     * `UnityEngine.Application.isFocused` 能零 shell 地直接回答"游戏窗口还有没有焦点"。
+     * 明知失焦时用这个入口锁存，效果与读到"别的包名"一致（同样关掉自愈、同样中止本次运行）。
+     */
+    fun noteLostFocus() {
+        noteFocus("（游戏失焦）")
+    }
+
     private fun noteFocus(pkg: String?) {
         val game = armedGamePkg ?: return
         if (pkg == null || pkg == game || switchedAwayPkg != null) return
@@ -92,8 +103,13 @@ object Foreground {
      *    **每 2 次点击就有 1 次缓存过期**，那一下要多跑一遍 `su dumpsys input`
      *    ⇒ 表现成"每两个点卡一下"的鼓点节奏（去掉固定 delay 后才暴露出来）。
      *    放宽到 2s 后，一个连点批次（5 个约 1.5s）最多只查一次。
-     *  ★安全性不靠这个 TTL：[MazeLoop] 主循环每轮用 `packageName(force = true)` **强制刷新**，
-     *    所以"前台被切走"仍然在下一轮（约 1s）就能发现。 */
+     *  ★★2026-11-17（ANR 根因）：**主循环不再每轮 force** —— 那等于每 100ms 一次
+     *    `su dumpsys input`（实测每秒 8~9 个 fork），而 `dumpsys` 要 system_server 序列化
+     *    整个服务状态，每秒十次会把 system_server 拖到 ANR ⇒ lmkd 以
+     *    "device is not responding" 连环杀进程（实测内存 4.2GB 可用、助手 CPU 2.5% 照杀）。
+     *    现在真实现查只由 [AutoForegroundService.watchLoop] 每 2s 做一次；
+     *    主循环 / [MazeLoop.tap] / [Navigator] 全部走这个 TTL 缓存。
+     */
     @Volatile private var cachedPkg: String? = null
     @Volatile private var cachedAt = 0L
     private const val TTL_MS = 2_000L

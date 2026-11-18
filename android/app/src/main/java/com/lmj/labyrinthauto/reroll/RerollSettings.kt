@@ -429,6 +429,33 @@ object RerollSettings {
         else -> "scoreChaseRules"
     }
 
+    // ────────────────────────── 点击探测间隔（2026-11-17 用户）──────────────────────────
+    /**
+     * ★tapAndCheck「点完探页面变了没」的间隔挡位，默认 150ms。
+     *  · 只作用于**用默认 probeMs 的调用点**（商店关框 / 关闭收到 / 三选一 / 遗物 / 战斗开始 /
+     *    EX 装备 / 结算下一步 / 预览开打 / 局内刷开局 / 导航）；
+     *  · 屏幕中心慢页 = 本值 ×2（见 Navigator）；
+     *  · 各调用的 settleMs（点完第一次探之前的等待）**不受影响**（那些值是逐个坑调出来的）。
+     */
+    val TAP_PROBE_STEPS: List<Int> = listOf(150, 200, 250, 300, 350)
+
+    /** 挡位显示名（由快到慢），与 [TAP_PROBE_STEPS] 一一对应；UI 不显示具体毫秒数 */
+    val TAP_PROBE_LABELS: List<String> = listOf("最快", "快", "较快", "普通", "较慢")
+
+    const val TAP_PROBE_DEFAULT = 150
+
+    fun loadTapProbeMs(context: Context): Int {
+        val v = context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+            .getInt("tapProbeMs", TAP_PROBE_DEFAULT)
+        return if (v in TAP_PROBE_STEPS) v else TAP_PROBE_DEFAULT
+    }
+
+    fun saveTapProbeMs(context: Context, ms: Int) {
+        val v = if (ms in TAP_PROBE_STEPS) ms else TAP_PROBE_DEFAULT
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()
+            .putInt("tapProbeMs", v).apply()
+    }
+
     fun loadCredentials(context: Context): Pair<String, String> {
         val sp = context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
         // 老版本的明文在这里会被 SecureStore 原地升级成密文
@@ -546,21 +573,28 @@ object RerollSettings {
      * 在"知道打不过"之后更稳）。理由：模型不一定比原来的策略好，别一条道走到黑。
      *
      * 不管哪种模式，模型算不出（未加载 / 关卡不在词表 / 角色不足 5 人）都会静默回落规则版。
+     *
+     * ★2026-11-16（用户）：**默认改回「旧版规则」** —— 模型不一定比规则好，先按规则稳定跑。
+     *   这里只动**默认值**：用户自己已经选过（SharedPreferences 里有值）的照旧读取，不受影响。
      */
     fun loadTeamMode(context: Context): String =
         context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
-            .getString("teamMode", TEAM_MIXED)
+            .getString("teamMode", TEAM_RULE)
             ?.takeIf { it == TEAM_RULE || it == TEAM_MODEL || it == TEAM_MIXED }
-            ?: TEAM_MIXED
+            ?: TEAM_RULE
 
     fun saveTeamMode(context: Context, mode: String) {
         context.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()
             .putString("teamMode", mode).apply()
     }
 
-    /** ★战后角色三选一方法（2026-11-14 用户）：true = 推理模型，false = 旧版规则。**默认模型**。 */
+    /**
+     * ★战后角色三选一方法（2026-11-14 用户）：true = 推理模型，false = 旧版规则。
+     * ★2026-11-16（用户）：**默认改回「旧版规则」**（原来默认模型）。只动默认值，
+     *   用户已经选过的（SharedPreferences 里有值）照旧。
+     */
     fun loadPickByModel(context: Context): Boolean =
-        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getBoolean("pickByModel", true)
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getBoolean("pickByModel", false)
 
     fun savePickByModel(context: Context, on: Boolean) {
         context.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()

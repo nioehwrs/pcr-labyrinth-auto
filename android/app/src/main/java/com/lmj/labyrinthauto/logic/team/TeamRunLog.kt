@@ -71,8 +71,10 @@ object TeamRunLog {
     /** 设备信息（每行都带一份：合并多台设备的记录后仍能分清"这条是哪台机器跑的"） */
     private var device: JSONObject = JSONObject()
 
-    /** 进程内已发过的 run_id（同毫秒也不会重号） */
-    private val used = HashSet<String>()
+    /** 进程内已发过的 run_id（同毫秒也不会重号）。有界：run_id 带毫秒时间戳+48bit 随机，
+     *  跨毫秒不可能重号，只需保留近期窗口 ⇒ 超过上限淘汰最老的一半，避免长跑单调增长。 */
+    private val used = LinkedHashSet<String>()
+    private const val USED_CAP = 4096
 
     /** 已写入的条数（初始化时数一次当前文件，之后每写一行 +1）——给 UI 显示用 */
     @Volatile private var writtenLines = 0
@@ -157,7 +159,13 @@ object TeamRunLog {
                 val ms = String.format(Locale.US, "%03d", System.currentTimeMillis() % 1000)
                 val rnd = UUID.randomUUID().toString().replace("-", "").take(12)
                 val rid = "$st|$ts-$ms|$rnd"
-                if (used.add(rid)) return rid
+                if (used.add(rid)) {
+                    if (used.size > USED_CAP) {
+                        val iter = used.iterator()
+                        repeat(USED_CAP / 2) { if (iter.hasNext()) { iter.next(); iter.remove() } }
+                    }
+                    return rid
+                }
             }
         }
     }

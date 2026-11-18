@@ -203,7 +203,9 @@ class Model:
         for mask, cost, score in subsets(items):
             if cost + 600 <= money:
                 total = score + self.g(money - cost - 600, disc)
-                if total > best[0] + EPS:
+                # ★2026-11-16（用户）：同为"换货"方案且期望相同 → 选**花费更少**的（剩余钱多 = 弱支配）。
+                #   原逻辑只判严格更优，tie 时保留先遍历到的，不保证省钱。
+                if total > best[0] + 1e-3 or (best[1] and abs(total - best[0]) <= 1e-3 and cost < best[3]):
                     best = (total, True, mask, cost, score)
         return best
 
@@ -248,7 +250,8 @@ class Model:
         for mask, cost, score in subsets(items):
             if cost + 300 <= money:
                 total = score + self.hv(money - cost - 300, disc)
-                if total > best[0] + EPS:
+                # ★2026-11-16（用户）：同上 —— 同期望时选花费更少的换货方案。
+                if total > best[0] + 1e-3 or (best[1] and abs(total - best[0]) <= 1e-3 and cost < best[3]):
                     best = (total, True, mask, cost, score)
         return best
 
