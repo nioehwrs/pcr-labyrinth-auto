@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import com.lmj.labyrinthauto.core.SecureStore
 import com.lmj.labyrinthauto.logic.EventRetreatRule
+import com.lmj.labyrinthauto.logic.LogicRule
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Calendar
@@ -381,7 +382,7 @@ object RerollSettings {
     }
 
     // ── 子条件 2：按「遇到的事件 + 结果」判撤退（2026-11-03 用户需求，见 [EventRetreatRule]）──
-    //   模式下拉框：无 / 断言模式 / 逻辑模式（逻辑模式暂未实现，选了也不判定）。
+    //   模式下拉框：无 / 断言模式 / 逻辑模式（逻辑模式见 [LogicRule]，节点结束时统一判定）。
     //   断言列表整份存成一段 JSON —— 条数不定（上限 30），拆成 N 个 key 反而难维护。
 
     /** 条件 2 的模式，默认**无**（不改变现有行为）。 */
@@ -427,6 +428,23 @@ object RerollSettings {
     private fun keyOfConds(mode: EventRetreatRule.Mode): String = when (mode) {
         EventRetreatRule.Mode.LOGIC -> "scoreChaseRulesLogic"
         else -> "scoreChaseRules"
+    }
+
+    /**
+     * ★逻辑模式规则（[LogicRule]，2026-11-18）：与断言共用 key `scoreChaseRulesLogic`，
+     * 但存的是**新格式**（规则 JSON）。旧数据（断言格式的 Cond JSON）读进来会被
+     * [LogicRule.decode] 判成脏数据 ⇒ 空表 —— 逻辑模式从没生效过，不会丢有用配置。
+     */
+    fun loadLogicRules(context: Context): List<LogicRule.Rule> =
+        LogicRule.decode(
+            context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getString(keyOfConds(EventRetreatRule.Mode.LOGIC), null),
+        )
+
+    fun saveLogicRules(context: Context, rules: List<LogicRule.Rule>) {
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+            .edit()
+            .putString(keyOfConds(EventRetreatRule.Mode.LOGIC), LogicRule.encode(rules))
+            .apply()
     }
 
     // ────────────────────────── 点击探测间隔（2026-11-17 用户）──────────────────────────

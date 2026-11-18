@@ -9,6 +9,7 @@ import com.lmj.labyrinthauto.logic.EventPick
 import com.lmj.labyrinthauto.logic.EventRetreatRule
 import com.lmj.labyrinthauto.logic.EventRuleData
 import com.lmj.labyrinthauto.logic.EventSettings
+import com.lmj.labyrinthauto.logic.LogicRule
 import com.lmj.labyrinthauto.logic.SampleLog
 import com.lmj.labyrinthauto.logic.shop.ShopSampleLog
 import com.lmj.labyrinthauto.data.GameData
@@ -47,6 +48,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -94,6 +96,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
@@ -1263,13 +1267,16 @@ private fun ScoreChaseCard(context: Context) {
                 }
                 HorizontalDivider(Modifier.padding(vertical = 2.dp))
                 // ── 子条件 2（2026-11-03 用户需求）：按「遇到的事件 + 结算结果」判撤退 ──
-                //   右侧下拉框单选：无 / 断言模式 / 逻辑模式（逻辑模式暂未实现，选了等于不判定）。
+                //   右侧下拉框单选：无 / 断言模式 / 逻辑模式（逻辑模式 2026-11-18 实现，节点结束时判定）。
                 //   ★选「无」只是**不参与判定**：断言内容原样留着，切回来立刻恢复。
                 var mode2 by remember { mutableStateOf(RerollSettings.loadScoreChaseMode2(context)) }
                 // ★两种模式**各自记住自己那套条件**（用户 2026-11-03）：切到哪个模式就显示哪个模式
                 //   上次配的，互不覆盖。没有额外的"保存"动作——改了就落盘，和别处一样。
                 var conds by remember(mode2) {
                     mutableStateOf(RerollSettings.loadScoreChaseConds(context, mode2))
+                }
+                var logicRules by remember(mode2) {
+                    mutableStateOf(RerollSettings.loadLogicRules(context))
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
@@ -1280,7 +1287,7 @@ private fun ScoreChaseCard(context: Context) {
                                 EventRetreatRule.Mode.ASSERT ->
                                     "断言模式：命中任意一条条件就撤退（已配 ${conds.count { it.ready }} 条）"
                                 EventRetreatRule.Mode.LOGIC ->
-                                    "逻辑模式：条件照常编辑/记住，但**暂不生效**（已配 ${conds.count { it.ready }} 条）"
+                                    "逻辑模式：节点结束时按顺序判定（已配 ${logicRules.size} 条），其他时机不工作"
                             },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1296,7 +1303,15 @@ private fun ScoreChaseCard(context: Context) {
                         },
                     )
                 }
-                if (mode2 != EventRetreatRule.Mode.NONE) {
+                if (mode2 == EventRetreatRule.Mode.LOGIC) {
+                    LogicRuleEditor(
+                        rules = logicRules,
+                        onChange = {
+                            logicRules = it
+                            RerollSettings.saveLogicRules(context, it)
+                        },
+                    )
+                } else if (mode2 == EventRetreatRule.Mode.ASSERT) {
                     EventAssertEditor(
                         context = context,
                         conds = conds,
@@ -1503,6 +1518,280 @@ private fun ConditionRow(
             Icon(Icons.Filled.Close, contentDescription = "删除这条条件")
         }
     }
+}
+
+// ────────────────────────── 条件 2 · 逻辑模式编辑器（2026-11-18）──────────────────────────
+// 一座小型规则引擎的 UI：每条规则 =「如果 条件A（且/或 条件B）→ 动作」。
+// 条件原子 = 遇到事件（族 + 可选结果） / 变量(T1..T8、当前层数) [比较] 整数；
+// 动作 = 撤退 / token += -= =。规则只在**节点结束时按顺序触发**（见 [LogicRule]）。
+
+/** 逻辑模式规则列表编辑器 */
+@Composable
+private fun LogicRuleEditor(
+    rules: List<LogicRule.Rule>,
+    onChange: (List<LogicRule.Rule>) -> Unit,
+) {
+    val families = remember { EventFamily.all }
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(
+            "规则按顺序执行：改 token 后后面的规则立刻看到新值；遇到「撤退」即停止。只在节点结束时判定。",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        rules.forEachIndexed { i, rule ->
+            LogicRuleRow(
+                index = i,
+                rule = rule,
+                families = families,
+                onEdit = { nr -> onChange(rules.toMutableList().also { it[i] = nr }) },
+                onDelete = { onChange(rules.toMutableList().also { it.removeAt(i) }) },
+            )
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            TextButton(
+                onClick = {
+                    onChange(rules + LogicRule.Rule(
+                        a = LogicRule.Atom.CompareAtom(LogicRule.Variable.Area, LogicRule.Op.GE, 1),
+                    ))
+                },
+                enabled = rules.size < LogicRule.MAX_RULES,
+            ) {
+                Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("增加规则")
+            }
+            Text(
+                " ${rules.size}/${LogicRule.MAX_RULES}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+/** 一条逻辑规则（可换条件类型/连接符/动作） */
+@Composable
+private fun LogicRuleRow(
+    index: Int,
+    rule: LogicRule.Rule,
+    families: List<EventFamily.Family>,
+    onEdit: (LogicRule.Rule) -> Unit,
+    onDelete: () -> Unit,
+) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(6.dp))
+            .padding(8.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("#${index + 1}", style = MaterialTheme.typography.labelMedium)
+            Spacer(Modifier.width(6.dp))
+            Text("如果", style = MaterialTheme.typography.bodySmall)
+        }
+        // 条件 A
+        LogicAtomRow(
+            atom = rule.a,
+            families = families,
+            label = "条件A",
+            onEdit = { onEdit(rule.copy(a = it)) },
+        )
+        // 连接符 + 可选条件 B
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(
+                onClick = {
+                    if (rule.b == null) {
+                        // 加一个默认条件 B（T1 = 0），并默认「且」
+                        onEdit(rule.copy(b = LogicRule.Atom.CompareAtom(LogicRule.Variable.Tok(0), LogicRule.Op.EQ, 0),
+                            combine = LogicRule.Combine.AND))
+                    } else {
+                        onEdit(rule.copy(b = null))
+                    }
+                },
+                modifier = Modifier.size(26.dp),
+            ) {
+                Icon(
+                    if (rule.b == null) Icons.Filled.Add else Icons.Filled.Remove,
+                    contentDescription = if (rule.b == null) "加第二个条件" else "去掉第二个条件",
+                    modifier = Modifier.size(14.dp),
+                )
+            }
+            if (rule.b != null) {
+                Text("连接：", style = MaterialTheme.typography.bodySmall)
+                tinyEnumDropdown(
+                    items = LogicRule.Combine.entries,
+                    selected = rule.combine,
+                    label = { it.cn },
+                    onPick = { onEdit(rule.copy(combine = it)) },
+                )
+            }
+        }
+        rule.b?.let { bAtom ->
+            LogicAtomRow(
+                atom = bAtom,
+                families = families,
+                label = "条件B",
+                onEdit = { onEdit(rule.copy(b = it)) },
+            )
+        }
+        // 动作
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("则 →", style = MaterialTheme.typography.bodySmall)
+            Spacer(Modifier.width(4.dp))
+            tinyEnumDropdown(
+                items = listOf(true, false),
+                selected = rule.act is LogicRule.Act.Retreat,
+                label = { if (it) "撤退" else "改 token" },
+                onPick = { retreat ->
+                    onEdit(rule.copy(act = if (retreat) LogicRule.Act.Retreat
+                        else LogicRule.Act.TokAct(0, LogicRule.TokOp.ADD, 1)))
+                },
+            )
+            val tok = rule.act as? LogicRule.Act.TokAct
+            if (tok != null) {
+                tinyEnumDropdown(
+                    items = (0 until LogicRule.TOKEN_COUNT).toList(),
+                    selected = tok.i,
+                    label = { LogicRule.tokenName(it) },
+                    onPick = { onEdit(rule.copy(act = tok.copy(i = it))) },
+                )
+                tinyEnumDropdown(
+                    items = LogicRule.TokOp.entries,
+                    selected = tok.op,
+                    label = { it.cn },
+                    onPick = { onEdit(rule.copy(act = tok.copy(op = it))) },
+                )
+                tinyNumField(value = tok.n) {
+                    onEdit(rule.copy(act = tok.copy(n = it.coerceIn(-99, 99))))
+                }
+            }
+            Spacer(Modifier.weight(1f))
+            IconButton(onClick = onDelete) {
+                Icon(Icons.Filled.Close, contentDescription = "删除这条规则", modifier = Modifier.size(18.dp))
+            }
+        }
+        Text(
+            LogicRule.ruleText(rule),
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/** 一个条件原子：类型下拉（事件 / 变量比较）+ 对应控件 */
+@Composable
+private fun LogicAtomRow(
+    atom: LogicRule.Atom,
+    families: List<EventFamily.Family>,
+    label: String,
+    onEdit: (LogicRule.Atom) -> Unit,
+) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(label, style = MaterialTheme.typography.labelSmall, modifier = Modifier.width(38.dp))
+        tinyEnumDropdown(
+            items = listOf(true, false),
+            selected = atom is LogicRule.Atom.EventAtom,
+            label = { if (it) "遇到事件" else "变量比较" },
+            onPick = { isEvent ->
+                onEdit(if (isEvent) {
+                    LogicRule.Atom.EventAtom(families.firstOrNull()?.eventIds ?: emptyList())
+                } else {
+                    LogicRule.Atom.CompareAtom(LogicRule.Variable.Area, LogicRule.Op.GE, 1)
+                })
+            },
+        )
+        Spacer(Modifier.width(4.dp))
+        when (atom) {
+            is LogicRule.Atom.EventAtom -> {
+                InlineDropdown(
+                    items = families.map { DropItem(it.name) },
+                    selected = families.indexOfFirst { it.eventIds.containsAll(atom.eventIds) },
+                    onPick = { k ->
+                        val f = families.getOrNull(k) ?: return@InlineDropdown
+                        onEdit(atom.copy(eventIds = f.eventIds, resultId = 0))
+                    },
+                    maxWidth = 170.dp,
+                )
+                val fam = families.firstOrNull { it.eventIds.containsAll(atom.eventIds) }
+                if (fam?.hasRandom == true) {
+                    Text("且结果", style = MaterialTheme.typography.labelSmall)
+                    InlineDropdown(
+                        items = listOf(DropItem("（无视结果）")) + fam.outcomes.map { DropItem(it.name) },
+                        selected = if (atom.resultId <= 0) 0 else fam.outcomes.indexOfFirst { it.id == atom.resultId } + 1,
+                        onPick = { k ->
+                            onEdit(atom.copy(resultId = if (k == 0) 0 else fam.outcomes[k - 1].id))
+                        },
+                        maxWidth = 170.dp,
+                    )
+                }
+            }
+            is LogicRule.Atom.CompareAtom -> {
+                tinyEnumDropdown(
+                    items = listOf(true, false),
+                    selected = atom.v is LogicRule.Variable.Tok,
+                    label = { isTok ->
+                        if (isTok) LogicRule.tokenName((atom.v as? LogicRule.Variable.Tok)?.i ?: 0) else "当前层数"
+                    },
+                    onPick = { isTok ->
+                        val nv = if (isTok) LogicRule.Variable.Tok((atom.v as? LogicRule.Variable.Tok)?.i ?: 0)
+                        else LogicRule.Variable.Area
+                        onEdit(atom.copy(v = nv))
+                    },
+                )
+                // token 变量可进一步选 T1..T8（当前层数没有这一步）
+                if (atom.v is LogicRule.Variable.Tok) {
+                    tinyEnumDropdown(
+                        items = (0 until LogicRule.TOKEN_COUNT).toList(),
+                        selected = atom.v.i,
+                        label = { LogicRule.tokenName(it) },
+                        onPick = { onEdit(atom.copy(v = LogicRule.Variable.Tok(it))) },
+                    )
+                }
+                tinyEnumDropdown(
+                    items = LogicRule.Op.entries,
+                    selected = atom.op,
+                    label = { it.key },
+                    onPick = { onEdit(atom.copy(op = it)) },
+                )
+                tinyNumField(value = atom.n) { onEdit(atom.copy(n = it)) }
+            }
+        }
+    }
+}
+
+/** 逻辑规则编辑器里的行内下拉（与断言模式的 [InlineDropdown] 同款视觉：一段带下划线的小字） */
+@Composable
+private fun <T> tinyEnumDropdown(
+    items: List<T>,
+    selected: T,
+    label: (T) -> String,
+    onPick: (T) -> Unit,
+) {
+    InlineDropdown(
+        items = items.map { DropItem(label(it)) },
+        selected = items.indexOf(selected),
+        onPick = { onPick(items[it]) },
+        maxWidth = 96.dp,
+    )
+}
+
+/** 逻辑规则编辑器里的行内整数输入（与行内下拉同款下划线小字，可负，最多 4 字符） */
+@Composable
+private fun tinyNumField(value: Int, onValue: (Int) -> Unit) {
+    val lineColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.35f)
+    BasicTextField(
+        value = value.toString(),
+        onValueChange = { s -> onValue(s.filter { it.isDigit() || it == '-' }.take(4).toIntOrNull() ?: 0) },
+        singleLine = true,
+        textStyle = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.primary),
+        modifier = Modifier
+            .width(44.dp)
+            .drawBehind {
+                val y = size.height - 1.dp.toPx()
+                drawLine(lineColor, Offset(0f, y), Offset(size.width, y), 1.dp.toPx())
+            },
+    )
 }
 
 /** 分数带千分位，例：50,000 */

@@ -356,6 +356,10 @@ object MazeLoop {
         pendingEventRetreat = null            // ★条件 2：上局命中的断言不能带到本局
         saidLogicMode2 = false
         eventRuleTracker = EventRetreatRule.Tracker()   // ★条件 2：断言进度每局从头算
+        logicEngine.reset()                  // ★逻辑模式：8 个 token 每局从 0 开始
+        logicEngine.rules = RerollSettings.loadLogicRules(ctx)  // 开局读一次（中途改配置下局生效，token 语义才稳定）
+        nodeEventFacts.clear()
+        logicFiredNode = null                // ★本局每个节点都能各 fire 一次
         MazeRetreat.resetReason()            // ★上局的撤退原因不能串到本局（归档 tag 要用）
         if (!input.isAvailable()) {
             AppState.addLog("停手：点击后端不可用")
@@ -1130,6 +1134,8 @@ object MazeLoop {
                 } else {
                     // ★回到地图 ⇒ 结算上一个事件的效果差（只在确实不在战斗时；见 [settleEventDiff]）
                     if (evSnapId != null && !st.optBoolean("inBattle", false)) settleEventDiff(null, "回地图")
+                    // ★逻辑模式（2026-11-18）：节点结束时统一 fire 一次（在此之后才考虑撤退/移动）
+                    logicRuleFire(st)
                     // ★条件 2：事件里命中断言 ⇒ 等这一刻（事件处理完、正准备前往下一节点，地图上有「撤退」按钮）再撤
                     if (pendingEventRetreat != null && doPendingEventRetreat(input)) return
                     acted = handleMove(input, st, screenW, screenH)   // PC 6373~6458
@@ -1669,6 +1675,15 @@ object MazeLoop {
      * 断言里的条件可能指向不同事件、分发生在不同时刻 ⇒ 必须跨多次结算累积。
      */
     private var eventRuleTracker: EventRetreatRule.Tracker? = null
+
+    /** ★逻辑模式（[LogicRule]）：token 引擎，每局重置 */
+    private var logicEngine: LogicRule.Engine = LogicRule.Engine()
+
+    /** 本节点收集到的事件结算事实：演出页/结算时采集，**节点结束时**统一喂给 [LogicRule] */
+    private val nodeEventFacts = mutableListOf<LogicRule.EventFact>()
+
+    /** ★逻辑模式：已经 fire 过的节点（`area:blockId`），每个节点只触发一次 */
+    private var logicFiredNode: String? = null
 
     /** ★策略=等待接手：这些节点关闭自动组队/自动开战，等用户自己操作 */
     private val manualTeamNodes = HashSet<String>()
@@ -2596,6 +2611,10 @@ object MazeLoop {
                 )
             }
         }
+        // ★逻辑模式（2026-11-18）：采集本节点事件事实（只采集，**不判规则** —— 规则只在节点结束时 fire）
+        if (rid != null && hit != null) {
+            nodeEventFacts += LogicRule.EventFact(hit.eid, rid, hit.slot, du)
+        }
         // ★"获得角色<N"型：只能用**结算后**的角色差判（演出页那一刻差恒为 0，见 [eventRuleCheck]）
         if (rid != null && du != null && EventFamily.isUnitRid(rid)) judgeUnitOutcome(hit, rid, du)
         // ★新增了哪些角色（不只是个数）：持有池为空（读失败）时算不出来，留空
@@ -2708,13 +2727,7 @@ object MazeLoop {
         if (!RerollSettings.loadScoreChaseOn(ctx)) return
         when (RerollSettings.loadScoreChaseMode2(ctx)) {
             EventRetreatRule.Mode.NONE -> return
-            EventRetreatRule.Mode.LOGIC -> {
-                if (!saidLogicMode2) {
-                    saidLogicMode2 = true
-                    AppState.addLog("[i] 凹分条件 2：当前是**逻辑模式**（暂未实现）→ 不做任何判定")
-                }
-                return
-            }
+            EventRetreatRule.Mode.LOGIC -> return   // ★逻辑模式：规则只在节点结束时 fire（见 logicRuleFire），演出页不判
             EventRetreatRule.Mode.ASSERT -> Unit
         }
         val tracker = eventRuleTracker ?: return
@@ -2747,6 +2760,45 @@ object MazeLoop {
             (h?.let { " ｜ ${it.label}" + (if (it.desc.isNotBlank()) " ｜ ${it.desc}" else "") } ?: "")
         AppState.addLog("凹分条件 2：$detail → 撤退")
         pendingEventRetreat = detail
+    }
+
+    /**
+     * ★凹分模式·条件 2 **逻辑模式**（2026-11-18）：**节点结束时统一 fire 一次**（由回地图分支调用）。
+     * 其他时机（事件演出页等）一律不工作（用户明确）；事件事实在 [settleEventDiff] 里采集。
+     *
+     * ★每个节点只 fire 一次（[logicFiredNode] = `area:blockId`）：同一节点多轮回地图不重复触发，
+     * 换节点（blockId 变）才再 fire。规则在开局时读入 [logicEngine]（中途改配置下局生效）。
+     */
+    private fun logicRuleFire(st: org.json.JSONObject) {
+        if (pendingEventRetreat != null) return
+        val ctx = appCtx ?: return
+        if (!RerollSettings.loadScoreChaseOn(ctx)) return
+        if (RerollSettings.loadScoreChaseMode2(ctx) != EventRetreatRule.Mode.LOGIC) return
+        if (logicEngine.rules.isEmpty()) return
+        val area = (st.opt("area") as? Number)?.toInt() ?: -1
+        val blockId = st.optString("blockId", "")
+        val nodeKey = "$area:$blockId"
+        if (nodeKey == logicFiredNode) return
+        logicFiredNode = nodeKey
+        val fired = logicEngine.fire(LogicRule.Ctx(area, nodeEventFacts))
+        nodeEventFacts.clear()
+        if (fired.isEmpty()) {
+            if (!saidLogicMode2) {
+                saidLogicMode2 = true
+                AppState.addLog(
+                    "[i] 凹分条件 2：逻辑模式已启用（${logicEngine.rules.size} 条规则，节点结束时判定）" +
+                        "｜本节点无命中 ${logicEngine.tokensState()}",
+                )
+            }
+            return
+        }
+        val last = fired.last()
+        AppState.addLog(
+            "凹分条件 2（逻辑）节点${blockId} 层数$area：" +
+                fired.joinToString("；") { it.log } + "｜${logicEngine.tokensState()}",
+        )
+        // ★撤退也走同一条"等回地图再撤"的兑现链（此时已在回地图，下一轮 doPendingEventRetreat 兑现）
+        if (last.act is LogicRule.Act.Retreat) pendingEventRetreat = "逻辑模式：${last.log}"
     }
 
     /**
@@ -5605,7 +5657,9 @@ object MazeLoop {
                         sess.openedAt = System.currentTimeMillis()
                         tap(input, eq.optInt("x"), eq.optInt("y"),
                             "打开特别装备${if (sess.exShare) "" else "（第2/3队：不共用其他角色装备）"}")
-                        delay(PartyPlan.LAB_PARTY_TAP_MS)
+                        // ★2026-11-18（用户）：点开特别装备后的这一拍等待，1×→1.5×
+                        //   （只改这一处，不动编组页其它共用 LAB_PARTY_TAP_MS 的点击）
+                        delay((PartyPlan.LAB_PARTY_TAP_MS * 3L) / 2L)
                         // ★★2026-11-08：三连页改成**打包跑完**（原来是"点开就交回主循环、由 handleExequip 单步接管"）。
                         //   现在在**同一次调用里**把①②③走完 ⇒ 走完就回到编组页 ⇒ 下一轮重新读页再点「战斗开始」。
                         //   （旧做法的坑：主循环下一轮看到的是 EX 页，顶框 DialogCommonBig ⇒ 通用弹窗白名单
@@ -5953,6 +6007,9 @@ object MazeLoop {
                 // ★★点完**探**几次（不是"等一下就重试"）—— 页面动画没走完时签名不会变，
                 //   探到"变了"就停；探完还没变才判"真没生效"（那时按钮已静止，再点才点得准）。
                 probe = PROBE_N,
+                // ★2026-11-18（用户）：探测"是否到达目标页"的间隔从 1×probeMs 稍稍延长到 1.5×
+                //   —— 三连页切页动画比普通页慢，探太快会在按钮还在动时判"没到达"⇒ 多点。
+                probeMs = (TapCheck.currentProbeMs() * 3L) / 2L,
                 // ★2026-11-17（用户）：统一走默认 skipFirstHits=1（1×probeMs=150ms，已覆盖原先
                 //   prio0 的 2×60=120ms 需求）；不再按 btnKey 单独设。
                 xyAt = xyAt@{
