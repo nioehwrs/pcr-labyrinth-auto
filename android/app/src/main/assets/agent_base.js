@@ -10345,6 +10345,20 @@ const LAB_PATHS = {
   //   ★这一下不点就不结算（实测 `coin` 与 `isSold` 到这时才变）。
   //   ★`top` 会被 `DialogLabyrinthShop`（索引更大）占住 ⇒ 这类框一律用 `dlg:` 根。
   "ShopSummonDone|OneButtonWhite": { dlg: "DialogCommonMiddle", path: [0, 2, 3], name: "OneButtonWhite" },   // 「关闭」
+  // ── 商店刷新（2026-11-18 实测：金币 7465→7165，六格货架**全部换新**）──
+  //   `RerollButton` 文本是「用 N 更新」；直调后弹「更新确认」（`DialogCommonSmall` 两按钮框，
+  //   里面有 `RerollCostLabel`=所需金币 / `CurrentLabyrinthCoinLabel`=持有金币）。
+  //   ★这个确认框的两按钮在 [0,2,2]/[0,2,3]，与 `MoveConfirm` 恰好同路径同坐标（786,496），可复用。
+  "ShopReroll|RerollButton": { dlg: "DialogLabyrinthShop", root: "top", path: [0, 3, 4], name: "RerollButton" },
+  "ShopRerollConfirm|TwoButtonRight": { dlg: "DialogCommonSmall", root: "top", path: [0, 2, 3], name: "TwoButtonRight" },  // 「确认」
+  "ShopRerollConfirm|TwoButtonLeft": { dlg: "DialogCommonSmall", root: "top", path: [0, 2, 2], name: "TwoButtonLeft" },    // 「取消」
+  // ── 关闭商店（2026-11-18 实测：直调后 statusType 7→0、pageTop 空、viewId=264、next=[30701]）──
+  //   `CloseButton` 是底部按钮组最左那颗；直调后弹 `DialogCommonSmall`「商店确认」（取消/确认）。
+  //   ★Small 的**两按钮框**位置固定：`[0,2,2]` 取消 / `[0,2,3]` 确认 —— 移动确认、更新确认、
+  //     商店确认都是这一对（坐标也都是 494,496 / 786,496），可共用；单/三按钮版位置不同，别混用。
+  "ShopClose|CloseButton": { dlg: "DialogLabyrinthShop", root: "top", path: [0, 3, 0], name: "CloseButton" },
+  "ShopCloseConfirm|TwoButtonRight": { dlg: "DialogCommonSmall", root: "top", path: [0, 2, 3], name: "TwoButtonRight" },   // 「确认」
+  "ShopCloseConfirm|TwoButtonLeft": { dlg: "DialogCommonSmall", root: "top", path: [0, 2, 2], name: "TwoButtonLeft" },     // 「取消」
 };
 
 /** 查固定路径表：给 key（找不到再退 name 匹配）→ { root, path, name } | null */
