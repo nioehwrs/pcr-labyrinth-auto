@@ -109,6 +109,22 @@ object AgentApi {
     /** 游戏主循环心跳 `{frame,time,exists,err}`（看门狗：帧数不涨=游戏被冻住） */
     suspend fun gameTick(): JSONObject? = obj("gameTick", timeoutMs = T_FAST)
 
+    /**
+     * ★2026-11-17：**游戏窗口是否获得焦点**（`UnityEngine.Application.isFocused`）——
+     * 零 shell / 微秒级，用来替代 `dumpsys input` 那套前台判定（那个每秒十次会把
+     * system_server 拖到 ANR，lmkd 就会以 "device is not responding" 杀进程）。
+     * 语义精确：切走=false；游戏卡死/加载/演出=true（和帧计数不同，不会混淆）。
+     * @return true=在前台 / false=已失焦 / null=读不到（调用方回退到 dumpsys）
+     */
+    suspend fun gameFocused(): Boolean? {
+        // ★超时收紧到 800ms：正常是微秒级（类已缓存）；万一 agent 侧走了慢路，
+        //   宁可超时返回 null（回退 dumpsys），也**不能把主循环拖住 2 秒**
+        //   （2026-11-17 23:53 实测：慢路 1.9s/次 × 每 0.5s 一次 ⇒ 流程卡死）。
+        val o = obj("gameFocused", timeoutMs = 800L) ?: return null
+        if (!o.has("focused") || o.isNull("focused")) return null
+        return o.optBoolean("focused")
+    }
+
     /** 卡死现场：所有线程调用栈（字符串数组） */
     suspend fun stuckDump(): JSONArray? = arr("stuckDump", timeoutMs = T_DUMP)
 
@@ -307,6 +323,18 @@ object AgentApi {
     /** ★★战斗结算按钮的**字段读**（2026-10-16）：`{ok, cands:[{x,y,label,src}]}`。
      *  每个候选带**配对标签文字**（判胜负）与坐标（判点哪）；`ok=false` ⇒ 调用方回退树遍历。 */
     suspend fun battleResultMem(): JSONObject? = obj("battleResultMem", timeoutMs = T_SLOW)
+
+    /**
+     * ★2026-11-18：结算按钮的**固定层级路径**读数：`{ok,kind:"fail"|"win",x,y,label,ms,err}`。
+     *
+     * 两条路径都是实测取证后写死的：
+     *  · 失败 `DialogQuestFailed` → `Main[0]/contents[0]/Anchor[4]/UIButton_Next[2]`
+     *  · 胜利 `DialogQuestResultWin` → `Main[0]/PartsFormer[1]/FormerButtons[4]/TopParts[0]/
+     *    BottomParts[1]/ButtonAnimator[0]/Button[0]/NextButton[0]`
+     *
+     * 比 [battleResultMem] 更省：几次 `GetChild` + 一次坐标换算，不扫字段、不遍历树。
+     */
+    suspend fun battleResultPath(): JSONObject? = obj("battleResultPath", timeoutMs = T_FAST)
 
     /** ★★结算按钮"**学一次、之后只校验**"（2026-10-16）：`{ok,hit,name,x,y,label}`。
      *  首次走一次"只限 DialogArea"的遍历学习并记住节点指针；之后只做"读指针 + 校验 + 算坐标"（零遍历）。 */

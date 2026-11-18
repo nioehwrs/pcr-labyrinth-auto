@@ -22,6 +22,12 @@ import com.lmj.labyrinthauto.data.Tables
  */
 class TeamBuild(private val tables: Tables) {
 
+    /**
+     * ★2026-11-18（用户）：dot 关凑不出 dot 队而降级到「单体目标队」时，额外给破甲角色的加权
+     * （叠加在 burst 权重 `bp_break=6` 之上 ⇒ 破甲分翻倍）。双向破甲已在上游修复，不会反被扣分。
+     */
+    private val DOT_FALLBACK_BREAK_BIAS = 6.0
+
 
     val rules = Rules(tables)
 
@@ -797,8 +803,23 @@ class TeamBuild(private val tables: Tables) {
         fun isDot(u: String): Boolean =
             rules.dotKindsOf(u).isNotEmpty() || TagIds.T_DOT in rules.tagsOf(u)
 
-        if (cands.none { isDot(it) }) {
-            res.fail = "池子里没有任何 dot 角色 → 组队失败"
+        // ★★2026-11-18（用户定的规则）：
+        //   ① **没有 dot** ⇒ 改用「正常的单体目标队」（岛鲸 / 巨大吞拿鱼那种 burst 队），并**更倾向破甲**；
+        //   ② **只有 1 个 dot** ⇒ 带上她，其余 4 人仍按单体目标输出选（同样更倾向破甲）；
+        //   ③ 2 个以上 dot ⇒ 仍走原「纯 dot 队」（强制坦克 + dot 种类最大化）；
+        //   ④ 本关**失败过** ⇒ 由 profile 的 `tank_on_fail` 统一补坦克（build() 里处理，对 ① ② 同样生效）。
+        val dotUnits = cands.filter { isDot(it) }
+        if (dotUnits.size <= 1) {
+            val pf2 = if (pf["break_bias"] == null) pf + ("break_bias" to DOT_FALLBACK_BREAK_BIAS) else pf
+            if (dotUnits.isEmpty()) {
+                res.log.add("dot_only：池里没有 dot → 改走单体爆发队（更倾向破甲）")
+                algoBurstImpl(pf2, cands, weak, n, relicsSkill, res)
+            } else {
+                res.log.add(
+                    "dot_only：池里只有 1 个 dot（${name(dotUnits[0])}）→ 带上她，其余按单体爆发队（更倾向破甲）",
+                )
+                algoBurstImpl(pf2, cands, weak, n, relicsSkill, res, preset = listOf(dotUnits[0]))
+            }
             return
         }
 
@@ -994,11 +1015,17 @@ class TeamBuild(private val tables: Tables) {
         pf: Map<String, Any?>,
         /** ★2026-11-15：幽灵方案1/2/3/4 的 1 号位硬性人选（涅比亚/抽蓝/坦克/前排） */
         force: String? = null,
+        /** ★2026-11-18（用户）：**预置成员**（dot 关只有 1 个 dot 时，先把她锁进队再按爆发补人） */
+        preset: List<String> = emptyList(),
     ): BurstTeamResult {
         var w = C.W["burst"]!!
         val boss = (pf["key"] as? String ?: "").startsWith("Boss_")
         // ★双敌/多目标：几个敌人加起来就是群体 → 「单体效果低」免扣
         if (truthy(pf["multi"])) w = w + ("weaksingle" to 0.0)
+        // ★2026-11-18（用户）：dot 关凑不出 dot 队而降级爆发时，"**更倾向于破甲角色**"
+        //   —— 直接在 bp_break 上加权（双向破甲已修复，不会反被扣分）。
+        val bb = (pf["break_bias"] as? Number)?.toDouble() ?: 0.0
+        if (bb > 0) w = w + ("bp_break" to (w["bp_break"]!! + bb))
         // ★对策·美空（need_direct）：非定向的单体输出重扣（见 burstScore 里的说明）
         if (truthy(pf["need_direct"])) {
             w = w + ("nondirect_single" to C.NONDIRECT_SINGLE) +
@@ -1015,6 +1042,8 @@ class TeamBuild(private val tables: Tables) {
             picked.add(u)
             fixed.add(u)
         }
+        // ★预置成员先锁进 picked/fixed（算结构位）：后面的同属性优化不许换掉它
+        preset.forEach { add(it) }
 
         // ① 必需位
         val nt = pf["need_tank"] as? String
@@ -1293,6 +1322,8 @@ class TeamBuild(private val tables: Tables) {
         front: String? = null,
         gap: Int = 0,
         plan: Int = 0,
+        /** ★2026-11-18（用户）：预置成员（dot 关只有 1 个 dot 时锁进队） */
+        preset: List<String> = emptyList(),
     ) {
         val w = C.W["burst"]!!
         val wt = C.W["burst_team"]!!
@@ -1313,7 +1344,7 @@ class TeamBuild(private val tables: Tables) {
         val branch = mutableListOf<Pair<String, Double>>()
 
         for (atk in opts) {
-            val bt = burstTeam(cands, weak, n, atk, pf, force)
+            val bt = burstTeam(cands, weak, n, atk, pf, force, preset)
             val picked = bt.picked
             // ★注意：PC 这里（和 _scb / ghost_plan3）**都没有**把 boss 传进 _burst_score
             fun sc(u: String): Double = burstScore(u, atk, w, truthy(pf["no_type"]), truthy(pf["no_break"]), false)

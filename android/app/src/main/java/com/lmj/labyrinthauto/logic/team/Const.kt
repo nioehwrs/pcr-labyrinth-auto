@@ -186,7 +186,12 @@ object Profiles {
         "EX_770121101" to mapOf("algo" to "sutong"),      // 北海狮首领+尖刺大螃蟹…
         "EX_770121201" to mapOf("algo" to "sutong"),      // 野性角鹿+淘气豆狸…
         // 纯 dot 关
-        "EX_770120201" to mapOf("algo" to "dot_only"),    // 好朋友X
+        // ★2026-11-18（用户）：dot 凑不出时会降级成"单体爆发队"，那时**失败过就补坦克**
+        //   （和岛鲸/巨大吞拿鱼同款；dot 队本身已强制坦克，这条只影响降级后的 burst 队）。
+        "EX_770120201" to mapOf(
+            "algo" to "dot_only",
+            "tank_on_fail" to "tank_or_mtank",
+        ),                                                // 好朋友X
         // 单体爆发
         // ★岛鲸：失败后补 1 个坦克/兼职坦克（2026-10-20 用户；与巨大吞拿鱼同款 tank_on_fail）
         "EX_770120301" to mapOf(

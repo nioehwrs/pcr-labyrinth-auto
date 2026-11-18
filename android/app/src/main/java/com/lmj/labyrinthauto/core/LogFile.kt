@@ -66,8 +66,20 @@ object LogFile {
     )
     private val lock = Any()
 
+    /**
+     * ★批量 flush 阈值（2026-11-17）：原来**每行都 `flush()` 两份文件** ⇒ 战斗中日志几十行/秒时
+     *   每秒上百次 write 系统调用，在 CPU/IO 紧张时会把系统拖到 lmkd 判定 "device is not responding"。
+     *   现在攒够 [FLUSH_BYTES] 或距上次满 [FLUSH_MS] 才 flush。
+     *   ⚠代价：进程被 SIGKILL（LMK/用户强杀）时最多丢最后这 ~0.5s/8KB 的日志。
+     */
+    private const val FLUSH_BYTES = 8 * 1024
+    private const val FLUSH_MS = 500L
+
     /** 一份正在写的文件（每个目录一份，内容相同） */
-    private class Sink(val f: File, val w: BufferedWriter, var bytes: Long = 0L)
+    private class Sink(val f: File, val w: BufferedWriter, var bytes: Long = 0L) {
+        var pending = 0L                       // 自上次 flush 以来写入的字节
+        var lastFlush = System.currentTimeMillis()
+    }
 
     private var dirs: List<File> = emptyList()
     @Volatile private var ready = false
@@ -670,9 +682,20 @@ object LogFile {
     }
 
     private fun writeAll(sinks: List<Sink>, line: String) {
+        val now = System.currentTimeMillis()
         for (s in sinks) {
             if (s.bytes >= MAX_BYTES) continue
-            runCatching { s.w.write(line); s.w.flush(); s.bytes += line.length }
+            runCatching {
+                s.w.write(line)
+                s.bytes += line.length
+                s.pending += line.length
+                // ★攒够字节数或时间才落盘（见 FLUSH_BYTES/FLUSH_MS 注释）
+                if (s.pending >= FLUSH_BYTES || now - s.lastFlush >= FLUSH_MS) {
+                    s.w.flush()
+                    s.pending = 0
+                    s.lastFlush = now
+                }
+            }
         }
     }
 

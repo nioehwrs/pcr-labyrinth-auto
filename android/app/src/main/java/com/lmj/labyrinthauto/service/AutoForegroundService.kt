@@ -970,7 +970,22 @@ class AutoForegroundService : Service() {
             // ★2026-11-10：心跳必须**现查**（不走 2s TTL 缓存）—— 它是"切屏锁存"最稳的
             //   实时来源。局内刷开局期间点击不走 MazeLoop.tap，光靠 frontOk() 的缓存读法，
             //   切走后又恰好被自愈顶回游戏就会漏判（雷电 9 实测）。
-            val pkg = Foreground.packageName(force = true)
+            // ★★2026-11-18：**改用 Unity `isFocused`（零 shell）** —— 原来这里每 2s 一次
+            //   `su dumpsys input`（30 次/分钟），是全机最后一条高频 dumpsys；`dumpsys` 要
+            //   system_server 序列化整个服务状态，长跑会把系统拖到 lmkd 的
+            //   "device is not responding" 连环杀（实测内存充裕也照杀）。
+            //   · true  ⇒ 前台就是游戏
+            //   · false ⇒ 游戏失焦 ⇒ 走锁存（等价于读到"别的包名"）
+            //   · null  ⇒ agent 还没连上（启动阶段）⇒ 才退回 dumpsys 现查一次
+            val focused = runCatching { com.lmj.labyrinthauto.frida.AgentApi.gameFocused() }.getOrNull()
+            val pkg: String? = when (focused) {
+                true -> com.lmj.labyrinthauto.frida.GameProcess.pkg()
+                false -> {
+                    Foreground.noteLostFocus()
+                    "（游戏失焦）"
+                }
+                null -> Foreground.packageName(force = true)
+            }
             if (pkg != lastPkg) {
                 lastPkg = pkg
                 AppState.addLog("前台切换 → ${pkg ?: "?"}")

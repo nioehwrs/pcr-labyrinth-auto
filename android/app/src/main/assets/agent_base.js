@@ -4583,6 +4583,14 @@ function battleResultBtn(minY) {
             if (page == null || _resLabelMatch(page, label)) {
               out.ok = true; out.hit = "缓存"; out.name = nm; out.x = x; out.y = y; out.label = label;
               good = true;
+              // ★2026-11-18：附带**窗口层级链**（每页只取一次）——供改造成固定路径取证用
+              try {
+                const pk = "btn:" + page;
+                if (!g_resPathSaid[pk]) {
+                  const p = _pathChainOf(slot.tr);
+                  if (p) { g_resPathSaid[pk] = true; out.path = p; }
+                }
+              } catch (e) {}
             }
           }
         }
@@ -4637,9 +4645,185 @@ function battleResultBtn(minY) {
     out.hit = (page ? "" : "（页未认出，不缓存）") + "学习并缓存";
     out.name = best.name; out.x = best.x; out.y = best.y; out.label = best.label;
     out.cands = cands.length;
+    // ★2026-11-18：附带**窗口层级链**（每页只取一次）——胜利页就是靠这里取的
+    try {
+      const pk = "btn:" + page;
+      if (page && !g_resPathSaid[pk]) {
+        const p = _pathChainOf(best.tr);
+        if (p) { g_resPathSaid[pk] = true; out.path = p; }
+      }
+    } catch (e) {}
     return out;
   } catch (e) { out.err = String(e); }
   return out;
+}
+
+// ★★2026-11-18：**一次性「窗口路径」取证**。
+//   按钮的 GameObject 名是通用 prefab 名（实测 `common_btn_s_sub_6` 这种），**没有语义名**
+//   ⇒ 按名字正则永远定位不到（这正是 `battleResultBtn` 学习路对失败页失效的原因）。
+//   但它在层级里的位置是固定的 ⇒ 从按钮 transform 向上走父链，把每层的
+//   `名字[同级索引]` 记下来，就能改成「从 DialogArea 一路 GetChild」的纯固定路径。
+//   每个对话框类只取一次（进程内），开销 = 每层 3 次 invoke × 深度(~6)。
+let g_resPathSaid = {};
+function _pathChainOf(tr) {
+  const segs = [];
+  let cur = tr, depth = 0;
+  while (cur && !cur.isNull() && depth < 12) {
+    let nm = "";
+    try { nm = _str(_inv(_inv(cur, "get_gameObject"), "get_name")); } catch (e) {}
+    let idx = -1;
+    try {
+      const r = _inv(cur, "GetSiblingIndex");
+      if (r && !r.isNull()) idx = r.add(0x10).readS32();
+    } catch (e) {}
+    segs.unshift(nm + "[" + idx + "]");
+    try { cur = _inv(cur, "get_parent"); } catch (e) { cur = null; }
+    depth++;
+  }
+  return segs.join("/");
+}
+
+// ── ★★2026-11-18：结算按钮的**固定层级路径** ──────────────────────────────────────
+// 实测取证（10:27 失败页那条日志）：
+//   _Game(Clone)[0]/UI Root[0]/FrontArea[4]/IgnoreBlurLayer[1]/DialogArea[0]/
+//   DialogQuestFailed(Clone)[6]/Main[0]/contents[0]/Anchor[4]/UIButton_Next[2]
+// ⇒ 从「结算对话框」往下就是这条固定链：Main → contents → Anchor → UIButton_Next。
+// 每层先按记录的索引取、并**校验名字**；索引漂了就在同层按名字找（同层子节点很少）。
+// 全程**不扫对话框字段、不遍历树、不做名字正则匹配**（名字是通用 prefab 名，正则本来也靠不住）。
+//   失败页（10:27 取证）：DialogQuestFailed → Main[0]/contents[0]/Anchor[4]/UIButton_Next[2]
+//   胜利页（11:25 取证）：DialogQuestResultWin → Main[0]/PartsFormer[1]/FormerButtons[4]/
+//                         TopParts[0]/BottomParts[1]/ButtonAnimator[0]/Button[0]/NextButton[0]
+const RES_FAIL_SUB = {
+  cls: "DialogQuestFailed", kind: "fail",
+  names: ["Main", "contents", "Anchor", "UIButton_Next"],
+  idxs: [0, 0, 4, 2],
+};
+const RES_WIN_SUB = {
+  cls: "DialogQuestResultWin", kind: "win",
+  names: ["Main", "PartsFormer", "FormerButtons", "TopParts", "BottomParts",
+          "ButtonAnimator", "Button", "NextButton"],
+  idxs: [0, 1, 4, 0, 1, 0, 0, 0],
+};
+//   BOSS/EX 胜利页（2026-11-18 15:24 取证，节点 30701）：DialogLabyrinthExResult →
+//     Main[0]/PartsFormer[1]/Main[0]/BottomParts[4]/BottomParent[0]/NextButton[0]
+//   kind 用 "exwin" 只为日志可辨；app 侧只按 "fail" 与否分胜负，这里会被当胜利。
+//   ★BOSS 失败页暂无样本。若它也用 DialogLabyrinthExResult 而按钮是「重新挑战」，
+//     _resLabelMatch 用 WIN 标签集校验会不匹配 ⇒ 安全回落字段读，不会误点。
+const RES_BOSS_SUB = {
+  cls: "DialogLabyrinthExResult", kind: "exwin",
+  // ★2026-11-18 16:02 取证：BOSS 失败与胜利是**同一个 NextButton 节点**，只是 label 不同
+  //   （失败「重新挑战」/ 胜利「下一步」）。dualKind ⇒ 按读到的 label 自己判胜负，
+  //   命中失败标签就把 kind 改成 "fail"（app 侧按 fail 与否分流）。
+  dualKind: true,
+  names: ["Main", "PartsFormer", "Main", "BottomParts", "BottomParent", "NextButton"],
+  idxs: [0, 1, 0, 4, 0, 0],
+};
+
+function _descendFixed(base, names, idxs) {
+  let cur = base;
+  for (let i = 0; i < names.length; i++) {
+    const cc = _childCountOf(cur);
+    if (cc <= 0) return null;
+    const want = names[i], wantIdx = idxs[i];
+    let ch = null;
+    if (wantIdx >= 0 && wantIdx < cc) {
+      const t = _inv1i(cur, "GetChild", wantIdx);
+      if (t && !t.isNull()) {
+        try {
+          const nm = _str(_inv(_inv(t, "get_gameObject"), "get_name"));
+          if (nm === want) ch = t;
+        } catch (e) {}
+      }
+    }
+    if (!ch) {                                  // 索引漂了 ⇒ 同层按名字找
+      for (let k = 0; k < cc && k < 32; k++) {
+        const t = _inv1i(cur, "GetChild", k);
+        if (!t || t.isNull()) continue;
+        try {
+          const nm = _str(_inv(_inv(t, "get_gameObject"), "get_name"));
+          if (nm === want) { ch = t; break; }
+        } catch (e) {}
+      }
+    }
+    if (!ch) return null;
+    cur = ch;
+  }
+  return cur;
+}
+
+/**
+ * ★2026-11-18：取 **DialogArea 下名为 `clsName` 的那个对话框的 transform**（= 路径的起点）。
+ *
+ * ⚠不能用 `_compInDialogs(cls).get_transform()`：那个用的是 `GetComponentInChildren`，
+ *   命中的组件**不一定挂在对话框根节点上**（可能在更深的子节点）⇒ 拿到的 transform 不是根，
+ *   "从对话框根往下"的固定路径就会整条对不上（实测：赢/输两条路径都 path-miss，只能落到第 2/3 档）。
+ */
+function _dlgRootByName(clsName) {
+  try {
+    if (!g_dialogArea || g_dialogArea.isNull() ||
+        _str(_inv(_inv(g_dialogArea, "get_gameObject"), "get_name")) !== "DialogArea") {
+      g_dialogArea = _findDialogAreaTr();
+    }
+    if (!g_dialogArea || g_dialogArea.isNull()) return null;
+    const cc = _childCountOf(g_dialogArea);
+    for (let i = cc - 1; i >= 0; i--) {                    // 倒序 = 最上层优先
+      const ch = _inv1i(g_dialogArea, "GetChild", i);
+      if (!ch || ch.isNull()) continue;
+      const go = _inv(ch, "get_gameObject");
+      if (!go || go.isNull()) continue;
+      const nm = _str(_inv(go, "get_name"));
+      if (nm === clsName || nm.indexOf(clsName) === 0) return ch;   // 兼容 "...(Clone)"
+    }
+    return null;
+  } catch (e) { return null; }
+}
+
+/** 按一条固定路径取结算按钮：`{ok,x,y,label,kind,base}` / `{ok:false,err}` */
+function _resPathOne(spec) {
+  const out = { ok: false, kind: spec.kind };
+  try {
+    const base = _dlgRootByName(spec.cls);
+    if (!base) { out.err = "no-dialog:" + spec.cls; return out; }
+    out.base = spec.cls;
+    const btnTr = _descendFixed(base, spec.names, spec.idxs);
+    if (!btnTr) { out.err = "path-miss:" + spec.cls; return out; }
+    const env = _camEnv();
+    if (!env) { out.err = "no-cam"; return out; }
+    const ss = _screenOf(btnTr, env.cam, env.mW2S);
+    if (!ss) { out.err = "no-screen"; return out; }
+    const x = Math.round(ss.x), y = Math.round(env.H - ss.y);
+    if (x < 0 || x > env.W || y < 0 || y > env.H) { out.err = "offscreen"; return out; }
+    let label = "";
+    try {
+      const go = _inv(btnTr, "get_gameObject");
+      const uk = findClass("CustomUILabel");
+      const lb = (uk && !uk.isNull() && ptrOk(go)) ? _compInChildren(go, uk) : ptr(0);
+      label = ptrOk(lb) ? (_str1(_inv(lb, "get_text")) || "") : "";
+    } catch (e) {}
+    // dualKind（BOSS/EX 同一按钮）：胜利「下一步」→ 保持 spec.kind；失败「重新挑战/撤退」→ kind="fail"。
+    if (spec.dualKind) {
+      if (_resLabelMatch("fail", label)) out.kind = "fail";
+      else if (!_resLabelMatch("win", label)) { out.err = "label:" + label; return out; }
+    } else if (!_resLabelMatch(spec.kind, label)) {
+      out.err = "label:" + label; return out;
+    }
+    out.ok = true; out.x = x; out.y = y; out.label = label;
+  } catch (e) { out.err = String(e); }
+  return out;
+}
+
+/**
+ * ★2026-11-18：结算按钮的**固定层级路径**（主路径）——失败页 → 普通胜利页 → BOSS/EX 胜利页。
+ * @return `{ok,kind:"fail"|"win"|"exwin",x,y,label,ms}` / `{ok:false,err,ms}`
+ */
+function battleResultPathBtn() {
+  const a = _resPathOne(RES_FAIL_SUB);
+  if (a.ok) return a;
+  const b = _resPathOne(RES_WIN_SUB);
+  if (b.ok) return b;
+  const c = _resPathOne(RES_BOSS_SUB);
+  if (c.ok) return c;
+  return { ok: false, err: a.err + " / " + b.err + " / " + c.err };
 }
 
 // ★战斗结算按钮"字段读"（见 RPC 注册处注释）。零扫描：只用 `_compInDialogs` 拿对话框组件。
@@ -4689,7 +4873,16 @@ function battleResultMem() {
             const ln = _safeKlassOf(lp);
             if (ln && ln.indexOf("CustomUILabel") >= 0) label = _str1(_inv(lp, "get_text")) || "";
           } catch (e) {}
-          out.cands.push({ x: x, y: y, label: label, src: h.src + "+0x" + off.toString(16) });
+          // ★2026-11-18：每个对话框类**只取一次**窗口路径（成功才记，失败下轮再试）
+          let pth = "";
+          if (!g_resPathSaid[cn]) {
+            try { pth = _pathChainOf(tr); if (pth) g_resPathSaid[cn] = true; } catch (e) {}
+          }
+          out.cands.push({
+            x: x, y: y, label: label,
+            src: h.src + "+0x" + off.toString(16),
+            path: pth,
+          });
         }
       }
       if (out.cands.length) break;
@@ -8215,6 +8408,16 @@ rpc.exports = {
   //   返回 {ok, cands:[{x,y,label,src}]}：每个候选都带**配对标签文字**（判胜负 ✓）与坐标（判点哪 ✓）。
   //   读不出 ⇒ ok=false ⇒ 调用方回退树遍历（**只慢、不点错** ✓）。
   battleResultMem: _rpcSafe(function () { try { return battleResultMem(); } catch (e) { return { ok: false, err: String(e) }; } }),
+  // ★2026-11-18：结算按钮的**固定层级路径**（失败页 + 胜利页，两条都写死）
+  //   比字段读省一个数量级：几次 GetChild + 1 次坐标换算，不扫字段、不扫树。
+  battleResultPath: _rpcSafe(function () {
+    const t0 = Date.now();
+    try {
+      const r = battleResultPathBtn();
+      if (r) r.ms = Date.now() - t0;          // ★实测耗时
+      return r;
+    } catch (e) { return { ok: false, err: String(e), ms: Date.now() - t0 }; }
+  }),
   // ★结算按钮"学一次、之后只校验"（见 battleResultBtn 注释）：`{ok,hit,name,x,y,label}`
   battleResultBtn: _rpcSafe(function (minY) {
     try { return battleResultBtn(minY == null ? null : minY); } catch (e) { return { ok: false, err: String(e) }; }
@@ -8336,6 +8539,8 @@ rpc.exports = {
   // 那个类不是本页零件（堆扫描出来的都是"别的对象存着这个类指针的字段槽"），改走 labCharaPageQuick。
   // 游戏主循环心跳（看门狗）：{frame, time} —— 判断"卡住"是游戏冻结还是我们点错
   gameTick: _rpcSafe(function () { try { return gameTickSnapshot(); } catch (e) { return null; } }),
+  // ★2026-11-17：游戏窗口是否获得焦点（零 shell 替代 dumpsys 前台判定）{focused, exists, err, ms}
+  gameFocused: _rpcSafe(function () { try { return gameFocusedSnapshot(); } catch (e) { return null; } }),
   // 卡死现场：所有线程的调用栈（返回字符串数组）
   stuckDump: _rpcSafe(function () { try { return globalThis.stuckDump(); } catch (e) { return ["stuckDump 失败: " + e]; } }),
   // 遗物页读不到卡时的现场诊断（失败时由 Python 自动调用并打印）
@@ -8403,6 +8608,77 @@ function gameTickSnapshot() {
       if (!r2.isNull() && ex2.readPointer().isNull()) out.time = r2.add(0x10).readFloat();
     }
   } catch (e) { out.err = "" + e; }
+  return out;
+}
+
+// ── ★游戏窗口是否获得焦点（2026-11-17）：用于替代 dumpsys 的前台判定 ──────────────
+// **为什么需要它**：主循环原来靠 `dumpsys input` / `dumpsys window displays` 判"前台是不是游戏"，
+//   而 dumpsys 要 system_server 序列化整个服务状态（几百 ms）。主循环 100ms 一轮 ⇒ 每秒十次 dump
+//   ⇒ system_server 被拖到 ANR ⇒ lmkd 以 "device is not responding" 连环杀进程
+//   （实测内存 4.2GB 可用、助手 CPU 仅 2.5% 照样被杀，2026-11-17 21:23 / 22:31 两次）。
+//   改成这里之后：零 shell、微秒级，也不再需要按 Android 版本分流 dumpsys 的各种段。
+// **为什么不用帧计数代替**：帧不涨 = 游戏卡死 / 加载 / 演出暂停，**不等于**用户切走了。
+//   `Application.isFocused` 才是"窗口是否获得焦点"的真值（切走=false，卡死/加载=true）。
+// 稳定性：与 gameTickSnapshot 完全同款调用（runtime_invoke 静态属性），那条路径已长期验证。
+let g_appKlass = null;
+let g_appKlassTriedAt = 0;
+function _appKlass() {
+  try {
+    if (g_appKlass && !g_appKlass.isNull()) return g_appKlass;
+    // ★★快路（零遍历）：`UnityEngine.Application` 在 UnityEngine.CoreModule.dll ——
+    //   直接按程序集取类（微秒级），**绝不能走 `findClassNS`**：它找不到时会全程序集 × 全类
+    //   遍历（几万次 il2cpp 调用，实测 1.8~2s/次），而主循环每 0.5s 调一次 ⇒ 直接把流程拖死
+    //   （2026-11-17 23:53 实测：日志刷满 `[slow] gameFocused 1928ms`，卡在编组页不动）。
+    const img = getImageByName("UnityEngine.CoreModule.dll");
+    if (img && !img.isNull()) {
+      const k = g_il2cpp.class_from_name(
+        img, Memory.allocUtf8String("UnityEngine"), Memory.allocUtf8String("Application"));
+      if (!k.isNull()) { g_appKlass = k; return k; }
+    }
+    // ★慢路兜底（全程序集扫，很贵）：找不到就 30s 内不再试，保证不会把主循环拖住
+    if (Date.now() - g_appKlassTriedAt < 30000) return null;
+    g_appKlassTriedAt = Date.now();
+    g_appKlass = findClassNS("Application", "UnityEngine");
+    return (g_appKlass && !g_appKlass.isNull()) ? g_appKlass : null;
+  } catch (e) { return null; }
+}
+
+// ★★方法指针也缓存（2026-11-17）：`_mInfo` 内部是 `findMethodAny`，它要**遍历这个类的方法表**
+//   （几十~几百次 il2cpp 调用）。每次 gameFocused 都重找一遍 → 白烧几毫秒。
+//   类指针/方法指针在进程内都稳定 ⇒ 找到后长期缓存，第二次起**零查找**（只剩一次 invoke）。
+let g_appFocusMethod = null;
+let g_appFocusTriedAt = 0;
+function _appFocusMethod() {
+  if (g_appFocusMethod && !g_appFocusMethod.isNull()) return g_appFocusMethod;
+  if (Date.now() - g_appFocusTriedAt < 30000) return null;   // 失败冷却，别反复扫方法表
+  g_appFocusTriedAt = Date.now();
+  const k = _appKlass();
+  if (!k || k.isNull()) return null;
+  g_appFocusMethod = _mInfo(k, "get_isFocused");
+  return (g_appFocusMethod && !g_appFocusMethod.isNull()) ? g_appFocusMethod : null;
+}
+
+function gameFocusedSnapshot() {
+  const out = { focused: null, exists: false, err: null, ms: 0 };
+  const t0 = Date.now();
+  try {
+    if (!g_il2cpp) { out.err = "il2cpp 未就绪"; out.ms = Date.now() - t0; return out; }
+    const k = _appKlass();
+    if (!k || k.isNull()) { out.err = "未找到 UnityEngine.Application"; out.ms = Date.now() - t0; return out; }
+    out.exists = true;
+    if (g_il2cpp.thread_attach) { try { g_il2cpp.thread_attach(g_il2cpp.domain_get()); } catch (e) {} }
+    const mf = _appFocusMethod();
+    if (!mf) { out.err = "Application 上没有 get_isFocused"; }
+    else {
+      const ex = Memory.alloc(8); ex.writePointer(ptr(0));
+      const r = g_il2cpp.runtime_invoke(mf, ptr(0), ptr(0), ex);
+      if (!ex.readPointer().isNull()) out.err = "get_isFocused 抛异常";
+      else if (r.isNull()) out.err = "get_isFocused 返回空";
+      // boxed bool：值在 +0x10（按 4 字节读，兼容对齐差异）
+      else out.focused = r.add(0x10).readS32() !== 0;
+    }
+  } catch (e) { out.err = "" + e; }
+  out.ms = Date.now() - t0;
   return out;
 }
 

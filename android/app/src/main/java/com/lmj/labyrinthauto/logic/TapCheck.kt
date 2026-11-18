@@ -57,14 +57,6 @@ object TapCheck {
     fun currentProbeMs(): Long = probeMsValue
 
     /**
-     * ★高危按钮（连点会把 input/系统拖到无响应 → lmkd 杀进程）的安全点击间隔：
-     * **probeMs × 2.5，且不低于 375ms**。
-     * 默认挡 150 ⇒ 375ms（≈ 原 400ms 事故修复值，约 2.7 次/秒）；挡位调大时自动更慢更安全；
-     * 下限 375 是给"以后可能新增更低挡位"留的保险（11-13/11-17 两次事故都是 settle 太短导致连点）。
-     */
-    fun safetySettleMs(): Long = (probeMsValue * 2.5).toLong().coerceAtLeast(375L)
-
-    /**
      * 一次 probe 的结果。
      *
      * ★`top` 和 `left` **必须来自同一次内存快照**：先读 labTop、再另读一次关闭态，
@@ -84,7 +76,8 @@ object TapCheck {
         y: Int,
         what: String,
         from: Set<String>,
-        /** 点完**第一次**探测前等多久。0（默认）= 自动取 [probeMs]×2（2026-11-17 用户：统一口径）。 */
+        /** 点完**第一次**探测前等多久。0（默认）= 自动取 [probeMs]（2026-11-17 用户：效率优先，
+         *  连点由 [probe] 次数兜住——探到离开就停，不会形成点击洪水）。 */
         settleMs: Long = 0L,
         retries: Int = 1,
         expect: Set<String> = emptySet(),
