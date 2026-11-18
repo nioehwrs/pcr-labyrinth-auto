@@ -137,6 +137,29 @@ class AutoForegroundService : Service() {
                 return START_NOT_STICKY
             }
 
+            // ★直调按钮自检（2026-11-15，实验 · 分支 feat/direct-trigger）：**不点屏幕**，
+            //   直接触发节点的点击回调（agent：常驻钩子 + onClick → EventDelegate.Execute）。
+            //   用法：am startservice -n <pkg>/.service.AutoForegroundService \
+            //           -a com.lmj.labyrinthauto.action.PRESS --es node btn_back [--es root dialog] [--ez probe true]
+            //   probe=true 只探不点（先把"这颗按钮的 onClick 里到底挂了什么"打出来再动手）。
+            ACTION_PRESS -> {
+                val node = intent?.getStringExtra("node")?.takeIf { it.isNotBlank() }
+                if (node == null) {
+                    AppState.addLog("直调按钮：缺参数 --es node（节点名正则）")
+                    return START_NOT_STICKY
+                }
+                val root = intent?.getStringExtra("root")?.takeIf { it.isNotBlank() }
+                val probe = intent?.getBooleanExtra("probe", false) ?: false
+                scope.launch {
+                    val r = AgentApi.pressNode(node, root, probe)
+                    AppState.addLog(
+                        "直调按钮「$node」" + (if (probe) "（只探不点）" else "") + "：" +
+                            (r?.toString() ?: "agent 没回（未连接/超时）"),
+                    )
+                }
+                return START_NOT_STICKY
+            }
+
             // ★日志落盘自检（2026-10-17）：不跑游戏也能确认"日志存到哪、后缀对不对"。
             //   写一局**假的** run（beginRun → 1 行日志 → endRun(DONE)），然后把路径报进日志；
             //   顺手也把**状态悬浮窗**推一段示例文字（开了开关的话能直接看到那一行字长什么样）。
@@ -1075,6 +1098,9 @@ class AutoForegroundService : Service() {
 
         /** ★战斗设定读取自检（2026-10-22，只读）：把 SaveDataManager 三项打进日志 */
         const val ACTION_BATTLESET = "com.lmj.labyrinthauto.action.BATTLESET"
+
+        /** ★直调按钮自检（2026-11-15，实验）：不点屏幕，直接触发节点点击回调（--es node / --es root / --ez probe） */
+        const val ACTION_PRESS = "com.lmj.labyrinthauto.action.PRESS"
 
         private const val CHANNEL_ID = "labyrinth_auto"
         private const val NOTIFICATION_ID = 1001

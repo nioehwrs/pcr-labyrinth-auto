@@ -57,5 +57,18 @@ tools/out_*/
 
 # 日志、临时文件
 *.log
+*.err
 *.hprof
 *.tmp
+
+# ★GitHub token（与 .gitee_token 同理：等同密码，绝不入库）
+tools/.github_token
+tools/.github_token*
+
+# 一次性探针脚本（_tmp_* 只用于当时排查，结论已落进代码注释/文档）
+tools/_tmp_*.py
+tools/tree_t*.json
+
+# 根目录的排查产物（截图 / adb 重定向输出）
+/shot*.png
+/ex_flow.err

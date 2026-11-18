@@ -4513,7 +4513,17 @@ object MazeLoop {
             // ★2026-11-10（用户方案）：点前先记顶层指针基线 —— 只认"点完之后**新出现**的框"，
             //   避免把上一页残留的对话框当成"是否前往"点掉。
             val basePtr = runCatching { AgentApi.labDlgPair() }.getOrNull()?.optString("ptr").orEmpty()
-            tap(input, t.optInt("x"), t.optInt("y"), what)
+            // ★★直调（2026-11-18）：地图格子按 **blockId** 直调（`UIButton.onClick`，
+            //   兜底 `onPanelButtonClick`），不投屏幕坐标 ⇒ 屏边缘/被挡住的格子也能点到。
+            //   直调不可用（面板不在可视列表 / agent 未就绪）才退回坐标点击。
+            val bid4 = t.optInt("blockId", -1)
+            val pnl = if (bid4 > 0) runCatching { AgentApi.pressPanel(bid4) }.getOrNull() else null
+            if (pnl?.optBoolean("ok") != true) {
+                AppState.addLog(
+                    "$what：格子直调失败（${pnl?.optString("err").orEmpty().ifEmpty { "无 blockId 或无回包" }}）→ 退回坐标点击",
+                )
+                tap(input, t.optInt("x"), t.optInt("y"), what)
+            }
             nodeSaidAt[nk] = now                                         // 同一节点 30s 内只"重点"一次（PC 6425）
             // ★不再盲等 800ms：先**抓确认框出现**（2~4ms/拍），出现即点确认，再**抓它开始消失**；
             //   没有框（直接移动/进战斗）就短等回主循环。
@@ -4621,7 +4631,10 @@ object MazeLoop {
                     //   而不是等按钮落位（那等于拿等待换准确）。
                     taps++
                     AppState.addLog("确认框：点「确认」#$taps ($x,$y)")
-                    input.tap(x, y)
+                    // ★★直调（2026-11-18）：走 `LAB_PATHS` 的 `MoveConfirm|TwoButtonRight`
+                    //   （`top` 根相对链 [0,2,3] —— 绝对 DialogArea 索引会随本局弹过的框漂移）。
+                    //   失败才退回坐标点击（入场动画期点空是正常代价，下一拍会用新坐标重试）。
+                    pathPressOrTap(input, "MoveConfirm|TwoButtonRight", x, y, "确认框：确认")
                     if (awaitDialogGone(t0, MOVE_CONFIRM_PROBE_MS)) return true
                     continue
                 }
@@ -5244,14 +5257,29 @@ object MazeLoop {
                 //   为什么这样坐标不会失效：编组页队伍**右对齐**，撤掉**最左边**那个人时，
                 //   右边的人**不动**（空位出现在左边）⇒ 一批坐标可以一直用到最后一个。
                 //   （"从左往右"正是这个前提的由来；反着撤就会越撤越偏。）
-                val todo = removes.filter { it.unit in nowIds }
+                // ★★2026-11-18 直调优先（分支 `feat/direct-trigger`）：`PartsPartyEditPlate.onClickUnitIcon(UnitIcon)`。
+                //   按 unitId 定位 ⇒ **不投坐标、不看可见区**，也就不存在"撤掉左边的人、
+                //   右边补位把坐标挪偏"的问题 —— 上面那套"从左往右"的顺序约束对直调部分不再需要。
+                //   直调没生效的（或整条链路不可用）才退回下面的 tap 兜底。
+                val rmWant = removes.map { it.unit }.filter { it in nowIds }.distinct()
+                val rmDone = partyDirectPress("remove", rmWant)
+                val rmLeft = if (rmDone == null) rmWant else rmWant.filter { it !in rmDone }
+                if (rmDone != null && rmDone.isNotEmpty()) {
+                    AppState.addLog("编队：撤人直调 ${rmDone.joinToString(",")}（Plate.onClickUnitIcon）")
+                }
+                val todo = removes.filter { it.unit in rmLeft }
                     .mapNotNull { op ->
                         val c = findUnitCoord(snap, op.unit, "槽位")
                         if (c != null) op to c else null
                     }
                     .sortedBy { it.second.first }          // ★x 从小到大 = 从左往右
                 if (todo.isEmpty()) {
-                    AppState.addLog("[!] 撤人：快照里找不到要撤的人（${removes.size} 个目标）→ 下轮再试")
+                    if (rmDone != null && rmDone.isNotEmpty()) {
+                        // 直调已经撤掉了 ⇒ 只需等队伍名单更新（快照留给加入批复用）
+                        snapAfterRemove = awaitPartyRoster(nowIds, wantSnap = true).snap
+                    } else {
+                        AppState.addLog("[!] 撤人：快照里找不到要撤的人（${removes.size} 个目标）→ 下轮再试")
+                    }
                 } else {
                     AppState.addLog(
                         "编队：撤人 ${todo.size} 个（坐标一次算好，按从左往右依次点，中途不读）",
@@ -5299,7 +5327,16 @@ object MazeLoop {
                 delay(PartyPlan.LAB_PARTY_BATCH_SETTLE)
                 return PARTY_STEP_AGAIN
             }
-            val addTodo = adds.filter { it.unit !in nowIds2 }                            // 已在队里的不必再点
+            // ★★2026-11-18 直调优先：`PartsPartyEditScrollController.onClickUnitIcon(UnitIcon)`。
+            //   按 uid 定位 ⇒ 屏外/被裁的人也能加，**不需要先滚动**（这对 `plan.offscreen` 是个大便宜）。
+            //   直调没生效的才退回下面按坐标 tap。
+            val addWant = adds.map { it.unit }.filter { it !in nowIds2 }.distinct()
+            val addDone = partyDirectPress("add", addWant)
+            val addLeft = if (addDone == null) addWant else addWant.filter { it !in addDone }
+            if (addDone != null && addDone.isNotEmpty()) {
+                AppState.addLog("编队：加人直调 ${addDone.joinToString(",")}（ScrollController.onClickUnitIcon）")
+            }
+            val addTodo = adds.filter { it.unit in addLeft }                            // 已在队里的不必再点
                 .mapNotNull { op ->
                     // ★坐标**一次算好**，整批点完中途不读（2026-11-07 用户要求）。
                     //   点的是"角色一览"里的卡 —— 一览是候选池，编不编它都在那儿、位置不动 ⇒ 坐标稳定。
@@ -5311,9 +5348,8 @@ object MazeLoop {
             if (addSkipped.isNotEmpty()) {
                 AppState.addLog("〔跳过〕加入 ${addSkipped.joinToString(",")}：快照里已在队里")
             }
-            val noCoord = adds.map { it.unit }.filter { u ->
-                u !in nowIds2 && addTodo.none { it.first.unit == u }
-            }
+            // ★直调已经加进去的、以及本来就在队里的都不算 noCoord ⇒ 只剩"要 tap 但找不到坐标的"
+            val noCoord = addLeft.filter { u -> addTodo.none { it.first.unit == u } }
             if (noCoord.isNotEmpty()) {
                 AppState.addLog(
                     "… 加入：${noCoord.joinToString(",")} 本页没有可点坐标（不在可见区？）→ 交给滚动分支",
@@ -5458,7 +5494,11 @@ object MazeLoop {
                         if (sess.exShare) sess.team1Sig = sig
                         sess.opened = true
                         sess.openedAt = System.currentTimeMillis()
-                        tap(input, eq.optInt("x"), eq.optInt("y"),
+                        // ★★直调（2026-11-18）：这颗「特别装备」是 `DialogCommonPartyEdit+0x158` 的
+                        //   `CustomUIButton` ⇒ 按组件指针直调 `onClick` 委托链，不投屏幕坐标
+                        //   （也就不会点空 / 点到叠层，还省掉 `input tap` 的 ~110ms）。
+                        //   直调失败（agent 未就绪等）才退回坐标点击。
+                        partyBtnOrTap(input, "exequip", eq.optInt("x"), eq.optInt("y"),
                             "打开特别装备${if (sess.exShare) "" else "（第2/3队：不共用其他角色装备）"}")
                         delay(PartyPlan.LAB_PARTY_TAP_MS)
                         // ★★2026-11-08：三连页改成**打包跑完**（原来是"点开就交回主循环、由 handleExequip 单步接管"）。
@@ -5551,7 +5591,7 @@ object MazeLoop {
                                     "队伍3=${PartyPlan.partyDicN(_dic, 2)}人" +
                                     "（本队=第${((_pt?.opt("nowSelectParty") as? Number)?.toInt() ?: 0) + 1}队）",
                             )
-                            tap(input, dec.optInt("x"), dec.optInt("y"), "决定·跳过本队（$curN 人，允许空）")
+                            partyBtnOrTap(input, "decide", dec.optInt("x"), dec.optInt("y"), "决定·跳过本队（$curN 人，允许空）")
                             // ★轮询等切队生效（**期间绝不再点**）
                             val t0 = SystemClock.elapsedRealtime()
                             var bt1 = bt0
@@ -5602,7 +5642,7 @@ object MazeLoop {
                         //   顶框还是 PartyEdit、tapAndCheck 判成"没生效"就会连点，
                         //   于是 2/3 队没编就被直接跳过。这里**只点一次**，并等它切过去。
                         val (pit0, pidx0) = AgentApi.labPartyIdx()
-                        tap(input, dec.optInt("x"), dec.optInt("y"), "战斗开始（Boss·切队/开战）")
+                        partyBtnOrTap(input, "decide", dec.optInt("x"), dec.optInt("y"), "战斗开始（Boss·切队/开战）")
                         var pbt1 = pit0
                         var pidx1 = pidx0
                         val pt0 = SystemClock.elapsedRealtime()
@@ -5646,6 +5686,13 @@ object MazeLoop {
                             probeMs = PROBE_MS,
                             // 阶段2 等"进入战斗"（无对话框，用 inBattle 判）
                             expect = setOf("@battle"),
+                            // ★★直调（2026-11-18）：编组页「战斗开始」= `DialogCommonPartyEdit+0x110`
+                            //   的 `CustomUIButton` ⇒ 直调 onClick 委托链，不投坐标。
+                            //   ⚠不能直接调 `onClickDecide`（实测 NPE）—— labPartyBtn 走的正是组件 onClick。
+                            //   直调失败（agent 未就绪等）才退回坐标点击。
+                            pressFn = {
+                                partyBtnOrTap(input, "decide", dec.optInt("x"), dec.optInt("y"), "战斗开始")
+                            },
                         )
                         return PARTY_STEP_EXITED
                     }
@@ -5808,9 +5855,9 @@ object MazeLoop {
                 //   刚进 setting 页时这一行还在入场动画里 ⇒ **首点前先只读不点跳 2 拍**
                 //   （2×60ms，不做长固定延迟），下一拍 xyAt 重新取落位后的坐标再点。
                 skipFirstHits = if (rule.btnKey == "prio0") 2 else 0,
-                xyAt = xyAt@{
+                pressFn = press@{
                     // ① 页面已经切走？⇒ 这一次不点（外层循环会重新读页面状态）
-                    if (exeqSigNow() != sigNow) return@xyAt null
+                    if (exeqSigNow() != sigNow) return@press null
                     // ② 拿动作：★**本轮只读一次那一个按钮**（按需读，~10ms），之后复用同一个坐标
                     val act = cachedAct ?: run {
                         val tFull = android.os.SystemClock.elapsedRealtime()
@@ -5822,20 +5869,20 @@ object MazeLoop {
                         if (xr == null) {
                             fullFail++
                             exeqSay(sess, "按钮读失败（agent 没回包）→ 这一轮不点")
-                            return@xyAt null
+                            return@press null
                         }
                         fullFail = 0
                         val sr = xr.optString("sig")
                         // ★读数与外层不一致 ⇒ 页面正在切/状态在变 ⇒ 这一轮**不点**（避免点到别的按钮）
                         if (sr != sigNow) {
                             exeqSay(sess, "读数签名≠轻量签名（页面在切）→ 这一轮不点")
-                            return@xyAt null
+                            return@press null
                         }
                         // ★按**转移表**的动作取按钮（外层已用签名定好"这一步做什么、去哪"；
                         //   这里只补上按钮实例 + 最新坐标）
                         val a = exeqActOf(rule, xr) ?: run {
                             exeqSay(sess, "${rule.what}：按钮读不到（页面数据不全）→ 这一轮不点")
-                            return@xyAt null
+                            return@press null
                         }
                         // 多点按**同一个按钮实例**计数（换按钮/换实例就清零）
                         val bn = a.btn.optString("name")
@@ -5850,7 +5897,7 @@ object MazeLoop {
                     }
                     if (sess.tapN >= EXEQ_TAP_MAX) {
                         exeqSay(sess, "${rule.what}：同一个按钮已点 $EXEQ_TAP_MAX 下 → 不再点")
-                        return@xyAt null
+                        return@press null
                     }
                     sess.tapN++
                     sess.n++
@@ -5873,7 +5920,24 @@ object MazeLoop {
                             "（按钮=${act.btn.optString("name")}" +
                             "@${act.btn.optString("id").takeLast(8)} 签名=$sigNow）",
                     )
-                    act.btn.optInt("x") to act.btn.optInt("y")
+                    // ★★直调（2026-11-18）：**不投屏幕坐标**，直接触发按钮的 onClick 委托链。
+                    //   定位仍走上面的 `labExBtn`（拿按钮实例 + 校验签名 + 多点锁同一实例），
+                    //   agent 侧 `labExPress` 用同一 key + preferId 再定位一次并投递到游戏线程
+                    //   （`EventDelegate.Execute`，兜底组件无参 `OnClick()`）。
+                    //   为什么值得：三连页是叠三层的，坐标点容易落到下面那层；且省掉 `input tap` 的 ~110ms。
+                    val pr = AgentApi.labExPress(rule.btnKey, sess.tapBtnId, timeoutMs = EXEQ_READ_FULL_MS)
+                    if (pr == null) {
+                        fullFail++
+                        exeqSay(sess, "直调投递失败（agent 没回包）→ 这一轮不点")
+                        return@press null
+                    }
+                    if (!pr.optBoolean("queued", false)) {
+                        fullFail++
+                        exeqSay(sess, "直调投递被拒：${pr.optString("err")} → 这一轮不点")
+                        return@press null
+                    }
+                    fullFail = 0
+                    true
                 },
             )
             // ★生效了 ⇒ 立刻进下一步（不等）；没生效 ⇒ 等一下再来（别把 agent 读爆）
@@ -6377,6 +6441,47 @@ object MazeLoop {
     }
 
     /** 整批核对：撤的人是否真出队、加的人是否真入队（[handlePartyEdit] 批末用；PC 3739 `_okteam` 同款） */
+    /**
+     * ★编组页加/减角色的**直调**（2026-11-18，不点屏幕）：返回**确实生效**的 unitId 集合。
+     *
+     * 走 [AgentApi.labPartyPress]：加 → `PartsPartyEditScrollController.onClickUnitIcon`，
+     * 减 → `PartsPartyEditPlate.onClickUnitIcon`。按 uid 定位，不投坐标、不看可见区。
+     *
+     * ★`ok=true` 只代表"没抛异常" ⇒ 这里**必须回读队伍复核**（`labPartyPlan`），
+     *   否则会把"点了没生效"当成功，后面的整批核对全乱。
+     *   （实测连续投递时偶发中间一次被吞：单发成功、批量里漏。）
+     * ★返回 `null` = 直调整条链路不可用（未连接 / agent 不是 cs102 / 钩子装不上）
+     *   ⇒ 调用方退回 `input tap` 老路，行为与之前完全一致。
+     * ★**减人只能在 Plate 上做**：池里 icon 的 `CustomUIButton.onClick` 只挂了
+     *   ScrollController 一条委托，跟着委托走永远只有"加"。
+     */
+    private suspend fun partyDirectPress(kind: String, uids: List<Int>): Set<Int>? {
+        if (uids.isEmpty()) return emptySet()
+        val want: Set<Int> = uids.toHashSet()
+        val r = runCatching { AgentApi.labPartyPress(kind, uids) }.getOrNull() ?: return null
+        if (!r.has("done")) {
+            AppState.addLog(
+                "编队：${if (kind == "add") "加" else "撤"}人直调不可用" +
+                    "（${r.optString("err", "无返回")}）→ 退回点击",
+            )
+            return null
+        }
+        val after = runCatching { AgentApi.labPartyPlan(timeoutMs = 1_200L) }.getOrNull()
+            ?.members?.filter { it != 0 }?.toSet()
+        if (after == null) {
+            AppState.addLog("编队：${if (kind == "add") "加" else "撤"}人直调后读不到队伍 → 退回点击")
+            return null
+        }
+        val done = if (kind == "add") want.filter { it in after } else want.filter { it !in after }
+        val miss = want - done.toHashSet()
+        if (miss.isNotEmpty()) {
+            AppState.addLog(
+                "编队：${if (kind == "add") "加" else "撤"}人直调没生效 ${miss.joinToString(",")} → 退回点击",
+            )
+        }
+        return done.toHashSet()
+    }
+
     private fun partyBatchOk(
         ops: List<PartyPlan.Op>,
         added: List<Pair<PartyPlan.Op, Pair<Int, Int>>>,
@@ -6715,6 +6820,14 @@ object MazeLoop {
                 expect = setOf("DialogCommonPartyEdit"),
                 // ★兜底：编组页一般 1 秒内就位，等不到就交回主循环（它会继续处理编组页），别卡 6 秒。
                 expectTimeoutMs = 3_000L,
+                // ★★直调（2026-11-18）：「挑战」走 `LAB_PATHS` 的 `QDStart|UIButton_Unit`。
+                //   ★这处以前出过事故：预览页和编组页叠在一起时按坐标点，点成了「战斗开始」。
+                //   直调按组件指针走，不会落到叠层上。
+                pressFn = press@{
+                    val pr = runCatching { AgentApi.labPathPress("QDStart|UIButton_Unit") }.getOrNull()
+                    if (pr?.optBoolean("ok") == true) return@press true
+                    tap(input, pFinal.first, pFinal.second, "预览·开打")
+                },
             )
             return
         }
@@ -7668,6 +7781,15 @@ object MazeLoop {
                 // 阶段2：普通战 → 选人/选遗物（Selection）；**最终 Boss(50801) → 直接进迷宫结算**
                 //   （实测 17:41:39 顶框=DialogLabyrinthResult）⇒ 两个都要认，否则会白等 6 秒
                 expect = setOf("DialogLabyrinthSelection", "DialogLabyrinthResult"),
+                // ★★直调（2026-11-18）：结算「下一步」走 `LAB_PATHS` 的 `ResultNext|NextButton`。
+                //   ★这处**最值得直调**：结算/奖励页要连点十几下，而坐标点击每次 ~110ms，
+                //   密集点击曾把系统 input 拖到无响应（实测 1.4s 内连点 7 下后 lmkd 杀进程）；
+                //   直调是进程内调用，没有这块开销，也不受按钮入场动画影响。
+                pressFn = press@{
+                    val pr = runCatching { AgentApi.labPathPress("ResultNext|NextButton") }.getOrNull()
+                    if (pr?.optBoolean("ok") == true) return@press true
+                    tap(input, win.optInt("x"), win.optInt("y"), "下一步")
+                },
             )
         }
         if (!resultFail) {
@@ -8040,6 +8162,54 @@ object MazeLoop {
      *   · [xyAt] —— **每次点击前现取坐标**。切页动画期间按钮坐标在动（实测 setting「确认」
      *     动画中 (1182,965) vs 稳定 (1179,960)）⇒ 用旧坐标会点空。返回 null = "这一刻不该点"。
      */
+    /**
+     * ★编组页三颗按钮的**直调 + 坐标兜底**（2026-11-18）。
+     *
+     * 为什么编组页要先试直调：这三颗都是 `DialogCommonPartyEdit` 的 `CustomUIButton` 字段
+     * （`decide +0x110` / `cancel +0x120` / `exequip +0x158`），按组件指针直调 `onClick`
+     * 委托链既快又不会点空；而坐标点击在"两页叠在一起"时容易落到上面那层的同位置按钮上
+     * （实测把「挑战」点成了「战斗开始」）。
+     *
+     * @return `true` = 这一下已经发出去了（直调或坐标兜底都算）；`false` = 连坐标都没打出去
+     */
+    private suspend fun partyBtnOrTap(
+        input: InputBackend,
+        which: String,
+        x: Int,
+        y: Int,
+        what: String,
+    ): Boolean {
+        val pr = runCatching { AgentApi.labPartyBtn(which) }.getOrNull()
+        if (pr?.optBoolean("queued") == true) return true
+        val err = pr?.optString("err").orEmpty().ifEmpty { "无回包" }
+        AppState.addLog("$what：直调失败（$err）→ 退回坐标点击")
+        return tap(input, x, y, what)
+    }
+
+    /**
+     * ★按 `LAB_PATHS` 固定路径**直调**，失败退回坐标点击（2026-11-18）。
+     *
+     * 为什么只对"页面上**唯一**的那颗按钮"用：路径是**按钮名 + 固定下标链**，
+     * 页里若有多颗同名按钮（三选一的 `Role0/1/2`、地图里 13 个同名格子），
+     * 下标链必须靠真机验证过才敢用 —— 点错就是选错卡/走错格。
+     *
+     * @param key `"<页名>|<按钮名>"`，见 [AgentApi.labPathPress]
+     * @return `true` = 这一下已经发出去了（直调或坐标兜底都算）
+     */
+    private suspend fun pathPressOrTap(
+        input: InputBackend,
+        key: String,
+        x: Int,
+        y: Int,
+        what: String,
+    ): Boolean {
+        val pr = runCatching { AgentApi.labPathPress(key) }.getOrNull()
+        if (pr?.optBoolean("ok") == true) return true
+        val err = pr?.optString("err").orEmpty().ifEmpty { "无回包" }
+        AppState.addLog("$what：路径直调失败（$key / $err）→ 退回坐标点击")
+        return tap(input, x, y, what)
+    }
+
     private suspend fun tapAndCheck(
         input: InputBackend,
         x: Int,
@@ -8060,6 +8230,8 @@ object MazeLoop {
         probeState: (suspend () -> TapCheck.Probe)? = null,
         /** ★首点前先「只读不点」几拍（新页入场动画期间按钮坐标还在动）；见 [TapCheck.run] */
         skipFirstHits: Int = 0,
+        /** ★直调执行器（2026-11-18）：给了它就**代替坐标点击**，见 [TapCheck.run] */
+        pressFn: (suspend () -> Boolean?)? = null,
     ): Boolean = TapCheck.run(
         tapFn = { tx, ty, tw -> tap(input, tx, ty, tw) },
         x = x, y = y, what = what, from = from,
@@ -8072,6 +8244,7 @@ object MazeLoop {
         skipMax = EXEQ_SKIP_MAX,
         skipDelayMs = EXEQ_POLL_MS,
         skipFirstHits = skipFirstHits,
+        pressFn = pressFn,
         verbose = TRANS_VERBOSE,
     )
 
@@ -8264,7 +8437,14 @@ object MazeLoop {
             from = setOf("DialogCommonBig"),
             expect = setOf("DialogCommonMiddle"),
             settleMs = SEL_TICK_MS, probe = 5, probeMs = 70L, retries = 3,
-            xyAt = { dlgReadyToTap("DialogCommonBig", bigXY) },
+            // ★★直调（2026-11-18）：Big 单按钮走 `LAB_PATHS` 的 `ResultBig|OneButtonWhite`
+            //   （top 根相对链 [0,2,6]）。直调不可用才退回"等按钮落位再点坐标"。
+            pressFn = press@{
+                val pr = runCatching { AgentApi.labPathPress("ResultBig|OneButtonWhite") }.getOrNull()
+                if (pr?.optBoolean("ok") == true) return@press true
+                val p2 = dlgReadyToTap("DialogCommonBig", bigXY) ?: return@press null
+                tap(input, p2.first, p2.second, "门票：关闭收到印记(Big)")
+            },
             probeState = { dlgProbe("DialogCommonBig") },
         )
         if (!first) {
@@ -8317,7 +8497,14 @@ object MazeLoop {
             expect = setOf(""),
             expectTimeoutMs = 2_000L,
             settleMs = SEL_TICK_MS, probe = 5, probeMs = 70L, retries = 3,
-            xyAt = { dlgReadyToTap("DialogCommonMiddle", xy) },
+            // ★★直调（2026-11-18）：Middle 单按钮走 `LAB_PATHS` 的 `SelectConfirm|OneButtonWhite`
+            //   （top 根相对链 [0,2,3]）。直调不可用（表外/投递失败）才退回"等按钮落位再点坐标"。
+            pressFn = press@{
+                val pr = runCatching { AgentApi.labPathPress("SelectConfirm|OneButtonWhite") }.getOrNull()
+                if (pr?.optBoolean("ok") == true) return@press true
+                val p2 = dlgReadyToTap("DialogCommonMiddle", xy) ?: return@press null
+                tap(input, p2.first, p2.second, what)
+            },
             probeState = { dlgProbe("DialogCommonMiddle") },
         )
         if (!ok) {

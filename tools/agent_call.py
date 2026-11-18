@@ -15,11 +15,13 @@
 import json
 import sys
 import time
+from pathlib import Path
 
 import frida
 
 REMOTE = '127.0.0.1:1234'
-BASE = r'd:\Users\zhouyi\Documents\LMJ\labyrinth_auto_android\android\app\src\main\assets\agent_base.js'
+# 相对本脚本解析（原来写死 d:\Users\zhouyi\... 的旧路径，换机器/换盘就失效）
+BASE = str(Path(__file__).resolve().parent.parent / 'android' / 'app' / 'src' / 'main' / 'assets' / 'agent_base.js')
 
 
 def main() -> int:

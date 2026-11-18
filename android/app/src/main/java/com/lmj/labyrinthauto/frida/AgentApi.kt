@@ -259,6 +259,122 @@ object AgentApi {
         return o.optInt("x", 0) to o.optInt("y", 0)
     }
 
+    /**
+     * ★编组页加/减角色的**轻读**（2026-11-18）：`{ok, party, slots, pool, ms}`。
+     *
+     * · `party` = 已选，**按槽位顺序**的 unitId（= `slots[].unitId` 去掉 0）
+     * · `slots` = 队伍那一排 `[{i, unitId, checked}]`（`checked` 恒 false：槽位 icon 的
+     *   `CheckIcon` 不是"已选"含义 ⇒ 判有没有人看 `unitId != 0`）
+     * · `pool`  = 角色一览 `[{i, unitId, checked}]`，`checked` = 截图上的打钩/变暗
+     *   （`UnitIcon+0x88` 的 GameObject `activeInHierarchy`）
+     *
+     * 字段直取、零遍历：编组页实例 → `+0x208` = abs → plate(`+0x68`) / scrollController(`+0x70`)。
+     * ★池子格子**位置固定**（不排序就不移动），`checked` 变了位置不变 ⇒ 可以拿 `i` 当稳定锚点。
+     */
+    suspend fun labPartySlots(timeoutMs: Long = T_SLOW): JSONObject? =
+        obj("labPartySlots", timeoutMs = timeoutMs)
+
+    /**
+     * ★编组页**加/减角色直调**（2026-11-18，不点屏幕）—— 两段式，结果见 `pressNodePoll`。
+     *
+     * ★同一颗 `UnitIcon`，打给**不同对象**是两种语义（同名方法 `onClickUnitIcon`）：
+     *   - `"add"`    → `PartsPartyEditScrollController.onClickUnitIcon(UnitIcon)`（`abs+0x70`）
+     *   - `"remove"` → `PartsPartyEditPlate.onClickUnitIcon(UnitIcon)`（`abs+0x68`）
+     *
+     * 池里 icon 的 `CustomUIButton.onClick` **只挂了 ScrollController 一条委托** ⇒ 走
+     * [pressNode] 那套 `EventDelegate.Execute` 永远只有"加"；"减"必须手动打给 Plate。
+     * （这就是以前"池里点已选角色反而又加了一个"的原因。）
+     *
+     * ★优势：按 unitId 定位、**不投屏幕坐标、不看可见区** ⇒ 屏外的角色也能直接加，不用滚动。
+     * ★坑：`ok=true` 只代表"没抛异常"，**不代表队伍变了** ⇒ 调用方必须读队伍复核、差的补一遍
+     *   （实测连续投递时偶发中间一次不生效）。
+     * ★坑：改完**不刷新视图** ⇒ 池子留白（后面格子不前移）；`ForceUpdateUnitIconParams` /
+     *   `ForceItemUpdate` / `UpdateSelectMember` 实测都不重排 ⇒ 要么重开编组页，要么直接 decide。
+     *   ⚠ 别调 `SC.onRemoveUnitIcon`：它会把 icon 从视图列表里删掉，那个角色连池子都找不到。
+     * ★编组页增删是**草稿**：`cancel` 丢弃改动，只有 `decide`（战斗开始）才提交。
+     *
+     * @param kind `"add"` / `"remove"`
+     * @param uids 目标 unitId 列表（顺序无关，每件任务在游戏线程重新按 uid 定位）
+     * @return `{pending:false, done, total, log:[{uid, ok, via, ex, err, idx, wasChecked}]}`；超时/未连接返回 null
+     */
+    suspend fun labPartyPress(kind: String, uids: List<Int>, timeoutMs: Long = 6_000L): JSONObject? {
+        val st = obj("labPartyPress", listOf(kind, uids), T_FAST) ?: return null
+        if (!st.optBoolean("queued", false)) return st        // 投递失败（钩子装不上等）→ 直接回错误对象
+        val t0 = SystemClock.elapsedRealtime()
+        while (SystemClock.elapsedRealtime() - t0 < timeoutMs) {
+            delay(120)
+            val r = obj("pressNodePoll", emptyList(), T_FAST) ?: continue
+            if (!r.optBoolean("pending", true)) return r
+        }
+        return JSONObject().put("ok", false).put("pending", false)
+            .put("err", "投递超时：游戏线程 ${timeoutMs}ms 内没执行")
+    }
+
+    /**
+     * ★**固定路径直调**（2026-11-18）：按 agent 侧 `LAB_PATHS` 表里的 key 直达按钮，**不投屏幕坐标**。
+     *
+     * 与 [pressNode] 的分工：pressNode 是"按名字遍历子树找节点"（冷 2s 级）；本方法是从
+     * `_pathRoots()` 的根（`canvas` / `top` / `dialog`）按**固定子节点下标链**下去，命中即直调
+     * （实测 6~12ms）。表里没有的按钮才回退 [pressNode]。
+     *
+     * 已在表里的 key（见 `agent_base.js` 的 `LAB_PATHS`）：
+     * - `QDStart|UIButton_Unit`、`PartyDecide|ButtonDecide`、`ResultNext|NextButton`
+     * - `SelectRole|Role0/1/2`、`SelectTicket|Ticket0/1/2`、`SelectRelic|Relic0/1/2`
+     * - `MoveConfirm|TwoButtonRight`、`SelectConfirm|OneButtonWhite`、`ResultBig|OneButtonWhite`
+     *
+     * ★弹窗那三条必须用 `top` 根（最上层对话框）—— 绝对 `DialogArea` 索引会随"本局弹过的框"漂移。
+     *
+     * @param key   `"<页名>|<按钮名>"`（`Role{index}` / `Ticket{index}` / `Relic{index}` 按序号拼）
+     * @param probe true = 只校验路径能否命中，不点
+     * @return `{ok, node, via, ex, err}`；投递失败或超时返回带 `err` 的对象
+     */
+    suspend fun labPathPress(key: String, probe: Boolean = false, timeoutMs: Long = 4_000L): JSONObject? =
+        pressTwoPhase("labPathPress", listOf("", emptyList<Int>(), "", probe, false, key), timeoutMs)
+
+    /**
+     * ★**特别装备三连页直调**（2026-11-18 真机验证）：key 与 [labExBtn] 完全一致。
+     *
+     * `ThreeButtonLeft/Center/Right`、`TwoButtonRight`、`prio0`、`check`、`"sort:<选项名>"`。
+     * 定位在 RPC 线程做（按字段直取组件指针，几十 ms）；触发投递到游戏线程走
+     * `onClick` → `EventDelegate.Execute`（兜底组件无参 `OnClick()`）。
+     *
+     * ★为什么必须直调而不是 [labExBtn] + 坐标点击：三连页是**叠三层**的（①下、②中、③上），
+     *   坐标点很容易落到下面那层；而且 `input tap` 本身 ~110ms，还要过前台/遮挡校验。
+     *
+     * @param preferId 上一次读到的 `btnId`（GameObject 指针）—— 把重试**锁在同一个按钮实例**上
+     */
+    suspend fun labExPress(key: String, preferId: String? = null, timeoutMs: Long = 4_000L): JSONObject? =
+        pressTwoPhase("labExPress", listOf(key, preferId ?: ""), timeoutMs)
+
+    /**
+     * ★**编组页三颗按钮直调**：`decide`（战斗开始，**提交**）/ `cancel`（丢弃改动）/ `exequip`（打开特别装备）。
+     *
+     * 三颗都是 `DialogCommonPartyEdit` 上的 `CustomUIButton` 字段（`+0x110/+0x120/+0x158`），
+     * 走 `onClick` → `EventDelegate.Execute`。比 [pressNode] 稳：编组页里同名按钮有多个。
+     * ★`decide` 不能直接调 `onClickDecide`（实测 NPE），只能走组件 `onClick` 委托链 —— 本入口就是干这个。
+     */
+    suspend fun labPartyBtn(which: String, timeoutMs: Long = 4_000L): JSONObject? =
+        pressTwoPhase("labPartyBtn", listOf(which), timeoutMs)
+
+    /**
+     * 两段式直调的公共骨架：投递 → 轮询 [pressNodePoll] 取结果。
+     *
+     * `runtime_invoke` 必须在游戏线程（RPC 线程直调撞 ART 断言），而 RPC 里同步等主线程会死锁
+     * ⇒ agent 侧一律先回 `queued` 再执行，这里只负责轮询。
+     */
+    private suspend fun pressTwoPhase(fn: String, args: List<Any?>, timeoutMs: Long): JSONObject? {
+        val st = obj(fn, args, T_FAST) ?: return null
+        if (!st.optBoolean("queued", false)) return st        // 投递失败（钩子装不上/参数非法）→ 直接回错误对象
+        val t0 = SystemClock.elapsedRealtime()
+        while (SystemClock.elapsedRealtime() - t0 < timeoutMs) {
+            delay(120)
+            val r = obj("pressNodePoll", emptyList(), T_FAST) ?: continue
+            if (!r.optBoolean("pending", true)) return r
+        }
+        return JSONObject().put("ok", false).put("pending", false)
+            .put("err", "投递超时：游戏线程 ${timeoutMs}ms 内没执行")
+    }
+
     suspend fun labBattleResult(timeoutMs: Long = 1_500L): BattleRaw? {
         val o = obj("labBattleResult", timeoutMs = timeoutMs) ?: return null
         val hasRe = o.has("resultEnable") && !o.isNull("resultEnable")
@@ -350,6 +466,78 @@ object AgentApi {
         }
         return JSONObject().put("ok", false).put("err", "读取超时：游戏线程 ${timeoutMs}ms 内没执行")
     }
+
+    /**
+     * ★直调按钮（实验，2026-11-15 · 分支 `feat/direct-trigger`）：**不点屏幕**，直接触发节点的点击回调。
+     *
+     * agent 侧新增（`agent_base.js` 的 `pressNodeStart/Poll`）：
+     *   - 常驻派发钩子（`UICamera.Update`，只装一次）→ 队列里的任务在游戏线程执行；
+     *   - 找节点 → `CustomUIButton`/`UIButton` 组件的 `onClick`(List<EventDelegate>) → `EventDelegate.Execute`；
+     *   - 取不到再退 `OnClick()`，都没有就返回错误 + 诊断（组件类名 / onClick 条数 / 委托方法名）。
+     *
+     * 两段式的原因同 [battleSettings]：`runtime_invoke` 必须在游戏线程，而 RPC 里同步等主线程会死锁。
+     *
+     * @param nameRe 节点名正则（不区分大小写），如 `btn_back`、`ButtonQuest`
+     * @param root   遍历根（`view`/`footer`/`layer`/`dialog`/`top`）；null = 整棵树（慢，约 2s）
+     * @param probe  true = **只探不点**（看 onClick 里有几条委托、方法名是什么）
+     * @return `{ok, via, node, btnCls, onClick:{count,items}, ex, err, frames}`；未连接/超时返回 null
+     */
+    suspend fun pressNode(
+        nameRe: String,
+        root: String? = null,
+        probe: Boolean = false,
+        timeoutMs: Long = 4_000L,
+    ): JSONObject? {
+        val opt = JSONObject().put("probe", probe)
+        val st = obj("pressNodeStart", listOf(nameRe, root, opt), T_FAST) ?: return null
+        if (!st.optBoolean("queued", false)) return st          // 投递失败（钩子装不上等）→ 直接回错误对象
+        val t0 = SystemClock.elapsedRealtime()
+        while (SystemClock.elapsedRealtime() - t0 < timeoutMs) {
+            delay(120)
+            val r = obj("pressNodePoll", emptyList(), T_FAST) ?: continue
+            if (!r.optBoolean("pending", true)) return r
+        }
+        return JSONObject().put("ok", false).put("pending", false)
+            .put("err", "投递超时：游戏线程 ${timeoutMs}ms 内没执行")
+    }
+
+    /** 直调链路状态（诊断用）：`{hooked, where, frames, jobs, queuedCount, err}` */
+    suspend fun pressState(): JSONObject? = obj("pressState", emptyList(), T_FAST)
+
+    /**
+     * ★地图节点 **按 BlockId** 直调（2026-11-16）。
+     *
+     * 为什么不能用 [pressNode] 找格子：可视面板全叫 `PartsLabyrinthPanel(Clone)`，名字一样、
+     * 指针每帧都变，**只能靠节点 id** 定位。agent 侧直接复用现有 `_moveLocate(blockId)`
+     * （从 `PartsLabyrinthMap+0x70` 可视面板列表里按 `panel+0x70 → PanelData → BlockId` 命中）。
+     *
+     * 触发：优先该面板 GameObject 上 `UIButton.onClick` → `EventDelegate.Execute`；
+     * 兜底老路径 `onPanelButtonClick`（`clickNodeThread` 用的就是它）。结果里的 `via` 说明走了哪条。
+     *
+     * @param blockId 目标格子 id（来自 [labStatusLite] 的 `next` / `labMap` 的 `panels[].blockId`）
+     * @param probe   true = 只探不点
+     * @return `{ok, via, blockId, node, go, onClick:{count,items}, ex, err}`
+     */
+    suspend fun pressPanel(
+        blockId: Int,
+        probe: Boolean = false,
+        timeoutMs: Long = 4_000L,
+    ): JSONObject? {
+        val st = obj("pressPanelStart", listOf(blockId, JSONObject().put("probe", probe)), T_SLOW) ?: return null
+        if (!st.optBoolean("queued", false)) return st
+        val t0 = SystemClock.elapsedRealtime()
+        while (SystemClock.elapsedRealtime() - t0 < timeoutMs) {
+            delay(120)
+            val r = obj("pressNodePoll", emptyList(), T_FAST) ?: continue
+            if (!r.optBoolean("pending", true)) return r
+        }
+        return JSONObject().put("ok", false).put("pending", false)
+            .put("err", "投递超时：游戏线程 ${timeoutMs}ms 内没执行")
+    }
+
+    /** 只定位不点：确认某个 blockId 能否拿到面板（诊断） */
+    suspend fun panelLocate(blockId: Int): JSONObject? =
+        obj("panelLocate", listOf(blockId), T_SLOW)
 
     /**
      * ★轻量页面签名 `{view, top}`（viewId + 最上层对话框名，几十 ms）。

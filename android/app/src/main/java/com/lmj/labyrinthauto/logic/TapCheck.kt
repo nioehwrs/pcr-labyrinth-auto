@@ -76,6 +76,16 @@ object TapCheck {
         skipDelayMs: Long = 60L,
         /** ★首点前先「只读不点」几拍（新页入场动画期间按钮坐标还在动，第一下必空）；每拍 [skipDelayMs] */
         skipFirstHits: Int = 0,
+        /**
+         * ★★**直调执行器**（2026-11-18）：给了它就**代替** [tapFn]（[x] / [y] / [xyAt] 全部忽略）。
+         *
+         * 为什么复用本模型而不是另写一套：重试、探针节奏、到达目标页的判据全都一样，
+         * 直调只是**换一个触发方式** —— 不投屏幕坐标 ⇒ 不受前台/遮挡/叠层影响，也省掉 `input tap` 的 ~110ms。
+         *
+         * @return `true` = 已投递到游戏线程；`false` = 投递失败（直接收工）；
+         *         `null` = 这一刻不该点（页面在切 / 按钮没定位到）⇒ 跳过并重试，**不消耗** [retries]
+         */
+        pressFn: (suspend () -> Boolean?)? = null,
         verbose: Boolean = true,
     ): Boolean {
         // ── 阶段 1：反复点，直到**离开 from**（证明这一下生效了）──
@@ -99,19 +109,32 @@ object TapCheck {
             // 坐标：给了 xyAt 就**每次点击前现取**（切页动画期间坐标在动 ⇒ 旧坐标会点空）。
             var px = x
             var py = y
-            if (xyAt != null) {
-                val p = runCatching { xyAt() }.getOrNull()
-                if (p == null) {
+            if (pressFn != null) {
+                // 直调：null = 这一刻不该点（页面在切 / 按钮没定位到）⇒ 跳过并重试，不消耗 retries
+                val fired = runCatching { pressFn() }.getOrNull()
+                if (fired == null) {
                     skip++
                     if (skip > skipMax) return false
                     delay(skipDelayMs)
                     continue
                 }
-                px = p.first
-                py = p.second
+                attempt++
+                if (!fired) return false
+            } else {
+                if (xyAt != null) {
+                    val p = runCatching { xyAt() }.getOrNull()
+                    if (p == null) {
+                        skip++
+                        if (skip > skipMax) return false
+                        delay(skipDelayMs)
+                        continue
+                    }
+                    px = p.first
+                    py = p.second
+                }
+                attempt++
+                if (!tapFn(px, py, what)) return false
             }
-            attempt++
-            if (!tapFn(px, py, what)) return false
             // ★探针轨迹（只在给了 `probeState` 时开）：每次 probe 记「相对点击的时刻 / RPC 耗时 / 诊断串」。
             //   ★probe 仍按 settleMs / probeMs 的节奏跑 —— 诊断是读取时**顺便**带回来的，
             //     不额外发 RPC、也不阻塞 ⇒ 2s 内自然是十几次探测，而不是"一次读取占住 2s"。

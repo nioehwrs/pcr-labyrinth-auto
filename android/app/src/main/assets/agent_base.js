@@ -2879,6 +2879,31 @@ let g_vm = null;                 // 缓存的活跃 ViewLabyrinthMap 实例（la
 
 // （已清理）hookDisplayClassCtor —— 钩闭包构造器的旧方案（会撞跳板 unable-to-intercept），已移除。
 
+/**
+ * ★轻读：从 `ViewManager+0x110`（currentView）直接取 `ViewLabyrinthMap` 实例（2026-11-18）。
+ *   原来 `_moveLocate` 靠 `Process.enumerateRanges + Memory.scanSync` 全堆扫类指针 —— 实测 2.6~3.7s。
+ *   这里只做 3 次读 + 1 次类名比对（~1ms），再用 +0xF8(属于哪份 LTD) / +0xD0(partsMap) 校验。
+ *   返回 null ⇒ 调用方退回旧的全堆扫描（不在迷宫地图 / 结构变了）。
+ */
+function _labyrinthMapView(ltdPtr) {
+  try {
+    const v = _viewManagerInst();
+    if (!v || v.isNull()) return null;
+    const cv = v.add(0x110).readPointer();
+    if (!ptrOk(cv)) return null;
+    let nm = null;
+    try { nm = g_il2cpp.class_get_name(g_il2cpp.object_get_class(cv)).readUtf8String(); } catch (e) { return null; }
+    if (!nm || nm.indexOf("ViewLabyrinthMap") < 0) return null;
+    const parts = cv.add(0xD0).readPointer();
+    if (parts.isNull()) return null;
+    if (ltdPtr) {
+      const ld = cv.add(0xF8).readPointer();
+      if (ld.isNull() || !ld.equals(ltdPtr)) return null;   // 不是当前这份迷宫的视图
+    }
+    return cv;
+  } catch (e) { return null; }
+}
+
 // 定位当前活跃 VM 与目标 PanelData
 function _moveLocate(targetBlockId) {
   if (!g_il2cpp || !g_il2cpp.runtime_invoke) { console.log("[move] 需要 runtime_invoke 路径"); return null; }
@@ -2890,20 +2915,26 @@ function _moveLocate(targetBlockId) {
   if (!vmk || vmk.isNull()) { console.log("[move] ViewLabyrinthMap 类未找到"); return null; }
   const ppk = findClass("PartsLabyrinthPanel");
   if (!ppk || ppk.isNull()) { console.log("[move] PartsLabyrinthPanel 类未找到"); return null; }
-  let vm = null;
-  for (const r of Process.enumerateRanges("r--").filter(x=>!x.file&&x.size>=0x1000).sort((a,b)=>b.size-a.size)) {
-    if (r.file||r.size<0x1000) continue;
-    try {
-      const kb = vmk.toString(16).padStart(16,"0").match(/../g).reverse().join(" ");
-      const ms = Memory.scanSync(r.base,r.size,kb);
-      for (const m of ms) { const a=m.address; try {
-        if (!objIsClass(a,vmk)) continue;
-        const ld=a.add(0xF8).readPointer();
-        const parts=a.add(0xD0).readPointer();
-        if (!ld.isNull()&&ld.equals(ltd.o)&&!parts.isNull()) vm=a;
-      } catch(e){} }
-    } catch(e){}
-    if (vm) break;
+  // ★轻读优先（2026-11-18）：正常在迷宫地图上是 ~1ms；只有取不到才退回全堆扫描（2.6s+）
+  let vm = _labyrinthMapView(ltd.o);
+  if (vm) {
+    console.log("[move] 轻读 VM=" + vm);
+  } else {
+    console.log("[move] 轻读取不到 VM ⇒ 退回全堆扫描（慢）");
+    for (const r of Process.enumerateRanges("r--").filter(x=>!x.file&&x.size>=0x1000).sort((a,b)=>b.size-a.size)) {
+      if (r.file||r.size<0x1000) continue;
+      try {
+        const kb = vmk.toString(16).padStart(16,"0").match(/../g).reverse().join(" ");
+        const ms = Memory.scanSync(r.base,r.size,kb);
+        for (const m of ms) { const a=m.address; try {
+          if (!objIsClass(a,vmk)) continue;
+          const ld=a.add(0xF8).readPointer();
+          const parts=a.add(0xD0).readPointer();
+          if (!ld.isNull()&&ld.equals(ltd.o)&&!parts.isNull()) vm=a;
+        } catch(e){} }
+      } catch(e){}
+      if (vm) break;
+    }
   }
   if (!vm) { console.log("[move] 未找到已接好 parts 的活跃 VM"); return null; }
   console.log("[move] 活跃 VM=" + vm);
@@ -3483,6 +3514,39 @@ function _pathAt(rootTr, path) {
     }
     return t;
   } catch (e) { return null; }
+}
+
+/**
+ * ★DFS 找出**全部**同名节点的索引链（2026-11-16）。
+ *   `_pathFind` 只返回第一个 ⇒ 三选一/多格这种"同名按钮 ×N"没法用；这个把每条路径都收下来，
+ *   调用方（Python/JS）自己按屏幕坐标排序后写进 `LAB_PATHS`。
+ *   只遍历一次（限 guard 16000），不是热路径。
+ */
+function _pathFindAll(rootTr, name, max) {
+  const out = [];
+  try {
+    if (!ptrOk(rootTr)) return out;
+    const st = [{ tr: rootTr, path: [] }];
+    let guard = 0;
+    while (st.length && guard++ < 16000 && out.length < (max || 8)) {
+      const it = st.pop();
+      const t = it.tr;
+      if (!ptrOk(t)) continue;
+      let go = null;
+      try { go = _inv(t, "get_gameObject"); } catch (e) { go = null; }
+      if (!ptrOk(go)) continue;
+      let nm = "";
+      try { nm = _str(_inv(go, "get_name")); } catch (e) {}
+      if (nm === name && _goActive(go) === true) out.push(it.path);
+      let cc = 0;
+      try { const r = _inv(t, "get_childCount"); cc = r.isNull() ? 0 : r.add(0x10).readS32(); } catch (e) {}
+      for (let i = cc - 1; i >= 0; i--) {
+        const ch = _inv1i(t, "GetChild", i);
+        if (!ch.isNull()) st.push({ tr: ch, path: it.path.concat([i]) });
+      }
+    }
+  } catch (e) {}
+  return out;
 }
 
 // 取一次相机环境（惰性算坐标时复用，别每个节点都重新查相机）
@@ -5331,6 +5395,184 @@ function labPartyLiteSnapshot() {
   return res;
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// ★★编组页「加 / 减角色」直调（2026-11-18 实测定案）
+//
+// 同一颗 `UnitIcon` 点下去，打给**两个不同对象**就是两种语义（同名方法、不同类）：
+//   加 → `PartsPartyEditScrollController.onClickUnitIcon(UnitIcon)`   （abs+0x70）
+//   减 → `PartsPartyEditPlate.onClickUnitIcon(UnitIcon)`              （abs+0x68）
+// ★为什么必须自己指定目标：池里 icon 的 `CustomUIButton.onClick` 只挂了 ScrollController
+//   一条委托 ⇒ 走 `EventDelegate.Execute` 永远只有"加"这一条路；"减"只能手动打给 Plate。
+//
+// · 参数必须是 **UnitIcon 实例**：传 GameObject 会抛异常（实测 ex≠0）。
+// · 定位必须发生在**游戏线程**（runtime_invoke），List 用**数组直读**
+//   （`+0x10` → `+0x20+i*8`）；走 `get_Item` 的 `_listItem` 在这个对象上会静默返回空。
+// · 全程按 unitId 定位：不看槽位序号、不投屏幕坐标。池子格子位置固定（不排序就不动）。
+// · 「已选」状态 = `CheckIcon(+0x88)` 的 GameObject `activeInHierarchy`。
+// · ⚠ 直调改完**不会刷新视图** ⇒ 池子留白（后面的格子不前移）；
+//   `ForceUpdateUnitIconParams` / `ForceItemUpdate` / `UpdateSelectMember` 实测**都不重排**。
+//   ⇒ 改完要么重开一次编组页，要么一次会话内改完直接 `decide`。
+//   ⇒ **别调** `SC.onRemoveUnitIcon`：它会把 icon 从视图列表里删掉，那个角色连池子都找不到。
+// · 编组页的增删是**草稿**：`cancel` 丢弃改动，只有 `decide`（战斗开始）才提交。
+// ══════════════════════════════════════════════════════════════════════════════
+const PARTY_BTN_OFF = { decide: 0x110, cancel: 0x120, exequip: 0x158 };
+
+/** 编组页数据对象：`DialogCommonPartyEdit +0x208` → abs（plate / scrollController 都挂在它下面） */
+function _partyAbs() {
+  try {
+    const f = labPartyFind();
+    if (!f || !f.ok) return { err: "没找到编组页实例" };
+    const abs = f.ptr.add(0x208).readPointer();
+    if (!ptrOk(abs)) return { err: "编组页 abs 读不到" };
+    return { abs: abs, dlg: f.ptr };
+  } catch (e) { return { err: "" + e }; }
+}
+
+// 槽位（队伍那一排）：`abs+0x68` → plate → `+0xC8` = UnitIcon[]
+function _partySlotIcon(abs, i) {
+  try {
+    const plate = abs.add(0x68).readPointer();
+    if (!ptrOk(plate)) return ptr(0);
+    const arr = plate.add(0xC8).readPointer();
+    if (!ptrOk(arr)) return ptr(0);
+    return arr.add(0x20 + i * 8).readPointer();
+  } catch (e) { return ptr(0); }
+}
+function _partySlotCount(abs) {
+  try {
+    const plate = abs.add(0x68).readPointer();
+    if (!ptrOk(plate)) return -1;
+    const arr = plate.add(0xC8).readPointer();
+    if (!ptrOk(arr)) return -1;
+    return arr.add(0x18).readS32();
+  } catch (e) { return -1; }
+}
+
+// 角色池：`abs+0x70` → scrollController → `+0x70` = List<UnitIcon>（数据数组直读）
+function _partyPoolIcon(abs, i) {
+  try {
+    const sc = abs.add(0x70).readPointer();
+    if (!ptrOk(sc)) return ptr(0);
+    const lst = sc.add(0x70).readPointer();
+    if (!ptrOk(lst)) return ptr(0);
+    const items = lst.add(0x10).readPointer();
+    if (!ptrOk(items)) return ptr(0);
+    return items.add(0x20 + i * 8).readPointer();
+  } catch (e) { return ptr(0); }
+}
+function _partyPoolCount(abs) {
+  try {
+    const sc = abs.add(0x70).readPointer();
+    if (!ptrOk(sc)) return -1;
+    const lst = sc.add(0x70).readPointer();
+    return ptrOk(lst) ? listCount(lst) : -1;
+  } catch (e) { return -1; }
+}
+
+/** 图标「已选」= CheckIcon(+0x88) 的 GameObject 是否 active（与截图上的打钩/变暗一致） */
+function _partyIconChecked(ic) {
+  try {
+    const c = ic.add(0x88).readPointer();
+    if (!ptrOk(c)) return null;
+    const go = _inv(c, "get_gameObject");
+    return ptrOk(go) ? _goActive(go) : null;
+  } catch (e) { return null; }
+}
+
+/** ★轻读：已选（槽位/队伍顺序）+ 可选（角色池，含各格已选状态）。字段直取，零遍历。 */
+function labPartySlotsSnapshot() {
+  const res = { ok: false, party: [], slots: [], pool: [], ms: 0, err: null };
+  const t0 = Date.now();
+  try {
+    const a = _partyAbs();
+    if (a.err) { res.err = a.err; res.ms = Date.now() - t0; return res; }
+    const abs = a.abs;
+    const ns = _partySlotCount(abs);
+    for (let i = 0; i < ns && i < 10; i++) {
+      const ic = _partySlotIcon(abs, i);
+      if (!ptrOk(ic)) continue;
+      let uid = 0; try { uid = partyUnitIdOfIcon(ic).unitId; } catch (e) {}
+      res.slots.push({ i: i, unitId: uid, checked: _partyIconChecked(ic) });
+      if (uid) res.party.push(uid);
+    }
+    const np = _partyPoolCount(abs);
+    for (let i = 0; i < np && i < 64; i++) {
+      const ic = _partyPoolIcon(abs, i);
+      if (!ptrOk(ic)) continue;
+      let uid = 0; try { uid = partyUnitIdOfIcon(ic).unitId; } catch (e) {}
+      res.pool.push({ i: i, unitId: uid, checked: _partyIconChecked(ic) });
+    }
+    res.ok = true;
+  } catch (e) { res.err = "" + e; }
+  res.ms = Date.now() - t0;
+  return res;
+}
+
+/** 池里按 uid 找图标（每件任务都要重新找：上一次点击会改队伍） */
+function _partyFindPoolIcon(abs, uid) {
+  const n = _partyPoolCount(abs);
+  for (let i = 0; i < n; i++) {
+    const ic = _partyPoolIcon(abs, i);
+    if (!ptrOk(ic)) continue;
+    let u = 0; try { u = partyUnitIdOfIcon(ic).unitId; } catch (e) {}
+    if (u === uid) return { ic: ic, i: i };
+  }
+  return null;
+}
+
+/** 打一发：kind='add' → ScrollController；'remove' → Plate */
+function _partyPressIcon(ic, kind, out) {
+  const a = _partyAbs();
+  if (a.err) { out.err = a.err; return out; }
+  const tgtOff = (kind === "remove") ? 0x68 : 0x70;
+  const target = a.abs.add(tgtOff).readPointer();
+  if (!ptrOk(target)) { out.err = "目标对象为空"; return out; }
+  const kls = g_il2cpp.object_get_class(target);
+  const m = _findMethodNP(kls, "onClickUnitIcon", 1);
+  if (!m) { out.err = "没找到 onClickUnitIcon(1)"; return out; }
+  const args = Memory.alloc(8);
+  args.writePointer(ic);
+  const ex = Memory.alloc(8); ex.writePointer(ptr(0));
+  g_il2cpp.runtime_invoke(m, target, args, ex);
+  const exv = ex.readPointer();
+  out.ex = String(exv);
+  out.via = (kind === "remove" ? "Plate" : "ScrollCtrl") + ".onClickUnitIcon";
+  out.ok = exv.isNull();
+  if (!out.ok) out.err = "调用抛异常";
+  return out;
+}
+
+/**
+ * ★编组页三颗按钮**直调**（两段式，结果见 `pressNodePoll`）：`decide` / `cancel` / `exequip`。
+ *
+ * 三颗都是 `DialogCommonPartyEdit` 上的 `CustomUIButton` 字段（`+0x110/+0x120/+0x158`），
+ * 走 `onClick` → `EventDelegate.Execute`（同 `_pressNow` 口径，兜底无参 `OnClick()`）。
+ *
+ * ★`exequip` 就是打开「特别装备三连页」的那颗按钮 —— 三连页的整套直调从这里进。
+ * ★`decide` 是**提交**（战斗开始）；编组页的增删是草稿，`cancel` 会丢弃改动。
+ */
+function labPartyBtn(which) {
+  const OFF = { decide: 0x110, cancel: 0x120, exequip: 0x158 };
+  const out = { ok: false, queued: false, which: String(which), via: null, ex: null, err: null };
+  if (!OFF[which]) { out.err = "which 只能是 decide / cancel / exequip"; return out; }
+  try {
+    const f = labPartyFind();
+    if (!f || !f.ok) { out.err = "没找到编组页实例"; return out; }
+    const comp = f.ptr.add(OFF[which]).readPointer();
+    if (!ptrOk(comp)) { out.err = "按钮字段为空"; return out; }
+    if (!_dispInstall()) { out.err = "派发钩子装不上"; return out; }
+    g_pressRes = { pending: true, which: String(which) };
+    g_dispQ.push(function () {
+      const o = { which: String(which), ok: false, via: null, ex: null, err: null };
+      try { _pressCompPtr(comp, o); } catch (e) { o.err = "" + e; }
+      o.pending = false;
+      g_pressRes = o;
+    });
+    out.queued = true;
+    return out;
+  } catch (e) { out.err = "" + e; return out; }
+}
+
 /**
  * ★「编组页顶部页签」（队伍1/2/3）。
  *
@@ -5570,7 +5812,7 @@ function _dlgBtnByField(dlgComp, name, env) {
     if (!ptrOk(tr)) return null;
     const p = _ndXY({ tr: tr }, env);
     if (!p || !p.onscreen) return null;
-    return { name: name, x: p.x, y: p.y, id: String(g) };
+    return { name: name, x: p.x, y: p.y, id: String(g), btnPtr: String(btn) };
   } catch (e) { return null; }
 }
 
@@ -6042,8 +6284,16 @@ function _exeqButtons(rootTr, only) {
       //   实测重读整包时会在两个候选之间跳：TwoButtonRight (1179,960) ↔ (1150,904)）
       //   ⇒ 调用方靠它把"多点"**锁定在同一个按钮实例**上 ⇒ 绝不会点到别的目标。
       let id = "";
-      try { const g = _inv(f.tr, "get_gameObject"); if (g && !g.isNull()) id = String(g); } catch (e) {}
-      out.push({ name: f.name, x: p.x, y: p.y, id: id });
+      let bp = "";
+      try {
+        const g = _inv(f.tr, "get_gameObject");
+        if (g && !g.isNull()) {
+          id = String(g);
+          const ck2 = findClass("CustomUIButton");
+          if (ck2 && !ck2.isNull()) { const c2 = _compSelfTry(g, ck2); if (ptrOk(c2)) bp = String(c2); }
+        }
+      } catch (e) {}
+      out.push({ name: f.name, x: p.x, y: p.y, id: id, btnPtr: bp });
     }
   }
   return out;
@@ -6148,7 +6398,8 @@ function _exeqXY(compPtr, env, name) {
     if (!(x >= 0 && x <= env.W && y >= 0 && y <= env.H)) return null;
     let id = "";
     try { const g = _inv(compPtr, "get_gameObject"); if (g && !g.isNull()) id = String(g); } catch (e) {}
-    return { name: name, x: x, y: y, id: id };
+    // ★cs103：把**组件指针**一起带出去 ⇒ `labExPress` 直接拿它压，不必再从 GameObject 反查组件
+    return { name: name, x: x, y: y, id: id, btnPtr: String(compPtr) };
   } catch (e) { return null; }
 }
 
@@ -6198,12 +6449,114 @@ function labExBtn(key, preferId) {
         if (!ptrOk(it)) continue;
         let t = null;
         try { const lb = it.add(0x30).readPointer(); if (ptrOk(lb)) t = _str1(_inv(lb, "get_text")); } catch (e) {}
-        if (t === want) { btn = _exeqXY(it, env, key); break; }
+        if (t === want) {
+          // ★★cs103 修正（2026-11-18 实测）：排序项本体是 `PartsUnitSortTypeToggle`，
+          //   **它自己既没有 `onClick` 字段、也没有无参 `OnClick()`** ⇒ 直调报
+          //   "onClick 为空且没有无参 OnClick()"。真正可压的是它的 `button @0x28`
+          //   （字段类型就是 `CustomUIButton`，GameObject 上也确认挂着它）。
+          let cp = ptr(0);
+          try { cp = it.add(0x28).readPointer(); } catch (e) {}
+          if (!ptrOk(cp)) cp = it;                     // 兜底：结构变了也不至于直接失败
+          btn = _exeqXY(cp, env, key);
+          break;
+        }
       }
     }
     res.btn = btn;
   } catch (e) { res.err = String(e); }
   return res;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ★特别装备三连页的**直调**（2026-11-18，cs103）
+//
+// 为什么不复用 `_pressNow`：它是"按节点名找 → 压"，而 EX 页的按钮**没法按名字找**——
+//   ①页有三个 `ThreeButton*`、`setting` 页的复选框/4 行按钮名字都叫同一个、
+//   ③页的排序项根本不是 Button（是 `PartsUnitSortTypeToggle`）。
+//   ⇒ 必须先按**页内语义**定位（`labExBtn` 已经做完了），再拿它给出的 `btnPtr` 直接压。
+//
+// 触发顺序（同 `_pressNow` 的口径）：
+//   ① `CustomUIButton/UIButton.onClick`(List<EventDelegate>) → `EventDelegate.Execute`
+//   ② 组件自己的**无参** `OnClick()`（`PartsUnitSortTypeToggle` 这类非按钮控件走这条）
+// ══════════════════════════════════════════════════════════════════════════════
+function _pressCompPtr(comp, out) {
+  // ── ① onClick → EventDelegate.Execute ──
+  let fl = null;
+  try { fl = _onClickOf(comp); } catch (e) { out.err = "" + e; }
+  if (fl && !fl.err) {
+    out.onClickOff = fl.off;
+    out.onClick = _delegateDump(fl.list, 3);
+    if (out.onClick && out.onClick.count > 0) {
+      const ed = findClass("EventDelegate");
+      const em = (ed && !ed.isNull())
+        ? (_findMethodNP(ed, "Execute", 1) || findMethodAny(ed, "Execute")) : null;
+      if (em) {
+        const pa = Memory.alloc(8); pa.writePointer(fl.list);   // 静态方法：实例参数传 NULL
+        const ex = Memory.alloc(8); ex.writePointer(ptr(0));
+        g_il2cpp.runtime_invoke(em, ptr(0), pa, ex);
+        const exv = ex.readPointer();
+        out.ex = String(exv);
+        out.via = "EventDelegate.Execute";
+        out.ok = exv.isNull();
+        if (!out.ok) out.err = "EventDelegate.Execute 抛异常";
+        return out;
+      }
+    }
+  }
+  // ── ② 组件自己的 OnClick()（只接受无参；带参调进去会崩）──
+  try {
+    const ccls = g_il2cpp.object_get_class(comp);
+    const om = _findMethodNP(ccls, "OnClick", 0);
+    if (om) {
+      const ex = Memory.alloc(8); ex.writePointer(ptr(0));
+      g_il2cpp.runtime_invoke(om, comp, ptr(0), ex);
+      const exv = ex.readPointer();
+      out.ex = String(exv);
+      out.via = "component.OnClick";
+      out.ok = exv.isNull();
+      if (!out.ok) out.err = "OnClick 抛异常";
+      return out;
+    }
+  } catch (e) { out.err = (out.err ? out.err + "；" : "") + e; }
+  out.err = (out.err ? out.err + "；" : "") + "onClick 为空且没有无参 OnClick()";
+  return out;
+}
+
+/**
+ * ★特别装备三连页**按 key 直调**（两段式，结果见 `pressNodePoll`）。
+ *
+ * @param key 与 `labExBtn` 同一套：`ThreeButtonLeft/Center/Right`、`TwoButtonRight`、
+ *            `prio0`(②页第1行右侧)、`check`(②页复选框)、`"sort:物理防御贯穿"`(③页排序项)
+ * @param preferId 上一次读到的 `btn.id`（GameObject 指针）—— 把重试**锁在同一个按钮实例**上
+ * @return `{queued, key, top, sig, btn}`；未投递则是错误对象
+ */
+function labExPress(key, preferId) {
+  const out = { ok: false, queued: false, key: key, via: null, sig: null, top: null,
+                btn: null, ex: null, err: null };
+  try {
+    const b = labExBtn(key, preferId);
+    out.sig = b.sig; out.top = b.top; out.btn = b.btn;
+    if (b.err) { out.err = b.err; return out; }
+    if (!b.btn) { out.err = "按钮定位失败（不在三连页 / 这一页没有该按钮）"; return out; }
+    const bp = b.btn.btnPtr || "";
+    if (!bp) { out.err = "按钮没有组件指针（btnPtr 空）"; return out; }
+    const comp = ptr(bp);
+    if (!ptrOk(comp)) { out.err = "组件指针无效"; return out; }
+    if (!_dispInstall()) { out.err = "派发钩子装不上"; return out; }
+    g_pressRes = { pending: true, key: key };
+    g_dispQ.push(function () {
+      const o = { key: key, ok: false, via: null, ex: null, err: null };
+      try {
+        o.btnName = b.btn ? b.btn.name : null;
+        o.btnId = b.btn ? b.btn.id : null;
+        _pressCompPtr(comp, o);
+      } catch (e) { o.err = "" + e; }
+      o.pending = false;
+      g_pressRes = o;
+    });
+    out.queued = true;
+    return out;
+  } catch (e) { out.err = "" + e; return out; }
 }
 
 // 只读快照：**只读"当前最上层"那一页**（wantBtns=false 时连按钮坐标都不算，省掉一次子树遍历）
@@ -6359,7 +6712,7 @@ function labExEquipTop() {
 // ── 选角色页（SUMMON_UNIT=1 且 pageTop 是对话框）：初始编成 / 门票召唤（★只读）──
 // ★构建号：改过读逻辑就 +1。attach 时 pcr_auto 会打出来（rpc jsBuild）——用来确认
 //   "正在跑的到底是哪一版脚本"，免得拿旧输出讨论半天（2026-10-10 踩过）。
-const JS_BUILD = "cs99";     // ★cs99（2026-11-12）：`labStartBtn` 取 Transform 改走 `Component.m_GameObject(+0x10)` → `GameObject.get_transform`（直接 `Component.get_transform` 实测 no-tr），并回传 btnCls/goCls/trCls 诊断。★cs98（2026-11-12）：新增 `labStartBtn` —— 259「出发」按钮字段直取（`ViewLabyrinthTop.challengeButton +0xE8` → 坐标，零遍历、零学习）。★cs97（2026-11-12）：新增 `_subtreeRoot("footer")` —— 底部导航层 `UI Root/ViewsArea/PartsFooter(Clone)`（HOME 的 `ButtonQuest` 父链实测），导航不再走整树兜底。★cs96（2026-11-12）：`findListPath` 支持**无根**（从 DialogArea 一路 get_parent 到 UI 顶）—— 用来定位"不在 view/layer/dialog/top 里"的按钮（HOME 的 `ButtonQuest` 各根全 0）。★cs95（2026-11-11）：`initIl2Cpp` 以 **domain 可用**（`il2cpp_domain_get()` 非空）作为就绪判据 —— 映射≠初始化完成；配合注入侧去掉固定 6s 静置，改由 agent 轮询就绪（Kotlin 最多等 30s）。★cs94（2026-11-11）：商店 slots **收全部** PurchaseButton（不再只收 onscreen）——屏外/半露按钮被丢会令槽位序号错位，`vis` 改按面板裁剪区判定。★cs93（2026-11-11）：`_topDialogGo(preferOverlay)` —— 商店链优先取叠加在 `DialogLabyrinthShop` 之上的确认框（商店节点索引反而更大，会把「购买完毕/角色加入」盖掉）。★cs92（2026-11-11）：新增 `labShopItems` —— 只读货架 lineup 字段（rewardId/price/isSold/availability，3~5ms），给「买完链内确认已售」用。★cs91（2026-11-11）：新增 `labDlgKids` —— 只读 DialogArea 全部直接子节点名+active，排查「角色加入」框为何不被 `_topDialogGo` 识别。★cs90（2026-11-11）：labShop 增 `resetCount` —— 读 LabyrinthTempData.ShopResetCount(+0x128)，判断本店**已刷几次**（get_resettableNum 刷新后不减，更像"上限"）。★cs89（2026-11-10）：新增 `labDlgBox` —— 弹窗箱体轻读（指针 + 关闭/出现 tween + 7 个按钮槽位，~5~8ms），给商店「新框出现 → 点确认 → 开始消失 → 下一个框」动画链用。★cs88（2026-11-10）：商店读取**不再用跨轮实例缓存** —— 每拍从当前最上层对话框现取 `_compSelf/_compInChildren`（刷新后不再读到刷新前的货架）；顶层是商店但 lineup 未填 ⇒ 直接回未就绪、不回退旧实例。★cs87（2026-11-10）：新增 `labDlgPair` —— 通用确认框**出现**轻读（`_topDialogGo` 的 GameObject 指针 + TwoButtonLeft/Right，2~4ms），给"点地图节点 → 是否前往"两步确认用。★cs86（2026-11-09）：`labGuildCards` 增加 `W`/`H`（屏幕宽高）—— 上层据此过滤**右越界**的卡（实测拉比林斯 x=2447 > 1920 被当成可见 ⇒ 点出去白等 1.8s）。★cs85（2026-11-09）：`labGuildCards` 不再用 `_ndXY.onscreen` 丢坐标 —— 半露卡（最左那张）的 departureButton 会投影到 x<0，之前被当成"不在可见区"⇒ 白拖一屏再拖回来；现在照给坐标 + `on` 标记，由 Kotlin 侧决定。★cs84（2026-11-09）：`dbgGuildCards` 转正为 **`labGuildCards`** —— 公会选择页卡列表字段直取（ViewManager→ViewLabyrinthGuildSetting+0xD0→scroll+0x20→wrap+0x30→mChildren+0x58），真机实测 **9ms**（原 findList 500~916ms），并带每卡 guildNameLabel 文本，可按名字选公会而不是"第 N 张"。★cs83（2026-11-09）【调试用·测试完请删除】：`dbgGuildCards` 修正 —— 上一版 `klassNameOf(GameObject)` 恒为 "GameObject"，改成读**节点名**；卡组件先 `_compSelf` 再 `_compInChildren`；新增 `cardKlassFound` 便于判断是不是类名找错了。★cs82（2026-11-09）【调试用·测试完请删除】：新增 `dbgGuildCards` —— 公会选择页（263）卡列表结构探针：ViewManager→ViewLabyrinthGuildSetting(+0xD0 controller→+0x20 scroll→+0x30 wrap→+0x58 mChildren)，每卡读 guildNameLabel(+0x40)/departureButton(+0x50)/clearedDifficultyObject(+0x20)，外加 LabyrinthTempData(+0xF0) 的 GuildId/Difficulty/SelectDifficulty。为了把 `findList("DepartureButton")`（~800ms 全树遍历）换成字段直取。★cs81（2026-11-09）：三选一探针改为**并进 probeState**（probe 按 150ms 节奏跑、每次读取顺带带回 proc/tween/selNum，不再同步阻塞采样）；三选一探针 RPC 由 `debugSelTrace` 转正为 `labSelState`（含 started/factor/closing）。★cs80（2026-11-09）：`labDlgClosing` 取组件改为 **DialogCommonAbstract 优先、DialogBase 兜底** —— `DialogLabyrinthSelection`（三选一页）是 DialogBase 直接子类，原先只按 DialogCommonAbstract 找会整个漏掉，读不到它的退出 tween/isProcess。配套 `debugSelTrace` 补 proc/tw。★cs79（2026-11-09）【已于 cs81 转正为 labSelState】：新增三选一页采样 `PartsLabyrinthSelectionItemView.selectionNum@0x38`、卡片列表长度、游戏显示的剩余数文本(+0x138)、剩余数 UI 是否显示(+0x130)、每卡 unitChoiceIndex(+0x98)，用来确定 selectionNum 是"已选数量"还是"选中下标"及其响应速度。★cs78（2026-11-09）：`labDlgClosing` 失败时标 `path=err`（调用方据此区分"读失败"与"窗口没了"，读失败绝不当成"已离开"）；`tapAndCheck` 阶段 1 改为**单次快照探针** `probeState`（top 与判据同源，少一次 RPC，也避免两次读之间的状态错位）。★cs77（2026-11-09）：新增 `labDlgClosing` —— 通用弹窗「关闭已启动」轻读（退出 tween 的 mStarted/factor，零 hook、3~6ms），替代"等窗口消失"当"这一下点生效了"；实测整页到 +800ms 才消失、退出 tween +200~300ms 就启动。★cs74（2026-11-09）：新增 `labDlgBtn` —— 通用弹窗按钮按 `DialogCommonAbstract +0x118` **字段直取**（零遍历，30ms 级），替代 `dialog()` 的 DialogArea 子树遍历（冷 0.5~0.6s / 大页 3~3.9s）；门票三选一两连弹改用它现取坐标。★cs73（2026-11-08）：`labStatusLite` / `labSnapshot` 补 `guildId`（`LabyrinthTempData+0x1C`）—— 局内刷"已在迷宫里要不要沿用"要核对公会，否则手动开着 A 公会的局、配置是 B 公会时会直接沿用、跑完当成 B 公会的成绩。cs72（2026-11-08）：**"最上层"只剩一个实现 + 根没了不再扫全树** —— ①`_topDialogTr`（`findList(...,"top")` 的根）改为复用 `_topDialogGo`，不再自己写一遍判据（原来有 3 份实现，正是 EX 三连页多点/点错的根源）；②`_rootWalkNodes` 的遍历缓存**加校验"根是不是同一个"**（原来只看 key ⇒ `"top"` 这个根会变，1.5s 内会把上一个对话框的子树当成当前的返回）；③新增 `_walkForRoot`：**显式给了根却取不到（如当前没有对话框）⇒ 返回空，不再退化成全树**（`findList(…,"top")` 实测 2633ms → 3ms；而且全树会捞到别处的同名节点）。cs71：**读取全面"按需"** —— ①新增 `labExBtn(key)`：EX 三连页只读**要点的那个按钮** + 当前签名（不再读整包：整包会把 setting 的 4 行文字/复选框、sort 的 11 个 toggle 文字都过一遍，纯浪费）；②新增 `labExtra()`：非分派字段（eventId/questId/eventResultId/effectNum/curChoice/remainChoice + LTD choices）拆成独立读，handler 要时才调；③`labStatusLite` 补 `next`（移动分支用，一次内存读）。cs70：**EX 整包读的按钮改按字段取**（DialogFundationObject：twoLeft 0x48 / twoRight 0x58 / threeLeft 0x70 / threeCenter 0x80 / threeRight 0x98，经对话框组件 +0x118 foundationObject），**不再遍历整棵子树**（①页遍历要 350ms+）。cs69：labExEquip(full, only) 只投影要点的那个；cs68：**"当前最上层"统一成一个实现**（_topDialogGo）—— ①_exeqFind 只查**最上层那一层**、**绝不往回退**（回退会永远读到下面那层仍 active 的①页 ⇒ 签名不变 ⇒ 误判"没生效"⇒多点⇒点错按钮）；②签名里带**最上层容器名**（"页面切了"能立刻看见）。cs67：去掉 agent 侧坐标"稳定化"（Thread.sleep 堵死单通道）；cs64：_findExTopPart 组件查找缓存；cs63：labExEquipSig 轻量签名读
+const JS_BUILD = "cs103";    // ★cs103（2026-11-18）：**特别装备三连页直调** —— `labExPress(key)` 按页内语义定位后压 `CustomUIButton.onClick`/无参 `OnClick()`（③页排序项是 `PartsUnitSortTypeToggle`，走后者）；`labExBtn` 的按钮对象新增 `btnPtr`（组件指针）；新增 `labPartyBtn(decide|cancel|exequip)`。★cs102（2026-11-18）：编组页**加/减角色直调**（`labPartySlots` 轻读 + `labPartyPress`）—— 加 → `PartsPartyEditScrollController.onClickUnitIcon(UnitIcon)`，减 → `PartsPartyEditPlate.onClickUnitIcon(UnitIcon)`；全程按 unitId 定位、参数必须是 UnitIcon、定位在游戏线程内做；已选状态读 `CheckIcon(+0x88).active`。★cs101（2026-11-16）：地图节点改为**按 BlockId 直调**（`pressPanelStart`/`panelLocate`，复用 `_moveLocate` 定位，UIButton.onClick 优先、`onPanelButtonClick` 兜底）。★cs100（2026-11-15 · feat/direct-trigger）：新增 `pressNodeStart/pressNodePoll/pressState` —— **直调按钮**（常驻派发钩子挂 UICamera.Update + onClick→EventDelegate.Execute，两段式 RPC，替代 root 点击的第一步，尚未接入 MazeLoop）。★cs99（2026-11-12）：`labStartBtn` 取 Transform 改走 `Component.m_GameObject(+0x10)` → `GameObject.get_transform`（直接 `Component.get_transform` 实测 no-tr），并回传 btnCls/goCls/trCls 诊断。★cs98（2026-11-12）：新增 `labStartBtn` —— 259「出发」按钮字段直取（`ViewLabyrinthTop.challengeButton +0xE8` → 坐标，零遍历、零学习）。★cs97（2026-11-12）：新增 `_subtreeRoot("footer")` —— 底部导航层 `UI Root/ViewsArea/PartsFooter(Clone)`（HOME 的 `ButtonQuest` 父链实测），导航不再走整树兜底。★cs96（2026-11-12）：`findListPath` 支持**无根**（从 DialogArea 一路 get_parent 到 UI 顶）—— 用来定位"不在 view/layer/dialog/top 里"的按钮（HOME 的 `ButtonQuest` 各根全 0）。★cs95（2026-11-11）：`initIl2Cpp` 以 **domain 可用**（`il2cpp_domain_get()` 非空）作为就绪判据 —— 映射≠初始化完成；配合注入侧去掉固定 6s 静置，改由 agent 轮询就绪（Kotlin 最多等 30s）。★cs94（2026-11-11）：商店 slots **收全部** PurchaseButton（不再只收 onscreen）——屏外/半露按钮被丢会令槽位序号错位，`vis` 改按面板裁剪区判定。★cs93（2026-11-11）：`_topDialogGo(preferOverlay)` —— 商店链优先取叠加在 `DialogLabyrinthShop` 之上的确认框（商店节点索引反而更大，会把「购买完毕/角色加入」盖掉）。★cs92（2026-11-11）：新增 `labShopItems` —— 只读货架 lineup 字段（rewardId/price/isSold/availability，3~5ms），给「买完链内确认已售」用。★cs91（2026-11-11）：新增 `labDlgKids` —— 只读 DialogArea 全部直接子节点名+active，排查「角色加入」框为何不被 `_topDialogGo` 识别。★cs90（2026-11-11）：labShop 增 `resetCount` —— 读 LabyrinthTempData.ShopResetCount(+0x128)，判断本店**已刷几次**（get_resettableNum 刷新后不减，更像"上限"）。★cs89（2026-11-10）：新增 `labDlgBox` —— 弹窗箱体轻读（指针 + 关闭/出现 tween + 7 个按钮槽位，~5~8ms），给商店「新框出现 → 点确认 → 开始消失 → 下一个框」动画链用。★cs88（2026-11-10）：商店读取**不再用跨轮实例缓存** —— 每拍从当前最上层对话框现取 `_compSelf/_compInChildren`（刷新后不再读到刷新前的货架）；顶层是商店但 lineup 未填 ⇒ 直接回未就绪、不回退旧实例。★cs87（2026-11-10）：新增 `labDlgPair` —— 通用确认框**出现**轻读（`_topDialogGo` 的 GameObject 指针 + TwoButtonLeft/Right，2~4ms），给"点地图节点 → 是否前往"两步确认用。★cs86（2026-11-09）：`labGuildCards` 增加 `W`/`H`（屏幕宽高）—— 上层据此过滤**右越界**的卡（实测拉比林斯 x=2447 > 1920 被当成可见 ⇒ 点出去白等 1.8s）。★cs85（2026-11-09）：`labGuildCards` 不再用 `_ndXY.onscreen` 丢坐标 —— 半露卡（最左那张）的 departureButton 会投影到 x<0，之前被当成"不在可见区"⇒ 白拖一屏再拖回来；现在照给坐标 + `on` 标记，由 Kotlin 侧决定。★cs84（2026-11-09）：`dbgGuildCards` 转正为 **`labGuildCards`** —— 公会选择页卡列表字段直取（ViewManager→ViewLabyrinthGuildSetting+0xD0→scroll+0x20→wrap+0x30→mChildren+0x58），真机实测 **9ms**（原 findList 500~916ms），并带每卡 guildNameLabel 文本，可按名字选公会而不是"第 N 张"。★cs83（2026-11-09）【调试用·测试完请删除】：`dbgGuildCards` 修正 —— 上一版 `klassNameOf(GameObject)` 恒为 "GameObject"，改成读**节点名**；卡组件先 `_compSelf` 再 `_compInChildren`；新增 `cardKlassFound` 便于判断是不是类名找错了。★cs82（2026-11-09）【调试用·测试完请删除】：新增 `dbgGuildCards` —— 公会选择页（263）卡列表结构探针：ViewManager→ViewLabyrinthGuildSetting(+0xD0 controller→+0x20 scroll→+0x30 wrap→+0x58 mChildren)，每卡读 guildNameLabel(+0x40)/departureButton(+0x50)/clearedDifficultyObject(+0x20)，外加 LabyrinthTempData(+0xF0) 的 GuildId/Difficulty/SelectDifficulty。为了把 `findList("DepartureButton")`（~800ms 全树遍历）换成字段直取。★cs81（2026-11-09）：三选一探针改为**并进 probeState**（probe 按 150ms 节奏跑、每次读取顺带带回 proc/tween/selNum，不再同步阻塞采样）；三选一探针 RPC 由 `debugSelTrace` 转正为 `labSelState`（含 started/factor/closing）。★cs80（2026-11-09）：`labDlgClosing` 取组件改为 **DialogCommonAbstract 优先、DialogBase 兜底** —— `DialogLabyrinthSelection`（三选一页）是 DialogBase 直接子类，原先只按 DialogCommonAbstract 找会整个漏掉，读不到它的退出 tween/isProcess。配套 `debugSelTrace` 补 proc/tw。★cs79（2026-11-09）【已于 cs81 转正为 labSelState】：新增三选一页采样 `PartsLabyrinthSelectionItemView.selectionNum@0x38`、卡片列表长度、游戏显示的剩余数文本(+0x138)、剩余数 UI 是否显示(+0x130)、每卡 unitChoiceIndex(+0x98)，用来确定 selectionNum 是"已选数量"还是"选中下标"及其响应速度。★cs78（2026-11-09）：`labDlgClosing` 失败时标 `path=err`（调用方据此区分"读失败"与"窗口没了"，读失败绝不当成"已离开"）；`tapAndCheck` 阶段 1 改为**单次快照探针** `probeState`（top 与判据同源，少一次 RPC，也避免两次读之间的状态错位）。★cs77（2026-11-09）：新增 `labDlgClosing` —— 通用弹窗「关闭已启动」轻读（退出 tween 的 mStarted/factor，零 hook、3~6ms），替代"等窗口消失"当"这一下点生效了"；实测整页到 +800ms 才消失、退出 tween +200~300ms 就启动。★cs74（2026-11-09）：新增 `labDlgBtn` —— 通用弹窗按钮按 `DialogCommonAbstract +0x118` **字段直取**（零遍历，30ms 级），替代 `dialog()` 的 DialogArea 子树遍历（冷 0.5~0.6s / 大页 3~3.9s）；门票三选一两连弹改用它现取坐标。★cs73（2026-11-08）：`labStatusLite` / `labSnapshot` 补 `guildId`（`LabyrinthTempData+0x1C`）—— 局内刷"已在迷宫里要不要沿用"要核对公会，否则手动开着 A 公会的局、配置是 B 公会时会直接沿用、跑完当成 B 公会的成绩。cs72（2026-11-08）：**"最上层"只剩一个实现 + 根没了不再扫全树** —— ①`_topDialogTr`（`findList(...,"top")` 的根）改为复用 `_topDialogGo`，不再自己写一遍判据（原来有 3 份实现，正是 EX 三连页多点/点错的根源）；②`_rootWalkNodes` 的遍历缓存**加校验"根是不是同一个"**（原来只看 key ⇒ `"top"` 这个根会变，1.5s 内会把上一个对话框的子树当成当前的返回）；③新增 `_walkForRoot`：**显式给了根却取不到（如当前没有对话框）⇒ 返回空，不再退化成全树**（`findList(…,"top")` 实测 2633ms → 3ms；而且全树会捞到别处的同名节点）。cs71：**读取全面"按需"** —— ①新增 `labExBtn(key)`：EX 三连页只读**要点的那个按钮** + 当前签名（不再读整包：整包会把 setting 的 4 行文字/复选框、sort 的 11 个 toggle 文字都过一遍，纯浪费）；②新增 `labExtra()`：非分派字段（eventId/questId/eventResultId/effectNum/curChoice/remainChoice + LTD choices）拆成独立读，handler 要时才调；③`labStatusLite` 补 `next`（移动分支用，一次内存读）。cs70：**EX 整包读的按钮改按字段取**（DialogFundationObject：twoLeft 0x48 / twoRight 0x58 / threeLeft 0x70 / threeCenter 0x80 / threeRight 0x98，经对话框组件 +0x118 foundationObject），**不再遍历整棵子树**（①页遍历要 350ms+）。cs69：labExEquip(full, only) 只投影要点的那个；cs68：**"当前最上层"统一成一个实现**（_topDialogGo）—— ①_exeqFind 只查**最上层那一层**、**绝不往回退**（回退会永远读到下面那层仍 active 的①页 ⇒ 签名不变 ⇒ 误判"没生效"⇒多点⇒点错按钮）；②签名里带**最上层容器名**（"页面切了"能立刻看见）。cs67：去掉 agent 侧坐标"稳定化"（Thread.sleep 堵死单通道）；cs64：_findExTopPart 组件查找缓存；cs63：labExEquipSig 轻量签名读
 // ★cs62（2026-10-22）：新增 battleSettingsStart/Poll（战斗设定只读；getter 是 IFix 模板 ⇒ 投递游戏线程执行）
 // ★JS 侧详细日志开关（2026-10-11 加）：默认关。
 //   关掉的是"每次调用都会打、但正常情况没信息量"的那几条（如 findMap 的"跳过堆扫描"、
@@ -7694,6 +8047,364 @@ function _battleSettingsReadNow() {
   return out;
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// ★直调按钮（2026-11-15 · 分支 feat/direct-trigger）—— 不点屏幕，直接触发按钮自己的点击回调
+//   范式取自 pcrtool：**常驻钩子只挂一次**，把"要在游戏线程做的事"排队，每帧取一件执行
+//   （它挂 `BattleHeaderController.SetRestTime`；我们挂 `UICamera.Update`）。差别：按钮类/方法名
+//   一律走 il2cpp 反射按名字查，**不写死 RVA** —— 游戏更新只要类名不变就还能用。
+//
+//   为什么两段式：Frida JS 单线程，RPC 里同步等游戏主线程返回会死锁（同 battleSettings 的坑）；
+//   而所有 `runtime_invoke` 必须在游戏线程（非游戏线程直调撞过 ART 断言，见 line 2674 的教训）。
+//     `pressNodeStart(nameRe, rootName, {probe})` 投递 → `pressNodePoll()` 取结果。
+//   触发链（逐级降级，结果里的 `via` 说明实际走了哪条）：
+//     ① 组件的 `onClick`(List<EventDelegate>) → `EventDelegate.Execute(list)`   ← NGUI 正道
+//     ② 组件自己的 `OnClick()`（无参）
+//     ③ 都没有 → 报错并带诊断（节点名 / 组件类 / onClick 条数 / 委托方法名）
+//   `probe=true` 只探不点。
+// ══════════════════════════════════════════════════════════════════════════════
+const g_disp = { hooked: false, where: null, frames: 0, jobs: 0, err: null };
+const g_dispQ = [];
+let g_pressRes = null;
+let g_pressSeq = 0;
+
+/** 每帧取一件任务执行（一次只做一件：一帧里跑多次 runtime_invoke 会拖住游戏主循环） */
+function _dispDrain() {
+  g_disp.frames++;
+  if (!g_dispQ.length) return;
+  const job = g_dispQ.shift();
+  g_disp.jobs++;
+  try { job(); } catch (e) { console.log("[press] 任务异常: " + e); }
+}
+
+/** 装常驻派发钩子（只装一次；候选方法按"所有界面都每帧跑"排序，跟 runOnGameThread 同一套候选） */
+function _dispInstall() {
+  if (g_disp.hooked) return true;
+  const cands = [["UICamera", "Update"], ["ViewManager", "Update"]];
+  for (let i = 0; i < cands.length; i++) {
+    const c = cands[i];
+    const ck = findClass(c[0]);
+    if (!ck || ck.isNull()) continue;
+    const u = findMethodAny(ck, c[1]);
+    if (!u) continue;
+    let fp; try { fp = _resolveThunk(methodPtr(u)); } catch (e) { continue; }
+    if (!fp || fp.isNull()) continue;
+    try {
+      Interceptor.attach(fp, { onEnter() { _dispDrain(); } });
+      g_disp.hooked = true; g_disp.where = c[0] + "." + c[1];
+      console.log("[press] 常驻派发钩子已装 → " + g_disp.where);
+      return true;
+    } catch (e) { g_disp.err = String(e); }
+  }
+  console.log("[press] 常驻钩子装不上: " + g_disp.err);
+  return false;
+}
+
+/** 字段偏移（含父类，最多 depth 层）；-1 = 没有该字段。按类指针记忆化。 */
+const g_fieldOff = Object.create(null);
+function _fieldOff(klass, name, depth) {
+  const key = String(klass) + "/" + name;
+  if (g_fieldOff[key] !== undefined) return g_fieldOff[key];
+  let c = klass, d = 0, hit = -1;
+  while (c && !c.isNull() && d < (depth || 6)) {
+    const it = Memory.alloc(Process.pointerSize); it.writePointer(ptr(0));
+    while (true) {
+      const f = g_il2cpp.class_get_fields(c, it);
+      if (!f || f.isNull()) break;
+      let nm = ""; try { nm = g_il2cpp.field_get_name(f).readUtf8String(); } catch (e) {}
+      if (nm === name) { hit = g_il2cpp.field_get_offset(f).toNumber(); break; }
+    }
+    if (hit >= 0) break;
+    c = g_il2cpp.class_get_parent(c); d++;
+  }
+  g_fieldOff[key] = hit;
+  return hit;
+}
+
+/** 方法参数个数（`il2cpp_method_get_param_count` 本构建可能没导出 → -1 = 未知） */
+let g_paramCntFn = null, g_paramCntTried = false;
+function _paramCount(m) {
+  if (!g_paramCntTried) {
+    g_paramCntTried = true;
+    try {
+      const mod = Process.findModuleByName("libil2cpp.so");
+      const e = mod ? mod.findExportByName("il2cpp_method_get_param_count") : null;
+      if (e) g_paramCntFn = new NativeFunction(e, "uint32", ["pointer"]);
+    } catch (e) {}
+  }
+  if (!g_paramCntFn) return -1;
+  try { return g_paramCntFn(m); } catch (e) { return -1; }
+}
+
+/**
+ * 按「名字 + 参数个数」精确找方法（含父类）——
+ * ★为什么不能直接用 findMethodAny：`EventDelegate.Execute` 有多个重载，`OnClick` 也可能带参，
+ *   拿错重载就会用错误的参数布局调进去（＝直接崩）。nParams<0 表示"个数未知，不过滤"。
+ */
+function _findMethodNP(klass, name, nParams) {
+  let c = klass, d = 0;
+  while (c && !c.isNull() && d < 12) {
+    const it = Memory.alloc(Process.pointerSize); it.writePointer(ptr(0));
+    while (true) {
+      const m = g_il2cpp.class_get_methods(c, it);
+      if (!m || m.isNull()) break;
+      let nm = ""; try { nm = g_il2cpp.method_get_name(m).readUtf8String(); } catch (e) {}
+      if (nm !== name) continue;
+      if (nParams < 0) return m;
+      if (_paramCount(m) === nParams) return m;
+    }
+    c = g_il2cpp.class_get_parent(c); d++;
+  }
+  return null;
+}
+
+/**
+ * 按名字找当前页（或指定根下）第一个 active 的节点。
+ * ★`xy` 可选：同名节点有多份时（地图格子全是 `PartsLabyrinthPanel(Clone)`）按**屏幕坐标最近**挑一个
+ *   —— 这是唯一能区分"要走哪一格"的手段（名字全一样，指针每帧都变）。
+ * @return {nd} 或 {err}；带 xy 时额外给 x/y/dist/matches
+ */
+function _findNodeP(re, rootName, xy) {
+  const root = rootName ? _subtreeRoot(rootName) : null;
+  const list = _walkForRoot(rootName, root);
+  if (!list) return { err: "根「" + rootName + "」不存在（换页中？）" };
+  const hits = [];
+  for (let i = 0; i < list.length; i++) {
+    const nd = list[i];
+    if (nd.active !== true) continue;
+    if (!re.test(nd.name || "")) continue;
+    hits.push(nd);
+  }
+  if (!hits.length) return { err: "没找到匹配节点" };
+  if (!xy) return { nd: hits[0], matches: hits.length };
+
+  const env = _camEnv();
+  if (!env) return { nd: hits[0], matches: hits.length, xyErr: "相机不可用，退回第一个" };
+  let best = null, bestD = 1e18;
+  const pts = [];
+  for (let i = 0; i < hits.length; i++) {
+    let p = null;
+    try { p = _ndXY(hits[i], env); } catch (e) {}
+    if (!p) continue;
+    pts.push({ x: p.x, y: p.y, onscreen: !!p.onscreen });
+    if (!p.onscreen) continue;
+    const d = Math.sqrt(Math.pow(p.x - xy[0], 2) + Math.pow(p.y - xy[1], 2));
+    if (d < bestD) { bestD = d; best = { nd: hits[i], x: p.x, y: p.y, dist: Math.round(d) }; }
+  }
+  if (!best) return { err: "匹配节点都不在屏内", pts: pts };
+  best.matches = hits.length;
+  best.pts = pts;
+  return best;
+}
+
+/** 读组件的 onClick 列表（NGUI：UIButton.onClick 是 List<EventDelegate>，可能在父类上） */
+function _onClickOf(comp) {
+  let k;
+  try { k = g_il2cpp.object_get_class(comp); } catch (e) { return { err: "取类失败" }; }
+  const off = _fieldOff(k, "onClick", 6);
+  if (off < 0) return { err: klassNameOf(comp) + " 上没有 onClick 字段" };
+  const l = comp.add(off).readPointer();
+  return { off: off, list: ptrOk(l) ? l : ptr(0) };
+}
+
+/** 委托列表摘要：条数 + 前 max 条的 {类, 方法名}（诊断用） */
+function _delegateDump(list, max) {
+  let n = -1;
+  try { n = _listCount(list); } catch (e) { n = -1; }
+  const items = [];
+  const lim = (n < 0) ? 0 : Math.min(n, max || 3);
+  for (let i = 0; i < lim; i++) {
+    let d = ptr(0); try { d = _listItem(list, i); } catch (e) {}
+    if (!ptrOk(d)) continue;
+    let mn = null, tgt = null;
+    try {
+      // NGUI 的 EventDelegate 字段是 mMethodName（旧代码只试 methodName → 恒为 null）
+      const k = g_il2cpp.object_get_class(d);
+      let off = _fieldOff(k, "mMethodName", 2);
+      if (off < 0) off = _fieldOff(k, "methodName", 2);
+      if (off < 0) off = _fieldOff(k, "method", 2);
+      if (off >= 0) mn = _str1(d.add(off).readPointer());
+      // 委托目标（诊断直调 NPE 用）：mTarget 是 MonoBehaviour ⇒ 给类名
+      let o2 = _fieldOff(k, "mTarget", 2);
+      if (o2 < 0) o2 = _fieldOff(k, "target", 2);
+      if (o2 >= 0) {
+        const tp = d.add(o2).readPointer();
+        if (ptrOk(tp)) tgt = klassNameOf(tp);
+      }
+    } catch (e) {}
+    items.push({ cls: klassNameOf(d), method: mn, target: tgt });
+  }
+  return { count: n, items: items };
+}
+
+/** 真正干活的部分 —— **必须在游戏线程执行**（非游戏线程 runtime_invoke 会撞 ART 断言） */
+function _pressNow(re, rootName, opt) {
+  const probe = !!(opt && opt.probe);
+  const out = { ok: false, probe: probe, via: null, node: null, btnCls: null,
+                onClickOff: null, onClick: null, err: null, ex: null,
+                x: null, y: null, dist: null, matches: null };
+
+  const xy = (opt && opt.xy && opt.xy.length === 2) ? opt.xy : null;
+  const f = _findNodeP(re, rootName, xy);
+  if (f.err) { out.err = f.err; if (f.pts) out.pts = f.pts; return out; }
+  const nd = f.nd;
+  out.node = nd.name;
+  out.matches = f.matches || 1;
+  if (f.x !== undefined) { out.x = f.x; out.y = f.y; out.dist = f.dist; }
+  if (f.xyErr) out.xyErr = f.xyErr;
+
+  const go = _inv(nd.tr, "get_gameObject");
+  if (!ptrOk(go)) { out.err = "节点没有 gameObject"; return out; }
+
+  // 组件：CustomUIButton 优先，其次 UIButton（都是 NGUI 按钮，onClick 是 List<EventDelegate>）
+  // ★必须用 `_compSelfTry` 而不是 `_compSelf`：本构建的 GameObject **没有 GetComponent(Type)**
+  //   （见 line 4479-4482 的实测），`_compSelf` 走的是 GetComponent ⇒ 必然扑空。
+  let comp = ptr(0);
+  const ck = findClass("CustomUIButton");
+  if (ck && !ck.isNull()) { comp = _compSelfTry(go, ck); if (ptrOk(comp)) out.btnCls = "CustomUIButton"; }
+  if (!ptrOk(comp)) {
+    const uk = findClass("UIButton");
+    if (uk && !uk.isNull()) { comp = _compSelfTry(go, uk); if (ptrOk(comp)) out.btnCls = "UIButton"; }
+  }
+  if (!ptrOk(comp)) { out.err = "节点上没有 CustomUIButton / UIButton 组件（不是标准按钮）"; return out; }
+
+  // ── ① onClick → EventDelegate.Execute ──
+  const fl = _onClickOf(comp);
+  if (fl.err) { out.err = fl.err; }
+  else {
+    out.onClickOff = fl.off;
+    out.onClick = _delegateDump(fl.list, 3);
+    if (probe) return out;
+    if (out.onClick.count > 0) {
+      const ed = findClass("EventDelegate");
+      // Execute 有多个重载 ⇒ 必须取「1 个参数」那个（参数个数查不到时才退回按名字拿）
+      const em = (ed && !ed.isNull())
+        ? (_findMethodNP(ed, "Execute", 1) || findMethodAny(ed, "Execute")) : null;
+      if (em) {
+        const pa = Memory.alloc(8); pa.writePointer(fl.list);      // 静态方法：实例参数传 NULL
+        const ex = Memory.alloc(8); ex.writePointer(ptr(0));
+        g_il2cpp.runtime_invoke(em, ptr(0), pa, ex);
+        const exv = ex.readPointer();
+        out.ex = String(exv);
+        out.via = "EventDelegate.Execute";
+        out.ok = exv.isNull();
+        if (!out.ok) out.err = "EventDelegate.Execute 抛异常";
+        return out;
+      }
+      out.err = "没找到 EventDelegate.Execute（组件类 " + out.btnCls + "）";
+    }
+  }
+  if (probe) return out;
+
+  // ── ② 组件自己的 OnClick()（只接受**无参**的，带参调进去会崩）──
+  const ccls = g_il2cpp.object_get_class(comp);
+  const om = _findMethodNP(ccls, "OnClick", 0) || findMethodAny(ccls, "OnClick");
+  if (om) {
+    const ex = Memory.alloc(8); ex.writePointer(ptr(0));
+    g_il2cpp.runtime_invoke(om, comp, ptr(0), ex);
+    const exv = ex.readPointer();
+    out.ex = String(exv);
+    out.via = "component.OnClick";
+    out.ok = exv.isNull();
+    if (!out.ok) out.err = "OnClick 抛异常";
+    return out;
+  }
+  out.err = (out.err ? out.err + "；" : "") + "onClick 为空且没有 OnClick 方法";
+  return out;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ★按 **BlockId** 直调地图节点（2026-11-16）
+//   地图格子全叫 `PartsLabyrinthPanel(Clone)`，**不能按名字/坐标随便取** —— 必须按节点 id。
+//   定位直接复用现有实现 `_moveLocate(targetBlockId)`（line 2883：从 PartsLabyrinthMap+0x70 的
+//   可视面板列表里，按 `panel+0x70 → PanelData → BlockId` 精确命中那个 `PartsLabyrinthPanel` 实例）。
+//   触发：优先该面板 GameObject 上 UIButton 的 onClick → EventDelegate.Execute；
+//         兜底沿用老路径 `onPanelButtonClick`（`clickNodeThread` 用的就是它）。
+// ══════════════════════════════════════════════════════════════════════════════
+function _locatePanel(bid) {
+  try {
+    const loc = _moveLocate(bid);
+    if (!loc || !loc.panel || loc.panel.isNull()) {
+      return { err: "未定位到 blockId=" + bid + " 的面板（不在可走范围/列表未刷新）" };
+    }
+    return loc;
+  } catch (e) { return { err: "定位异常: " + e }; }
+}
+
+/**
+ * 组件 → 它的 GameObject。
+ * ★首选 `Component.get_gameObject()`（不依赖偏移、版本无关）；
+ *   实测 `PartsLabyrinthPanel` 用 `+0x20` 读到的是个叫 "root" 的对象（不是它自己）⇒ 不能只用偏移。
+ */
+function _panelGo(panel) {
+  try {
+    const go = _inv(panel, "get_gameObject");
+    if (ptrOk(go)) return go;
+  } catch (e) {}
+  try {
+    const go2 = panel.add(0x20).readPointer();
+    if (ptrOk(go2)) { _inv(go2, "get_name"); return go2; }
+  } catch (e) {}
+  return ptr(0);
+}
+
+function _pressPanelNow(panel, bid, probe) {
+  const out = { ok: false, probe: probe, via: null, blockId: bid, node: null, btnCls: null,
+                onClickOff: null, onClick: null, err: null, ex: null, go: null };
+  const go = _panelGo(panel);
+  out.go = ptrOk(go) ? String(go) : null;
+  if (ptrOk(go)) { try { out.node = _str(_inv(go, "get_name")); } catch (e) {} }
+
+  if (ptrOk(go)) {
+    let comp = ptr(0);
+    const ck = findClass("CustomUIButton");
+    if (ck && !ck.isNull()) { comp = _compSelfTry(go, ck); if (ptrOk(comp)) out.btnCls = "CustomUIButton"; }
+    if (!ptrOk(comp)) {
+      const uk = findClass("UIButton");
+      if (uk && !uk.isNull()) { comp = _compSelfTry(go, uk); if (ptrOk(comp)) out.btnCls = "UIButton"; }
+    }
+    if (ptrOk(comp)) {
+      const fl = _onClickOf(comp);
+      if (!fl.err) {
+        out.onClickOff = fl.off;
+        out.onClick = _delegateDump(fl.list, 3);
+        if (probe) return out;
+        if (out.onClick.count > 0) {
+          const em = _edExecOf();      // ★方法指针全局缓存（不再每轮 findClass + 方法遍历）
+          if (em) {
+            const pa = Memory.alloc(8); pa.writePointer(fl.list);
+            const ex = Memory.alloc(8); ex.writePointer(ptr(0));
+            g_il2cpp.runtime_invoke(em, ptr(0), pa, ex);
+            const exv = ex.readPointer();
+            out.ex = String(exv);
+            out.via = "EventDelegate.Execute";
+            out.ok = exv.isNull();
+            if (!out.ok) out.err = "EventDelegate.Execute 抛异常";
+            return out;
+          }
+          out.err = "没找到 EventDelegate.Execute";
+        }
+      } else { out.err = fl.err; }
+    }
+  }
+  if (probe) return out;
+
+  // 兜底：老路径（现有 clickNodeThread 用的就是这条）
+  const mAny = findMethodAny(g_il2cpp.object_get_class(panel), "onPanelButtonClick");
+  const m = (mAny && mAny.m) ? mAny.m : mAny;
+  if (m && !m.isNull()) {
+    const ex = Memory.alloc(8); ex.writePointer(ptr(0));
+    g_il2cpp.runtime_invoke(m, panel, ptr(0), ex);
+    const exv = ex.readPointer();
+    out.ex = String(exv);
+    out.via = "onPanelButtonClick";
+    out.ok = exv.isNull();
+    if (!out.ok) out.err = "onPanelButtonClick 抛异常";
+    return out;
+  }
+  out.err = (out.err ? out.err + "；" : "") + "既没有 UIButton.onClick 也没有 onPanelButtonClick";
+  return out;
+}
+
 rpc.exports = {
   viewId: _rpcSafe(function () { try { return getViewId(); } catch (e) { return -999; } }),
   ready: function () { return !!g_il2cpp; },
@@ -7909,6 +8620,32 @@ rpc.exports = {
     try {
       const re = new RegExp(String(startBtnRe || "UIButton_Unit"), "i");
       const partyRe = /^(UnitIcon(L2|L1|C|R1|R2)|ButtonDecide)$/i;
+      // ★轻读优先（2026-11-16）：有路径就沿**父子索引链**直达 —— 实测 ~10ms，
+      //   而下面"最上层对话框子树遍历"(204 节点) 是 230~480ms。路径失效才继续往下走。
+      const nm0 = String(startBtnRe || "UIButton_Unit");
+      const slot0 = g_labBtn["QDStart|" + nm0] || _pathFixed("QDStart|" + nm0, nm0);
+      const rk0 = rootKind || (slot0 && slot0.root);
+      const pt0 = (pathArr && pathArr.length) ? pathArr : (slot0 && slot0.path);
+      if (rk0 && pt0 && pt0.length) {
+        const lb0 = _pathBtnNow(rk0, pt0, nm0, true);
+        if (lb0.ok) {
+          out.start = { name: nm0, x: lb0.x, y: lb0.y, hit: "路径", ms: lb0.ms };
+          // ★party 用**另一个轻读**拿（2026-11-16 用户）：判"编组页是否盖在上面"不需要遍历子树，
+          //   直接看最上层对话框名（`_topDialogGo` 只遍历 DialogArea 的少数子节点，~10ms）。
+          //   原实现的语义本来就是"预览页被编组页盖住"，用 top 名判断反而更直接。
+          try {
+            const tt = _topDialogTr();
+            if (tt) out.top = _str(_inv(_inv(tt, "get_gameObject"), "get_name"));
+            else out.top = null;
+            out.party = (out.top || "").indexOf("DialogCommonPartyEdit") >= 0;
+            // 顶层不是编组页、但屏上确实有编组页零件（少见）⇒ 仍标记"未检查"，让调用方别当成 false
+            if (!out.party && !out.top) out.party = null;
+          } catch (e) { out.party = null; }
+          out._ms = Date.now() - t0;
+          return out;
+        }
+        out.pathMiss = lb0.err;
+      }
       const tr = _topDialogTr();
       if (!tr) { out.err = "取不到最上层对话框"; out._ms = Date.now() - t0; return out; }
       out.top = _str(_inv(_inv(tr, "get_gameObject"), "get_name"));
@@ -8006,6 +8743,78 @@ rpc.exports = {
     out.at = g_battleSetRes.at;
     return out;
   },
+
+  // ★直调按钮（2026-11-15 · feat/direct-trigger）：不点屏幕，直接触发节点的点击回调。
+  //   两段式（同 battleSettings）：Start 投递到常驻派发钩子 → Poll 隔 ~120ms 取结果。
+  //   `opt.probe=true` 只探不点（看组件类 / onClick 条数 / 委托方法名）。
+  //   结果字段：{ok, via, node, btnCls, onClickOff, onClick:{count,items}, ex, err, id, root, at}
+  pressNodeStart: _rpcSafe(function (nameRe, rootName, opt) {
+    if (!g_il2cpp) return { queued: false, err: "il2cpp 未就绪" };
+    let re;
+    try { re = new RegExp(String(nameRe), "i"); } catch (e) { return { queued: false, err: "正则无效: " + nameRe }; }
+    if (!_dispInstall()) return { queued: false, err: "常驻钩子装不上" + (g_disp.err ? "：" + g_disp.err : "") };
+    const probe = !!(opt && opt.probe);
+    const xy = (opt && opt.xy && opt.xy.length === 2) ? [Number(opt.xy[0]), Number(opt.xy[1])] : null;
+    const rn = (rootName && String(rootName)) ? String(rootName) : null;
+    const id = ++g_pressSeq;
+    g_pressRes = null;
+    g_dispQ.push(function () {
+      let r;
+      try { r = _pressNow(re, rn, { probe: probe, xy: xy }); }
+      catch (e) { r = { ok: false, probe: probe, err: "执行异常: " + e }; }
+      r.id = id; r.at = Date.now(); r.root = rn;
+      g_pressRes = r;
+    });
+    return { queued: true, id: id, hook: g_disp.where, queuedCount: g_dispQ.length };
+  }),
+  pressNodePoll: function () {
+    if (!g_pressRes) return { pending: true, frames: g_disp.frames, queuedCount: g_dispQ.length };
+    const out = {};
+    for (const k in g_pressRes) out[k] = g_pressRes[k];
+    out.pending = false;
+    out.hook = g_disp.where;
+    out.frames = g_disp.frames;
+    return out;
+  },
+  // ★地图节点按 **BlockId** 直调（2026-11-16）：定位走现有 `_moveLocate`，
+  //   定位放 JS 线程（要扫堆，别占游戏线程），触发投递到常驻钩子。
+  //   结果同样写进 g_pressRes ⇒ 复用 `pressNodePoll` 取。
+  pressPanelStart: _rpcSafe(function (blockId, opt) {
+    if (!g_il2cpp) return { queued: false, err: "il2cpp 未就绪" };
+    const bid = Number(blockId);
+    if (!isFinite(bid)) return { queued: false, err: "blockId 无效: " + blockId };
+    if (!_dispInstall()) return { queued: false, err: "常驻钩子装不上" + (g_disp.err ? "：" + g_disp.err : "") };
+    const probe = !!(opt && opt.probe);
+    const loc = _locatePanel(bid);
+    if (loc.err) return { queued: false, err: loc.err };
+    const id = ++g_pressSeq;
+    g_pressRes = null;
+    g_dispQ.push(function () {
+      let r;
+      try { r = _pressPanelNow(loc.panel, bid, probe); }
+      catch (e) { r = { ok: false, probe: probe, blockId: bid, err: "执行异常: " + e }; }
+      r.id = id; r.at = Date.now();
+      g_pressRes = r;
+    });
+    return { queued: true, id: id, blockId: bid, hook: g_disp.where,
+             panel: String(loc.panel), prevBlockId: loc.bidBefore, queuedCount: g_dispQ.length };
+  }),
+  /** 只定位不点：确认「某个 blockId 能不能拿到面板 + 面板 GameObject」 */
+  panelLocate: _rpcSafe(function (blockId) {
+    const bid = Number(blockId);
+    const loc = _locatePanel(bid);
+    if (loc.err) return { ok: false, blockId: bid, err: loc.err };
+    const go = _panelGo(loc.panel);
+    return { ok: ptrOk(go), blockId: bid, panel: String(loc.panel),
+             prevBlockId: loc.bidBefore, go: ptrOk(go) ? String(go) : null };
+  }),
+
+  /** 钩子/队列状态（诊断："装了没、每帧在跑没"） */
+  pressState: function () {
+    return { hooked: g_disp.hooked, where: g_disp.where, frames: g_disp.frames,
+             jobs: g_disp.jobs, queuedCount: g_dispQ.length, err: g_disp.err };
+  },
+
   // ★按"元素名"取按钮坐标（学一次 → 之后只校验指针，零遍历）—— 刷开局用。
   //   学习只走 **当前 View 子树 + DialogArea 子树**（不是整棵 UI 树，实测整树 ~600 节点/2s）；
   //   之后每次只做：读缓存 Transform → 校验 GameObject 名一致 → 现算屏幕坐标（约 5 次调用）。
@@ -8014,6 +8823,84 @@ rpc.exports = {
   //   之前 Kotlin 只不传路径，但本进程里上次学的 slot 还在 ⇒ 仍走"路径"命中，白叫一声"重新学"。
   labBtn: _rpcSafe(function (key, name, rootKind, pathArr, fresh) {
     return _labBtnCore(key, name, rootKind, pathArr, fresh);
+  }),
+  /**
+   * ★路径轻读 + 直调（2026-11-16）：root/path 用 `labBtn` 学到的（hit="学习" 时的 root/path，
+   *   可落盘跨局回喂）。一次 ≈ **6~12ms**：GetChild×深度 + 坐标 + UIButton + onClick + Execute。
+   *   对照：同样的按钮走"最上层对话框子树遍历"是 230~480ms。
+   *
+   * ★★两段式（2026-11-16 实测教训）：`runtime_invoke` **必须在游戏线程执行**，
+   *   在 RPC 线程直接 invoke 会 `Error: breakpoint triggered`（实测）。
+   *   ⇒ `probe=true`：同步轻读（只读内存，任何线程安全）；
+   *     `probe=false`：投递到常驻钩子（`UICamera.Update`）里执行，返回 {queued,id}，
+   *                    结果照旧用 `pressNodePoll()` 取（和 pressNode/pressPanel 共用结果槽）。
+   *
+   * 返回（probe）: {ok, ms, x, y, name, btnCls, off, cnt, hasExec, via, ex, err}
+   */
+  /**
+   * ★一次性找出"同名节点 ×N"的全部索引链（2026-11-16）：给三选一这类页面录 `LAB_PATHS` 用。
+   *   只遍历一次（不是热路径）；返回 {paths:[[i,j,...], ...], kinds:[...]}。
+   *   配套用 `labPathPress(root, path, name, true)` 逐条验证坐标，然后抄进 `LAB_PATHS`。
+   */
+  labPathFindAll: _rpcSafe(function (rootKind, name, max) {
+    const t0 = Date.now();
+    const roots = _pathRoots();
+    let r = null;
+    for (const x of roots) if (x.kind === rootKind) { r = x; break; }
+    if (!r) return { err: "根不可用: " + rootKind, kinds: roots.map(function (x) { return x.kind; }), ms: Date.now() - t0 };
+    const paths = _pathFindAll(r.tr, String(name), max || 8);
+    return { root: rootKind, name: String(name), paths: paths, ms: Date.now() - t0 };
+  }),
+  labPathPress: _rpcSafe(function (rootKind, pathArr, name, probe, deep, key) {
+    // ★支持只给 key（走 `LAB_PATHS` 固定路径表）：没有 root/path 就从表里取，不学习
+    if ((!rootKind || !pathArr || !pathArr.length) && key) {
+      const fx = _pathFixed(String(key), name);
+      if (fx) { rootKind = fx.root; pathArr = fx.path; if (!name) name = fx.name; }
+    }
+    if (probe) return _pathBtnNow(rootKind, pathArr, name, true, deep);
+    if (!g_il2cpp) return { queued: false, err: "il2cpp 未就绪" };
+    if (!_dispInstall()) return { queued: false, err: "常驻钩子装不上" + (g_disp.err ? "：" + g_disp.err : "") };
+    const id = ++g_pressSeq;
+    g_pressRes = null;
+    g_dispQ.push(function () {
+      let r;
+      try { r = _pathBtnNow(rootKind, pathArr, name, false); }
+      catch (e) { r = { ok: false, err: "执行异常: " + e }; }
+      r.id = id; r.at = Date.now();
+      g_pressRes = r;
+    });
+    return { queued: true, id: id, hook: g_disp.where, queuedCount: g_dispQ.length };
+  }),
+  /**
+   * ★预热缓存（2026-11-16）：新 session 第一次调用轻读要 **300ms**（findClass / 字段偏移 /
+   *   相机环境 / Execute 方法指针全是冷缓存），之后才 6~12ms。
+   *   60ms 级轮询前先调一次这个，把首轮尖峰挪走。返回各步耗时，便于诊断。
+   */
+  labWarm: _rpcSafe(function () {
+    const t0 = Date.now();
+    const out = { ms: 0, part: {} };
+    const step = function (k, fn) {
+      const a = Date.now();
+      try { fn(); out.part[k] = Date.now() - a; } catch (e) { out.part[k] = "err:" + e; }
+    };
+    step("CustomUIButton", function () { findClass("CustomUIButton"); });
+    step("UIButton", function () { findClass("UIButton"); });
+    step("onClickOff", function () {
+      const ck = findClass("CustomUIButton");
+      if (ck && !ck.isNull()) _fieldOff(ck, "onClick", 6);
+    });
+    step("EventDelegate", function () { findClass("EventDelegate"); });
+    step("mMethodName", function () {
+      const ek = findClass("EventDelegate");
+      if (ek && !ek.isNull()) _fieldOff(ek, "mMethodName", 2);
+    });
+    step("edExec", function () { _edExecOf(); });
+    step("camEnv", function () { _camEnv(); });
+    step("viewMgr", function () { _viewManagerInst(); });
+    step("pathRoots", function () { _pathRoots(); });
+    step("dialogArea", function () { _topDialogGo(); });
+    out.ms = Date.now() - t0;
+    return out;
   }),
   // ★轻量"页面签名"：{view, top}。给 Kotlin 侧的按钮坐标缓存做 key ——
   //   同一页 + 同一顶层对话框下按钮位置是稳定的，可以直接点，省掉 2s 级的全树 find。
@@ -8076,6 +8963,51 @@ rpc.exports = {
   //   **不返回**页签候选与诊断字段 ⇒ 每轮省掉一大坨序列化+传输+解析。
   //   字段名与 `labParty` 一致 ⇒ Kotlin 侧不用改。
   labPartyLite: _rpcSafe(function () { try { return labPartyLiteSnapshot(); } catch (e) { return null; } }),
+  // ★★编组页加/减角色的**轻读**：已选（槽位顺序）+ 可选（池子各格 unitId/已选状态）
+  labPartySlots: _rpcSafe(function () { try { return labPartySlotsSnapshot(); } catch (e) { return { ok: false, err: String(e) }; } }),
+  // ★★编组页加/减角色的**直调**（两段式）：kind='add'|'remove'，uids=[...]
+  //   加 → ScrollController.onClickUnitIcon(UnitIcon)；减 → Plate.onClickUnitIcon(UnitIcon)
+  //   每件任务在**游戏线程**重新按 uid 定位（上一次点击会改队伍）⇒ 结果见 pressNodePoll()。
+  //   ⚠ 改完不会刷新视图（池子会留白）⇒ 改完重开编组页，或直接 decide。
+  labPartyPress: _rpcSafe(function (kind, uids) {
+    const out = { queued: false, kind: String(kind), n: 0, err: null };
+    try {
+      if (kind !== "add" && kind !== "remove") { out.err = "kind 必须是 add / remove"; return out; }
+      const list = (uids && uids.length) ? uids : [];
+      if (!list.length) { out.err = "uids 为空"; return out; }
+      if (!_dispInstall()) { out.err = "派发钩子装不上"; return out; }
+      const log = [];
+      g_pressRes = { pending: true, kind: String(kind), done: 0, total: list.length, log: log };
+      for (let k = 0; k < list.length; k++) {
+        (function (uid) {
+          g_dispQ.push(function () {
+            const o = { uid: uid, ok: false, via: null, err: null, ex: null };
+            try {
+              const a = _partyAbs();
+              if (a.err) { o.err = a.err; }
+              else {
+                const hit = _partyFindPoolIcon(a.abs, uid);
+                if (!hit) { o.err = "池里没有 " + uid; }
+                else {
+                  o.idx = hit.i;
+                  o.wasChecked = _partyIconChecked(hit.ic);
+                  _partyPressIcon(hit.ic, String(kind), o);
+                }
+              }
+            } catch (e) { o.err = "" + e; }
+            log.push(o);
+            // ★只有**最后一件**做完才置 pending=false：否则轮询会在第 1 件完成时就返回，
+            //   后面的任务还在派发队列里没跑（实测 remove 两个 → done=1/total=2 就返回了）。
+            g_pressRes = { pending: log.length < list.length, kind: String(kind), done: log.length,
+                           total: list.length, log: log, last: o };
+          });
+        })(list[k]);
+      }
+      out.queued = true;
+      out.n = list.length;
+      return out;
+    } catch (e) { out.err = "" + e; return out; }
+  }),
   // ★编组页顶部页签（切队伍腾空用；以前每轮都从 labParty 里带 40 个候选回来）
   labPartyTabs: _rpcSafe(function () { try { return labPartyTabsSnapshot(); } catch (e) { return null; } }),
   // ★★**极简分派读**（2026-11-08）：只读分派要的字段（全是内存读）⇒ ~10ms；
@@ -8300,6 +9232,17 @@ rpc.exports = {
   // ★★**按需读按钮**（2026-11-08）：三连页"这一步只点一个按钮" ⇒ 只读那一个 + 当前签名。
   //   返回 {sig, top, btn:{name,x,y,id}} —— **不读**整包（labels/terms/toggles/按钮全家桶）。
   labExBtn: _rpcSafe(function (key, preferId) { try { return labExBtn(key || "", preferId || ""); } catch (e) { return { sig: null, top: null, btn: null, err: String(e) }; } }),
+  // ★cs103：特别装备三连页**按 key 直调**（两段式）。key 同 labExBtn：
+  //   ThreeButtonLeft/Center/Right、TwoButtonRight、prio0、check、sort:<选项名>
+  labExPress: _rpcSafe(function (key, preferId) {
+    try { return labExPress(key || "", preferId || ""); }
+    catch (e) { return { queued: false, key: key, err: String(e) }; }
+  }),
+  // ★cs103：编组页三颗按钮直调（decide / cancel / exequip），exequip = 打开特别装备页
+  labPartyBtn: _rpcSafe(function (which) {
+    try { return labPartyBtn(which || ""); }
+    catch (e) { return { queued: false, which: which, err: String(e) }; }
+  }),
   // 诊断版：带"每个对象槽挂的是什么类"的现场 dump（★不再把内部 diag 覆盖成空对象）
   labPartyDiag: _rpcSafe(function () { try { return labPartySnapshot(true); } catch (e) { return null; } }),
   // 选角色页旧读法（PartsDialogLabyrinthSelectableChara + 堆扫描）已在 2026-10-11 退役：
@@ -8772,6 +9715,223 @@ const g_instCache = {};
 const g_labBtn = {};
 
 /**
+ * ★★固定路径表（2026-11-16 用户："不用学，直接写到程序里面"）★
+ *   key → { root, path, name }。root ∈ view|canvas|dlg，path 是**父子索引链**（GetChild 的索引序列）。
+ *   · 命中即直达（稳态 6~12ms）；**不做 DFS 学习**（canvas 子树太大，学一次 1.8~6.9s）。
+ *   · 路径失效（换页面结构）时返回 "path-miss"，调用方再决定：兜底学一次 / 走遍历 / 用点击。
+ *   · 新增按钮：先用 `press_test.py --list / findListPath` 探一次，把 root+path 抄到这里。
+ *   实测（2026-11-16，1280x720，view 264 迷宫）：
+ *     QDStart|UIButton_Unit   预览页「挑战」      （编组页出现 19.7ms）
+ *     PartyDecide|ButtonDecide 编组页「战斗开始」
+ *     ResultNext|NextButton   结算/奖励页「下一步」（★同一按钮要点**两次**：pose 胜利动画 → 奖励页）
+ */
+const LAB_PATHS = {
+  "QDStart|UIButton_Unit": { root: "canvas", path: [0, 4, 1, 0, 9, 0, 2, 0, 1, 0], name: "UIButton_Unit" },
+  "PartyDecide|ButtonDecide": { root: "canvas", path: [0, 4, 1, 0, 10, 0, 2, 0], name: "ButtonDecide" },
+  "ResultNext|NextButton": { root: "canvas", path: [0, 4, 1, 0, 6, 0, 1, 4, 0, 1, 0, 0, 0], name: "NextButton" },
+  // ── 角色/遗物三选一（`DialogLabyrinthSelection`，2026-11-16 实测）──
+  //   三个按钮同名 DecideButton×3，只能靠**索引**区分（0=最左/1=中/2=右）。
+  //   角色 id **每局都变** ⇒ 不要在表里写 id，用 `labSelection` 读 cards[i].unitId 与 decideX 对应。
+  //   （dlg 根的等价链更短：dlg [5,0,1,1,0,0,6] 等；这里统一用 canvas，与其他条目一致）
+  "SelectRole|Role0": { root: "canvas", path: [0, 4, 1, 0, 5, 0, 1, 1, 0, 0, 6], name: "DecideButton" },
+  "SelectRole|Role1": { root: "canvas", path: [0, 4, 1, 0, 5, 0, 1, 1, 1, 0, 6], name: "DecideButton" },
+  "SelectRole|Role2": { root: "canvas", path: [0, 4, 1, 0, 5, 0, 1, 1, 2, 0, 6], name: "DecideButton" },
+  // ── ★★DialogArea 里的按钮一律用 `top`（最上层对话框）作根，**不要用 dlg 绝对索引** ──
+  //   2026-11-18 实测：同一颗 OneButtonWhite 在 DialogArea 下的索引会**漂移**
+  //     · 门票结果 DialogCommonBig  → dlg[7,0,2,6]
+  //     · 事件结果 DialogCommonBig  → dlg[8,0,2,6]   ← 同 prefab，索引 +1
+  //     · DialogCommonMiddle        → dlg[6,0,2,3] / 事件时 dlg[7,0,2,3]
+  //   DialogArea 的子节点会随本局弹过的框累积 ⇒ 绝对索引不可用；相对"最上层对话框"的链才稳定：
+  //     Middle = [0,2,3]，Big = [0,2,6]。
+  // ── 移动确认框（DialogCommonSmall「将移动到…确定吗？」右侧「确认」，2026-11-17 实测）──
+  //   事件 = `onClickRightButton`，直调可过；直调后 ~1.4s 才切到目标页（是网络往返，不是慢）。
+  "MoveConfirm|TwoButtonRight": { root: "top", path: [0, 2, 3], name: "TwoButtonRight" },
+  // ── 三选一之后的确认窗（`DialogCommonMiddle` 里的单按钮，2026-11-16 实测）──
+  //   事件 = `onClickCenterButton`，直调可过（ex=0x0），触发后 ~530ms 回地图。
+  //   ★★**位置三选一是「两连弹」**（MazeLoop.kt:8341 原实现注释：`印记是 Big→Middle→地图 两连弹`，
+  //     遗物只有一弹）⇒ 顺序必须是 ResultBig → SelectConfirm → 地图。
+  //     ⚠中间两弹之间 `pageTop` 会**短暂为空**，且顶框名有最长 3.9s 延迟（MazeLoop.kt:8343）
+  //       ⇒ 判"已回地图"**不能**只看一次 `pageTop==null`（2026-11-17 我就是这么误判成"点一次就回图"）。
+  //       正确判据：连续 3 次空（每次间隔 ≥150ms）**且** `statusType==0`。
+  "SelectConfirm|OneButtonWhite": { root: "top", path: [0, 2, 3], name: "OneButtonWhite" },
+  // ── 门票页三选一（`DialogLabyrinthSelection`，2026-11-17 实测）──
+  //   ★与"战后选人"**同一个 prefab、不同层级**：战后选人在 dlg[5,...]，门票页在 dlg[6,...]
+  //     ⇒ 用 `SelectRole|Role*` 在门票页会"路径无效"，必须用这一组。
+  //   卡面内容是「水/光/风属性的随机印记×3」（unitId=null，不是角色）。
+  "SelectTicket|Ticket0": { root: "canvas", path: [0, 4, 1, 0, 6, 0, 1, 1, 0, 0, 6], name: "DecideButton" },
+  "SelectTicket|Ticket1": { root: "canvas", path: [0, 4, 1, 0, 6, 0, 1, 1, 1, 0, 6], name: "DecideButton" },
+  "SelectTicket|Ticket2": { root: "canvas", path: [0, 4, 1, 0, 6, 0, 1, 1, 2, 0, 6], name: "DecideButton" },
+  // ── 遗物三选一（`DialogLabyrinthSelection` + statusType=9 RELIC_CHOICE，2026-11-18 实测）──
+  //   ★与**门票页同层**（dlg[6,...]），只是按钮 y 从 591 变 **619**；与战后选人（dlg[5,...]）不同层。
+  //   卡面：topText=遗物名、bottomText=效果（unitId=null）。
+  "SelectRelic|Relic0": { root: "canvas", path: [0, 4, 1, 0, 6, 0, 1, 1, 0, 0, 6], name: "DecideButton" },
+  "SelectRelic|Relic1": { root: "canvas", path: [0, 4, 1, 0, 6, 0, 1, 1, 1, 0, 6], name: "DecideButton" },
+  "SelectRelic|Relic2": { root: "canvas", path: [0, 4, 1, 0, 6, 0, 1, 1, 2, 0, 6], name: "DecideButton" },
+  // ── 门票/道具**结果页**（`DialogCommonBig` 的单按钮，2026-11-17 实测）──
+  //   ★又和 Middle 那层不同（dlg[7,...] vs dlg[6,...]）⇒ 同一颗 OneButtonWhite 必须按页面分条。
+  //   这是**两连弹的第一弹**：点掉它之后还会再冒一个 `DialogCommonMiddle`（第二弹）。
+  "ResultBig|OneButtonWhite": { root: "top", path: [0, 2, 6], name: "OneButtonWhite" },
+};
+
+/** 查固定路径表：给 key（找不到再退 name 匹配）→ { root, path, name } | null */
+function _pathFixed(key, name) {
+  let v = LAB_PATHS[key];
+  if (!v && name) {
+    for (const k in LAB_PATHS) if (LAB_PATHS[k].name === name) { v = LAB_PATHS[k]; break; }
+  }
+  return v || null;
+}
+
+/** 路径根集合（2026-11-16 从 `_labBtnCore` 内联块抽出，`_pathAt`/轻读共用）：
+ *    · view  = 当前 View（`ViewManager+0x110`）的 Transform 子树（最小）
+ *    · canvas= 它往上爬到的最顶祖先（挑战按钮实测挂这里）
+ *    · dlg   = DialogArea 子树
+ *   ★路径是"父子**索引**链"，只有同一个根下才有效 ⇒ 换根必须重新学习。 */
+function _pathRoots() {
+  const roots = [];
+  try {
+    const vm = _viewManagerInst();
+    if (!vm.isNull()) {
+      const cv = vm.add(0x110).readPointer();
+      if (ptrOk(cv)) {
+        const tr = _inv(cv, "get_transform");
+        if (ptrOk(tr)) {
+          roots.push({ kind: "view", tr: tr });
+          let top = tr;
+          // ⚠GetParent 在剥离版里不存在（qdDiag=not-found ×12 的原因）⇒ get_parent 优先
+          for (let i = 0; i < 8; i++) {
+            let p2 = null;
+            try { p2 = _inv(top, "get_parent"); } catch (e) {}
+            if (!p2 || p2.isNull() || !ptrOk(p2)) {
+              try { p2 = _inv(top, "GetParent"); } catch (e) {}
+            }
+            if (!p2 || p2.isNull() || !ptrOk(p2)) break;
+            top = p2;
+          }
+          if ("" + top !== "" + tr) roots.push({ kind: "canvas", tr: top });
+        }
+      }
+    }
+  } catch (e) {}
+  // ★`top` = 最上层对话框本身（2026-11-18）：DialogArea 的子节点索引会随本局弹过的框累积而**漂移**，
+  //   绝对索引（dlg[7,...] / dlg[8,...]）不可复用；相对"最上层对话框"的链才是稳定指纹。
+  try {
+    const td = _topDialogTr();
+    if (ptrOk(td)) roots.push({ kind: "top", tr: td });
+  } catch (e) {}
+  try { const d = _dialogAreaTr(); if (ptrOk(d)) roots.push({ kind: "dlg", tr: d }); } catch (e) {}
+  return roots;
+}
+
+/** `EventDelegate.Execute` 的方法指针缓存（全局一次查找；脱离 _pressPanelNow 的每轮 findClass） */
+let g_edExec = null;
+function _edExecOf() {
+  if (g_edExec && !g_edExec.isNull()) return g_edExec;
+  try {
+    const ed = findClass("EventDelegate");
+    if (!ed || ed.isNull()) return null;
+    g_edExec = _findMethodNP(ed, "Execute", 1) || findMethodAny(ed, "Execute");
+    return g_edExec;
+  } catch (e) { return null; }
+}
+
+/** 把 `runtime_invoke` 拿到的异常对象转成「类名 | 消息」（诊断直调失败的原因） */
+function _exText(ex) {
+  try {
+    if (!ptrOk(ex)) return null;
+    let kn = "?";
+    try { kn = g_il2cpp.class_get_name(g_il2cpp.object_get_class(ex)).readUtf8String(); } catch (e) {}
+    let msg = null;
+    try { msg = _str1(_inv(ex, "get_Message")); } catch (e) {}
+    if (!msg) { try { msg = _str1(_inv(ex, "ToString")); } catch (e) {} }
+    return kn + (msg ? " | " + msg : "");
+  } catch (e) { return null; }
+}
+
+/**
+ * ★路径轻读（2026-11-16）：沿 `labBtn` 学到的**父子索引链**直达目标节点，一次拿全
+ *   「屏幕坐标 + UIButton 组件 + onClick 偏移 + onClick 条数 + Execute 方法指针」，可选立即直调。
+ *
+ * 为什么要有它：同样的【挑战】按钮，走"最上层对话框子树遍历"（204 节点）实测 **230~480ms**；
+ *   沿索引链（深度 10）稳态 **6~12ms**（含坐标、组件、onClick、Execute 查找）。
+ *   ⇒ 60ms 级轮询只能用这条；遍历只在"首次学习/路径失效"时跑一次。
+ *
+ * 返回值：{ok, ms, x, y, name, btnCls, off, cnt, hasExec, via, ex, err}
+ *   · probe=true ⇒ 只读到「坐标 + onClick 条数 + Execute 是否可用」，**不执行**；
+ *   · root/path 由 `labBtn` 学习得到（hit="学习" 时的 root/path），可落盘跨局回喂。
+ */
+function _pathBtnNow(rootKind, pathArr, name, probe, deep) {
+  const t0 = Date.now();
+  const out = { ok: false, ms: 0, x: null, y: null, name: null, btnCls: null,
+                off: null, cnt: null, hasExec: false, via: null, ex: null, err: null };
+  try {
+    if (!rootKind || !pathArr || !pathArr.length) { out.err = "缺 root/path"; out.ms = Date.now() - t0; return out; }
+    const env = _camEnv();
+    if (!env) { out.err = "取不到相机环境"; out.ms = Date.now() - t0; return out; }
+    const roots = _pathRoots();
+    let r = null;
+    for (const x of roots) if (x.kind === rootKind) { r = x; break; }
+    if (!r) {
+      out.err = "根不可用: " + rootKind + "（现有 " + roots.map(function (x) { return x.kind; }).join("/") + "）";
+      out.ms = Date.now() - t0; return out;
+    }
+    const tr = _pathAt(r.tr, pathArr);
+    if (!tr || tr.isNull()) { out.err = "路径无效（当前页/结构不匹配，检查 LAB_PATHS）"; out.ms = Date.now() - t0; return out; }
+    const go = _inv(tr, "get_gameObject");
+    if (!ptrOk(go)) { out.err = "取不到 GameObject"; out.ms = Date.now() - t0; return out; }
+    const nm = _str(_inv(go, "get_name"));
+    out.name = nm;
+    if (name && nm !== name) {
+      out.err = "节点名不符（期望 " + name + "，实际 " + nm + "）";
+      out.ms = Date.now() - t0; return out;
+    }
+    const ss = _screenOf(tr, env.cam, env.mW2S);
+    if (!ss) { out.err = "算不出屏幕坐标"; out.ms = Date.now() - t0; return out; }
+    out.x = Math.round(ss.x); out.y = Math.round(env.H - ss.y);
+    if (out.x < 0 || out.y < 0 || out.x > env.W || out.y > env.H) {
+      out.err = "不在屏内（" + out.x + "," + out.y + "）"; out.ms = Date.now() - t0; return out;
+    }
+    let comp = ptr(0);
+    const ck = findClass("CustomUIButton");
+    if (ck && !ck.isNull()) { comp = _compSelfTry(go, ck); if (ptrOk(comp)) out.btnCls = "CustomUIButton"; }
+    if (!ptrOk(comp)) {
+      const uk = findClass("UIButton");
+      if (uk && !uk.isNull()) { comp = _compSelfTry(go, uk); if (ptrOk(comp)) out.btnCls = "UIButton"; }
+    }
+    if (!ptrOk(comp)) { out.err = "没有 UIButton 组件"; out.ms = Date.now() - t0; return out; }
+    // 按钮是否可用（disabled 时直调 onClick 会在游戏内部 NPE，2026-11-16 实测编组页 ButtonDecide）
+    try {
+      const en = _inv(comp, "get_isEnabled");
+      if (en && !en.isNull()) out.enabled = (en.add(0x10).readU8() !== 0);
+    } catch (e) {}
+    const fl = _onClickOf(comp);                       // 偏移走 g_fieldOff 缓存
+    if (fl.err) { out.err = fl.err; out.ms = Date.now() - t0; return out; }
+    out.off = fl.off;
+    if (!fl.list || fl.list.isNull()) { out.err = "onClick 列表为 null"; out.ms = Date.now() - t0; return out; }
+    out.cnt = _listCount(fl.list);
+    const em = _edExecOf();
+    out.hasExec = !!em;
+    if (probe) {
+      out.ok = out.cnt > 0;
+      if (deep) { try { out.dump = _delegateDump(fl.list, 3); } catch (e) {} }   // 诊断：方法名 + 委托目标
+      out.ms = Date.now() - t0; return out;
+    }
+    if (!em) { out.err = "没找到 EventDelegate.Execute"; out.ms = Date.now() - t0; return out; }
+    // EventDelegate.Execute 的**静态重载**：this=null，参数是 List<EventDelegate>
+    const pa = Memory.alloc(8); pa.writePointer(fl.list);
+    const ex = Memory.alloc(8); ex.writePointer(ptr(0));
+    g_il2cpp.runtime_invoke(em, ptr(0), pa, ex);
+    const exv = ex.readPointer();
+    out.ex = String(exv);
+    out.via = "EventDelegate.Execute";
+    out.ok = exv.isNull();
+    if (!out.ok) { out.err = "EventDelegate.Execute 抛异常"; out.exMsg = _exText(exv); }
+  } catch (e) { out.err = "异常: " + e; }
+  out.ms = Date.now() - t0;
+  return out;
+}
+
+/**
  * ★`labBtn` 的实现主体（2026-10-20 从 RPC 里抽出来）：`labBtn` 和 `labQuestDetail`（start 提取）
  *   共用。返回 {ok, x, y, hit, root, path, waiting, err}：
  *   · ok=true 时 x/y 是按钮的**屏幕坐标**（现算）；
@@ -8790,35 +9950,11 @@ function _labBtnCore(key, name, rootKind, pathArr, fresh) {
       if (x < 0 || y < 0 || x > env.W || y > env.H) return false;
       out.x = x; out.y = y; return true;
     };
-    const roots = [];
-    try {
-      const vm = _viewManagerInst();
-      if (!vm.isNull()) {
-        const cv = vm.add(0x110).readPointer();
-        if (ptrOk(cv)) {
-          const tr = _inv(cv, "get_transform");
-          if (ptrOk(tr)) {
-            roots.push({ kind: "view", tr: tr });
-            // ★canvas 根（2026-10-20）：预览页「挑战」按钮实测**不在 View/DialogArea 子树里**
-            //   （QDStart 每次学习都静默失败 ⇒ 每场战斗退回 1.1s 全树 find，16480 09:46 局 11 次共 12.4s），
-            //   它挂在 Canvas 下的别的容器 ⇒ 从 currentView 往上爬到最顶，把这个根也纳入学习/回喂。
-            let top = tr;
-            // ⚠GetParent 在这个剥离版里不存在（qdDiag=not-found ×12 的原因）⇒ get_parent 优先
-            for (let i = 0; i < 8; i++) {
-              let p2 = null;
-              try { p2 = _inv(top, "get_parent"); } catch (e) {}
-              if (!p2 || p2.isNull() || !ptrOk(p2)) {
-                try { p2 = _inv(top, "GetParent"); } catch (e) {}
-              }
-              if (!p2 || p2.isNull() || !ptrOk(p2)) break;
-              top = p2;
-            }
-            if ("" + top !== "" + tr) roots.push({ kind: "canvas", tr: top });
-          }
-        }
-      }
-    } catch (e) {}
-    try { const d = _dialogAreaTr(); if (ptrOk(d)) roots.push({ kind: "dlg", tr: d }); } catch (e) {}
+    // ★canvas 根（2026-10-20）：预览页「挑战」按钮实测**不在 View/DialogArea 子树里**
+    //   （QDStart 每次学习都静默失败 ⇒ 每场战斗退回 1.1s 全树 find，16480 09:46 局 11 次共 12.4s），
+    //   它挂在 Canvas 下的别的容器 ⇒ 从 currentView 往上爬到最顶，把这个根也纳入学习/回喂。
+    //   2026-11-16：三根构造抽到 `_pathRoots()`，与 `_pathBtnNow` 共用。
+    const roots = _pathRoots();
     const nameOf = function (tr) {
       try {
         const go = _inv(tr, "get_gameObject");
@@ -8831,11 +9967,20 @@ function _labBtnCore(key, name, rootKind, pathArr, fresh) {
     if (!slot && rootKind && pathArr && pathArr.length != null) {
       slot = { root: rootKind, path: pathArr };
     }
+    // ★固定路径表优先于"学习"（2026-11-16 用户）：表里有就直接用，不去 DFS
+    if (!slot) {
+      const fx = _pathFixed(key, name);
+      if (fx) slot = { root: fx.root, path: fx.path };
+    }
     if (slot && slot.path) {
       const r = roots.find(function (x) { return x.kind === slot.root; });
       const tr = r ? _pathAt(r.tr, slot.path) : null;
       if (tr && nameOf(tr) === name) {
-        if (put(tr)) { out.ok = true; out.hit = "路径"; return out; }
+        if (put(tr)) {
+          out.ok = true; out.hit = "路径";
+          out.root = slot.root; out.path = slot.path;   // 命中时也回传 ⇒ 调用方也能落盘
+          return out;
+        }
         out.waiting = true;                 // 位置有效但还没在屏上 ⇒ 保留，稍后重试
         return out;
       }

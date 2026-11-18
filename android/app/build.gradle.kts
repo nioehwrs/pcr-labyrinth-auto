@@ -92,6 +92,14 @@ android {
                 signingConfig = signingConfigs.getByName("release")
             }
         }
+        debug {
+            // ★2026-11-16（分支 feat/direct-trigger，**仅供本机试验**）：
+            //   本机没有 release keystore（keystore.properties / release.keystore 都不在），
+            //   debug 签名与已安装的 release 包证书不同 ⇒ 覆盖安装会 INSTALL_FAILED_UPDATE_INCOMPATIBLE。
+            //   加个后缀让它**与正式包并存**（com.lmj.labyrinthauto.dev），测完卸载即可，不动正式包的数据。
+            //   ⚠合并回 master 前要去掉这一行。
+            applicationIdSuffix = ".dev"
+        }
     }
 
     compileOptions {
