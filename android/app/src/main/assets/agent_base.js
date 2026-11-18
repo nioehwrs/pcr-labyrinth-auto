@@ -8994,7 +8994,16 @@ rpc.exports = {
       //   而下面"最上层对话框子树遍历"(204 节点) 是 230~480ms。路径失效才继续往下走。
       const nm0 = String(startBtnRe || "UIButton_Unit");
       const slot0 = g_labBtn["QDStart|" + nm0] || _pathFixed("QDStart|" + nm0, nm0);
-      const rk0 = rootKind || (slot0 && slot0.root);
+      // ★2026-11-18：候选根链（与 `labPathPress` 同款）。表里有 `dlg` 页面名就先按名字取层，
+      //   其次条目自带 root，最后退 top；跨局回喂（Kotlin 传 rootKind）时以传参为准。
+      let rk0 = rootKind || null;
+      if (!rk0 && slot0) {
+        const c0 = [];
+        if (slot0.dlg) c0.push("dlg:" + slot0.dlg);
+        if (slot0.root && c0.indexOf(slot0.root) < 0) c0.push(slot0.root);
+        if ((slot0.dlg || slot0.root) && c0.indexOf("top") < 0) c0.push("top");
+        rk0 = c0.length ? c0 : null;
+      }
       const pt0 = (pathArr && pathArr.length) ? pathArr : (slot0 && slot0.path);
       if (rk0 && pt0 && pt0.length) {
         const lb0 = _pathBtnNow(rk0, pt0, nm0, true);
@@ -9230,7 +9239,19 @@ rpc.exports = {
     // ★支持只给 key（走 `LAB_PATHS` 固定路径表）：没有 root/path 就从表里取，不学习
     if ((!rootKind || !pathArr || !pathArr.length) && key) {
       const fx = _pathFixed(String(key), name);
-      if (fx) { rootKind = fx.root; pathArr = fx.path; if (!name) name = fx.name; }
+      if (fx) {
+        if (!name) name = fx.name;
+        pathArr = fx.path;
+        // ★★2026-11-18：候选根**按优先级降级，命中即止**（用户定调"要准"）：
+        //   ① `dlg:<页面名>` —— 名字是稳定指纹，不怕叠层、不怕本局弹框累积导致绝对索引漂移；
+        //   ② 条目自带的 root（canvas/view/top，兼容历史条目与回喂的学习结果）；
+        //   ③ `top` —— 页面名改版时的兜底，相对链同一套（top 就是某一层的 Transform）。
+        const c = [];
+        if (fx.dlg) c.push("dlg:" + fx.dlg);
+        if (fx.root && c.indexOf(fx.root) < 0) c.push(fx.root);
+        if ((fx.dlg || fx.root) && c.indexOf("top") < 0) c.push("top");
+        rootKind = c.length ? c : null;
+      }
     }
     if (probe) return _pathBtnNow(rootKind, pathArr, name, true, deep);
     if (!g_il2cpp) return { queued: false, err: "il2cpp 未就绪" };
@@ -10184,26 +10205,53 @@ const g_labBtn = {};
 
 /**
  * ★★固定路径表（2026-11-16 用户："不用学，直接写到程序里面"）★
- *   key → { root, path, name }。root ∈ view|canvas|dlg，path 是**父子索引链**（GetChild 的索引序列）。
+ *   key → { dlg?, root?, path, name }。path 是**父子索引链**（GetChild 的索引序列）。
+ *   · `dlg` = **对话框页面名**（如 "DialogQuestDetail"）⇒ 运行时按名字取那一层当根（2026-11-18 起推荐）：
+ *     名字是稳定指纹，不受"本局弹过几个框 ⇒ DialogArea 绝对索引漂移"影响，也能定位**被叠在下面**的层。
+ *   · `root` ∈ view|canvas|top：条目自带的固定根，作 `dlg` 的降级/兼容。
+ *     （canvas 链 `[0,4,1,0,X,...]` 里的 X 就是那个会漂的绝对索引 —— 历史条目仍有它。）
+ *   · 候选顺序：`dlg:页面名` → `root` → `top`，**命中即止**（每个候选都过 name 校验）。
  *   · 命中即直达（稳态 6~12ms）；**不做 DFS 学习**（canvas 子树太大，学一次 1.8~6.9s）。
  *   · 路径失效（换页面结构）时返回 "path-miss"，调用方再决定：兜底学一次 / 走遍历 / 用点击。
  *   · 新增按钮：先用 `press_test.py --list / findListPath` 探一次，把 root+path 抄到这里。
  *   实测（2026-11-16，1280x720，view 264 迷宫）：
- *     QDStart|UIButton_Unit   预览页「挑战」      （编组页出现 19.7ms）
+ *     QDStart|UIButton_Unit   预览页「挑战」      （★2026-11-18 改用 top 根，见条目注释）
  *     PartyDecide|ButtonDecide 编组页「战斗开始」
  *     ResultNext|NextButton   结算/奖励页「下一步」（★同一按钮要点**两次**：pose 胜利动画 → 奖励页）
  */
 const LAB_PATHS = {
-  "QDStart|UIButton_Unit": { root: "canvas", path: [0, 4, 1, 0, 9, 0, 2, 0, 1, 0], name: "UIButton_Unit" },
-  "PartyDecide|ButtonDecide": { root: "canvas", path: [0, 4, 1, 0, 10, 0, 2, 0], name: "ButtonDecide" },
+  // ★★2026-11-18 真机修正（区3 30502 EX 战预览页 pageTop=DialogQuestDetail）：
+  //   原 canvas 链 [0,4,1,0,**9**,0,2,0,1,0] 已指到 `common_icon_alert`（DialogArea 累积索引从 9 漂到 10）
+  //   ⇒ name 校验挡下 ⇒ 白跑一次直调再退坐标兜底（不误点，但没省时间）。
+  //   现在按 **dlg 页面名取层** + 相对链，实测命中 UIButton_Unit @ (1090,610)，EventDelegate.Execute
+  //   成功切到 DialogCommonPartyEdit。`root:"top"` 留作降级（页面 prefab 改名时还能用）。
+  //   canvas 等价链：[0,4,1,0,10,0,2,0,1,0]。
+  "QDStart|UIButton_Unit": { dlg: "DialogQuestDetail", root: "top", path: [0, 2, 0, 1, 0], name: "UIButton_Unit" },
+  // ★★2026-11-18 真机修正（区3 30502 编组页 pageTop=DialogCommonPartyEdit，与预览页**叠在一起**时：
+  //   预览页 dlg[10]、编组页 dlg[11] ⇒ 原 canvas 链 [0,4,1,0,10,0,2,0] 落到 `contents`）。
+  //   实测真实链：[0,4,1,0,11,0,3,0]（尾部也变了：预览页是 [0,2,0,1,0]、编组页是 [0,3,0]）。
+  //   改用 **top 根相对链** = 最上层对话框（此页即 DialogCommonPartyEdit），实测命中 @ (1134,605)。
+  "PartyDecide|ButtonDecide": { dlg: "DialogCommonPartyEdit", root: "top", path: [0, 3, 0], name: "ButtonDecide" },
+  // ── 胜利结算页「下一步」（`DialogQuestResultWin`）──
+  //   ★★2026-11-18 真机：**直调不推进**！`onClick = OnClickNext`（target `PartsQuestResultFormer`），
+  //     `EventDelegate.Execute` 连调 3 次都返回 `ok:true / ex:0x0`，但对话框栈与页面**毫无变化**；
+  //     改**坐标点击** (1109,656) 一次就进遗物页 ⇒ 这条**必须保留坐标点击**（Kotlin `tapAndCheck`
+  //     的路线是对的）。别"优化"成直调 —— 那会看起来点成功了、实际一直卡在结算页。
+  //   实测位置：`DialogArea[6]` = `DialogQuestResultWin`；相对链 = [0,1,4,0,1,0,0,0]（@ y=656）。
+  //   同一按钮可能要点多次（pose 胜利动画 → 奖励页）。
   "ResultNext|NextButton": { root: "canvas", path: [0, 4, 1, 0, 6, 0, 1, 4, 0, 1, 0, 0, 0], name: "NextButton" },
-  // ── 角色/遗物三选一（`DialogLabyrinthSelection`，2026-11-16 实测）──
+  // ── 角色三选一（`DialogLabyrinthSelection`，statusType=1 SUMMON_UNIT）──
   //   三个按钮同名 DecideButton×3，只能靠**索引**区分（0=最左/1=中/2=右）。
   //   角色 id **每局都变** ⇒ 不要在表里写 id，用 `labSelection` 读 cards[i].unitId 与 decideX 对应。
-  //   （dlg 根的等价链更短：dlg [5,0,1,1,0,0,6] 等；这里统一用 canvas，与其他条目一致）
-  "SelectRole|Role0": { root: "canvas", path: [0, 4, 1, 0, 5, 0, 1, 1, 0, 0, 6], name: "DecideButton" },
-  "SelectRole|Role1": { root: "canvas", path: [0, 4, 1, 0, 5, 0, 1, 1, 1, 0, 6], name: "DecideButton" },
-  "SelectRole|Role2": { root: "canvas", path: [0, 4, 1, 0, 5, 0, 1, 1, 2, 0, 6], name: "DecideButton" },
+  //   ★★2026-11-18 真机（区3 30502 EX 战后）：**选人页在 dlg[7]**，button y=**591**；
+  //     而遗物页在 dlg[5]、y=619 ⇒ 原 canvas 链写的 5 在选人页直接"路径无效"（实测就是这样）。
+  //     关键是**相对链三者完全相同**：[0,1,1,{i},0,6]（同一 prefab PartsLabyrinthSelectionItemView）。
+  //   ⇒ 一律用 `dlg:DialogLabyrinthSelection` 作根，索引 5/7 的差异自然消失。
+  //   ⚠Role/Ticket/Relic 三条 key 的**路径完全一样**，区分只看 `statusType`（1/2/9）与卡内容；
+  //     调用方别拿 Relic 的 key 去点选人页 —— 名字校验挡不住（按钮都叫 DecideButton）。
+  "SelectRole|Role0": { dlg: "DialogLabyrinthSelection", root: "top", path: [0, 1, 1, 0, 0, 6], name: "DecideButton" },
+  "SelectRole|Role1": { dlg: "DialogLabyrinthSelection", root: "top", path: [0, 1, 1, 1, 0, 6], name: "DecideButton" },
+  "SelectRole|Role2": { dlg: "DialogLabyrinthSelection", root: "top", path: [0, 1, 1, 2, 0, 6], name: "DecideButton" },
   // ── ★★DialogArea 里的按钮一律用 `top`（最上层对话框）作根，**不要用 dlg 绝对索引** ──
   //   2026-11-18 实测：同一颗 OneButtonWhite 在 DialogArea 下的索引会**漂移**
   //     · 门票结果 DialogCommonBig  → dlg[7,0,2,6]
@@ -10222,26 +10270,41 @@ const LAB_PATHS = {
   //       ⇒ 判"已回地图"**不能**只看一次 `pageTop==null`（2026-11-17 我就是这么误判成"点一次就回图"）。
   //       正确判据：连续 3 次空（每次间隔 ≥150ms）**且** `statusType==0`。
   "SelectConfirm|OneButtonWhite": { root: "top", path: [0, 2, 3], name: "OneButtonWhite" },
-  // ── 门票页三选一（`DialogLabyrinthSelection`，2026-11-17 实测）──
-  //   ★与"战后选人"**同一个 prefab、不同层级**：战后选人在 dlg[5,...]，门票页在 dlg[6,...]
-  //     ⇒ 用 `SelectRole|Role*` 在门票页会"路径无效"，必须用这一组。
+  // ── 门票页三选一（`DialogLabyrinthSelection`，statusType=2 SUMMON_TICKET_CHOICE）──
   //   卡面内容是「水/光/风属性的随机印记×3」（unitId=null，不是角色）。
-  // ★2026-11-18 实测修正：门票页结构已经和选角页一致（第 5 段 = 5，原来记的 6 是旧版本取证）。
-  //   用 `pathTrace("^DecideButton$","canvas")` 从现场反推确认：三条都是 [0,4,1,0,5,0,1,1,{i},0,6]。
-  //   ⇒ 以后路径再失效，别靠猜，直接跑 pathTrace 重建。
-  "SelectTicket|Ticket0": { root: "canvas", path: [0, 4, 1, 0, 5, 0, 1, 1, 0, 0, 6], name: "DecideButton" },
-  "SelectTicket|Ticket1": { root: "canvas", path: [0, 4, 1, 0, 5, 0, 1, 1, 1, 0, 6], name: "DecideButton" },
-  "SelectTicket|Ticket2": { root: "canvas", path: [0, 4, 1, 0, 5, 0, 1, 1, 2, 0, 6], name: "DecideButton" },
-  // ── 遗物三选一（`DialogLabyrinthSelection` + statusType=9 RELIC_CHOICE，2026-11-18 实测）──
-  //   ★与**门票页同层**（dlg[6,...]），只是按钮 y 从 591 变 **619**；与战后选人（dlg[5,...]）不同层。
+  //   ★2026-11-18：与选人/遗物**同一个 prefab、同一条相对链** [0,1,1,{i},0,6]，
+  //     区别只在卡内容与 `statusType`（2 / 1 / 9）；根统一用 `dlg:DialogLabyrinthSelection`，
+  //     不再依赖"这一页恰好在 DialogArea 的第几个"（实测选人 7、遗物 5）。
+  "SelectTicket|Ticket0": { dlg: "DialogLabyrinthSelection", root: "top", path: [0, 1, 1, 0, 0, 6], name: "DecideButton" },
+  "SelectTicket|Ticket1": { dlg: "DialogLabyrinthSelection", root: "top", path: [0, 1, 1, 1, 0, 6], name: "DecideButton" },
+  "SelectTicket|Ticket2": { dlg: "DialogLabyrinthSelection", root: "top", path: [0, 1, 1, 2, 0, 6], name: "DecideButton" },
+  // ── 遗物三选一（`DialogLabyrinthSelection` + statusType=9 RELIC_CHOICE）──
+  //   ★★2026-11-18 真机修正（区3 30502 **EX 战胜利后**的遗物页）：实测 DecideButton 在 **dlg[5]**，
+  //     不是原记录的 dlg[6]（那条是 11-17 门票页的旧取证；门票后来也修正成 5）。
+  //     实测三颗 canvas = [0,4,1,0,**5**,0,1,1,{0,1,2},0,6] @ y=**619**；top 相对 = [0,1,1,{i},0,6]。
+  //   ★★与**战后选人**同一个 prefab、同一层、相对链**完全一样** ⇒ 区分"选人/遗物/门票"只能看
+  //     **卡内容**（unitId / relicIcon / choiceInfo），不能靠按钮路径 —— 路径只是"第 i 张卡"。
+  //   ★EX 战后遗物页的卡走 `relicIcon(+0xA0)`，遗物节点走 `choiceInfo(+0xA8)`（见 _readChoiceCard）。
   //   卡面：topText=遗物名、bottomText=效果（unitId=null）。
-  "SelectRelic|Relic0": { root: "canvas", path: [0, 4, 1, 0, 6, 0, 1, 1, 0, 0, 6], name: "DecideButton" },
-  "SelectRelic|Relic1": { root: "canvas", path: [0, 4, 1, 0, 6, 0, 1, 1, 1, 0, 6], name: "DecideButton" },
-  "SelectRelic|Relic2": { root: "canvas", path: [0, 4, 1, 0, 6, 0, 1, 1, 2, 0, 6], name: "DecideButton" },
+  "SelectRelic|Relic0": { dlg: "DialogLabyrinthSelection", root: "top", path: [0, 1, 1, 0, 0, 6], name: "DecideButton" },
+  "SelectRelic|Relic1": { dlg: "DialogLabyrinthSelection", root: "top", path: [0, 1, 1, 1, 0, 6], name: "DecideButton" },
+  "SelectRelic|Relic2": { dlg: "DialogLabyrinthSelection", root: "top", path: [0, 1, 1, 2, 0, 6], name: "DecideButton" },
   // ── 门票/道具**结果页**（`DialogCommonBig` 的单按钮，2026-11-17 实测）──
   //   ★又和 Middle 那层不同（dlg[7,...] vs dlg[6,...]）⇒ 同一颗 OneButtonWhite 必须按页面分条。
   //   这是**两连弹的第一弹**：点掉它之后还会再冒一个 `DialogCommonMiddle`（第二弹）。
   "ResultBig|OneButtonWhite": { root: "top", path: [0, 2, 6], name: "OneButtonWhite" },
+  // ── 战斗失败页（`DialogQuestFailed`，2026-11-18 真机：区3 30502 空队速败）──
+  //   结构很浅（深度 4）⇒ 路径稳；左 =「结束」（会弹三按钮确认框），右 =「重新挑战」。
+  //   两条都是 probe 命中 + enabled=true，按名字取层可穿透战斗视图残留。
+  "QuestFailedUnitList|UIButton_UnitList": { dlg: "DialogQuestFailed", root: "top", path: [0, 0, 4, 3], name: "UIButton_UnitList" },
+  "QuestFailedNext|UIButton_Next": { dlg: "DialogQuestFailed", root: "top", path: [0, 0, 4, 2], name: "UIButton_Next" },
+  // ── 「结束冒险」确认框（`DialogCommonSmall` 的**三按钮**版，2026-11-18 实测）──
+  //   ★与 `MoveConfirm|TwoButtonRight` **不是同一个布局**（那是两按钮 [0,2,3]）；
+  //     本框三颗挂在 ButtonGroup 下、编号 4/5/6 ⇒ 必须按**名字**分条，不能凭"索引长度"猜。
+  //   ★★中间 `ThreeButtonCenter` = **无报酬**结束（用户 2026-11-18 点名要记这条）。
+  "EndConfirm|ThreeButtonLeft": { dlg: "DialogCommonSmall", root: "top", path: [0, 2, 4], name: "ThreeButtonLeft" },
+  "EndConfirm|ThreeButtonCenter": { dlg: "DialogCommonSmall", root: "top", path: [0, 2, 5], name: "ThreeButtonCenter" },  // ★无报酬
+  "EndConfirm|ThreeButtonRight": { dlg: "DialogCommonSmall", root: "top", path: [0, 2, 6], name: "ThreeButtonRight" },
 };
 
 /** 查固定路径表：给 key（找不到再退 name 匹配）→ { root, path, name } | null */
@@ -10257,41 +10320,99 @@ function _pathFixed(key, name) {
  *    · view  = 当前 View（`ViewManager+0x110`）的 Transform 子树（最小）
  *    · canvas= 它往上爬到的最顶祖先（挑战按钮实测挂这里）
  *    · dlg   = DialogArea 子树
- *   ★路径是"父子**索引**链"，只有同一个根下才有效 ⇒ 换根必须重新学习。 */
-function _pathRoots() {
+ *    · top   = 最上层对话框本身
+ *   ★路径是"父子**索引**链"，只有同一个根下才有效 ⇒ 换根必须重新学习。
+ *   ★`need`（2026-11-18）：只解析指定的一个 kind。原来**无条件**把四个根全解析一遍
+ *     （canvas 要爬 8 级父链、top 要扫 DialogArea 子节点）⇒ 单条轻读白烧一次遍历。
+ *     `dlg:<Dialog名>` 不走本函数，见 [_rootTrOf]。 */
+function _pathRoots(need) {
   const roots = [];
-  try {
-    const vm = _viewManagerInst();
-    if (!vm.isNull()) {
-      const cv = vm.add(0x110).readPointer();
-      if (ptrOk(cv)) {
-        const tr = _inv(cv, "get_transform");
-        if (ptrOk(tr)) {
-          roots.push({ kind: "view", tr: tr });
-          let top = tr;
-          // ⚠GetParent 在剥离版里不存在（qdDiag=not-found ×12 的原因）⇒ get_parent 优先
-          for (let i = 0; i < 8; i++) {
-            let p2 = null;
-            try { p2 = _inv(top, "get_parent"); } catch (e) {}
-            if (!p2 || p2.isNull() || !ptrOk(p2)) {
-              try { p2 = _inv(top, "GetParent"); } catch (e) {}
+  const want = need ? String(need) : null;
+  const ok = function (k) { return !want || want === k; };
+  if (ok("view") || ok("canvas")) {
+    try {
+      const vm = _viewManagerInst();
+      if (!vm.isNull()) {
+        const cv = vm.add(0x110).readPointer();
+        if (ptrOk(cv)) {
+          const tr = _inv(cv, "get_transform");
+          if (ptrOk(tr)) {
+            roots.push({ kind: "view", tr: tr });
+            let top = tr;
+            // ⚠GetParent 在剥离版里不存在（qdDiag=not-found ×12 的原因）⇒ get_parent 优先
+            for (let i = 0; i < 8; i++) {
+              let p2 = null;
+              try { p2 = _inv(top, "get_parent"); } catch (e) {}
+              if (!p2 || p2.isNull() || !ptrOk(p2)) {
+                try { p2 = _inv(top, "GetParent"); } catch (e) {}
+              }
+              if (!p2 || p2.isNull() || !ptrOk(p2)) break;
+              top = p2;
             }
-            if (!p2 || p2.isNull() || !ptrOk(p2)) break;
-            top = p2;
+            if ("" + top !== "" + tr) roots.push({ kind: "canvas", tr: top });
           }
-          if ("" + top !== "" + tr) roots.push({ kind: "canvas", tr: top });
         }
       }
-    }
-  } catch (e) {}
+    } catch (e) {}
+  }
   // ★`top` = 最上层对话框本身（2026-11-18）：DialogArea 的子节点索引会随本局弹过的框累积而**漂移**，
   //   绝对索引（dlg[7,...] / dlg[8,...]）不可复用；相对"最上层对话框"的链才是稳定指纹。
-  try {
-    const td = _topDialogTr();
-    if (ptrOk(td)) roots.push({ kind: "top", tr: td });
-  } catch (e) {}
-  try { const d = _dialogAreaTr(); if (ptrOk(d)) roots.push({ kind: "dlg", tr: d }); } catch (e) {}
+  if (ok("top")) {
+    try {
+      const td = _topDialogTr();
+      if (ptrOk(td)) roots.push({ kind: "top", tr: td });
+    } catch (e) {}
+  }
+  if (ok("dlg")) {
+    try { const d = _dialogAreaTr(); if (ptrOk(d)) roots.push({ kind: "dlg", tr: d }); } catch (e) {}
+  }
   return roots;
+}
+
+/** ★★2026-11-18：按**对话框名**取那一层的 Transform（`DialogArea` 的直接子节点）。
+ *
+ *  为什么比 `top` 好（用户 2026-11-18 定调"要准"）：
+ *    · `top` 只给"最上面那一层"。预览页+编组页这类**叠层**场景（MazeLoop.kt:7036 的事故形态）
+ *      想点**被压在下面**那层的按钮，`top` 永远给不到 ⇒ 只能退回 1s 级全树 find。
+ *    · 名字是**稳定指纹**：绝对索引 `dlg[10]` 会随"本局弹过几个框"漂移（实测 9→10、10→11），
+ *      名字不会。中途注入/助手半路启动也不需要知道累积数。
+ *    · 成本与 `top` **同一个循环**（get_childCount + GetChild + get_name + active），只多一次字符串比较。
+ *
+ *  比较用 [_normWindowName]（容忍 `(Clone)` / `(Instance)`）；同名多个时取索引最大（最新）的 active 实例。
+ *  返回 Transform（与 `_pathAt` 的根同类型），找不到返回 null。 */
+function _dlgTrByName(want) {
+  try {
+    const w = _normWindowName(want);
+    if (!w) return null;
+    const area = _dialogAreaTr();
+    if (!area) return null;
+    let cc = 0;
+    try { const r = _inv(area, "get_childCount"); cc = r.isNull() ? 0 : r.add(0x10).readS32(); } catch (e) {}
+    let hit = null;
+    for (let i = 0; i < cc; i++) {          // 正序：后者覆盖前者 = 更上层
+      const ch = _inv1i(area, "GetChild", i);
+      if (ch.isNull()) continue;
+      const go = _inv(ch, "get_gameObject");
+      if (go.isNull()) continue;
+      if (_goActive(go) !== true) continue;
+      if (_normWindowName(_str(_inv(go, "get_name"))) !== w) continue;
+      hit = ch;
+    }
+    return hit;
+  } catch (e) { return null; }
+}
+
+/** ★★2026-11-18：解析**一个**根 kind → Transform。
+ *    `dlg:<Dialog名>` 按名字取层（[`_dlgTrByName`]）；其余 kind 走 [`_pathRoots`]，只解析要的那一个。 */
+function _rootTrOf(kind) {
+  if (!kind) return null;
+  const k = String(kind);
+  try {
+    if (k.indexOf("dlg:") === 0) return _dlgTrByName(k.slice(4));
+    const rs = _pathRoots(k);
+    for (const r of rs) if (r.kind === k) return r.tr;
+  } catch (e) {}
+  return null;
 }
 
 /**
@@ -10336,8 +10457,8 @@ function pathTrace(re, kind) {
   const out = { root: kind || "canvas", hits: [], err: null };
   try {
     const want = kind || "canvas";
-    let rt = null;
-    for (const r of _pathRoots()) { if (r.kind === want) { rt = r.tr; break; } }
+    // ★2026-11-18：支持 `dlg:<Dialog名>`（按名字定位那一层再回溯），便于叠层时反推下层按钮
+    const rt = _rootTrOf(want);
     if (!rt) { out.err = "根不存在:" + want; return out; }
     const list = _rootWalkNodes(rt, "trace_" + want);
     if (!list) { out.err = "遍历失败"; return out; }
@@ -10393,21 +10514,36 @@ function _exText(ex) {
  */
 function _pathBtnNow(rootKind, pathArr, name, probe, deep) {
   const t0 = Date.now();
-  const out = { ok: false, ms: 0, x: null, y: null, name: null, btnCls: null,
+  const out = { ok: false, ms: 0, x: null, y: null, name: null, btnCls: null, root: null,
                 off: null, cnt: null, hasExec: false, via: null, ex: null, err: null };
   try {
     if (!rootKind || !pathArr || !pathArr.length) { out.err = "缺 root/path"; out.ms = Date.now() - t0; return out; }
     const env = _camEnv();
     if (!env) { out.err = "取不到相机环境"; out.ms = Date.now() - t0; return out; }
-    const roots = _pathRoots();
-    let r = null;
-    for (const x of roots) if (x.kind === rootKind) { r = x; break; }
-    if (!r) {
-      out.err = "根不可用: " + rootKind + "（现有 " + roots.map(function (x) { return x.kind; }).join("/") + "）";
-      out.ms = Date.now() - t0; return out;
+    // ★★2026-11-18：rootKind 可以是**候选根数组**（按顺序降级，命中即止）。典型：
+    //   `["dlg:DialogQuestDetail", "top"]` —— 先按页面名精确取层（不怕叠层/绝对索引漂移），
+    //   名字失效再退最上层对话框；每个候选都过同一套 name 校验 ⇒ 只会"晚一点命中"，不会点错层。
+    const kinds = Array.isArray(rootKind) ? rootKind : [rootKind];
+    const tried = [];
+    let tr = null, usedKind = null;
+    for (let ki = 0; ki < kinds.length; ki++) {
+      const k = kinds[ki];
+      const rt = _rootTrOf(k);
+      if (!ptrOk(rt)) { tried.push(k + "=根不可用"); continue; }
+      const t2 = _pathAt(rt, pathArr);
+      if (!t2 || t2.isNull()) { tried.push(k + "=路径无效"); continue; }
+      const g2 = _inv(t2, "get_gameObject");
+      if (!ptrOk(g2)) { tried.push(k + "=无GameObject"); continue; }
+      const n2 = _str(_inv(g2, "get_name"));
+      if (name && n2 !== name) { tried.push(k + "=" + n2); continue; }
+      tr = t2; usedKind = k; break;
     }
-    const tr = _pathAt(r.tr, pathArr);
-    if (!tr || tr.isNull()) { out.err = "路径无效（当前页/结构不匹配，检查 LAB_PATHS）"; out.ms = Date.now() - t0; return out; }
+    if (!tr) {
+      out.err = "候选根都未命中（期望 " + name + "）：" + tried.join(" / ");
+      out.tried = tried; out.ms = Date.now() - t0; return out;
+    }
+    out.root = usedKind;
+    if (tried.length) out.tried = tried;       // 只有降级过才带（诊断"为什么没走第一优先"）
     const go = _inv(tr, "get_gameObject");
     if (!ptrOk(go)) { out.err = "取不到 GameObject"; out.ms = Date.now() - t0; return out; }
     const nm = _str(_inv(go, "get_name"));

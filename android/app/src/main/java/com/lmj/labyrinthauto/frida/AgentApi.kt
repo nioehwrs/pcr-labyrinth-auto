@@ -339,16 +339,20 @@ object AgentApi {
     /**
      * ★**固定路径直调**（2026-11-18）：按 agent 侧 `LAB_PATHS` 表里的 key 直达按钮，**不投屏幕坐标**。
      *
-     * 与 [pressNode] 的分工：pressNode 是"按名字遍历子树找节点"（冷 2s 级）；本方法是从
-     * `_pathRoots()` 的根（`canvas` / `top` / `dialog`）按**固定子节点下标链**下去，命中即直调
-     * （实测 6~12ms）。表里没有的按钮才回退 [pressNode]。
+     * 与 [pressNode] 的分工：pressNode 是"按名字遍历子树找节点"（冷 2s 级）；本方法按 `LAB_PATHS`
+     * 条目的**候选根链**（`dlg:<页面名>` → 条目自带 `root` → `top`）沿**固定子节点下标链**下去，
+     * 命中即直调（稳态 6~12ms）。表里没有的按钮才回退 [pressNode]。
      *
      * 已在表里的 key（见 `agent_base.js` 的 `LAB_PATHS`）：
      * - `QDStart|UIButton_Unit`、`PartyDecide|ButtonDecide`、`ResultNext|NextButton`
      * - `SelectRole|Role0/1/2`、`SelectTicket|Ticket0/1/2`、`SelectRelic|Relic0/1/2`
      * - `MoveConfirm|TwoButtonRight`、`SelectConfirm|OneButtonWhite`、`ResultBig|OneButtonWhite`
+     * - `QuestFailedUnitList|UIButton_UnitList`、`QuestFailedNext|UIButton_Next`
+     * - `EndConfirm|ThreeButtonLeft/Center/Right`（★中间 Center = **无报酬**结束）
      *
-     * ★弹窗那三条必须用 `top` 根（最上层对话框）—— 绝对 `DialogArea` 索引会随"本局弹过的框"漂移。
+     * ★★2026-11-18 起条目推荐写 `dlg: "<页面名>"`：`DialogArea` 的**绝对索引会随本局弹过的框累积
+     *   而漂移**（实测 `QDStart` 的 9→10、`PartyDecide` 的 10→11），页面名才是稳定指纹；
+     *   而且按名字能取到**被叠在下层**的那一层（`top` 只能给最上面一层）。`root` 留作降级候选。
      *
      * @param key   `"<页名>|<按钮名>"`（`Role{index}` / `Ticket{index}` / `Relic{index}` 按序号拼）
      * @param probe true = 只校验路径能否命中，不点
