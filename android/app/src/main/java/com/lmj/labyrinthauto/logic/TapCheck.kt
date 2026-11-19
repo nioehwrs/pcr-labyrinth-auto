@@ -135,22 +135,17 @@ object TapCheck {
             }
             attempt++
             if (!tapFn(px, py, what)) return false
-            // ★探针轨迹（只在给了 `probeState` 时开）：每次 probe 记「相对点击的时刻 / RPC 耗时 / 诊断串」。
-            //   ★probe 仍按 settleMs / probeMs 的节奏跑 —— 诊断是读取时**顺便**带回来的，
-            //     不额外发 RPC、也不阻塞 ⇒ 2s 内自然是十几次探测，而不是"一次读取占住 2s"。
-            val pt0 = android.os.SystemClock.elapsedRealtime()
-            val pTrace = if (probeState != null) ArrayList<String>() else null
+            // ★2026-11-19（日志精简）：删掉「⏱ probe … 轨迹」输出（每次探测一行、纯诊断噪音）；
+            //   命中与否由下面的 `⤷ …` 一行体现。
             // ── 点完**探**一下"页面变没变" ──
             var probed = 0
             while (probed < maxProbe) {
                 delay(if (probed == 0) effSettle else probeMs)
                 probed++
-                val tRead0 = android.os.SystemClock.elapsedRealtime()
-                var ps: Probe? = null
                 val hit: Boolean
                 if (probeState != null) {
                     // ★一次快照：top / 判据 / 诊断同源；读失败 ⇒ top 空、left=false（不算离开）
-                    ps = runCatching { probeState() }.getOrNull()
+                    val ps = runCatching { probeState() }.getOrNull()
                     nowTop = ps?.top ?: ""
                     hit = ps?.left == true
                 } else {
@@ -164,18 +159,8 @@ object TapCheck {
                     // 判据优先用 reached（"到达目标页了没"）；没传就退回老行为（离开 from 就算生效）
                     hit = if (reached != null) reached(nowTop) else (nowTop !in from)
                 }
-                if (pTrace != null) {
-                    val tNow = android.os.SystemClock.elapsedRealtime()
-                    val d = ps?.diag
-                    pTrace.add(
-                        "+${tNow - pt0}ms/${tNow - tRead0}ms" + (if (d.isNullOrEmpty()) "" else " $d"),
-                    )
-                }
                 if (hit) {
                     left = true
-                    if (pTrace != null && pTrace.isNotEmpty()) {
-                        AppState.addLog("⏱ probe $what：${pTrace.joinToString(" ｜ ")} ⇒ 命中")
-                    }
                     if (verbose) {
                         AppState.addLog(
                             "⤷ [${from.joinToString("/")}] --$what--> [$nowTop] " +

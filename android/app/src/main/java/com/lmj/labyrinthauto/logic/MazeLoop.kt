@@ -3651,7 +3651,8 @@ object MazeLoop {
     ): Boolean {
         val base = dlgBoxNow() ?: return false
         val basePtr = base.optString("ptr")
-        var taps = 0
+        // ★2026-11-19（日志精简）：不再自己记「点第几下」—— tap() 已打「点了 商店：X (x,y)」，
+        //   原来那行「商店：X → 点「按钮」#N」是同一次点击的第二次记录。
         // ★2026-11-12（用户）：**不再自己实现"首拍只读不点"** —— 统一交给 [TapCheck.run] 的
         //   `skipFirstHits`（与特别装备「全部」行同一套能力）；本函数只提供"点哪个按钮 + 什么算框没了"。
         //   判据：这个框 **开始消失**（`closing`）或换成别的框（ptr 变），都算这一下生效。
@@ -3685,8 +3686,6 @@ object MazeLoop {
                 //   `proc`（`DialogBase.isProcess` +0xB4）：点生效后 0→1，比 tween 可靠。
                 if (b.optBoolean("closing")) return@xyAt null
                 val hit = pickBoxBtn(b, keys) ?: return@xyAt null
-                taps++
-                AppState.addLog("商店：$what → 点「${hit.first}」#$taps (${hit.second},${hit.third})")
                 hit.second to hit.third
             },
         )
@@ -3704,7 +3703,6 @@ object MazeLoop {
         val keys = listOf("OneButtonWhite", "OneButtonBlue", "TwoButtonRight", "ThreeButtonCenter")
         val t0 = SystemClock.elapsedRealtime()
         var lastPtr = skipPtr          // 购买确认框不算"到账框"
-        var lastTop = ""
         var sawReceipt = false         // 见过并点掉「购买完毕」
         var sawRole = false            // 见过并点掉「角色加入」
         while (SystemClock.elapsedRealtime() - t0 < SHOP_ANIM_RECEIPT_MS) {
@@ -3713,14 +3711,7 @@ object MazeLoop {
             val top = b.optString("top")
             val ptr = b.optString("ptr")
             val btns = boxButtonMap(b)
-            if (top != lastTop) {
-                lastTop = top
-                AppState.addLog(
-                    "商店：到账链看到顶层「${top.ifEmpty { "无" }}」" +
-                        "（comp=${b.optString("compCls").ifEmpty { "?" }}，" +
-                        "按钮=${btns.keys.joinToString(",").ifEmpty { "无" }}）",
-                )
-            }
+            // ★2026-11-19（日志精简）：不再逐层打「到账链看到顶层 …」（每笔购买 2~3 行，纯内部细节）
             if (top.startsWith("DialogLabyrinthShop")) {
                 // ★按"见过哪个框"判定，**不计数**（用户 2026-11-11）：
                 //   遗物：购买完毕点掉即可；印记：购买完毕 + 角色加入 都要点掉。
@@ -3814,7 +3805,8 @@ object MazeLoop {
             AppState.addLog("[!] 商店：$what 后 ${SHOP_ANIM_BOX_WAIT_MS}ms 没等到确认框（可能点空/无确认）")
             return false
         }
-        AppState.addLog("商店：$what → 确认框出现（${b.optString("top")}）")
+        // ★2026-11-19（日志精简）：不再打「确认框出现（…）」—— 正常流程必然出现，
+        //   异常（没等到确认框 / 点了 N 次没消失）下面各有告警。
         val confirmPtr = b.optString("ptr")
         // ★2026-11-17（用户）：统一走默认 skipFirstHits=1（1×probeMs=150ms ≥ 原先 2×60=120ms）
         if (!tapBoxButton(input, confirmKeys, "$what 确认")) {
@@ -4770,7 +4762,8 @@ object MazeLoop {
                     //   [MOVE_CONFIRM_PROBE_MS]；没开始消失就**用下一拍的新坐标再点**，
                     //   而不是等按钮落位（那等于拿等待换准确）。
                     taps++
-                    if (taps >= 2) AppState.addLog("确认框：点「确认」#$taps ($x,$y)")
+                    // ★2026-11-19（日志精简）：不再逐次打「点「确认」#N」—— 需要多点时
+                    //   由 awaitDialogGone 汇总成一条「点了 N 次后开始消失」。
                     input.tap(x, y)
                     if (awaitDialogGone(t0, MOVE_CONFIRM_PROBE_MS, taps)) return true
                     continue
@@ -5218,10 +5211,15 @@ object MazeLoop {
         val _planMs = SystemClock.elapsedRealtime() - _tPlan
         // ★★"进编组页 → 算出目标队伍"的分段耗时（2026-11-07 用户："这段中间可能有些地方慢"）。
         //   这几段**加起来**才是用户体感的"进页到出决策"的等待；算法本身只占 `_planMs`。
-        AppState.addLog(
-            "… 进页→出决策：共 ${SystemClock.elapsedRealtime() - _tParty}ms " +
-                "（读页 ${_readMs}ms｜遗物 ${_relMs}ms｜持有池 ${_ctxMs}ms｜算队伍 ${_planMs}ms）",
-        )
+        // ★2026-11-19（日志精简）：正常（<600ms）不再每次进页都打一条，只有明显慢时才留，
+        //   慢的时候仍能看到是哪一段拖的。
+        val _totalMs = SystemClock.elapsedRealtime() - _tParty
+        if (_totalMs >= 600) {
+            AppState.addLog(
+                "… 进页→出决策偏慢：共 ${_totalMs}ms " +
+                    "（读页 ${_readMs}ms｜遗物 ${_relMs}ms｜持有池 ${_ctxMs}ms｜算队伍 ${_planMs}ms）",
+            )
+        }
         // 换目标/换就绪时才打日志（避免每轮刷屏，PC 同款）
         // ★去重键带上**节点**（2026-10-16）：原来只有"done|目标"，于是**不同节点只要结论相同就一行都不打**
         //   —— 实机就这样：进了编组页、按"目标已一致"直接开打，日志里却完全看不出来，
@@ -5509,7 +5507,7 @@ object MazeLoop {
                 )
             }
             if (addTodo.isNotEmpty()) {
-                AppState.addLog("编队：加入 ${addTodo.size} 个（坐标一次算好，整批点完中途不读）")
+                // ★2026-11-19（日志精简）：不再先打一行"加入 N 个"—— 下面每人一条「点了 编队：add X」已够。
                 for ((op, c) in addTodo) {
                     tap(input, c.first, c.second, "编队：add ${op.unit}")
                     // ★2026-11-07：不再死等 350ms ⇒ **等这个人真的进队**就立刻点下一个。
@@ -6855,9 +6853,11 @@ object MazeLoop {
             }
         }
         val qTop = qd?.let { jStr(it, "top") } ?: ""
-        if (n == 1) {
+        // ★2026-11-19（日志精简）：预览页读得慢（>=300ms）才提示；正常 20~100ms 不再每次打。
+        val qdMs = qd?.optInt("_ms") ?: -1
+        if (n == 1 && qdMs >= 300) {
             AppState.addLog(
-                "预览页：一次读 ${qd?.optInt("_ms") ?: -1}ms（最上层=$qTop，子树节点=${qd?.optInt("nodes") ?: -1}）",
+                "… 预览页读得慢：${qdMs}ms（最上层=$qTop，子树节点=${qd?.optInt("nodes") ?: -1}）",
             )
         }
         // 编组页零件在屏 ⇒ 预览页其实被编组页盖住（PC 1247：这时按预览页坐标点会落到「战斗开始」）→ 不点
@@ -8490,6 +8490,9 @@ object MazeLoop {
     /** ★上一次被"前台闸门"拦下的包名（同一句只打一次，别刷屏） */
     private var lastFrontBlockPkg: String? = null
 
+    /** ★上次报过的"弹窗已在收起"的顶框名（同一弹窗只报一次，2026-11-19 日志精简） */
+    private var lastClosingSaid: String? = null
+
     // ── 窗口转移观测（2026-11-06 状态机前置）──────────────────────────
     //   只记录、不改变任何行为：点击前记下"当时窗口"，主循环下一轮看到窗口变了就落一行。
     //   目的是攒出「from + action → after + 耗时」的真实样本，再据此定义状态机的期望转移。
@@ -8830,7 +8833,11 @@ object MazeLoop {
             val closingNow = cl.optBoolean("closing") ||
                 (cl.optInt("started", 0) == 1 && cl.optDouble("factor", 1.0) < 0.99)
             if (closingNow && (top.isEmpty() || cTop.contains(top.removeSuffix("(Clone)")))) {
-                if (tag.isNotEmpty()) AppState.addLog("弹窗已在收起（$cTop）→ 不再点")
+                // ★2026-11-19（日志精简）：同一个弹窗只提示一次（原来每次进这里都打，一局 20+ 条）
+                if (tag.isNotEmpty() && lastClosingSaid != cTop) {
+                    lastClosingSaid = cTop
+                    AppState.addLog("弹窗已在收起（$cTop）→ 不再点")
+                }
                 return true
             }
         }
