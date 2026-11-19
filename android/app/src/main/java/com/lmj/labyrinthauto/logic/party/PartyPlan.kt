@@ -661,8 +661,8 @@ object PartyPlan {
         var tb: Res
         val cached = cachedRes(bkey)
         if (cached != null) {
+            // ★2026-11-19（日志精简）：命中缓存不再打日志（每次进编组页都来一条"0ms 命中缓存"，零信息量）
             tb = cached
-            AppState.addLog("组队算法 ${SystemClock.elapsedRealtime() - t0}ms（命中缓存，池 ${pool.size} 个）")
         } else {
             // ★2026-11-14（用户）：编队可切「推理模型」。算不出（未加载 / 关卡不在词表 /
             //   认识的角色不足 5 人）就**静默**回落规则版，不打扰用户。
@@ -783,11 +783,10 @@ object PartyPlan {
             )
         }
         lines.add("目标(${target.size})=${target} ｜ 当前(站位序)=${cur}")
-        // ★把**池**和**算法的决策过程**也打出来（用户 2026-10-16）：这样"自动组出来是不是现在这队"
-        //   当场就能对——**池 → 算法日志（逐项打分/取舍）→ 目标**三段都在日志里。
-        //   （`target` 就是 `TeamBuild.buildBest` 的输出，不是继承来的队伍；两者相等=真的不用改。）
-        lines.add("池(${pool.size}，取本页可编入)=$pool")
-        if (ctx.poolNote.isNotEmpty()) lines.add("持有明细（仅参考）：${ctx.poolNote}")
+        // ★2026-11-19（日志精简）：池不再列全部 unitId（一行十几个 id、200+ 字节，实际没人逐个看），
+        //   只给数量；"缺谁/多谁"下面另有专门一行，排查够用。`持有明细（仅参考）` 直接不再输出。
+        lines.add("池 ${pool.size} 个（取本页可编入）")
+        // ★页面可编入 > `labUnits` 持有是**正常**的（页面会多给租借/NPC，也可能少给"本关限定"）。
         // ★页面可编入 > `labUnits` 持有是**正常**的（页面会多给租借/NPC，也可能少给"本关限定"）。
         //   池子现在直接用页面这份 ⇒ 这行只作对照，不再是"目标不可信"。
         if (allOrdered.size != ctx.own.size) {

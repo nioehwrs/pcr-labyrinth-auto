@@ -4762,19 +4762,17 @@ object MazeLoop {
                 if (x != null && y != null) {
                     if (seenAt == 0L) {
                         seenAt = now
-                        AppState.addLog(
-                            "确认框：出现 +${now - t0}ms（$top / comp=${r.optString("compCls")} / " +
-                                "读 ${r.optLong("ms")}ms）",
-                        )
+                        // ★2026-11-19（日志精简）：正常"出现就点、一下就过"不再打日志；
+                        //   只在需要多点（异常）时由下面 #2 起的行体现。
                     }
                     // ★★2026-11-10（用户口径：**多点是一种手段**，不要等完全出现才点）：
                     //   出现就点。入场动画期间坐标会变、点空是正常代价 —— 点完只探
                     //   [MOVE_CONFIRM_PROBE_MS]；没开始消失就**用下一拍的新坐标再点**，
                     //   而不是等按钮落位（那等于拿等待换准确）。
                     taps++
-                    AppState.addLog("确认框：点「确认」#$taps ($x,$y)")
+                    if (taps >= 2) AppState.addLog("确认框：点「确认」#$taps ($x,$y)")
                     input.tap(x, y)
-                    if (awaitDialogGone(t0, MOVE_CONFIRM_PROBE_MS)) return true
+                    if (awaitDialogGone(t0, MOVE_CONFIRM_PROBE_MS, taps)) return true
                     continue
                 }
             }
@@ -4787,13 +4785,20 @@ object MazeLoop {
     }
 
     /** 第二步：等确认框**开始消失**（`labDlgClosing`）；[timeoutMs] 内没动静返回 false（调用方重试）。 */
-    private suspend fun awaitDialogGone(t0: Long, timeoutMs: Long = MOVE_CONFIRM_GONE_MS): Boolean {
+    private suspend fun awaitDialogGone(
+        t0: Long,
+        timeoutMs: Long = MOVE_CONFIRM_GONE_MS,
+        /** 本轮已经点了几下：≥2 = 需要多点（异常）才打日志，正常一下就过不刷屏（2026-11-19） */
+        taps: Int = 1,
+    ): Boolean {
         val g0 = SystemClock.elapsedRealtime()
         while (SystemClock.elapsedRealtime() - g0 < timeoutMs) {
             delay(MOVE_CONFIRM_PROBE_POLL_MS)
             val c = runCatching { AgentApi.labDlgClosing() }.getOrNull()
             if (c == null || c.optBoolean("closing", false) || c.optString("top").isEmpty()) {
-                AppState.addLog("确认框：开始消失 +${SystemClock.elapsedRealtime() - t0}ms")
+                if (taps >= 2) {
+                    AppState.addLog("确认框：点了 $taps 次后开始消失（+${SystemClock.elapsedRealtime() - t0}ms）")
+                }
                 return true
             }
         }
@@ -5958,11 +5963,13 @@ object MazeLoop {
             if (sess.tapSig != sigNow) {
                 sess.tapSig = sigNow
                 sess.tapN = 0
-                // ★把两种读的耗时都打出来（轻量签名读 vs 按需读按钮）——
-                //   间隔取值（轮询/探针）要照着真实耗时定，不能想当然。
-                AppState.addLog(
-                    "    · 状态检测 ${detMs}ms（签名=$sigNow）｜按钮读累计 ${sess.fullMs}ms",
-                )
+                // ★2026-11-19（日志精简）：正常切页（通常 5~26ms）不再打这行；只有读得明显慢
+                //   （>=300ms，说明 agent/游戏在卡）才提示 —— 保留了"间隔是否够"的诊断价值。
+                if (detMs >= 300) {
+                    AppState.addLog(
+                        "    [!] 特别装备：状态检测 ${detMs}ms 偏慢（签名=$sigNow）｜按钮读累计 ${sess.fullMs}ms",
+                    )
+                }
             }
             if (fullFail >= 3) {
                 AppState.addLog("    [!] 特别装备：连续 $fullFail 次读不到页面（agent 不在状态）→ 收手")
@@ -6007,9 +6014,13 @@ object MazeLoop {
                 // ★★点完**探**几次（不是"等一下就重试"）—— 页面动画没走完时签名不会变，
                 //   探到"变了"就停；探完还没变才判"真没生效"（那时按钮已静止，再点才点得准）。
                 probe = PROBE_N,
-                // ★2026-11-18（用户）：探测"是否到达目标页"的间隔从 1×probeMs 稍稍延长到 1.5×
-                //   —— 三连页切页动画比普通页慢，探太快会在按钮还在动时判"没到达"⇒ 多点。
-                probeMs = (TapCheck.currentProbeMs() * 3L) / 2L,
+                // ★2026-11-19（用户）：探测间隔从 1.5× 提到 **2×probeMs** —— 对齐 0.7.2 的手感：
+                //   0.7.2 这一步的首次探测是写死的 `EXEQ_TAP_SETTLE_MS = 300ms`，而默认档
+                //   （最快 150ms）×2 = 300ms，正好一致。三连页切页动画比普通页慢，探太快会在
+                //   按钮还在动时判"没到达" ⇒ 重试 ⇒ 第二下落在动画中的错坐标上（点穿到装备格）。
+                //   ★probeMs 同时是 TapCheck.run 里 effSettle / skipDelayMs 的默认值 ⇒ 首次探测、
+                //     后续探测、首点前跳拍三处都跟着 ×2。
+                probeMs = TapCheck.currentProbeMs() * 2L,
                 // ★2026-11-17（用户）：统一走默认 skipFirstHits=1（1×probeMs=150ms，已覆盖原先
                 //   prio0 的 2×60=120ms 需求）；不再按 btnKey 单独设。
                 xyAt = xyAt@{
@@ -6650,10 +6661,13 @@ object MazeLoop {
             if (first < 0) first = cnt
             last = cnt
             if ((unit in plan.members) == want) {
-                AppState.addLog(
-                    "编队[$label] $unit ${if (want) "进队" else "出队"} 命中 第${n}轮 " +
-                        "${SystemClock.elapsedRealtime() - t0}ms（人数 $first→$last）",
-                )
+                // ★2026-11-19（日志精简）：第 1 轮就命中是常态，不打；只有重试后（n>1）才记
+                if (n > 1) {
+                    AppState.addLog(
+                        "编队[$label] $unit ${if (want) "进队" else "出队"} 重试 ${n - 1} 次后命中 " +
+                            "${SystemClock.elapsedRealtime() - t0}ms（人数 $first→$last）",
+                    )
+                }
                 return true
             }
             kotlinx.coroutines.delay(50)
@@ -8256,6 +8270,12 @@ object MazeLoop {
         what: String,
         /** ★2026-10-27：非 null 表示这颗按钮参与"点早了就下次多等"的自学习（见 [tapProbeKey]）。 */
         learnKey: String? = null,
+        /**
+         * ★2026-11-19（日志精简）：是否登记"窗口转移观测"（主循环下一轮打 `⟳ from--动作-->to`）。
+         *   [tapAndCheck]/[tapAndAwait] 自己已经打 `⤷ from--动作-->to`（同一件事）⇒ 传 false，避免两遍。
+         *   普通 [tap] 仍传默认 true（它是这类点击唯一的转移记录）。
+         */
+        markTrans: Boolean = true,
     ): Boolean {
         // ★★★**前台闸门**（2026-11-08 实测 10:39:55 补的）：前台不是游戏 ⇒ **这一下不点**。
         //   实测：用户切到助手前台看日志，助手**还在连点「战斗开始」6 下** ——
@@ -8303,7 +8323,7 @@ object MazeLoop {
                     "点了 $what ($x,$y)［${input.name}］" + if (inCost >= 200) " 输入 ${inCost}ms" else "",
                 )
                 PlanProbe.act(what)          // ★观测：挂到当前页的动作列表（不落盘、不判定）
-                markTransition(what)         // ★观测：等主循环下一轮看窗口有没有变（不改行为）
+                if (markTrans) markTransition(what)   // ★观测：等主循环下一轮看窗口有没有变（不改行为）
                 // ★2026-10-27：参与自学习的按钮，挂个探针 —— 下一轮用"现场 tag 变没变"判它点早了没有
                 if (learnKey != null) {
                     tapProbeKey = learnKey
@@ -8342,7 +8362,8 @@ object MazeLoop {
         expect: Set<String>,
         timeoutMs: Long = 2_500L,
     ): Boolean {
-        if (!tap(input, x, y, what)) return false
+        // ★markTrans=false：本函数命中/超时都会自己打 `⤷`，不必再重复一条 `⟳`
+        if (!tap(input, x, y, what, markTrans = false)) return false
         val t0 = android.os.SystemClock.elapsedRealtime()
         while (android.os.SystemClock.elapsedRealtime() - t0 < timeoutMs) {
             val t = runCatching { AgentApi.labTop() }.getOrNull() ?: ""
@@ -8404,7 +8425,8 @@ object MazeLoop {
         /** ★首点前先「只读不点」几拍（新页入场动画期间按钮坐标还在动）；见 [TapCheck.run] */
         skipFirstHits: Int = 1,
     ): Boolean = TapCheck.run(
-        tapFn = { tx, ty, tw -> tap(input, tx, ty, tw) },
+        // ★markTrans=false：本函数自己在命中时已打 `⤷`，别再让主循环重复打一条 `⟳`
+        tapFn = { tx, ty, tw -> tap(input, tx, ty, tw, markTrans = false) },
         x = x, y = y, what = what, from = from,
         settleMs = settleMs, retries = retries,
         expect = expect, expectTimeoutMs = expectTimeoutMs,
