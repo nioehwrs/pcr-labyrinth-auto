@@ -50,6 +50,8 @@ object PartyPlan {
         val failed: Boolean,
         val sk: Int,
         val pool: List<Int>,
+        /** ★2026-11-19：本节点失败的次数（0=首次）—— 决定用第几队，必须进缓存键 */
+        val attempt: Int = 0,
     )
 
     @Volatile private var buildKey: BuildKey? = null
@@ -90,23 +92,32 @@ object PartyPlan {
      *   ⇒ **直接命中缓存**，整整省掉一次算法（~1 秒）。
      *   不一样也不影响正确性：进页后照常实算（只是这次预算是白跑的）。
      */
-    fun precompute(ctx: PartyCtx, st: JSONObject, failed: Boolean) {
+    fun precompute(ctx: PartyCtx, st: JSONObject, failed: Boolean, attempt: Int = 0) {
         val tb = teamBuild ?: return
         val (stage, _) = stageFor(st)
         val floor = (st.opt("area") as? Number)?.toInt() ?: 1
         val pool = ctx.own.filter { it != 0 }.sorted()
         if (pool.isEmpty()) return
         val t0 = SystemClock.elapsedRealtime()
+        // ★2026-11-19（用户）：预计算也要按"第几次尝试"选队，否则失败重编时会先白算一次第 1 队。
+        val pickIdx = pickIdxFor(stage, attempt)
         // ★2026-11-14：预计算原来**直接跑规则版并写缓存** ⇒ 编组页一律"命中缓存"，
         //   模型分支根本没机会执行（真机上"组队：模型版"出现 0 次就是这个原因）。
-        //   这里必须走同一套"模型优先、算不出再规则"的逻辑。
-        val modelTeam = modelTeamOf(stage, st, pool, failed)
+        //   这里必须走同一套"模型优先、算不出再规则"的逻辑（备选队只走规则版）。
+        val modelTeam = if (pickIdx == 0) modelTeamOf(stage, st, pool, failed) else null
         var res = if (modelTeam != null) {
             Res(
                 stage = stage, algo = "model", cands = mutableListOf(), weak = mutableListOf(),
                 drop = mutableListOf(), attrlimUnits = mutableListOf(), todo = null,
                 forceAttr = null, floorRule = null, failed = failed,
             ).apply { team = modelTeam.map { it.toString() } }
+        } else if (pickIdx > 0) {
+            val tops = tb.buildTop(
+                stage, pool.map { it.toString() }, relicsSkill = ctx.sk, floor = floor,
+                size = LAB_PARTY_SIZE, failed = failed,
+                tpUp = ctx.tpUp, initTp = ctx.sk, topN = 3,
+            )
+            tops.getOrNull(pickIdx) ?: tops.first()
         } else {
             tb.buildBest(
                 stage, pool.map { it.toString() }, relicsSkill = ctx.sk, floor = floor,
@@ -124,10 +135,11 @@ object PartyPlan {
                 size = LAB_PARTY_SIZE, failed = failed, allowAttrlim = true,
             )
         }
-        rememberBuild(BuildKey(stage, floor, failed, ctx.sk, pool), res)
+        rememberBuild(BuildKey(stage, floor, failed, ctx.sk, pool, pickIdx), res)
         AppState.addLog(
             "… 提前算队伍 ${SystemClock.elapsedRealtime() - t0}ms" +
-                "（${if (modelTeam != null) "模型版" else "规则版"}，池 ${pool.size} 个，大地图持有池）",
+                "（${if (pickIdx > 0) "备选队#${pickIdx + 1}" else if (modelTeam != null) "模型版" else "规则版"}，" +
+                "池 ${pool.size} 个，大地图持有池）",
         )
     }
     /** PC `LAB_SELECT_TAP_MAX`(447)：同一组候选卡最多点几次（点不动就停手，免得把游戏点卡）。
@@ -591,7 +603,30 @@ object PartyPlan {
      *   `tank_on_fail` 补 1 个坦克/兼职坦克（站最前由游戏按攻击范围自排）。
      *   ⚠Android 侧**一直没把 failed 传下去** ⇒ 这条规则在手机上从未生效（PC 一直在传）。
      */
-    fun partyPlan(st: JSONObject, pt: JSONObject, ctx: PartyCtx, failed: Boolean = false): Plan {
+    /**
+     * ★2026-11-19（用户）：**第几次尝试该用第几队**。
+     *  · BOSS 关卡只有一队；
+     *  · 关卡带 `tank_on_fail`（失败要补坦克）⇒ 前两次仍用第 1 队，第 3 次才换第 2 名；
+     *  · 其它关卡 ⇒ 第 2 次用第 2 队、第 3 次用第 3 队。
+     */
+    private fun pickIdxFor(stage: String, attempt: Int): Int {
+        if (attempt <= 0) return 0
+        if (stage.startsWith("Boss_")) return 0
+        val hasTankOnFail = Profiles.profileOf(stage)["tank_on_fail"] != null
+        return if (hasTankOnFail) (if (attempt >= 2) 1 else 0) else minOf(attempt, 2)
+    }
+
+    fun partyPlan(
+        st: JSONObject,
+        pt: JSONObject,
+        ctx: PartyCtx,
+        failed: Boolean = false,
+        /**
+         * ★2026-11-19（用户）：本节点**已经失败过几次**（0=首次编组）。非 BOSS 关卡会按它选
+         * "排名第 N 的备选队"（见 [TeamBuild.buildTop]）；BOSS 关卡只有一队，始终用第 1 队。
+         */
+        attempt: Int = 0,
+    ): Plan {
         val curNm = intListOf(pt.optJSONArray("nowMember")).filter { it != 0 }
         val cur = if (curNm.isNotEmpty()) curNm else (pt.optJSONArray("icons") ?: JSONArray())
             .toListOfObj().mapNotNull { (it.opt("unitId") as? Number)?.toInt() }.filter { it != 0 }
@@ -654,9 +689,14 @@ object PartyPlan {
         }
         val (stage, note) = stageFor(st)
         val floor = (st.opt("area") as? Number)?.toInt() ?: 1
+        // ★★2026-11-19（用户）：**失败重编时按"第几次"换队**
+        //   · BOSS 关卡：只有一队（保持原行为）；
+        //   · 关卡带 `tank_on_fail`（失败要补坦克）：前两次仍用第 1 队，第 3 次才换第 2 名；
+        //   · 其它关卡：第 2 次用第 2 队、第 3 次用第 3 队（见 [TeamBuild.buildTop]）。
+        val pickIdx = pickIdxFor(stage, attempt)
         // ★★走缓存（2026-11-07）：一轮编队要调 `partyPlan` 4 遍，每遍重跑一遍完整算法（~1 秒）⇒
-        //   光"算"就吃掉好几秒。目标队伍只取决于（stage/floor/池/技能值/失败过）⇒ 没变就复用。
-        val bkey = BuildKey(stage, floor, failed, ctx.sk, pool.sorted())
+        //   光"算"就吃掉好几秒。目标队伍只取决于（stage/floor/池/技能值/失败过/第几队）⇒ 没变就复用。
+        val bkey = BuildKey(stage, floor, failed, ctx.sk, pool.sorted(), pickIdx)
         val t0 = SystemClock.elapsedRealtime()
         var tb: Res
         val cached = cachedRes(bkey)
@@ -666,7 +706,8 @@ object PartyPlan {
         } else {
             // ★2026-11-14（用户）：编队可切「推理模型」。算不出（未加载 / 关卡不在词表 /
             //   认识的角色不足 5 人）就**静默**回落规则版，不打扰用户。
-            val modelTeam = modelTeamOf(stage, st, pool, failed)
+            // ★2026-11-19：备选队（pickIdx>0）只走规则版 —— 模型只产出一队，没有"第 2/3 名"。
+            val modelTeam = if (pickIdx == 0) modelTeamOf(stage, st, pool, failed) else null
             if (modelTeam != null) {
                 AppState.addLog(
                     "组队：模型版 ${SystemClock.elapsedRealtime() - t0}ms（池 ${pool.size} 个）→ " +
@@ -677,6 +718,17 @@ object PartyPlan {
                     drop = mutableListOf(), attrlimUnits = mutableListOf(), todo = null,
                     forceAttr = null, floorRule = null, failed = failed,
                 ).apply { team = modelTeam.map { it.toString() } }
+            } else if (pickIdx > 0) {
+                val tops = teamBuild!!.buildTop(
+                    stage, pool.map { it.toString() }, relicsSkill = ctx.sk, floor = floor,
+                    size = LAB_PARTY_SIZE, failed = failed,
+                    tpUp = ctx.tpUp, initTp = ctx.sk, topN = 3,
+                )
+                tb = tops.getOrNull(pickIdx) ?: tops.first()
+                AppState.addLog(
+                    "组队：第 ${attempt + 1} 次尝试 → 换成备选队 #${pickIdx + 1}" +
+                        "（共产 ${tops.size} 队，池 ${pool.size} 个）",
+                )
             } else {
                 tb = teamBuild!!.buildBest(
                     stage, pool.map { it.toString() }, relicsSkill = ctx.sk, floor = floor,

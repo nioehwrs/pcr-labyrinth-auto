@@ -670,8 +670,11 @@ class TeamBuild(private val tables: Tables) {
         size: Int?,
         base: Res,
         failed: Boolean,
+        /** ★2026-11-19：收集**所有被比较过的完整队伍**（含原方案），供"返回前三名"用。null=只要最优（老行为） */
+        sink: MutableList<Res>? = null,
     ): Res {
         val pf = Profiles.profileOf(stage)
+        sink?.add(base)
         if (base.score == null) return base
         val ids = poolIn.map { it.toString() }.filter { tables.unit(it) != null }
         val w = C.W["burst"]!!
@@ -723,6 +726,7 @@ class TeamBuild(private val tables: Tables) {
                 js?.let { "加:" + name(it) },
             ).joinToString("+")
             tried.add(nm to altScore)
+            sink?.add(alt)
             if (altScore > best.score!!) {
                 alt.log.add("★多方案：$nm → 总分 $altScore > 原队 ${best.score} ⇒ 取这队")
                 best = alt
@@ -748,10 +752,12 @@ class TeamBuild(private val tables: Tables) {
         failed: Boolean = false,
         tpUp: Double = 0.0,
         initTp: Int = 0,
+        /** ★2026-11-19：收集所有被比较过的完整队伍（供 [buildTop] 取前三名）。null = 老行为 */
+        sink: MutableList<Res>? = null,
     ): Res {
         val n = size ?: C.SIZE
         var res = build(stage, pool, relicsSkill, floor, size, failed = failed, tpUp = tpUp, initTp = initTp)
-        res = variantBest(stage, pool, relicsSkill, floor, size, res, failed)
+        res = variantBest(stage, pool, relicsSkill, floor, size, res, failed, sink)
 
         val al = res.attrlimUnits
         if (al.isEmpty()) return res
@@ -773,7 +779,7 @@ class TeamBuild(private val tables: Tables) {
                 continue
             }
             var alt = build(stage, same, relicsSkill, floor, size, forceAttr = attr, failed = failed)
-            alt = variantBest(stage, same, relicsSkill, floor, size, alt, failed)
+            alt = variantBest(stage, same, relicsSkill, floor, size, alt, failed, sink)
             val altScore = alt.score ?: continue
             res.log.add("属性限定：同属性队（$attr）整队总分 $altScore ｜ 默认队 ${res.score}")
             if (altScore > res.score!!) {
@@ -782,6 +788,76 @@ class TeamBuild(private val tables: Tables) {
             }
         }
         return res
+    }
+
+    /**
+     * ★★2026-11-19（用户）：**返回前 N 名队伍**（默认 3），供"战斗失败后换一队再试"。
+     *
+     * 候选从两个来源拿：
+     *  ① **有整队总分**（burst/aoE 档）：[variantBest] 本来就会枚举"换坦克/治疗/首动/加速"的最多 300 组，
+     *     现在把这些队伍全部收进 [sink]（只是多存几个对象，**零额外计算**），按总分排序取前 N。
+     *  ② **没有整队总分**（速通 / dot / 普通档）：只有一条贪心轨迹 ⇒ 用**逐位替换**补备选：
+     *     把第 i 位的人从池里去掉重算一队（算法自己会补一个替补），最多 5 次 `build`。
+     *     这是**邻域近似**（不是全局次优），但对"失败后换个人再试"完全够用。
+     *
+     * ★允许各队之间有重复角色（用户 2026-11-19 明确）；只去掉 picked **完全相同**的队伍。
+     * ★`topN <= 1` 时直接走 [buildBest]，行为与老版本完全一致（500 条 fixtures 不受影响）。
+     */
+    fun buildTop(
+        stage: String,
+        pool: List<String>,
+        relicsSkill: Int = 0,
+        floor: Int = 1,
+        size: Int? = null,
+        failed: Boolean = false,
+        tpUp: Double = 0.0,
+        initTp: Int = 0,
+        topN: Int = 3,
+    ): List<Res> {
+        if (topN <= 1) {
+            return listOf(
+                buildBest(stage, pool, relicsSkill, floor, size, failed, tpUp, initTp),
+            )
+        }
+        val n = size ?: C.SIZE
+        val cands = mutableListOf<Res>()
+        val best = buildBest(stage, pool, relicsSkill, floor, size, failed, tpUp, initTp, sink = cands)
+
+        // 去重（同一个人集合只留分最高的那条），同时保持插入顺序
+        val uniq = LinkedHashMap<String, Res>()
+        fun add(r: Res) {
+            if (r.picked.isEmpty()) return
+            val k = r.picked.sorted().joinToString(",")
+            val old = uniq[k]
+            if (old == null || ((r.score ?: Double.NEGATIVE_INFINITY) > (old.score ?: Double.NEGATIVE_INFINITY))) {
+                uniq[k] = r
+            }
+        }
+        add(best)
+        cands.forEach { add(it) }
+
+        // ② 候选不够（典型：这档没有整队总分，sink 里只有 base）⇒ 逐位替换补
+        val ids = pool.map { it.toString() }.filter { tables.unit(it) != null }
+        if (uniq.size < topN && ids.size > n) {
+            var guard = 0
+            for (u in best.picked.toList()) {
+                if (uniq.size >= topN || guard++ >= 8) break
+                val reduced = ids.filter { it != u }
+                if (reduced.size < n) continue
+                val alt = build(
+                    stage, reduced, relicsSkill, floor, size,
+                    failed = failed, tpUp = tpUp, initTp = initTp,
+                )
+                if (alt.picked.isNotEmpty()) {
+                    alt.log.add("★备选（逐位替换近似）：换掉 ${name(u)}")
+                    add(alt)
+                }
+            }
+        }
+        // 排序：有总分的按分降序；全没分时保持插入顺序（base 第一）
+        return uniq.values
+            .sortedWith(compareByDescending { it.score ?: Double.NEGATIVE_INFINITY })
+            .take(topN)
     }
 
     // ────────────────────────── 尚未移植（下一批）──────────────────────────

@@ -423,6 +423,7 @@ object MazeLoop {
         battleDumps = 0                         // 战斗结算页对象字段抓取（每场一次、每局上限）
         labResultDumps = 0                      // 迷宫结算页对象字段抓取（单独预算，每局 ≤2 次）
         saidRelicErr = ""                       // 持有遗物读取异常提示（本局重新报一次）
+        resMemDiagKey = null                    // 结算按钮字段读诊断（每局重新抓一次）
         dlgTapSig = null                        // 弹窗点击熔断（本局重新计数）
         dlgTapN = 0
         labResultSig = ""                       // 结算页"落位闸门"（连续两轮同坐标才点）
@@ -1096,11 +1097,20 @@ object MazeLoop {
             if (stt != 0) {
                 when (stt) {
                     1 -> {
-                        // ★SUMMON_UNIT 两种脸：①初始编成（DialogArea/无 DialogLabyrinthSelection）
+                        // ★SUMMON_UNIT 三种脸：①初始编成（DialogArea/无 DialogLabyrinthSelection）
                         //   ②战后"选取奖励角色"页（pageTop=DialogLabyrinthSelection，3 张卡选 1）
+                        //   ③★2026-11-19（用户实测）：**战斗失败结算页被报成 SUMMON_UNIT**
+                        //     （失败页 DialogQuestFailed 出现时 statusType=1，而不是平时的 5/6）。
+                        //     不认它 ⇒ 分派到"选角色页"handler、读不到就静默等 ⇒ 实测空转 120s+ 一动不动。
                         val top = jStr(st, "pageTop")
-                        if (top.contains("DialogLabyrinthSelection")) handleLabSelection(input, st, tag, charaPick, tries, "战后选人")
-                        else handleSummonUnit(input, st, tag, charaPick, tries, waitSaid)
+                        when {
+                            // 失败页被报成 SUMMON_UNIT 时直接按结算页处理（不再单独打日志——下面
+                            // 「战斗失败…」那行已经说清楚了，这里每拍都会进，打了会刷屏）
+                            PAGE_QUEST_FAILED in top -> handleQuestFailed(input, st)
+                            top.contains("DialogLabyrinthSelection") ->
+                                handleLabSelection(input, st, tag, charaPick, tries, "战后选人")
+                            else -> handleSummonUnit(input, st, tag, charaPick, tries, waitSaid)
+                        }
                     }   // PC 2120 / 战后选人
                     2 -> handleLabSelection(input, st, tag, charaPick, tries, "门票")   // PC 门票页（同 DialogLabyrinthSelection）
                     3 -> { /* USE_RELIC 演出，仅等待、不做决策（PC MAZE_WAIT_ONLY={3}） */ }
@@ -1353,6 +1363,18 @@ object MazeLoop {
     private val WIN_LABELS = listOf("下一步", "次へ", "Next")
     private val FAIL_LABELS = listOf("挑战", "Retry")
 
+    /**
+     * ★2026-11-19（用户）：**四类结算页**的完整集合，点击"从哪儿出发"统一用它。
+     *
+     * 原来胜/负分支各写自己的 `from`（胜利缺 `DialogQuestFailed`、失败缺 `DialogQuestResultWin`）——
+     * 一旦"页面类型与按钮标签不一致"（失败页显示「下一步」，见 [battleResultPathPick] 的标签纠正），
+     * 纠正后的分支会因为 `from` 不含当前页而**误判"已离开"** ⇒ 一下都不点、直接空等。
+     * 放宽成全集是安全的：点击前确实就在其中之一。
+     */
+    private val RESULT_FROM = setOf(
+        "DialogBackKeyCapture", "DialogLabyrinthExResult", "DialogQuestResultWin", "DialogQuestFailed",
+    )
+
     /** PC `MAZE_BATTLE_RESULT_GRACE`(5183)：结算就绪但没读到按钮 → 先等这么久再提醒 */
     private const val BATTLE_RESULT_GRACE_MS = 8_000L
 
@@ -1497,6 +1519,8 @@ object MazeLoop {
     private var battleSaid = 0
     private var battleWinSaid = false
     private var battleFailSaid = false
+    /** ★2026-11-19：本场"失败页显示「下一步」"的日志只打一次 */
+    private var failNextSaid = false
 
     /** ★本**局**已抓过几次战斗结算页的对象字段（每场一次、每局最多 [BATTLE_DUMP_MAX] 次，见 [dumpBattleResult]） */
     private var battleDumps = 0
@@ -2540,6 +2564,9 @@ object MazeLoop {
 
     /** 上一次报过的"持有遗物读取异常"文案（同一条只报一次，别刷屏） */
     private var saidRelicErr = ""
+
+    /** 上次打过"结算按钮字段读诊断"的顶框名（同一页只打一次，2026-11-19） */
+    private var resMemDiagKey: String? = null
 
     private suspend fun labSnap(): LabSnap {
         val u = AgentApi.labUnits()?.optJSONArray("unitIds")
@@ -3648,6 +3675,8 @@ object MazeLoop {
         input: InputBackend,
         keys: List<String>,
         what: String,
+        /** 日志前缀（默认"商店"；"失败页-下一步"那条弹窗传自己的，免得日志里看着像开店） */
+        logPrefix: String = "商店",
     ): Boolean {
         val base = dlgBoxNow() ?: return false
         val basePtr = base.optString("ptr")
@@ -3657,7 +3686,7 @@ object MazeLoop {
         //   `skipFirstHits`（与特别装备「全部」行同一套能力）；本函数只提供"点哪个按钮 + 什么算框没了"。
         //   判据：这个框 **开始消失**（`closing`）或换成别的框（ptr 变），都算这一下生效。
         return tapAndCheck(
-            input, 0, 0, "商店：$what",
+            input, 0, 0, "$logPrefix：$what",
             from = setOf(basePtr),
             retries = SHOP_ANIM_TAP_MAX,
             readTop = {
@@ -5207,7 +5236,9 @@ object MazeLoop {
         // ★★按需补 ids：组队判定（`PartyPlan.stageFor`）要看 **questId** 才知道"这是不是 Boss 格"
         //   （分派读里没有 questId ⇒ 这里补读一次，~0ms）。
         fillIds(st)
-        val plan = PartyPlan.partyPlan(st, pt, ctx, failed = (nodeFailed[nodeKey(st)] ?: 0) > 0)
+        // ★2026-11-19（用户）：把**失败次数**传下去 —— 第 2/3 次尝试会换成排名第 2/3 的备选队
+        val _nf = nodeFailed[nodeKey(st)] ?: 0
+        val plan = PartyPlan.partyPlan(st, pt, ctx, failed = _nf > 0, attempt = _nf)
         val _planMs = SystemClock.elapsedRealtime() - _tPlan
         // ★★"进编组页 → 算出目标队伍"的分段耗时（2026-11-07 用户："这段中间可能有些地方慢"）。
         //   这几段**加起来**才是用户体感的"进页到出决策"的等待；算法本身只占 `_planMs`。
@@ -6925,7 +6956,9 @@ object MazeLoop {
                 // ★按需补 ids：预计算也要 questId（判断是不是 Boss 格）⇒ 分派读里没有，这里补一次
                 fillIds(st)
                 preTeamJob = teamScope.async {
-                    PartyPlan.precompute(preCtx, st, (nodeFailed[nodeKey(st)] ?: 0) > 0)
+                    // ★2026-11-19：把失败次数一起给出去 —— 失败重编时预计算就直接算"该用的那一队"
+                    val _nfPre = nodeFailed[nodeKey(st)] ?: 0
+                    PartyPlan.precompute(preCtx, st, _nfPre > 0, _nfPre)
                 }
             }
             // ★2026-11-13（用户）：战斗节点采样（普通战 / EX 战，**不含 Boss**）——{节点编号, 关卡(敌人组)编号}
@@ -7038,7 +7071,7 @@ object MazeLoop {
 
     /** PC `handle_battle_node` 的失败页分支（3771~3801）：点底部右那颗「重新挑战」并记账（≤3 次）。 */
     private suspend fun handleQuestFailed(input: InputBackend, st: JSONObject) {
-        val (_, fail) = battleResultBtns(wide = true, deep = true)
+        val (win, fail) = battleResultBtns(wide = true, deep = true)
         // ★失败页也抓一次（与胜利页共用"一局一次"的标志）：这是同一段链路的另一条分支，
         //   而且失败页的按钮名/位置与胜利页不同，正需要对上偏移。
         //   ★只在 [AUTO_RESULT_DUMP] 打开时才抓（默认关，见那里的说明）。
@@ -7047,6 +7080,40 @@ object MazeLoop {
             dumpBattleResult(jStr(st, "pageTop"))
         }
         if (fail == null) {
+            // ★★2026-11-19（用户）：**失败页也可能只显示「下一步」**（既不是「重新挑战」，也不是胜利）。
+            //   这时 battleResultBtns 会按**标签**把它归到 win ⇒ fail 为空、win 非空。
+            //   行为等同胜利（点完会弹一个单按钮小弹窗，再正常进三选一/遗物），
+            //   但**不记失败、也不记胜利**，日志单独标出来。
+            if (win != null) {
+                if (!failNextSaid) {
+                    failNextSaid = true
+                    AppState.addLog(
+                        "战斗失败（页面显示「${win.optString("text")}」）→ 点它继续（不记失败）",
+                    )
+                }
+                val left = tapAndCheck(
+                    input, win.optInt("x"), win.optInt("y"), "下一步（失败页）",
+                    // ★2026-11-19（用户）：与另两条**同构** —— 点前现读坐标。
+                    //   agent 现在会把失败页的「下一步」按标签判成 `failnext`，固定路径能直接命中；
+                    //   某一拍读不到（过渡态 offscreen）就这拍不点、下一拍再取，不会用过期坐标硬点。
+                    xyAt = { battleResultXY(wantWin = true) },
+                    from = RESULT_FROM,
+                    probe = 8,
+                    retries = 25,
+                    // ★阶段 1 只等"离开结算页"；**后面那个单按钮小弹窗由下一段专门点掉**
+                    //   （它有自己的判据，塞进这里会把两件事混成一件）。
+                    expect = emptySet(),
+                )
+                if (left) {
+                    // ★★2026-11-19（用户）：第三条路比另两条多一份**单按钮小弹窗**
+                    //   （`DialogCommonSmall` + `OneButtonWhite`）：
+                    //   下一步 → 小弹窗 → 三选一。这里主动点掉它（判据=**框开始消失**，同商店那套），
+                    //   再等三选一出现；不让主循环的通用白名单兜（那样日志里看不出是谁点的）。
+                    dismissFailNextReceipt(input)
+                }
+                battleProbeAt = SystemClock.elapsedRealtime() + 2_500
+                return
+            }
             AppState.addLog("… 战斗失败页：还没读到「重新挑战」按钮 → 等它出现（不点别的）")
             return
         }
@@ -7072,7 +7139,7 @@ object MazeLoop {
                     tapAndCheck(
                         input, fail.optInt("x"), fail.optInt("y"), "重新挑战（回编队页）",
                         xyAt = { battleResultXY(wantWin = false) },
-                        from = setOf("DialogBackKeyCapture", "DialogLabyrinthExResult", "DialogQuestFailed"),
+                        from = RESULT_FROM,
                         retries = 12,
                         expect = setOf(PAGE_QUEST_DETAIL),
                     )
@@ -7090,13 +7157,53 @@ object MazeLoop {
         tapAndCheck(
             input, fail.optInt("x"), fail.optInt("y"), "重新挑战",
             xyAt = { battleResultXY(wantWin = false) },
-            from = setOf("DialogBackKeyCapture", "DialogLabyrinthExResult", "DialogQuestFailed"),
+            from = RESULT_FROM,
             // ★settle 用默认 1×probeMs；连点由 probe=8（≈1.2s 窗口）兜住
             probe = 8,
             retries = 12,
             expect = setOf(PAGE_QUEST_DETAIL),
         )
         delay(1_500)
+    }
+
+    /**
+     * ★★2026-11-19（用户）：**"失败-下一步"独有的那份单按钮小弹窗**（`DialogCommonSmall` + `OneButtonWhite`）。
+     *
+     * 时序：结算页「下一步」→ 小弹窗（收到角色/道具）→ 三选一（`DialogLabyrinthSelection`）。
+     * 这一步主动点掉小弹窗：
+     *   · 点击判据用 **[tapBoxButton]** —— "框开始消失 / 换成别的框"（和商店到账框同一套），
+     *     而不是"等某个页面出现"（这一下本来就没有目标页）；
+     *   · 点完再等**三选一**出现，让这条链闭环（等不到也不卡，主循环认得 Selection）。
+     *
+     * 只在"失败页显示【下一步】"这条很少见的路上走，成本可接受。
+     */
+    private suspend fun dismissFailNextReceipt(input: InputBackend) {
+        // ① 等小弹窗出现（也可能根本没弹、直接就到三选一）
+        val t0 = SystemClock.elapsedRealtime()
+        while (SystemClock.elapsedRealtime() - t0 < 3_000L) {
+            val top = runCatching { AgentApi.labTop() }.getOrNull().orEmpty()
+            if (top.contains("DialogLabyrinthSelection")) return   // 没弹窗，已经到三选一
+            val b = dlgBoxNow()
+            val bTop = b?.optString("top").orEmpty()
+            if (bTop.startsWith("DialogCommon")) {
+                // 点掉小弹窗（判据=框开始消失）；具体点位由 tapBoxButton 打一条「点了 …」
+                tapBoxButton(
+                    input,
+                    listOf("OneButtonWhite", "OneButtonBlue", "TwoButtonRight", "ThreeButtonCenter"),
+                    "收到",
+                    logPrefix = "失败页-下一步",
+                )
+                break
+            }
+            delay(150)
+        }
+        // ② 等三选一出现（最多 6s）：到了就闭环；等不到交给主循环（它认得 DialogLabyrinthSelection）
+        val t1 = SystemClock.elapsedRealtime()
+        while (SystemClock.elapsedRealtime() - t1 < 6_000L) {
+            val top = runCatching { AgentApi.labTop() }.getOrNull().orEmpty()
+            if (top.contains("DialogLabyrinthSelection")) return
+            delay(150)
+        }
     }
 
     // ────────────────────────── 结算奖励（LabyrinthTempData）──────────────────────────
@@ -7614,11 +7721,31 @@ object MazeLoop {
         }
         val o = JSONObject().put("x", x).put("y", y).put("text", lb)
         val ms = r.optInt("ms")
-        lastBtnSrc = "固定路径($kind)@${ms}ms"
-        if (!battleBtnSaid) {
-            AppState.addLog("结算按钮来源：固定路径 $kind 「$lb」@($x,$y)（${ms}ms）")
+        // ★★2026-11-19（用户）：**失败页也有可能出现「下一步」**（不是「重新挑战」）。
+        //   固定路径是按**容器类名**定 kind（DialogQuestFailed ⇒ fail），不看标签 ⇒ 会把
+        //   「下一步」当成「重新挑战」：于是被记成"失败 +1"、还期望回到预览页（DialogQuestDetail）
+        //   ⇒ 到不了就重试 12 次、在错的页面上乱点。
+        //   ⇒ 这里按**按钮标签**纠正一次（标签本来就已经读回来了）：
+        //     标签像「下一步/次へ/Next」 ⇒ 一律当 win（推进），不记失败、不期望预览页。
+        val isWinLabel = WIN_LABELS.any { lb.contains(it, ignoreCase = true) }
+        val isFailLabel = FAIL_LABELS.any { lb.contains(it, ignoreCase = true) }
+        val effKind = when {
+            // ★2026-11-19：agent 已在失败页按标签判好 "failnext"（失败但显示「下一步」）⇒ 保留这个值，
+            //   只为日志可辨；下面的返回仍把它归到 win 槽（失败页分支会单独处理，见 handleQuestFailed）。
+            kind == "failnext" -> "failnext"
+            isWinLabel -> "win"
+            isFailLabel -> "fail"
+            else -> kind            // 标签读不到/不认识 ⇒ 维持原判（后面还有树遍历兜底按标签分）
         }
-        return if (kind == "fail") null to o else o to null
+        lastBtnSrc = "固定路径($effKind)@${ms}ms"
+        if (!battleBtnSaid) {
+            AppState.addLog("结算按钮来源：固定路径 $effKind 「$lb」@($x,$y)（${ms}ms）")
+        }
+        if (effKind != kind) {
+            // 只在"页面类型与标签不一致"时打一行，方便对日志确认这种边界情况发生了。
+            AppState.addLog("[!] 结算页类型与按钮标签不一致：页面=$kind 标签「$lb」→ 按「$effKind」处理")
+        }
+        return if (effKind == "fail") null to o else o to null
     }
 
     /**
@@ -7682,6 +7809,10 @@ object MazeLoop {
             if (SystemClock.elapsedRealtime() - readT0 >= RESULT_READ_BUDGET_MS) break
             delay(RESULT_READ_GAP_MS)
         }
+        // ★2026-11-19（用户）：固定路径全灭 ⇒ 打一次**字段读诊断**（只读，不改判定）：
+        //   把每个 CustomUIButton 的「层级路径 + 配对标签 + 坐标」列出来，
+        //   用于取证"失败页显示【下一步】"这类路径未知的形态（同一顶框只打一次）。
+        dumpResultMemDiagOnce()
         // ★名单**顺序很重要**（2026-10-16 修正回归）：上一版为了省遍历把宽档改成"只用宽名单"，
         //   结果宽名单把 `Button(959,984)`（名字就叫 `Button`）排在 `NextButton(1664,979)` **前面**
         //   ⇒ 我们点了那颗**不推进**的 ✗（22:27 实测：每 4s 重复点 (959,984)、页面纹丝不动）。
@@ -7739,6 +7870,45 @@ object MazeLoop {
             }
         }
         return null to null
+    }
+
+    /**
+     * ★2026-11-19（用户）：结算页按钮的**字段读诊断**（只读，不参与胜负判定）。
+     *
+     * 用途：固定路径读不到时，把 `DialogQuestFailed` / `DialogQuestResultWin` / `DialogLabyrinthExResult`
+     * 里每个 `CustomUIButton` 的「层级路径 + 配对标签 + 坐标」打进日志 —— 专为
+     * **"失败页显示【下一步】"** 这类路径未知的形态取证；拿到路径后可直接新增固定路径常量。
+     *
+     * 只做一次/同顶框（[resMemDiagKey]），避免每拍都读一遍字段。
+     */
+    private suspend fun dumpResultMemDiagOnce() {
+        val top = runCatching { AgentApi.labTop(800L) }.getOrNull() ?: return
+        if (!RESULT_TOP_RE.containsMatchIn(top)) return
+        val key = top.removeSuffix("(Clone)")
+        if (resMemDiagKey == key) return
+        resMemDiagKey = key
+        val r = runCatching { AgentApi.battleResultMem() }.getOrNull() ?: run {
+            AppState.addLog("… 结算按钮诊断（$key）：battleResultMem 调用失败")
+            return
+        }
+        val cands = r.optJSONArray("cands")
+        if (cands == null || cands.length() == 0) {
+            AppState.addLog(
+                "… 结算按钮诊断（$key）：字段读没找到 CustomUIButton" +
+                    (r.optString("err").takeIf { it.isNotEmpty() }?.let { "（err=$it）" } ?: ""),
+            )
+            return
+        }
+        AppState.addLog("… 结算按钮诊断（$key）：共 ${cands.length()} 个候选（路径｜标签｜坐标）")
+        for (i in 0 until minOf(cands.length(), 8)) {
+            val c = cands.optJSONObject(i) ?: continue
+            val lbRaw = c.opt("label")
+            val lb = if (lbRaw == null || lbRaw === JSONObject.NULL) "" else lbRaw.toString().trim()
+            AppState.addLog(
+                "    [${i + 1}] ${c.optString("path").ifEmpty { "（未取到路径）" }}" +
+                    "  「${lb.ifEmpty { "«无标签»" }}」@(${c.optInt("x")},${c.optInt("y")})",
+            )
+        }
     }
 
     /**
@@ -7941,7 +8111,7 @@ object MazeLoop {
                         tapAndCheck(
                             input, fail.optInt("x"), fail.optInt("y"), "重新挑战（回编队页）",
                             xyAt = { battleResultXY(wantWin = false) },
-                            from = setOf("DialogBackKeyCapture", "DialogLabyrinthExResult", "DialogQuestFailed"),
+                            from = RESULT_FROM,
                                 retries = 12,
                             expect = setOf(PAGE_QUEST_DETAIL),
                         )
@@ -7964,7 +8134,7 @@ object MazeLoop {
             tapAndCheck(
                 input, fail.optInt("x"), fail.optInt("y"), "重新挑战",
                 xyAt = { battleResultXY(wantWin = false) },
-                from = setOf("DialogBackKeyCapture", "DialogLabyrinthExResult", "DialogQuestFailed"),
+                from = RESULT_FROM,
                 // ★settle 用默认 1×probeMs；连点由 probe=8（≈1.2s 窗口）兜住
                 probe = 8,
                 retries = 12,
@@ -7998,7 +8168,7 @@ object MazeLoop {
                 //   ⚠更早那版用 findTextIn(half=scrH/2,root=top) 探索 + 无标签校验 ⇒ 捞到干扰
                 //     节点 (1109,652) ⇒ 点空/抓不到。这里换成固定路径现读，见 [battleResultXY]。
                 xyAt = { battleResultXY(wantWin = true) },
-                from = setOf("DialogBackKeyCapture", "DialogLabyrinthExResult", "DialogQuestResultWin"),
+                from = RESULT_FROM,
                 // ★2026-11-13（用户："走了几个节点之后闪退"）：200ms → **400ms**。
                 //   日志 00:38:58~59 在 1.4s 内连点 7 次「下一步」（每次都是 root `input tap`），
                 //   紧接着 00:39:01 系统 `device is not responding` 触发 lmkd 杀进程 —— 点击太密会把
@@ -8051,6 +8221,7 @@ object MazeLoop {
         battleT0 = 0L
         battleFailSaid = false
         battleWinSaid = false
+        failNextSaid = false
         battleSaid = 0
         battleRes0 = 0L
     }
