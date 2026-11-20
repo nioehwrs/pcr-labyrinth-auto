@@ -5118,8 +5118,10 @@ object MazeLoop {
         // ★★2026-11-20（用户："每次 500ms 是对的，反应快，但应该多试几次"）：
         //   每轮仍只等 [MOVE_CONFIRM_WAIT_MS]=500ms（**框一出现就点，不等满**），没框就再试几轮；
         //   每轮结束读一次 `labMapBusy`（协程句柄，几 ms）：
-        //     · 换区滑场 / 角色移动在跑 ⇒ 点击其实**已生效**，直接收工（不再等、更不再点）
-        //     · 都没在跑 ⇒ 这一下确实被吞了，继续下一轮探测（总窗口 500×3=1.5s）
+        //     · `unitMove` 在跑（角色正走向目标）⇒ 这次点击**已生效**，直接收工
+        //     · `areaSlide`（游戏自动换区：10601 结算完滑到 20101）**不算已生效** ——
+        //       那时还没到新区域、本来就什么都不能操作；`finish` 同理
+        //     · 都不在跑 ⇒ 这一下确实被吞了，继续下一轮探测（总窗口 500×3=1.5s）
         var roundAt = t0
         var rounds = 0
         var busySaid = false
@@ -5139,22 +5141,24 @@ object MazeLoop {
             if (seenAt == 0L) {
                 if (now - roundAt >= MOVE_CONFIRM_WAIT_MS) {            // 这一轮 500ms 没等到框
                     val b = runCatching { AgentApi.labMapBusy() }.getOrNull()
-                    if (b?.optBoolean("ok") == true && b.optBoolean("busy")) {
+                    // ★★2026-11-20（用户纠正）：只有 `unitMove`（角色正走向目标）才算"这一下生效了"。
+                    //   `areaSlide` 是**游戏自动换区**（10601 结算完自动滑到 20101），此时还没到新区域、
+                    //   原本就什么都不能操作 ⇒ 不能当成"我们点的那下生效"；`finish` 同理。
+                    if (b?.optBoolean("ok") == true && b.optBoolean("unitMove")) {
                         if (!busySaid) {
                             busySaid = true
-                            val tag = buildString {
-                                if (b.optBoolean("areaSlide")) append("换区滑场")
-                                if (b.optBoolean("unitMove")) { if (isNotEmpty()) append("＋"); append("角色移动") }
-                                if (b.optBoolean("finish")) { if (isNotEmpty()) append("＋"); append("收尾") }
-                            }
-                            AppState.addLog("… 没等到「是否前往」，但地图动画在跑（$tag）→ 判定移动已生效，不再点节点")
+                            AppState.addLog("… 没等到「是否前往」，但角色移动动画在跑 → 判定这次点击已生效，不再点节点")
                         }
                         return true
                     }
                     rounds++
                     if (rounds >= MOVE_CONFIRM_NO_PTR_ROUNDS) break
                     if (rounds == 1) {
-                        AppState.addLog("… 还没等到「是否前往」→ 多试一轮（${rounds + 1}/$MOVE_CONFIRM_NO_PTR_ROUNDS）")
+                        val tag = buildString {
+                            if (b?.optBoolean("areaSlide") == true) append("换区滑场中")
+                            if (b?.optBoolean("finish") == true) { if (isNotEmpty()) append("＋"); append("收尾中") }
+                        }.ifEmpty { "动画没在跑" }
+                        AppState.addLog("… 还没等到「是否前往」（$tag）→ 多试一轮（${rounds + 1}/$MOVE_CONFIRM_NO_PTR_ROUNDS）")
                     }
                     roundAt = now
                 }
