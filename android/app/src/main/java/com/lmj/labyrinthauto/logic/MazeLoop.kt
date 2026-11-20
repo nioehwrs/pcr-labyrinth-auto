@@ -935,6 +935,13 @@ object MazeLoop {
                     //   "上次没点「装备确定」就走了"的缺口 —— 否则 EX 页留在屏幕上，
                     //   后面所有操作都在**错的页面**上做（2026-11-08 实测 10:29:36~10:29:45）。
                     val es = exeqSess()
+                    // ★2026-11-20：刚提前收工（「装备确定」已确认投递成功）⇒ 给关闭动画留 2s 放行窗口，
+                    //   别在 EX 容器还在退场时又接管一遍（否则等于没省时间，还会重启一次流程）。
+                    if (es.earlyExitAt > 0 && System.currentTimeMillis() - es.earlyExitAt < 2_000L) {
+                        idle = 0
+                        delay(POLL_MS)
+                        continue
+                    }
                     es.fbN++
                     if (es.fbN > EXEQ_FB_MAX) {
                         es.exStuck = true
@@ -1815,6 +1822,10 @@ object MazeLoop {
     private const val PROBE_N = 4               // ★探几次（200ms 起步 + 3×150ms = 650ms 窗口）
     private const val PROBE_MS = 150L           // ★探针间隔
     private const val EXEQ_IDLE_WAIT_MS = 250L  // ★过渡态（EX 页在收尾、还没接管）的轮询间隔
+    /** ★★2026-11-20（用户）：**最后一击「装备确定」直调成功后提前收工**，不等 EX 容器从顶层消失。
+     *   实测过渡态最长 11s（见 6229 注释）——直调已确认投递成功就无需再等动画。
+     *   关闭即回退成"等容器消失"的老行为（改常量或改成 false 重编译）。 */
+    private const val EXEQ_EARLY_EXIT = true
     private const val EXEQ_FB_MAX = 3              // ★主循环兜底接管 EX 页的次数上限（超了 ⇒ 让用户手动关）
     private const val EXEQ_RETRY_WAIT_MS = 300L      // "这一轮点了没生效"时的等待（别把 agent 读爆）
     private const val EXEQ_AUTO_WAIT_MS = 900L       // 点完「自动装备」后等页面切到②的上限（超了 ⇒ 再点一次）
@@ -1896,6 +1907,13 @@ object MazeLoop {
         var sayN: Int = 0,
         /** ★本次特别装备要选的排序项（[exeqSortTarget] 按目标队算出；默认物理） */
         var sortTarget: String = EXEQ_SORT_PHYS,
+        /** ★★2026-11-20：最后一击「装备确定」**直调真的投递成功**（ok=true）——
+         *  与 [exDone]（投递前就置、失败也算）不同，这个只在 agent 确认 ok 时才置，
+         *  用于 [EXEQ_EARLY_EXIT] 提前收工（确认点上了才敢不等容器消失）。 */
+        var finalPressOk: Boolean = false,
+        /** ★2026-11-20：提前收工的时刻（非 0 = 刚跳过"等容器消失"）——
+         *  主循环兜底据此刻意放行 2s，别在关闭动画期间又接管一遍。 */
+        var earlyExitAt: Long = 0L,
     )
 
     /**
@@ -6195,6 +6213,7 @@ object MazeLoop {
         sess.tapX = -1
         sess.tapY = -1
         sess.tapN = 0
+        sess.finalPressOk = false                    // ★2026-11-20：新一轮重置"最后一击已确认"
         sess.stall = 0                               // ★连续失败计数（新一轮清零）
         sess.sayN = 0                                // ★诊断日志节流（新一轮清零）
         sess.pending = true                          // ★"流程进行中"（收尾处靠它判"异常收手"）
@@ -6221,6 +6240,19 @@ object MazeLoop {
                 // ★连续两次读到空才判"真走完"（一次可能是"最上层被别的东西盖住"的误判）
                 sess.offN++
                 if (sess.offN < 2) { delay(EXEQ_POLL_MS); continue }
+                // ★★2026-11-20（用户）：最后一击「装备确定」**已确认直调投递成功** ⇒ 立刻收工，
+                //   不再等 EX 容器从顶层消失（那只是关闭动画，实测过渡态最长 11s）。
+                //   依据：直调 ok=true 已确认 onClick 执行；且签名连续两轮读空 = 三连页确实在退。
+                if (EXEQ_EARLY_EXIT && sess.finalPressOk) {
+                    sess.earlyExitAt = System.currentTimeMillis()
+                    AppState.addLog(
+                        "    ✓ 特别装备走完（「装备确定」已确认投递成功 → 提前收工，不等容器消失）" +
+                            "｜从最后一次点击算起 ${System.currentTimeMillis() - sess.lastTapAt}ms",
+                    )
+                    sess.pending = false
+                    sess.fbN = 0
+                    break
+                }
                 // ★★★2026-11-08 实测 10:29:36 修：**光看签名空是不够的** ——
                 //   切页动画期间会**短暂读空**（②页正在关、①页还没接管，最上层一时没有 EX 组件）。
                 //   那时若就判"走完" ⇒ ①页其实还开着、**「装备确定」根本没点**（装备没设上！），
@@ -6399,6 +6431,8 @@ object MazeLoop {
                     // ★`pressTwoPhase` 返回轮询后的最终结果（ok/via/err），没有 queued
                     if (pr?.optBoolean("ok") == true) {
                         exeqDirectFail = 0
+                        // ★2026-11-20：最后一击「装备确定」直调确认成功 ⇒ 允许提前收工（不等容器消失）
+                        if (act.isFinal) sess.finalPressOk = true
                         return@xyAt true
                     }
                     if (++exeqDirectFail >= 2) {

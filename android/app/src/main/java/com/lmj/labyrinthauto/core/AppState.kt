@@ -20,7 +20,8 @@ import java.util.Locale
  */
 object AppState {
     private const val LOG_CAP = 800
-    private val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.US)
+    // ★2026-11-20（用户）：日志时间加毫秒 —— 看每次点击/探测之间到底隔了多久。
+    private val timeFmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
 
     private val _running = MutableStateFlow(false)
     val running: StateFlow<Boolean> = _running.asStateFlow()
