@@ -132,9 +132,9 @@ object TapCheck {
          *   ⇒ 保持 1：只投一次、之后只探测（把 [retries] 当纯探测窗口用）。日志仍打出 `直调N轮` 供观察。
          */
         pressMax: Int = 1,
-        /** ★直调是否走加速档（默认 true）。少数**直调内部会退回坐标点击**的页（结算页：普通战胜利
-         *   按钮是假成功）必须传 false 保留慢节奏——否则 settle 30ms + probe 密会重现 2026-11-13 的
-         *   「1.4s 连点 7 下 → lmkd 杀进程」。纯直调页（选人/编组/EX/商店/门票）无需管。 */
+        /** ★直调是否走加速档（默认 true）。结算页（pressFn 内部直调失败会退坐标）传 false 保留
+         *   慢节奏——否则 settle 30ms + probe 密会重现 2026-11-13 的「1.4s 连点 7 下 → lmkd 杀进程」。
+         *   纯直调页（选人/编组/EX/商店/门票）无需管。 */
         directFast: Boolean = true,
         verbose: Boolean = true,
     ): Boolean {

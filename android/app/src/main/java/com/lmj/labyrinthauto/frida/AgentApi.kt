@@ -361,6 +361,11 @@ object AgentApi {
     /** ★结算奖励（LabyrinthTempData 内存字段）：`{ok, result:{...}, questFinish[], challenge[], rewardInfo[], normalBox[[]], rareBox[[]]}` */
     suspend fun labRewards(): JSONObject? = obj("labRewards", timeoutMs = T_SLOW)
 
+    /** ★★结算演出加速（cs125，2026-11-22）：把 LabyrinthDefineData 单例的演出时长压到 0.05s
+     *  （②屏滚分/三块逐个显示/关闭按钮等待/宝箱落下——客户端视觉参数，游戏重启即恢复）。
+     *  `{ok, params:[名称: 原值→新值], err}`；`err`="Instance 未就绪…" ⇒ 稍后重试。 */
+    suspend fun labSpeedup(): JSONObject? = obj("labSpeedup", timeoutMs = T_FAST)
+
     /** ★战斗结算页"对象字段"抓取（2026-10-16）：返回最上层对话框 + 屏内按钮节点的
      *  GameObject 指针 / 候选组件（`类名@实例指针`）/ 字段槽，用于将来"按字段读按钮坐标"（不再扫树）。 */
     suspend fun battleResultDump(): JSONObject? = obj("battleResultDump", timeoutMs = T_SLOW)

@@ -294,6 +294,9 @@ object MazeLoop {
         // ★「结算后点中心」是**本局**语义：每局开始先关（2026-10-22 用户：第二局开局选角色被误点）
         labResultSeen = false
         CenterTapGate.reset("新的一局开始")
+        // ★演出加速补丁跟随 agent 会话（写一次持续整个会话）；agent 若重连，重新打一次
+        labSpeedupOk = false
+        labSpeedupTries = 0
         LogFile.init(ctx.applicationContext)
         LogFile.beginRun("maze")
         PlanProbe.startRun(ctx.applicationContext)      // ★观测：一局一个 maze_seq_*.jsonl
@@ -1011,6 +1014,28 @@ object MazeLoop {
             //   战斗中我们本来也"只等、只在结算时点下一步/重新挑战"，所以跳过它语义不变 ✓
             //   （真卡死另有帧看门狗兜着）。
             val inBattleNow = st.optBoolean("inBattle", false)
+            // ★★结算演出加速（cs125，2026-11-22 用户方案）：把迷宫结算的演出时长一次性压到 0.05s
+            //   （②屏滚分/三块逐个显示/关闭按钮等待/宝箱落下——全在 `LabyrinthDefineData` 静态单例，
+            //   客户端视觉参数，写一次持续整个会话，游戏重启恢复默认）。
+            //   ⚠Instance 只在迷宫运行期间非空（出迷宫即 Release）⇒ "未就绪"不算失败、每轮重试，
+            //   每局 newRun 都会重置重打（防资产每局重建补丁丢失）；只有硬错误才计数（5 次放弃）。
+            if (!labSpeedupOk && !inBattleNow) {
+                val sp = runCatching { AgentApi.labSpeedup() }.getOrNull()
+                if (sp?.optBoolean("ok") == true) {
+                    labSpeedupOk = true
+                    val n = sp.optJSONArray("params")?.length() ?: 0
+                    AppState.addLog("… 结算演出加速已生效（$n 项演出时长 → 0.05s）")
+                } else {
+                    val err = sp?.let { jStr(it, "err") } ?: "无回包"
+                    if (!err.startsWith("Instance 未就绪")) {
+                        labSpeedupTries++
+                        if (labSpeedupTries == 5) {
+                            AppState.addLog("[!] 结算演出加速失败（$err）→ 仍用点中心加速")
+                            labSpeedupOk = true
+                        }
+                    }
+                }
+            }
             // ★★「过了结算分数页」→ 打开中心加速（2026-10-22 用户方案）。
             //   ⚠必须放在通用弹窗段**之前**：奖励页第一屏（AnimationViewer）如果要先跑一次
             //   `dialog()`（实测 3~7s）才打开，就白白错过第一屏（11:34 那局正是：先烧 3.2s 才开）。
@@ -1401,12 +1426,11 @@ object MazeLoop {
     /**
      * ★★2026-11-19（用户）：结算页的**最大投递次数**（= 原来 `retries` 的量级）。
      *
-     * 为什么要单独放大：结算按钮目前**有一部分仍是真点击**（普通胜利页的「下一步」直调是"假成功"），
-     * 坐标点击多点只是点空，**必须允许反复点**；而直调在多点的场景会真的重复执行游戏逻辑
-     * （三选一那次连投 8 次 → 205 崩）。两者共用一个 [TapCheck.run].`pressMax` ⇒ 这里按"结算页"单独给。
-     *
-     * ★直调真生效的页面（失败/重新挑战、BOSS·EX 两页）投 1 次就切页，下一拍探测即命中，
-     *   不会真的投满 —— 所以放大不影响它们。等普通胜利页也能直调时，把这里改回 1。
+     * ★2026-11-20（cs122 翻案）：普通胜利页直调**真生效**（旧"假成功"= 读到残留壳非激活实例），
+     *   但这里**不能改回 1** —— 胜利结算有**同壳两页**（WIN → 奖励页，同一 `DialogQuestResultWin` 壳），
+     *   一次 [TapCheck.run] 里要投 **2 次**（第二页不设显式 expect，靠"expect 没命中就再投"推进）
+     *   ⇒ pressMax ≥2 是推进刚需。每次投递前 agent 只认激活按钮，不会重复执行同一颗 onClick；
+     *   正常路径投 2 次即出壳，直调失败由 pressFn 内部退坐标兜底。
      */
     private const val RESULT_PRESS_MAX = 12
 
@@ -1613,6 +1637,12 @@ object MazeLoop {
     /** ★是否**已经走过迷宫结算页**（`DialogLabyrinthResult`）—— 只有它之后的 `DialogCommonBig`
      *  才允许"读不到按钮就点屏幕中央"这个定向兜底（2026-10-17 用户要求，只此一页） */
     private var labResultSeen = false
+
+    /** ★★结算演出加速（cs125，2026-11-22）：`LabyrinthDefineData` 单例演出时长已压到 0.05s。
+     *  补丁写进 agent 会话内存、持续有效；每局 newRun 重置重打（防资产每局重建补丁丢失）。
+     *  [labSpeedupTries] 只计**硬错误**（"Instance 未就绪"不算，5 次硬错误放弃、退回点中心）。 */
+    private var labSpeedupOk = false
+    private var labSpeedupTries = 0
 
     /** ★本局是否已经打过"结算奖励"日志（只打一次；结算页/奖励页谁先读到算谁） */
     private var rewardsLogged = false
@@ -7712,13 +7742,14 @@ object MazeLoop {
                     //   某一拍读不到（过渡态 offscreen）就这拍不点、下一拍再取，不会用过期坐标硬点。
                     pressFn = { battleResultPressOrTap(input, wantWin = true, what = "下一步（失败页）") },
                     pressMax = RESULT_PRESS_MAX,
-                    directFast = false,   // ★结算页 pressFn 内部会退坐标（胜利页假成功），保留慢节奏防 lmkd 连点事故
+                    directFast = false,   // ★结算页 pressFn 直调失败会退坐标，保留慢节奏防 lmkd 连点事故
                     from = RESULT_FROM,
                     probe = 8,
                     retries = 25,
-                    // ★阶段 1 只等"离开结算页"；**后面那个单按钮小弹窗由下一段专门点掉**
-                    //   （它有自己的判据，塞进这里会把两件事混成一件）。
-                    expect = emptySet(),
+                    // ★★2026-11-20（用户定口径）：**两级 expect 的第一级** —— 失败页 except **小窗**
+                    //   （星辉吐息改判的「遗物效果结果」/收到角色·道具收据，都是 `DialogCommonSmall`）；
+                    //   第二级（小窗 except 三选一）在 [dismissFailNextReceipt] 里走。
+                    expect = setOf(PAGE_SMALL),
                 )
                 if (left) {
                     // ★★2026-11-19（用户）：第三条路比另两条多一份**单按钮小弹窗**
@@ -7756,7 +7787,7 @@ object MazeLoop {
                         input, fail.optInt("x"), fail.optInt("y"), "重新挑战（回编队页）",
                         pressFn = { battleResultPressOrTap(input, wantWin = false, what = "重新挑战") },
                         pressMax = RESULT_PRESS_MAX,
-                        directFast = false,   // ★结算页 pressFn 内部会退坐标（胜利页假成功），保留慢节奏防 lmkd 连点事故
+                        directFast = false,   // ★结算页 pressFn 直调失败会退坐标，保留慢节奏防 lmkd 连点事故
                         from = RESULT_FROM,
                         retries = 12,
                         expect = setOf(PAGE_QUEST_DETAIL),
@@ -7787,44 +7818,40 @@ object MazeLoop {
     }
 
     /**
-     * ★★2026-11-19（用户）：**"失败-下一步"独有的那份单按钮小弹窗**（`DialogCommonSmall` + `OneButtonWhite`）。
+     * ★★2026-11-20（用户定口径）：**"失败-下一步"两级 expect 的第二级** —— 小窗（`DialogCommonSmall` +
+     * `OneButtonWhite`，星辉吐息改判的「遗物效果结果」/收到角色·道具的收据）→ expect **三选一**。
      *
-     * 时序：结算页「下一步」→ 小弹窗（收到角色/道具）→ 三选一（`DialogLabyrinthSelection`）。
-     * 这一步主动点掉小弹窗：
-     *   · 点击判据用 **[tapBoxButton]** —— "框开始消失 / 换成别的框"（和商店到账框同一套），
-     *     而不是"等某个页面出现"（这一下本来就没有目标页）；
-     *   · 点完再等**三选一**出现，让这条链闭环（等不到也不卡，主循环认得 Selection）。
-     *
-     * 只在"失败页显示【下一步】"这条很少见的路上走，成本可接受。
+     * 时序（2026-11-20 探测实测）：结算页「下一步」直调 → 「遗物效果结果」小窗 → 直调「关闭」
+     * → `DialogLabyrinthSelection` 三选一。上一级 [tapAndCheck] 的 expect 已是 `PAGE_SMALL`，
+     * 进来时小窗多半已在；也可能根本没弹、直接就到三选一（那样这里直接返回）。
      */
     private suspend fun dismissFailNextReceipt(input: InputBackend) {
-        // ① 等小弹窗出现（也可能根本没弹、直接就到三选一）
+        // ① 确认小窗在场（没弹窗、已到三选一 ⇒ 直接返回）
         val t0 = SystemClock.elapsedRealtime()
+        var small = false
         while (SystemClock.elapsedRealtime() - t0 < 3_000L) {
             val top = runCatching { AgentApi.labTop() }.getOrNull().orEmpty()
-            if (top.contains("DialogLabyrinthSelection")) return   // 没弹窗，已经到三选一
-            val b = dlgBoxNow()
-            val bTop = b?.optString("top").orEmpty()
-            if (bTop.startsWith("DialogCommon")) {
-                // 点掉小弹窗（判据=框开始消失）；具体点位由 tapBoxButton 打一条「点了 …」
-                tapBoxButton(
-                    input,
-                    listOf("OneButtonWhite", "OneButtonBlue", "TwoButtonRight", "ThreeButtonCenter"),
-                    "收到",
-                    logPrefix = "失败页-下一步",
-                    pathKey = "SelectConfirm|OneButtonWhite",   // ★2026-11-19：同款 Middle/Small 单白按钮
-                )
-                break
-            }
+            if (top.startsWith(PAGE_LAB_SELECTION)) return   // 没弹窗，已经到三选一
+            if (top.startsWith(PAGE_SMALL)) { small = true; break }
             delay(150)
         }
-        // ② 等三选一出现（最多 6s）：到了就闭环；等不到交给主循环（它认得 DialogLabyrinthSelection）
-        val t1 = SystemClock.elapsedRealtime()
-        while (SystemClock.elapsedRealtime() - t1 < 6_000L) {
-            val top = runCatching { AgentApi.labTop() }.getOrNull().orEmpty()
-            if (top.contains("DialogLabyrinthSelection")) return
-            delay(150)
-        }
+        if (!small) return
+        // ② 小窗直调「关闭」→ expect **三选一**（两级 expect 的第二级）。
+        //    ★直调只投一次（收据类弹窗重复点无意义）；定位不到（框已在收起）跳拍重试，
+        //      一直不行就交回主循环白名单兜底。
+        tapAndCheck(
+            input, 0, 0, "小窗「关闭」→三选一",
+            pressFn = {
+                val pr = runCatching { AgentApi.pressNode("^OneButtonWhite$", "dialog") }.getOrNull()
+                if (pr != null && pr.optBoolean("ok")) true else null
+            },
+            from = setOf(PAGE_SMALL),
+            expect = setOf(PAGE_LAB_SELECTION),
+            probe = 8,
+            retries = 12,
+            pressMax = 1,
+            directFast = true,      // 纯直调、无点穿风险 ⇒ 加速档
+        )
     }
 
     // ────────────────────────── 结算奖励（LabyrinthTempData）──────────────────────────
@@ -8064,6 +8091,17 @@ object MazeLoop {
             }
             return
         }
+        // ★★★直调优先（cs124，2026-11-20 探测实测）：50801 迷宫结算两屏的按钮——
+        //   ①「下一步」= NextButton → PartsLabyrinthResultItemView.onClickNextButton
+        //   ②「关闭」  = CloseButton → PartsLabyrinthResultScoreView.onClickCloseButton
+        //   agent 已把 `DialogLabyrinthResult` 壳纳入 battleResultPathBtn 扫描（stage=scan、kind=lab，
+        //   label「下一步/关闭」区分屏）。直调 4~16ms、无 input-tap 风险；失败退回下面 ①②③ 字段/树链。
+        runCatching { AgentApi.battleResultPress() }.getOrNull()?.takeIf { it.optBoolean("ok") == true }?.let { pr ->
+            val lab = jStr(pr, "label") ?: "?"
+            tries["$tag|rtaps"] = taps0 + 1
+            AppState.addLog("… 结算页「$lab」（直调 ${jStr(pr, "compCls") ?: "CustomUIButton"}）")
+            return
+        }
         // ★按钮定位：**对象字段为主、节点树兜底**（2026-10-16 修：上一版照搬 PC 第 1 档的
         //   "`on`=子视图激活"却**没做兜底** ⇒ 实测这页 `next`/`close` 的 `on` 都是假 ⇒ 永远点不了，
         //   只能空点中间，最后"点了 6 次仍没离开"。PC 那边 `on` 只是**第 1 档快路径**，
@@ -8286,9 +8324,11 @@ object MazeLoop {
      * ★收益：结算页要连点十几下，坐标点击每次 ~110ms；历史上 1.4s 连点 7 下把系统 input 拖到
      *   无响应、随后 lmkd 杀进程。直调是进程内调用、10ms 级，且不受入场动画/遮挡影响。
      *
-     * ★★**普通战胜利页不能用直调**（cs109 实测）：`DialogQuestResultWin` 的 `NextButton`
-     *   `onClick` 返回 `ok/ex=0x0` 但页面**纹丝不动**（会"看起来点成功、实际卡死在结算页"）。
-     *   失败页（`onExit`）与 BOSS/EX 页（`DialogLabyrinthExResult` 的 NextButton）直调都是真生效的。
+     * ★四类结算页（普通胜/负、BOSS/EX 胜负）直调**全部真生效**。
+     *   普通"胜利页直调无效"是**旧误判**（cs109）：当时从 `DialogQuestResultWin+0x108` 字段槽
+     *   拿按钮，命中的是上一场残留壳的非激活实例；2026-11-20 探测工具实测：按"只认激活层级"
+     *   的扫描链拿到同一方法名（`PartsQuestResultFormer.OnClickNext`）的按钮，直调一次即推进
+     *   （NextButton → NextButtonLarge → 出结算页，viewId 29→264）。
      *
      * @return `true` = 已发出；`null` = 这一刻不该点（页面在切 / 与期望胜负不符）⇒ 跳过重试
      */
@@ -8297,14 +8337,6 @@ object MazeLoop {
         wantWin: Boolean,
         what: String,
     ): Boolean? {
-        // ★普通战胜利页：直接走坐标（直调是"假成功"，白费一次还判不出来）
-        if (wantWin) {
-            val pk = runCatching { AgentApi.resPageKind() }.getOrNull()
-            if (pk == "win") {
-                val xy = battleResultXY(true) ?: return null
-                return tap(input, xy.first, xy.second, what)
-            }
-        }
         val pr = runCatching { AgentApi.battleResultPress() }.getOrNull()
         // ★`pressTwoPhase` 返回轮询后的最终结果（ok/kind/via/err），没有 queued
         if (pr?.optBoolean("ok") == true) {
@@ -8314,7 +8346,10 @@ object MazeLoop {
                 AppState.addLog("$what：直调读到失败页（kind=fail）→ 与期望不符，本轮不点")
                 return null
             }
-            if (!wantWin && kind != "fail") {
+            if (!wantWin && kind != "fail" && kind != "failnext") {
+                // ★failnext（cs123，2026-11-20 公会版实测）：失败壳上的「下一步」=「星辉吐息」遗物
+                //   把败北改判成胜利的确认按钮，onClick 同 onClickNextButton，直调后弹
+                //   「遗物效果结果」通知 → 关闭 → 进胜利流程三选一。按它就对了。
                 AppState.addLog("$what：直调读到胜利页（kind=$kind）→ 与期望不符，本轮不点")
                 return null
             }
@@ -8784,7 +8819,7 @@ object MazeLoop {
                             input, fail.optInt("x"), fail.optInt("y"), "重新挑战（回编队页）",
                             pressFn = { battleResultPressOrTap(input, wantWin = false, what = "重新挑战") },
                             pressMax = RESULT_PRESS_MAX,
-                            directFast = false,   // ★结算页 pressFn 内部会退坐标（胜利页假成功），保留慢节奏防 lmkd 连点事故
+                            directFast = false,   // ★结算页 pressFn 直调失败会退坐标，保留慢节奏防 lmkd 连点事故
                             from = RESULT_FROM,
                                 retries = 12,
                             expect = setOf(PAGE_QUEST_DETAIL),
@@ -9913,6 +9948,15 @@ object MazeLoop {
                 val pr = runCatching { AgentApi.labPathPress(oneKey) }.getOrNull()
                 if (pr?.optBoolean("ok") == true) {
                     AppState.addLog("对话框「OneButtonWhite」（直调 $oneKey）")
+                    return true
+                }
+            } else if (top.removeSuffix("(Clone)") == "DialogCommonSmall") {
+                // ★2026-11-20（探测实测）：Small 壳上的 OneButtonWhite（如公会「遗物效果结果」通知窗）
+                //   没有稳定的 canvas 固定路径 ⇒ 用名字直调（root=dialog 只走激活节点，
+                //   实测 ^OneButtonWhite$ matches=1、Execute ok → 通知关、落三选一）。失败退坐标。
+                val pr = runCatching { AgentApi.pressNode("^OneButtonWhite$", "dialog") }.getOrNull()
+                if (pr?.optBoolean("ok") == true) {
+                    AppState.addLog("对话框「OneButtonWhite」（直调 pressNode@Small）")
                     return true
                 }
             }
