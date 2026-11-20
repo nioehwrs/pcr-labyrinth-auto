@@ -9052,8 +9052,8 @@ object MazeLoop {
         skipFirstHits: Int = 1,
         /** ★★直调执行器（2026-11-19）：给了它就**代替**坐标点击，重试/探针/判据全复用；见 [TapCheck.run] */
         pressFn: (suspend () -> Boolean?)? = null,
-        /** ★直调最多真投几次（★2026-11-20 用户放开到 4 做实验：直调无点穿风险，日志打出实际轮数再收敛；原 1 是 205 事故后的保守值） */
-        pressMax: Int = 4,
+        /** ★直调最多真投几次（默认 1，不可放开：2026-11-20 放开到 4 实测复现 205，见 [TapCheck.run]） */
+        pressMax: Int = 1,
         /** ★直调是否走加速档；结算页（pressFn 内部退坐标）传 false 保留慢节奏，见 [TapCheck.run] */
         directFast: Boolean = true,
     ): Boolean = TapCheck.run(
