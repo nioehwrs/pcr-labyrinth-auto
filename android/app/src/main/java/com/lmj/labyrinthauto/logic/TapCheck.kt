@@ -113,21 +113,36 @@ object TapCheck {
          */
         pressFn: (suspend () -> Boolean?)? = null,
         /**
-         * ★★**直调最多真正投递几次**（默认 1）。
+         * ★★**直调最多真正投递几次**。
          *
-         * 2026-11-19 实测事故：三选一的卡片动画慢（约 1s），探针在动画期间判"没到达"⇒ 按 [retries]
-         * 连着直调了 8 次。而**直调是真执行 `onClick`**，不像坐标点击"点在动画里=点空"——
-         * 游戏真的收到 8 次"选中"，直接状态错乱（错误码 205 回标题）。
+         * 2026-11-19 曾因三选一卡片动画慢（约 1s）连投 8 次 ⇒ 游戏收到 8 次「选中」、错误码 205 回标题，
+         * 当时把它限成 1（只投一次、之后只探测）。
          *
-         * ⇒ 直调只投一次，之后**只探测不再投**（把 [retries] 当成纯探测窗口用）。
+         * ★2026-11-20（用户）重估：点穿/点错是**坐标点击**的锅（点击时页面可能已不是检测时的页面）。
+         *   直调走 `LAB_PATHS` 结构链、调的是按钮 `onClick` 本身，两层页面同位置的按钮路径不同 ⇒
+         *   无点穿风险；`ok=true` 只代表 onClick 投递成功，重复投的后果至多是重复执行同一动作。
+         *   故放开到 4 做实验：**用日志打出每处实际投了几轮**（`⤷ … 直调N次`），跑一天看真实需求再收敛。
+         *   若某页因此错乱，给那个调用点显式传 `pressMax=1` 即可单独回退。
          */
-        pressMax: Int = 1,
+        pressMax: Int = 4,
+        /** ★直调是否走加速档（默认 true）。少数**直调内部会退回坐标点击**的页（结算页：普通战胜利
+         *   按钮是假成功）必须传 false 保留慢节奏——否则 settle 30ms + probe 密会重现 2026-11-13 的
+         *   「1.4s 连点 7 下 → lmkd 杀进程」。纯直调页（选人/编组/EX/商店/门票）无需管。 */
+        directFast: Boolean = true,
         verbose: Boolean = true,
     ): Boolean {
+        // ══ 2026-11-20 直调加速档（用户：直调无点穿风险，坐标时代的等待对它是纯浪费）══
+        //   · skipFirstHits（首点前只读一拍等坐标落位）、effSettle（首探前等页面稳定）、
+        //     probeMs×2（EX 防"点穿到动画中按钮"）——这些都是坐标点击的护栏，直调一概不需要。
+        //   · 阶段2 expect/arrived（等游戏切页）、pressMax（防重复 onClick）保留。
+        val isDirect = pressFn != null
+        val fast = isDirect && directFast
+        val effProbeMs = if (fast) currentProbeMs() else probeMs   // 直调忽略调用点的 ×2（EX），回到基础挡位
+        val effSkipFirstHits = if (fast) 0 else skipFirstHits
+        val effSkipDelayMs = if (fast) 30L else skipDelayMs   // 直调跳拍留 30ms 窗口（0 会让 6 次跳拍几毫秒跑完）
         // ── 阶段 1：反复点，直到**离开 from**（证明这一下生效了）──
-        // ★settleMs 未显式给（0）⇒ 统一取 probeMs（2026-11-17 用户：sl 只是"点完后多久开始确认"，
-        //   不该拖慢首探；治"第一下点早"是 skipFirstHits/skipDelayMs 的事，不是 settleMs）
-        val effSettle = if (settleMs > 0L) settleMs else probeMs
+        // ★settleMs 未显式给（0）⇒ 取 probeMs（直调压到 30ms 让首探尽快返回）。
+        val effSettle = if (settleMs > 0L) settleMs else if (fast) 30L else probeMs
         var attempt = 0
         var skip = 0                        // "这一刻不该点"的次数（不消耗 retries，但要有上限防死循环）
         var firstSkip = 0                   // 首点前已经跳过的拍数
@@ -139,11 +154,11 @@ object TapCheck {
             // ★2026-11-12（用户）：新页刚出现时按钮还在入场动画（RectTransform 未落位）⇒
             //   首次点击前先**只读不点**跳几拍，下一拍 `xyAt` 会重新取落位后的坐标再点。
             //   不做长固定延迟；跳拍不消耗 retries，但计入 skip 上限防死循环。
-            if (attempt == 0 && firstSkip < skipFirstHits) {
+            if (attempt == 0 && firstSkip < effSkipFirstHits) {
                 firstSkip++
                 skip++
                 if (skip > skipMax) return false
-                delay(skipDelayMs)
+                delay(effSkipDelayMs)
                 continue
             }
             // 坐标：给了 xyAt 就**每次点击前现取**（切页动画期间坐标在动 ⇒ 旧坐标会点空）。
@@ -159,7 +174,7 @@ object TapCheck {
                     if (fired == null) {
                         skip++
                         if (skip > skipMax) return false
-                        delay(skipDelayMs)
+                        delay(effSkipDelayMs)
                         continue
                     }
                     attempt++
@@ -186,7 +201,7 @@ object TapCheck {
             // ── 点完**探**一下"页面变没变" ──
             var probed = 0
             while (probed < maxProbe) {
-                delay(if (probed == 0) effSettle else probeMs)
+                delay(if (probed == 0) effSettle else effProbeMs)
                 probed++
                 val hit: Boolean
                 if (probeState != null) {
@@ -208,9 +223,10 @@ object TapCheck {
                 if (hit) {
                     left = true
                     if (verbose) {
+                        val fireTag = if (isDirect) "，直调 $directFired 轮" else ""
                         AppState.addLog(
                             "⤷ [${from.joinToString("/")}] --$what--> [$nowTop] " +
-                                "（第 $attempt 次点击，探 $probed 次已离开）",
+                                "（第 $attempt 次点击${fireTag}，探 $probed 次已离开）",
                         )
                     }
                     break
@@ -220,9 +236,10 @@ object TapCheck {
                 if ("@battle" in from && runCatching { AgentApi.labInBattle() }.getOrDefault(false)) {
                     left = true
                     if (verbose) {
+                        val fireTag = if (isDirect) "，直调 $directFired 轮" else ""
                         AppState.addLog(
                             "⤷ [${from.joinToString("/")}] --$what--> [已进入战斗] " +
-                                "（第 $attempt 次点击，探 $probed 次）",
+                                "（第 $attempt 次点击${fireTag}，探 $probed 次）",
                         )
                     }
                     break

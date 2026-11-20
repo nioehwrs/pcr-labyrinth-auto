@@ -7487,6 +7487,7 @@ object MazeLoop {
                     //   某一拍读不到（过渡态 offscreen）就这拍不点、下一拍再取，不会用过期坐标硬点。
                     pressFn = { battleResultPressOrTap(input, wantWin = true, what = "下一步（失败页）") },
                     pressMax = RESULT_PRESS_MAX,
+                    directFast = false,   // ★结算页 pressFn 内部会退坐标（胜利页假成功），保留慢节奏防 lmkd 连点事故
                     from = RESULT_FROM,
                     probe = 8,
                     retries = 25,
@@ -7530,6 +7531,7 @@ object MazeLoop {
                         input, fail.optInt("x"), fail.optInt("y"), "重新挑战（回编队页）",
                         pressFn = { battleResultPressOrTap(input, wantWin = false, what = "重新挑战") },
                         pressMax = RESULT_PRESS_MAX,
+                        directFast = false,   // ★结算页 pressFn 内部会退坐标（胜利页假成功），保留慢节奏防 lmkd 连点事故
                         from = RESULT_FROM,
                         retries = 12,
                         expect = setOf(PAGE_QUEST_DETAIL),
@@ -7549,6 +7551,7 @@ object MazeLoop {
             input, fail.optInt("x"), fail.optInt("y"), "重新挑战",
             pressFn = { battleResultPressOrTap(input, wantWin = false, what = "重新挑战") },
             pressMax = RESULT_PRESS_MAX,
+            directFast = false,   // ★结算页 pressFn 内部会退坐标，保留慢节奏防 lmkd 连点事故
             from = RESULT_FROM,
             // ★settle 用默认 1×probeMs；连点由 probe=8（≈1.2s 窗口）兜住
             probe = 8,
@@ -8556,6 +8559,7 @@ object MazeLoop {
                             input, fail.optInt("x"), fail.optInt("y"), "重新挑战（回编队页）",
                             pressFn = { battleResultPressOrTap(input, wantWin = false, what = "重新挑战") },
                             pressMax = RESULT_PRESS_MAX,
+                            directFast = false,   // ★结算页 pressFn 内部会退坐标（胜利页假成功），保留慢节奏防 lmkd 连点事故
                             from = RESULT_FROM,
                                 retries = 12,
                             expect = setOf(PAGE_QUEST_DETAIL),
@@ -8580,6 +8584,7 @@ object MazeLoop {
                 input, fail.optInt("x"), fail.optInt("y"), "重新挑战",
                 pressFn = { battleResultPressOrTap(input, wantWin = false, what = "重新挑战") },
                 pressMax = RESULT_PRESS_MAX,
+                directFast = false,   // ★结算页 pressFn 内部会退坐标，保留慢节奏防 lmkd 连点事故
                 from = RESULT_FROM,
                 // ★settle 用默认 1×probeMs；连点由 probe=8（≈1.2s 窗口）兜住
                 probe = 8,
@@ -8615,6 +8620,7 @@ object MazeLoop {
                 //     节点 (1109,652) ⇒ 点空/抓不到。这里换成固定路径现读，见 [battleResultXY]。
                 pressFn = { battleResultPressOrTap(input, wantWin = true, what = "下一步") },
                 pressMax = RESULT_PRESS_MAX,
+                directFast = false,   // ★结算页「下一步」pressFn 内部退坐标，保留 400ms 慢节奏防 lmkd 连点事故
                 from = RESULT_FROM,
                 // ★2026-11-13（用户："走了几个节点之后闪退"）：200ms → **400ms**。
                 //   日志 00:38:58~59 在 1.4s 内连点 7 次「下一步」（每次都是 root `input tap`），
@@ -9046,8 +9052,10 @@ object MazeLoop {
         skipFirstHits: Int = 1,
         /** ★★直调执行器（2026-11-19）：给了它就**代替**坐标点击，重试/探针/判据全复用；见 [TapCheck.run] */
         pressFn: (suspend () -> Boolean?)? = null,
-        /** ★直调最多真投几次（默认 1：直调多点会真的重复执行游戏逻辑，2026-11-19 三选一 205 事故） */
-        pressMax: Int = 1,
+        /** ★直调最多真投几次（★2026-11-20 用户放开到 4 做实验：直调无点穿风险，日志打出实际轮数再收敛；原 1 是 205 事故后的保守值） */
+        pressMax: Int = 4,
+        /** ★直调是否走加速档；结算页（pressFn 内部退坐标）传 false 保留慢节奏，见 [TapCheck.run] */
+        directFast: Boolean = true,
     ): Boolean = TapCheck.run(
         // ★markTrans=false：本函数自己在命中时已打 `⤷`，别再让主循环重复打一条 `⟳`
         tapFn = { tx, ty, tw -> tap(input, tx, ty, tw, markTrans = false) },
@@ -9063,6 +9071,7 @@ object MazeLoop {
         skipFirstHits = skipFirstHits,
         pressFn = pressFn,
         pressMax = pressMax,
+        directFast = directFast,
         verbose = TRANS_VERBOSE,
     )
 
