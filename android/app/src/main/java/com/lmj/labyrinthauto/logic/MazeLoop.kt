@@ -984,7 +984,13 @@ object MazeLoop {
                 // ★★2026-11-20（205 事故）：**商店页也算 own page**。它有自己的 handler（handleShop），
                 //   原来漏了 ⇒ 每轮都跑通用弹窗扫描 ⇒ 把商店里的 `OneButtonBlue` 当弹窗点了
                 //   （实测：进店 0.4s 后又点一次 ⇒ 重复进店 ⇒ 205 回标题）。
-                PAGE_SHOP in top
+                PAGE_SHOP in top ||
+                // ★★2026-11-20（用户："初始角色一个个点 / 选角后等很久"）：**开局选角色页**同样漏了。
+                //   它的 pageTop 是 `DialogCommonFullSize`（跟 EX 页同壳，不能按名字认），只能按状态认：
+                //   statusType==1 的三种脸里，扣掉"战后选人"(Selection) 和"失败页"(QuestFailed) 剩下的
+                //   就是**初始编成页**。不排除 ⇒ 每轮白烧 `dialog()`575ms + `findTextIn`575ms ≈1.15s，
+                //   3 个角色被拆成 2s 才点完（实测 15:56:23.4→25.5）。
+                (stt == 1 && PAGE_LAB_SELECTION !in top && PAGE_QUEST_FAILED !in top)
             // ★own page 上只有"**真的弹窗壳**压上来"才查通用弹窗（2026-10-17 用户："弹窗检查在编队页
             //   1.5~1.9s，这个是必要的还是多余的？"——**答：多余**）：编队/选人/预览/失败页本身就是
             //   一个对话框，`dialog()` 走一遍 DialogArea 子树实测 1.5~1.9s（别处才 500ms），
@@ -2356,17 +2362,33 @@ object MazeLoop {
      * 之后不同公会不一样（拉比林斯有额外奖励框、有的直接进地图）⇒ 这里只做「见到 Dialog 就点掉」，
      * **连续 4 拍没有对话框**就收手，把后续交给主循环按页面状态决定。
      */
+    /** ★2026-11-20：连续几拍"没有对话框"就收手（3 拍 ×120ms ≈ 360ms，够框退场） */
+    private const val SUMMON_RECEIPT_IDLE = 3
+
     private suspend fun drainSummonReceipts(input: InputBackend) {
         val keys = listOf("OneButtonWhite", "OneButtonBlue", "TwoButtonRight", "ThreeButtonCenter")
         val t0 = SystemClock.elapsedRealtime()
         var idle = 0
         var taps = 0
         while (SystemClock.elapsedRealtime() - t0 < 8_000L && taps < 6) {
+            // ★★2026-11-20（用户："选角后等待时间有点长"）：先用**轻读** `labTop()`（几 ms）看还有没有对话框；
+            //   没有就直接算一拍收手。原来每拍都调 `dlgBoxNow()`（`labDlgBox` 实测 500ms+）⇒
+            //   "等框消失"这一件事就白烧 4×600ms ≈ 2.4s（实测 15:56:25.9→30.0 才回到地图）。
+            val topQuick = runCatching { AgentApi.labTop() }.getOrNull().orEmpty()
+            if (topQuick.isEmpty() || !topQuick.startsWith("Dialog")) {
+                idle++
+                if (idle >= SUMMON_RECEIPT_IDLE) {
+                    AppState.addLog("选角后：收到角色框已处理完（$taps 个）→ 交回主循环")
+                    return
+                }
+                delay(120)
+                continue
+            }
             val b = dlgBoxNow()
             val top = b?.optString("top").orEmpty()
             if (b == null || !top.startsWith("Dialog")) {
                 idle++
-                if (idle >= 4) {
+                if (idle >= SUMMON_RECEIPT_IDLE) {
                     AppState.addLog("选角后：收到角色框已处理完（$taps 个）→ 交回主循环")
                     return
                 }
