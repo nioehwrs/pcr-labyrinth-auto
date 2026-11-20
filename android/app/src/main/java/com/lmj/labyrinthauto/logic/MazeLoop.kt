@@ -2343,6 +2343,20 @@ object MazeLoop {
      */
     private const val EVENT_DIALOG_AFTER_N = 3
 
+    /**
+     * ★★2026-11-20（用户）：事件页**直调**的"只投一次"窗口。
+     *   直调是真 onClick（`EventDelegate.Execute`），同一次选择重复投 = 游戏真的收到多次选中 ⇒
+     *   状态错乱（三选一 205 事故同源）。所以同一张卡/同一个跳过按钮在 [EVENT_PRESS_HOLD_MS] 内
+     *   只投一次，之后只等页面自己变。
+     */
+    private const val EVENT_PRESS_HOLD_MS = 2_500L
+    /** 已直调过的选项卡钥匙 `ev|eventId|第N项` */
+    private var evPressKey: String? = null
+    private var evPressAt = 0L
+    /** 已直调过的"演出跳过"钥匙 */
+    private var evSkipKey: String? = null
+    private var evSkipAt = 0L
+
 
     /**
      * 事件选择页（EVENT_CHOICE=4）：按 eventId 选第 N 张选项卡（PC `handle_event_choice` 1088）。
@@ -2535,6 +2549,33 @@ object MazeLoop {
         val chosen = btns[(want - 1).coerceIn(0, btns.size - 1)]
         val cx = chosen.optInt("x")
         val cy = chosen.optInt("y")
+        // ★★2026-11-20（用户）：**直调优先** —— 按卡片 `selectButton(+0x80)` 指针触发 onClick，不投坐标。
+        //   好处：不看卡片"从屏下滑入"的坐标抖动、也不会误选空槽（3 槽 2 卡那种）。
+        //   ★只投一次：直调是真 onClick，重复投会重复提交选择（205 同源）⇒ 已投过就只等页面变。
+        val pk = "ev|${eid ?: 0}|$want"
+        if (evPressKey == pk && SystemClock.elapsedRealtime() - evPressAt < EVENT_PRESS_HOLD_MS) {
+            return
+        }
+        val pr = runCatching { AgentApi.labEventPress(want - 1) }.getOrNull()
+        if (pr?.optBoolean("ok") == true) {
+            evPressKey = pk
+            evPressAt = SystemClock.elapsedRealtime()
+            AppState.addLog("事件选项卡#$want（直调；eventId=${pr.opt("eventId")}）")
+            return
+        }
+        // 卡片还在屏外（滑入动画中）⇒ 这一轮不点，等下一轮重读（不退回坐标硬点）
+        if (pr?.optBoolean("offscreen") == true) {
+            if (n <= 2) {
+                AppState.addLog("… 事件选项卡#$want 还在屏外（${pr.optString("err")}）→ 等下一轮重读")
+            }
+            return
+        }
+        // 直调不可用（旧版 agent / 找不到实例）⇒ 退回原来的坐标点击
+        if (pr != null) {
+            AppState.addLog(
+                "事件选项卡#$want：直调失败（${pr.optString("err").ifEmpty { "无回包" }}）→ 退回坐标点击",
+            )
+        }
         // ★★2026-11-08（实测 16:27:12 / 16:35:04）：卡片是从屏幕下方**滑入**的，某些帧 `btnY` 还是
         //   `1193`（> 屏高 1080）⇒ 交给 [tap] 会被它的屏外闸门拒掉，还打一条误导性的
         //   `[!] … 读取/换算出错了？`。这里**先自己判**：这一轮不点，下一轮重读（下一轮通常就是 893）。
@@ -2952,6 +2993,20 @@ object MazeLoop {
         eventRuleCheck()
         // ★事件结果观测（2026-11-03）：演出页停留很短，第一轮就把 eventResultId 读一次（只读不点，见 [observeEventResult]）
         if (n == 1) observeEventResult(st)
+        // ★★2026-11-20（用户）：跳过改**直调** —— `DialogLabyrinthEvent.dramaSkipButton(+0x160)` 字段直取。
+        //   旧的文本搜索会命中屏幕正中的容器节点（实测连点 4 次 (640,360) 才打到真按钮 (1168,55)），
+        //   又慢又准不了。★只投一次（直调是真 onClick）。
+        val sk = "evskip|$tag"
+        if (evSkipKey == sk && SystemClock.elapsedRealtime() - evSkipAt < EVENT_PRESS_HOLD_MS) return
+        val skPr = runCatching { AgentApi.labEventSkip() }.getOrNull()
+        if (skPr?.optBoolean("ok") == true) {
+            evSkipKey = sk
+            evSkipAt = SystemClock.elapsedRealtime()
+            AppState.addLog("事件演出：跳过（直调）")
+            return
+        }
+        if (skPr?.optBoolean("offscreen") == true) return    // 跳过按钮还没上屏 ⇒ 等下一轮
+        // 直调不可用（旧版 agent / 演出已结束）⇒ 退回原来的文本搜索 + 坐标点击
         // ★根顺序（2026-10-17 四次改）：`dialog`（DialogArea 子树）→ `layer`（DialogArea 的父层）。
         //   去掉 `view`（2026-10-17 实机 13:28:25：一次 **2156ms** ✗）：演出页的 `view` 根 = 整张地图页，
         //   而「跳过」按钮在对话框里（实测命中 (1752,82)）⇒ 这个根又贵又没必要。
@@ -4576,7 +4631,16 @@ object MazeLoop {
             // ★**不串链**：只在 left=true 时触发 —— left 来自上面 tapAndCheck 的阶段 2，
             //   战后选人的 expect = selExpect(kind) = DialogCommonMiddle ⇒ 已经**等到** Middle 出现。
             if (left && kind != "门票") {
-                closeMiddleRewardDialog(input, "战后选人：关闭收到角色(Middle)")
+                // ★★2026-11-20（用户）：**事件节点的战斗**（魔物竞技场等）收尾要多一层 ——
+                //   选完角色后不是直接回地图，而是还有【获得道具-金币】弹窗
+                //   （事件效果 = 进入战斗 + 获得 xx 金币）。
+                //   判断依据：当前节点类型 = EVENT(5)，与面板 mapInfo.BlockType 同源（`labStatusLite.panelType`）。
+                val isEventBattle = (st.opt("panelType") as? Number)?.toInt() == 5
+                if (isEventBattle) {
+                    closeEventBattleRewardChain(input)
+                } else {
+                    closeMiddleRewardDialog(input, "战后选人：关闭收到角色(Middle)")
+                }
             }
             // ★★"一次都没点出去"要说出来（2026-11-08 事故：取不到坐标 ⇒ 静默空转 20 秒，
             //   日志里只有一屏幕 `⏸ 3 选 1`，完全看不出为什么）。节流：本轮第一次 + 每 10 次。
@@ -9411,6 +9475,66 @@ object MazeLoop {
             AppState.addLog("[!] $what 未确认 → 交给主循环通用弹窗兜底")
         }
         return ok
+    }
+
+    /**
+     * ★★2026-11-20（用户）：**事件节点战斗**（魔物竞技场等）的奖励收尾链 —— 比普通战后多一层。
+     * ```
+     * 普通战：Selection(选角色) → Middle(收到角色) → 地图
+     * 事件战：Selection(选角色) → Middle(收到角色) → Big(获得道具-金币) → 地图
+     * ```
+     * 原因：事件效果是"进入战斗并获得 xx 金币" ⇒ 角色弹窗之后还有一次「获得道具」。
+     * 判断依据由调用方给：当前节点 `panelType == 5`（EVENT）。
+     *
+     * 直调优先（`SelectConfirm|OneButtonWhite` / `ResultBig|OneButtonWhite`），失败退坐标；
+     * 任一步没确认到就打日志交回主循环的通用弹窗兜底（不猜、不硬点）。
+     */
+    private suspend fun closeEventBattleRewardChain(input: InputBackend) {
+        // ① Middle(收到角色) → 获得道具 Big
+        val midXY = stableDlgConfirmXY("DialogCommonMiddle")
+        if (midXY == null) {
+            AppState.addLog("[!] 事件战：Middle 按钮没落位 → 交给主循环通用弹窗兜底")
+            return
+        }
+        val ok1 = tapAndCheck(
+            input, midXY.first, midXY.second, "事件战：关闭收到角色(Middle)",
+            from = setOf("DialogCommonMiddle"),
+            expect = setOf("DialogCommonBig"),
+            expectTimeoutMs = 4_000L,
+            probe = 5, retries = 3,
+            pressFn = {
+                pathPressOrReady(input, "SelectConfirm|OneButtonWhite", "事件战：关闭收到角色(Middle)") {
+                    dlgReadyToTap("DialogCommonMiddle", midXY)
+                }
+            },
+            probeState = { dlgProbe("DialogCommonMiddle") },
+        )
+        if (!ok1) {
+            AppState.addLog("[!] 事件战：Middle → 获得道具 未确认 → 交给主循环通用弹窗兜底")
+            return
+        }
+        // ② 获得道具 Big → 地图
+        val bigXY = stableDlgConfirmXY("DialogCommonBig")
+        if (bigXY == null) {
+            AppState.addLog("[!] 事件战：获得道具按钮没落位 → 交给主循环通用弹窗兜底")
+            return
+        }
+        val ok2 = tapAndCheck(
+            input, bigXY.first, bigXY.second, "事件战：关闭获得道具(Big)",
+            from = setOf("DialogCommonBig"),
+            expect = setOf(""),
+            expectTimeoutMs = 4_000L,
+            probe = 5, retries = 3,
+            pressFn = {
+                pathPressOrReady(input, "ResultBig|OneButtonWhite", "事件战：关闭获得道具(Big)") {
+                    dlgReadyToTap("DialogCommonBig", bigXY)
+                }
+            },
+            probeState = { dlgProbe("DialogCommonBig") },
+        )
+        if (!ok2) {
+            AppState.addLog("[!] 事件战：获得道具 → 地图 未确认 → 交给主循环通用弹窗兜底")
+        }
     }
 
     /**

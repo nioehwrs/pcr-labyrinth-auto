@@ -300,6 +300,21 @@ object AgentApi {
     suspend fun labNodes(): JSONArray? = arr("labNodes", timeoutMs = T_SLOW)
     suspend fun labMap(): JSONObject? = obj("labMap", timeoutMs = T_SLOW)
     suspend fun labEvent(): JSONObject? = obj("labEvent", timeoutMs = T_SLOW)
+
+    /**
+     * ★★2026-11-20：**事件选项卡直调**（第 i 张卡，0 起）。
+     *
+     * 按 `PartsSelectionEventInfo+0x80`（selectButton）指针直接触发 onClick，不投坐标 ⇒
+     * 不受卡片"从屏下滑入"的动画影响、也不会误点空槽（3 槽只有 2 卡那种）。
+     *
+     * @return `{ok, i, eventId, x, y, offscreen, err}`；`offscreen=true` = 卡片还在屏外（**这一拍不该点**）。
+     */
+    suspend fun labEventPress(i: Int, probe: Boolean = false, timeoutMs: Long = 4_000L): JSONObject? =
+        pressTwoPhase("labEventPress", listOf(i, probe), timeoutMs)
+
+    /** ★★2026-11-20：**事件演出「跳过」直调**（`DialogLabyrinthEvent.dramaSkipButton+0x160` 字段直取）。 */
+    suspend fun labEventSkip(probe: Boolean = false, timeoutMs: Long = 4_000L): JSONObject? =
+        pressTwoPhase("labEventSkip", listOf(probe), timeoutMs)
     /** 选取页（选角色/印记）。[force]=true 绕过 agent 的 1s 读缓存（滑入动画期间重读用） */
     suspend fun labSelection(force: Boolean = false): JSONObject? =
         obj("labSelection", listOf(force), timeoutMs = T_SLOW)
