@@ -1710,7 +1710,6 @@ object MazeLoop {
      * TwoButtonRight）每一下都是真实"确认"，会真的提交一次移动 ⇒ 连点会让游戏连着弹两次。
      * 与奖励弹窗（可以多点救场）不同，这一颗按 [MOVE_CONFIRM_ONCE_MS] 只投一次。
      */
-    private var dlgMoveSig: String? = null
     private var dlgMoveAt = 0L
     private const val MOVE_CONFIRM_ONCE_MS = 2_500L
     /** ★2026-11-20：地图动画（换区/移动）提示的节流时间戳 */
@@ -5346,8 +5345,10 @@ object MazeLoop {
                         }.getOrNull()
                         if (pr?.optBoolean("ok") == true) {
                             directFired = true                 // 直调投递成功 → 后面只探不投
+                            dlgMoveAt = SystemClock.elapsedRealtime()   // ★同步给通用弹窗的限流窗口
                         } else if (!coordTapped) {
                             coordTapped = true
+                            dlgMoveAt = SystemClock.elapsedRealtime()   // ★同上
                             AppState.addLog(
                                 "确认框：直调失败（${pr?.optString("err").orEmpty().ifEmpty { "无回包" }}）→ 退回坐标点击一次",
                             )
@@ -10066,11 +10067,17 @@ object MazeLoop {
         //   每一下 TwoButtonRight 都是一次真实"确认"⇒ 真的提交一次移动；连点会让游戏排队弹两次。
         //   （奖励弹窗仍允许连点救场，所以只对 CommonSmall + TwoButtonRight 单独限流。）
         val shellNow = top.removeSuffix("(Clone)")
-        if (shellNow == "DialogCommonSmall" && hit.optString("name") == "TwoButtonRight") {
-            val mvSig = "mv|$tag"
-            if (mvSig == dlgMoveSig && now - dlgMoveAt < MOVE_CONFIRM_ONCE_MS) return true
-            dlgMoveSig = mvSig
-            dlgMoveAt = now
+        // ★★2026-11-20（205 事故·第二次确认）：`DialogCommonSmall` 是「是否前往」专用壳，
+        //   点过 `TwoButtonRight` 之后**这个壳上任何按钮都不再点**。
+        //   实测（session_162251 16:24）：11.481 直调 `MoveConfirm|TwoButtonRight`（前往）→
+        //   12.430 Small 还在退场、按钮树里 TwoButtonRight 已消失、**只剩一颗 `OneButtonBlue`** ⇒
+        //   白名单接着点它 ⇒ 同一节点第二次提交移动 ⇒ 13.7 进 Splash/205。
+        if (shellNow == "DialogCommonSmall") {
+            // ⚠不能用 tag 做 key：移动请求提交后 `CurrentBlockId` 立刻从 10201 变成 10301，
+            //   而画面上盖的还是"10201→10301"那个确认框 ⇒ tag 一变，按 tag 的限流就失效了。
+            //   ⇒ 纯时间窗：2.5s 内点过「前往」，这个壳上的任何按钮都不再点。
+            if (now - dlgMoveAt < MOVE_CONFIRM_ONCE_MS) return true
+            if (hit.optString("name") == "TwoButtonRight") dlgMoveAt = now
         }
         // ★★2026-11-20（用户："钓鱼结束收获用的还是 tap"）：结果/收获类单按钮弹窗**先直调**。
         //   `DialogCommonBig`(获得印记/道具/遗物) 和 `DialogCommonMiddle`(收到角色) 的 OneButtonWhite
