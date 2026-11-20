@@ -264,8 +264,9 @@ object MazeLoop {
     /** 刷新确认后，等"货架签名真的变了"的上限 */
     private const val SHOP_ANIM_REFRESH_MS = 2_500L
 
-    /** 关闭确认后，等"离开商店页"的上限 */
-    private const val SHOP_ANIM_CLOSE_BOX_MS = 2_000L
+    /** 关闭确认后，等"离开商店页"的上限
+     *  ★2026-11-20：2000→800。正常靠"商店开始收起"就返回；这里只是兜底上限（超时就交主循环读状态）。 */
+    private const val SHOP_ANIM_CLOSE_BOX_MS = 800L
 
     /**
      * 动画链探针间隔（`labDlgBox` ~5~8ms）。
@@ -4212,11 +4213,18 @@ object MazeLoop {
         ) return false
         val t0 = SystemClock.elapsedRealtime()
         while (SystemClock.elapsedRealtime() - t0 < SHOP_ANIM_CLOSE_BOX_MS) {
+            // ★★2026-11-20（用户："关商店到回地图之间为什么 2s"）：**商店一出退场 tween 就算离开**。
+            //   原来只认"一个 Dialog 都没有"，而退场期间 dlgBox 一直能看到 Dialog ⇒ 白等满
+            //   [SHOP_ANIM_CLOSE_BOX_MS]=2s 上限才返回（实测 44.518→46.700 正好 2.18s）。
+            val cl = runCatching { AgentApi.labDlgClosing() }.getOrNull()
+            val clTop = cl?.optString("top").orEmpty()
+            if (cl != null && cl.optBoolean("closing") && clTop.contains(PAGE_SHOP)) {
+                AppState.addLog("商店：关闭确认 → 商店对话框开始收起 → 视为已离开（${SystemClock.elapsedRealtime() - t0}ms）")
+                return true
+            }
             val b = dlgBoxNow()
             if (b == null) { delay(SHOP_ANIM_POLL_MS); continue }
             val top = b.optString("top")
-            // ★实测：关闭确认框还在 out tween 时 top 已是 `DialogCommonSmall`（不是商店）⇒
-            //   旧判据立刻返回"已离开"，下一轮又读到商店。要等**一个 Dialog 都没有**（地图/View）。
             if (!top.startsWith("Dialog")) {
                 AppState.addLog("商店：关闭确认 → 已离开商店页（${top.ifEmpty { "无顶框" }}）")
                 return true
