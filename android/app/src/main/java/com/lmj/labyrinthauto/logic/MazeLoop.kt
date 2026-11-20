@@ -1186,9 +1186,15 @@ object MazeLoop {
     /** ★卡死自愈：杀掉后等"游戏回到前台 + agent 回连"的上限 */
     private const val STUCK_BACK_MS = 90_000L
 
-    /** PC `MAZE_NODE_TAP_GAP`(5418) / `MAZE_NODE_TAP_BACKOFF`(5419)：同一地图节点的点击间隔（1s 起、逐步退避到 3s） */
-    private const val NODE_TAP_GAP_MS = 1_000L
-    private const val NODE_TAP_BACKOFF_MS = 3_000L
+    /**
+     * ★2026-11-20（用户）：同一地图节点的**重试间隔**。原为 1s 起、逐步退避到 3s
+     *   （2026-10-13 用户："防走图时无意义点击"）。但换区动画期间头几下点击会被游戏吞掉
+     *   （直调返回 ok、不弹确认框），3s 退避让"换区首节点"固定卡 ~6s（实测点 3 下、间隔 2s/3s）。
+     *   用户口径："多点当手段，别拿等待换准确"、并明确"每 150ms 重点一次试试"
+     *   ⇒ 降到 150ms 起、450ms 封顶。正常节点点一下就切页，用不到这个间隔 ⇒ 无副作用。
+     */
+    private const val NODE_TAP_GAP_MS = 150L
+    private const val NODE_TAP_BACKOFF_MS = 450L
 
     /**
      * ★2026-11-10（用户方案）：点地图节点后「抓出现 + 抓消失」两步确认。
@@ -3474,7 +3480,16 @@ object MazeLoop {
             val vi = shopSlotIndex(gi, items.size, slots.size)   // → 屏上槽位数组下标（滚动后按底部对齐）
             val visOK = vi != null && vi < slots.size && slots[vi].optBoolean("vis", false)
             val tgtTag = "${tgt.opt("rewardId")}@${tgt.opt("price")}"
-            if (!visOK) {
+            // ★2026-11-20（用户）：4 层 3×3 商店最后一行被 UIPanel 裁掉 ⇒ vis=false，
+            //   但购买按钮 active、y 仍在屏内 ⇒ 按 (page,idx) 结构定位的直调 pickup 照样能点
+            //   （实测 r1c0 y=604 > 裁剪 bottom=579 直调成功）。所以不可见时**先 probe 直调路径**：
+            //   命中 ⇒ 跳过上滑、直接走结构直调（不上滑这条路）；不命中 ⇒ 才退回原上滑兜底。
+            val buyPage = (tgt.opt("page") as? Number)?.toInt() ?: (gi / ShopPlan.SHOP_GROUP_SIZE)
+            val buyIdx = (tgt.opt("idx") as? Number)?.toInt() ?: (gi % ShopPlan.SHOP_GROUP_SIZE)
+            val buyKey = "ShopBuy|Buy${buyPage}_${buyIdx}"
+            val directOK = !visOK && (runCatching { AgentApi.labPathPress(buyKey, probe = true) }
+                .getOrNull()?.optBoolean("ok") == true)
+            if (!visOK && !directOK) {
                 // PC：目标在「可视窗口上方」(gi < 商品数-屏上槽数) 时下拉只会越跑越远 → 停手
                 if (vi == null && slots.size < items.size && gi < items.size - slots.size) {
                     if (n <= 2 || n % 20 == 0) AppState.addLog("[!] 商店目标（全局槽#$gi）在可视窗口上方 → 不该下拉，停手（留人工）")
@@ -3493,7 +3508,9 @@ object MazeLoop {
                 input.swipe(x, y1, x, y2, SHOP_DRAG_MS)
                 return
             }
-            // 可见 → 直接点（目标可见后计数复位）
+            // 可见 / 直调 probe 命中 → 直接点（目标可点后计数复位）
+            //   ★directOK 时 vi 仍在（4 层 slots=items，vi=gi），s 的坐标仅作直调失败兜底用。
+            if (directOK) AppState.addLog("商店：目标#$gi（$buyKey）被裁剪但直调 probe 命中 → 不上滑，直接直调")
             shopDragCount = 0; shopDragTarget = null
             val idx = vi ?: return
             val s = slots[idx]
@@ -3531,9 +3548,8 @@ object MazeLoop {
                 expectReceipts = true,
                 isMark = isMark,
                 // ★2026-11-19：走 `LAB_PATHS` 的 `ShopBuy|Buy{page}_{idx}`（按结构定位，不靠坐标/滚动）
-                pathKey = "ShopBuy|Buy" +
-                    ((tgt.opt("page") as? Number)?.toInt() ?: (gi / ShopPlan.SHOP_GROUP_SIZE)) + "_" +
-                    ((tgt.opt("idx") as? Number)?.toInt() ?: (gi % ShopPlan.SHOP_GROUP_SIZE)),
+                //   ★2026-11-20：复用上面 probe 用的同一个 buyKey（含 4 层 page=2 的 Buy2_x）
+                pathKey = buyKey,
                 confirmPathKey = "ShopBuyConfirm|TwoButtonRight",   // ★2026-11-20：购买确认框（Middle 两按钮）
             )
             if (ok) {
@@ -4332,10 +4348,18 @@ object MazeLoop {
         val dx = chosen.optInt("decideX")
         val dy = chosen.optInt("decideY")
         val onScreen = dx in 0 until scrW && dy in 0 until scrH
+        // ★2026-11-20（用户）：结果页弹出即网络已完成，这段没有演出——DecideButton 是 prefab 自带节点，
+        //   对话框一弹出它就存在，(dx,dy) 只是 transform 还在做滑入动画。
+        //   ⇒ 能直调时（SelectRole/SelectTicket 走 UI 树结构链、不看坐标）跳过"等坐标落位"这道闸门，
+        //     直接进 tapAndCheck 让 pressFn 直调；只有坐标点击兜底路径才需要等屏内（否则点空、白烧次数）。
+        val canDirect = CharaPick.AUTO && !viaTree
+        if (!onScreen && canDirect && n == 1) {
+            AppState.addLog("… $kind 页「决定」坐标 ($dx,$dy) 在屏外，但有直调 → 不等落位，直接投")
+        }
         // ★坐标在屏外：卡片/按钮常带"从屏外滑入"的动画，某时刻读到还在屏外。
         //   处理策略 = **先别点、也别标记已选**，等下一轮重读（动画停稳坐标就回屏内）；
         //   停太久（本例 8 轮 ≈ 1~2s）才退化为节点树找「选择」按钮兜底。
-        if (!onScreen) {
+        if (!onScreen && !canDirect) {
             if (n == 1) {
                 AppState.addLog("[!] $kind 页「决定」坐标 ($dx,$dy) 在屏外（大概在滑动动画中）→ 等下一轮重读")
             }
@@ -4733,7 +4757,8 @@ object MazeLoop {
      *
      *   ① 优先按**预计算路线**走：取路线里"当前节点的下一站"（这就是"局内按路线前进"）；
      *   ② 不可点/没路线 → [Route.pickNode] 兜底（按类型优先级），并标 `（偏离路线）`；
-     *   ③ 同一节点 [NODE_TAP_GAP_MS] 内不重复点，间隔按 **1→2→3s 退避**（用户 2026-10-13：防"走图时无意义的点击"）；
+     *   ③ 同一节点 [NODE_TAP_GAP_MS] 内不重复点，间隔按 **150→300→450ms 退避**（2026-11-20 用户改；
+     *      原 1→2→3s 是为了防无意义点击，但换区动画吞点击时退避太长 ⇒ 首节点卡 6s）；
      *   ④ 目标在屏外 → **横向拖动地图**把它拉进视野（最多 [DRAG_LIMIT] 次；时长越长=抬手越慢≈削弱惯性）。
      *
      * @return true = 本轮点了或拖了（有效动作）；false = 什么也没找到（调用方据此加 `idle`）
