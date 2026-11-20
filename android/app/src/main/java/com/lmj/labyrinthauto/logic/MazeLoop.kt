@@ -743,6 +743,7 @@ object MazeLoop {
                 if (nullReads == 1 || nullReads % 10 == 0) {
                     AppState.addLog("[!] 分派读为空（不在迷宫/换区途中/读取失败），等待…（第 $nullReads 次）")
                 }
+                logMapSignals(null)      // ★诊断：读空时也打（换区窗口正是这段）
                 // ★2026-11-03：读不到时**顺手看一眼视图**。掉回标题/登录页或主界面说明客户端掉线/被重启了
                 //   （上次就在这里静默等了 16 分钟，日志只有"等待…（第 460 次）"）。
                 //   ★用户 2026-11-03："重启了也没事，登录页随便点一下，再按正常流程进迷宫就行" ⇒
@@ -1732,6 +1733,36 @@ object MazeLoop {
      * ⇒ 关掉闸门，恢复"用确认框/页面状态判断"的原行为；将来要实测换区时序再打开（只认 areaSlide）。
      */
     private const val MOVE_BUSY_GATE = false
+
+    /**
+     * ★★2026-11-20（用户）：**地图信号诊断开关** —— 跑一局观察换区时到底哪个字段在变。
+     * 每 250ms 打一行 `[信号] …`。确认完把这里改 false 重编译即可停（不影响逻辑）。
+     */
+    private const val MAP_SIGNAL_LOG = true
+    private var mapSignalAt = 0L
+
+    /**
+     * 打一行地图现场信号（含 `inAnimation` = 换区过渡动画真实播放标志）。
+     * 只读、几 ms；读不到就跳过（不刷屏）。
+     */
+    private suspend fun logMapSignals(st: JSONObject?) {
+        if (!MAP_SIGNAL_LOG) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - mapSignalAt < 250L) return
+        mapSignalAt = now
+        val b = runCatching { AgentApi.labMapBusy() }.getOrNull() ?: return
+        if (!b.optBoolean("ok")) return
+        fun bit(k: String): Int = if (b.optBoolean(k)) 1 else 0
+        fun any(k: String): String = if (b.isNull(k)) "?" else b.opt(k).toString()
+        AppState.addLog(
+            "[信号] a=${st?.opt("area") ?: "-"} b=${st?.opt("blockId") ?: "-"} " +
+                "st=${st?.opt("statusType") ?: "-"} " +
+                "| IE unitMove=${bit("unitMove")} areaSlide=${bit("areaSlide")} finish=${bit("finish")} " +
+                "| inAnim=${any("inAnimation")} viewMode=${bit("isMapViewMode")} " +
+                "notFired=${bit("moveEventNotFired")} forceClear=${bit("isForcePlayPanelClearAnimation")} " +
+                "| active partsMap=${any("partsMapActive")} phase=${any("phaseActive")} anim=${any("animActive")}",
+        )
+    }
 
     /**
      * ★★2026-11-20（用户："你有能力读到换区动画吗？"）：**能**，但**不能只看"非空"**。
@@ -5067,6 +5098,7 @@ object MazeLoop {
             return true
         }
         moveBlockedTop = ""
+        logMapSignals(st)                                  // ★诊断：回地图后每 250ms 打一行信号
         // ★★2026-11-20（用户）：**换区滑场 / 角色移动动画在跑 ⇒ 现在点节点只会被吞**（还会排多个确认框）。
         //   直接读 `ViewLabyrinthMap` 的协程句柄（`labMapBusy`，几 ms）⇒ 动画期间这一轮不点。
         if (moveBusyNow()) {
