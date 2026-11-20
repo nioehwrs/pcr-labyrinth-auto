@@ -6139,6 +6139,17 @@ object MazeLoop {
                         if (pidx1 > 0 && needBackup) return PARTY_STEP_AGAIN
                         return PARTY_STEP_DONE
                     } else {
+                        // ★2026-11-20 诊断：EX 提前收工后到「战斗开始」这段到底花在哪
+                        //   （只在收工后 5s 内打，平时不产生日志）。
+                        val _exAt = exeqSess().earlyExitAt
+                        val _postEx = _exAt > 0 && System.currentTimeMillis() - _exAt < 5_000L
+                        if (_postEx) {
+                            AppState.addLog(
+                                "… [EX后] 战斗开始前距收工 ${System.currentTimeMillis() - _exAt}ms" +
+                                    "｜本轮已用 ${SystemClock.elapsedRealtime() - _tParty}ms" +
+                                    "（读页 ${_readMs}｜遗物 ${_relMs}｜持有池 ${_ctxMs}｜算队伍 ${_planMs}）",
+                            )
+                        }
                         // ★普通战：「战斗开始」的终点是**战斗中**（顶框为空）——离开编组页即算生效
                         // ★★2026-11-08 改成**探针制**（原来是 settleMs=800 固定等一次）：
                         //   · 原来"点完死等 800ms 再读一次"——切走了也得等满；而 2026-11-07 实测
@@ -6165,10 +6176,15 @@ object MazeLoop {
                             //   （`DialogCommonPartyEdit+0x110`）。⚠不能直接调 `onClickDecide`（实测 NPE）。
                             //   直调整个失败时 partyBtnOrTap 内部会退回坐标点击。
                             pressFn = {
-                                partyBtnOrTap(
+                                val _tPB = SystemClock.elapsedRealtime()
+                                val _r = partyBtnOrTap(
                                     input, "decide",
                                     dec.optInt("x"), dec.optInt("y"), "战斗开始",
                                 )
+                                if (_postEx) {
+                                    AppState.addLog("… [EX后] 战斗开始直调耗时 ${SystemClock.elapsedRealtime() - _tPB}ms")
+                                }
+                                _r
                             },
                         )
                         return PARTY_STEP_EXITED
