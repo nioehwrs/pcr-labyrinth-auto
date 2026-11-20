@@ -5134,50 +5134,60 @@ object MazeLoop {
             val bt = (t.opt("blockType") as? Number)?.toInt()
             val what = "前进到节点$nk[${Route.LAB_BLOCK_TYPE[bt] ?: Py.str(bt)}]$rt"
             OverlayStatus.setState("前往节点$nk")      // ★悬浮窗（细于 overlayTick 的默认描述）
-            // ★★2026-11-20（用户方案）：**两级直调、各投一次、用 expect 串起来**，全程无时间窗。
-            //   理想流程（以 20201 → 20301 战斗为例）：
-            //     ① 直调节点 `onClickPanel`  ⇒ expect = **离开地图**（顶框非空 / 已进战斗）
-            //     ② 若弹「是否前往」确认窗   ⇒ 直调【确认】   ⇒ expect = **离开确认窗**（进目标页/战斗）
+            // ★★2026-11-20（用户方案）：**两级直调、各投一次、两级 expect 都精确指定**，全程无时间窗：
+            //   ① 直调节点 `onClickPanel`  ⇒ expect = **「是否前往」确认框**（DialogCommonSmall）
+            //   ② 直调【确认】            ⇒ expect = **该节点类型的首个页面**
+            //        普通/困难/Boss → DialogQuestDetail（战斗预览）
+            //        门票/遗物      → DialogLabyrinthSelection
+            //        事件           → DialogLabyrinthEvent
+            //        商店           → DialogLabyrinthShop
             //   两级各自 `pressMax=1`（固定只投一次），靠状态推进，主流程不会在中间介入重投同一个节点。
-            AppState.addLog("[移动] 投递 目标=$nk（出发=$curB）")
+            val targetPages: Set<String> = when (bt) {
+                2, 3, 8 -> setOf("DialogQuestDetail")            // NORMAL / HARD / BOSS → 战斗预览
+                4, 6 -> setOf("DialogLabyrinthSelection")        // TICKET / RELIC → 选择页
+                5 -> setOf("DialogLabyrinthEvent")               // EVENT → 事件页
+                7 -> setOf("DialogLabyrinthShop")                // SHOP → 商店页
+                else -> emptySet()
+            }
+            AppState.addLog(
+                "[移动] 投递 目标=$nk（出发=$curB，期望页面=" +
+                    (if (targetPages.isEmpty()) "任意" else targetPages.joinToString("/")) + "）",
+            )
             nodeSaidAt[nk] = now                                         // 同一节点 30s 内只"重点"一次（PC 6425）
             val nkx = t.optInt("x")
             val nky = t.optInt("y")
-            // ① 点节点：直调优先（失败才退坐标），expect = 离开地图
-            val leftMap = tapAndCheck(
+            // ① 点节点：直调优先（失败才退坐标），**expect = 确认框**
+            val gotConfirm = tapAndCheck(
                 input, nkx, nky, what,
                 from = setOf(""),
+                expect = setOf("DialogCommonSmall"),
                 expectTimeoutMs = 2_500L,
                 retries = 3, probe = 2,
                 pressFn = { AgentApi.pressPanel(nk)?.optBoolean("ok") == true },
                 pressMax = 1,
-                probeState = {
-                    val tp = runCatching { AgentApi.labTop() }.getOrNull().orEmpty()
-                    val bt2 = runCatching { AgentApi.labInBattle() }.getOrDefault(false)
-                    TapCheck.Probe(
-                        top = tp,
-                        left = tp.isNotEmpty() || bt2,
-                        diag = "top=" + (if (tp.isEmpty()) "空" else tp) + " battle=" + bt2,
-                    )
+                // 兜底：个别节点不弹确认框、点了直接进页面/战斗（此时阶段1 也算到达）
+                arrived = suspend@{ tp: String ->
+                    targetPages.any { tp.contains(it) } ||
+                        runCatching { AgentApi.labInBattle() }.getOrDefault(false)
                 },
             )
-            // ② 若第一级等来的是「是否前往」确认窗 ⇒ 直调确认，expect = 离开它
-            if (leftMap) {
+            // ② 确认框出现 ⇒ 直调【确认】，**expect = 该节点的首个页面**
+            if (gotConfirm) {
                 val topNow = runCatching { AgentApi.labTop() }.getOrNull().orEmpty()
                 if (topNow.startsWith("DialogCommonSmall")) {
                     tapAndCheck(
                         input, nkx, nky, "确认前往$nk",
                         from = setOf("DialogCommonSmall"),
+                        expect = targetPages,
                         expectTimeoutMs = 4_000L,
                         retries = 2, probe = 3,
                         pressFn = {
                             AgentApi.labPathPress("MoveConfirm|TwoButtonRight")?.optBoolean("ok") == true
                         },
                         pressMax = 1,
-                        // 到达判据：离开 Small（任何非空且非 Small 的页面）或已进战斗
-                        arrived = suspend@{ top: String ->
-                            (top.isNotEmpty() && !top.startsWith("DialogCommonSmall")) ||
-                                runCatching { AgentApi.labInBattle() }.getOrDefault(false)
+                        // 兜底：确认后直接进战斗（没有预览页）
+                        arrived = suspend@{ _: String ->
+                            runCatching { AgentApi.labInBattle() }.getOrDefault(false)
                         },
                     )
                 }
