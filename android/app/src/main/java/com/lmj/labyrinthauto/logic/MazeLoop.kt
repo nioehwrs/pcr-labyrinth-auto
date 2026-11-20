@@ -1149,6 +1149,34 @@ object MazeLoop {
                 if (stillPopup) {
                     acted = tapDialogUnknown(input, tag, tries, topNow)
                 } else {
+                    // ★★2026-11-20（用户）：顶框空 **≠** 已回地图 —— 事件收尾/奖励结算时，收益要在
+                    //   地图页结算，中间有一段"空窗期"（无 top）但事件还在继续 ⇒ 只看 statusType==0
+                    //   会误判"已回地图"、提前去点下一个节点。
+                    //   真正判据：地图上**至少有一个「可前往」节点**（`PartsLabyrinthPanel.panelState==4`，亮着）。
+                    val ready = runCatching { AgentApi.labMoveReady() }.getOrNull()
+                    val canMove = if (ready?.optBoolean("ok") == true) {
+                        ready.optInt("selectable", 0) > 0
+                    } else {
+                        true      // 读不到地图视图/面板 ⇒ 不拦（保持原行为）
+                    }
+                    if (!canMove) {
+                        val nowR = SystemClock.elapsedRealtime()
+                        if (moveReadySince == 0L) {
+                            moveReadySince = nowR
+                            AppState.addLog("… 顶框已空但地图上还没有可前往节点（事件/奖励结算中）→ 等")
+                        } else if (nowR - moveReadySince <= MOVE_READY_WAIT_MAX_MS) {
+                            // 仍在结算：不点、不结算、也不当成"无事可做"（别让 idle 涨上去）
+                            delay(POLL_MS)
+                            continue
+                        } else {
+                            AppState.addLog(
+                                "[!] 等 ${(nowR - moveReadySince) / 1000}s 仍无可前往节点 → 按原逻辑继续（避免卡死）",
+                            )
+                            moveReadySince = 0L
+                        }
+                    } else {
+                        moveReadySince = 0L
+                    }
                     // ★回到地图 ⇒ 结算上一个事件的效果差（只在确实不在战斗时；见 [settleEventDiff]）
                     if (evSnapId != null && !st.optBoolean("inBattle", false)) settleEventDiff(null, "回地图")
                     // ★逻辑模式（2026-11-18）：节点结束时统一 fire 一次（在此之后才考虑撤退/移动）
@@ -2630,6 +2658,15 @@ object MazeLoop {
      *   照 1112 的算法会得出"印记数=0"的错数。
      */
     private const val FIXED_PARTNER_EVENT = 1112
+
+    /**
+     * ★★2026-11-20（用户）：判"真的回到地图"——`statusType==0 && top==""` 不够，
+     *   事件收尾时收益在地图页结算，中间有"空窗期"（无 top）但事件仍在继续。
+     *   真判据 = 地图上至少有一个**可前往**节点（`PartsLabyrinthPanel.panelState==4`）。
+     *   这里记录"开始等可前往节点"的时刻（0 = 没在等）；超 [MOVE_READY_WAIT_MAX_MS] 就放行防卡死。
+     */
+    private var moveReadySince = 0L
+    private const val MOVE_READY_WAIT_MAX_MS = 10_000L
 
     private var evSnapId: Int? = null
     private var evSnapUnits = -1
@@ -9509,63 +9546,59 @@ object MazeLoop {
     }
 
     /**
-     * ★★2026-11-20（用户）：**事件节点战斗**（魔物竞技场等）的奖励收尾链 —— 比普通战后多一层。
-     * ```
-     * 普通战：Selection(选角色) → Middle(收到角色) → 地图
-     * 事件战：Selection(选角色) → Middle(收到角色) → Big(获得道具-金币) → 地图
-     * ```
-     * 原因：事件效果是"进入战斗并获得 xx 金币" ⇒ 角色弹窗之后还有一次「获得道具」。
-     * 判断依据由调用方给：当前节点 `panelType == 5`（EVENT）。
+     * ★★2026-11-20（用户）：**不预设顺序**地把奖励弹窗点完 —— 事件战用它，普通战不用。
      *
-     * 直调优先（`SelectConfirm|OneButtonWhite` / `ResultBig|OneButtonWhite`），失败退坐标；
-     * 任一步没确认到就打日志交回主循环的通用弹窗兜底（不猜、不硬点）。
+     * 为什么不能写死链条：事件收尾连弹的 `DialogCommon*` **个数和顺序都因事件而异**
+     * （有时 Middle→Big，有时只有一个，有时还夹 Small）。写死 `Middle→Big` 会：
+     * 没有 Big 的事件白等 4s 超时；顺序相反的则直接断链。
+     *
+     * ⇒ 改成"**按当前顶框逐层点掉**"：
+     * ```
+     * 循环（最多 maxRounds 层）：
+     *   top = labTop()
+     *   top 为空          → 返回（收尾完成；真正的"回地图"判据在主循环：有可前往节点）
+     *   Big / Middle      → 直调对应 OneButtonWhite（失败退坐标），等这一层开始消失
+     *   其它壳（Small 等）→ 立刻返回，交给主循环（不猜）
+     * ```
      */
-    private suspend fun closeEventBattleRewardChain(input: InputBackend) {
-        // ① Middle(收到角色) → 获得道具 Big
-        val midXY = stableDlgConfirmXY("DialogCommonMiddle")
-        if (midXY == null) {
-            AppState.addLog("[!] 事件战：Middle 按钮没落位 → 交给主循环通用弹窗兜底")
-            return
-        }
-        val ok1 = tapAndCheck(
-            input, midXY.first, midXY.second, "事件战：关闭收到角色(Middle)",
-            from = setOf("DialogCommonMiddle"),
-            expect = setOf("DialogCommonBig"),
-            expectTimeoutMs = 4_000L,
-            probe = 5, retries = 3,
-            pressFn = {
-                pathPressOrReady(input, "SelectConfirm|OneButtonWhite", "事件战：关闭收到角色(Middle)") {
-                    dlgReadyToTap("DialogCommonMiddle", midXY)
+    private suspend fun closeEventBattleRewardChain(input: InputBackend, maxRounds: Int = 4) {
+        repeat(maxRounds) { i ->
+            val top = runCatching { AgentApi.labTop() }.getOrNull() ?: return
+            if (top.isEmpty()) return                                  // 顶框空 = 收尾完成
+            val shell = top.removeSuffix("(Clone)")
+            val key = when (shell) {
+                "DialogCommonBig" -> "ResultBig|OneButtonWhite"
+                "DialogCommonMiddle" -> "SelectConfirm|OneButtonWhite"
+                else -> {
+                    if (i == 0) AppState.addLog("事件战：顶框是 $shell（不在奖励弹窗白名单）→ 交回主循环")
+                    return
                 }
-            },
-            probeState = { dlgProbe("DialogCommonMiddle") },
-        )
-        if (!ok1) {
-            AppState.addLog("[!] 事件战：Middle → 获得道具 未确认 → 交给主循环通用弹窗兜底")
-            return
+            }
+            // 已经在收起 ⇒ 让主循环等它走完，别再点
+            if (dlgProbe(shell).left) return
+            val xy = stableDlgConfirmXY(shell)
+            if (xy == null) {
+                AppState.addLog("事件战：$shell 按钮没落位 → 交回主循环")
+                return
+            }
+            val ok = tapAndCheck(
+                input, xy.first, xy.second, "事件战：关闭 $shell",
+                from = setOf(shell),
+                expect = emptySet(),        // 不关心下一层是谁，离开这一层就算过
+                probe = 5, retries = 3,
+                pressFn = {
+                    pathPressOrReady(input, key, "事件战：关闭 $shell") {
+                        dlgReadyToTap(shell, xy)
+                    }
+                },
+                probeState = { dlgProbe(shell) },
+            )
+            if (!ok) {
+                AppState.addLog("事件战：$shell 没关掉 → 交回主循环")
+                return
+            }
         }
-        // ② 获得道具 Big → 地图
-        val bigXY = stableDlgConfirmXY("DialogCommonBig")
-        if (bigXY == null) {
-            AppState.addLog("[!] 事件战：获得道具按钮没落位 → 交给主循环通用弹窗兜底")
-            return
-        }
-        val ok2 = tapAndCheck(
-            input, bigXY.first, bigXY.second, "事件战：关闭获得道具(Big)",
-            from = setOf("DialogCommonBig"),
-            expect = setOf(""),
-            expectTimeoutMs = 4_000L,
-            probe = 5, retries = 3,
-            pressFn = {
-                pathPressOrReady(input, "ResultBig|OneButtonWhite", "事件战：关闭获得道具(Big)") {
-                    dlgReadyToTap("DialogCommonBig", bigXY)
-                }
-            },
-            probeState = { dlgProbe("DialogCommonBig") },
-        )
-        if (!ok2) {
-            AppState.addLog("[!] 事件战：获得道具 → 地图 未确认 → 交给主循环通用弹窗兜底")
-        }
+        AppState.addLog("事件战：奖励弹窗连点了 $maxRounds 层仍未清空 → 交回主循环")
     }
 
     /**

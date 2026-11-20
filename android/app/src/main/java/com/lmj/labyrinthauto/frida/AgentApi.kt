@@ -299,6 +299,17 @@ object AgentApi {
     /** 地图上所有节点面板：**是数组** `[{blockId,blockType,panelState,x,y}]`（PC `lab_nodes` 1020 同款） */
     suspend fun labNodes(): JSONArray? = arr("labNodes", timeoutMs = T_SLOW)
     suspend fun labMap(): JSONObject? = obj("labMap", timeoutMs = T_SLOW)
+
+    /**
+     * ★★2026-11-20（用户）：**"真的在地图"判据** —— 地图上至少有一个「可前往」面板
+     * （`PartsLabyrinthPanel.panelState(+0x90)==4`，即节点图标"亮"着）。
+     *
+     * 用途：事件收尾/奖励结算时，收益要在地图页结算，中间有段"空窗期"（pageTop 为空）但事件仍在继续。
+     * 只看 `statusType==0 && pageTop==""` 会误判"已回地图" ⇒ 提前点下一个节点。
+     *
+     * @return `{ok, selectable, current, total}`；`ok=false` 表示读不到（调用方应**不拦**）。
+     */
+    suspend fun labMoveReady(): JSONObject? = obj("labMoveReady", timeoutMs = T_FAST)
     suspend fun labEvent(): JSONObject? = obj("labEvent", timeoutMs = T_SLOW)
 
     /**
