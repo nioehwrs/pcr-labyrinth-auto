@@ -4345,26 +4345,14 @@ object MazeLoop {
             return
         }
         val lvlTxt = if (level == 0) "评分" else "L$level"
-        // ★★2026-11-20（205 根因·选卡前闸门）：进门票/选人页时，点节点那颗**导航确认框
-        //   DialogCommonSmall** 可能还在收起（退出 tween 3s，比选卡决策还慢），它盖在 Selection 上 ⇒
-        //   此时直调选卡，selProbe 读到 top=Small 误判"已离开" ⇒ 阶段2 等 Big 超时 ⇒ 重进重复选 ⇒ 205。
-        //   ⇒ 选卡前先看最上层：若是正在收起的 Small，本轮不点、等它退干净（下一轮 top 变回 Selection）。
-        val selTop = runCatching { AgentApi.labSelState() }.getOrNull()
-        if (selTop != null && selTop.optString("top").startsWith("DialogCommonSmall") &&
-            selTop.optBoolean("closing", false)
-        ) {
-            if (n <= 3) AppState.addLog("… $kind 页：导航确认框 DialogCommonSmall 还在收起 → 等它退场再选卡（本轮不点）")
-            if (n <= 15) return                         // 最多等 15 轮（≈20s）；超时放行，交 selNoDecide 处置
-        }
         val dx = chosen.optInt("decideX")
         val dy = chosen.optInt("decideY")
         val onScreen = dx in 0 until scrW && dy in 0 until scrH
-        // ★★2026-11-20（根因修复）：`_pathBtnNow` 已去掉"不在屏内就拒"的坐标护栏（cs112）——
-        //   直调走 EventDelegate.Execute 直接执行 onClick，与屏幕坐标无关，屏外按钮照样能触发。
-        //   所以「坐标在屏外」对直调不再是失败信号，这道闸门只对**坐标点击兜底**（非直调）有意义。
-        //   能直调时跳过；只有坐标路径才等落位（15 轮）→ 再退节点树兜底。
-        val canDirect = CharaPick.AUTO && !viaTree
-        if (!onScreen && !canDirect) {
+        // ★★2026-11-20（实测回退 cs112）：屏幕外卡片（decideY=819 > 屏高720）直调**虽能触发**，
+        //   但会把卡片卡在滑入动画里、后续页面操作不了 ⇒ 补点 ⇒ 205（session_112948 两次复现）。
+        //   ⇒ 无论直调还是坐标点击，屏外一律**先等落位**（本轮 return），不再用 canDirect 跳过。
+        //   agent 侧 cs113 也恢复 `_pathBtnNow` 的"不在屏内就拒"——双保险。
+        if (!onScreen) {
             if (n == 1) {
                 AppState.addLog("[!] $kind 页「决定」坐标 ($dx,$dy) 在屏外（大概在滑动动画中）→ 等下一轮重读")
             }
@@ -9288,21 +9276,14 @@ object MazeLoop {
         val diag = "tw=${r.optString("tw")} proc=${r.optString("proc")}" +
             " selNum=${r.optString("selNum")} listN=${r.optString("listN")}" +
             " remain=${r.optString("remainText")}"
-        // ★★2026-11-20（205 根因）：`top` 取的是**最上层对话框**，`closing` 是**最上层自己**的退出 tween。
-        //   点节点后导航确认框 `DialogCommonSmall` 收起慢、仍盖在 Selection 上时：
-        //   top=CommonSmall、closing=true ⇒ 旧判据 `top != shell || closing` 双重成立 ⇒ 误判"选卡已生效"，
-        //   实际 Big 根本没来 ⇒ 阶段2 空等 2s 超时 ⇒ 重进重复选 ⇒ 205（日志 `选0→[DialogCommonSmall] 探2次已离开`）。
-        //   ⇒ 分三种：① top 就是 shell：只有它自己收起才算生效；② top 是**正在收起的 Small**（导航框退场，
-        //   不是选卡结果）⇒ 不算离开，继续等；③ 真换了页（Big/Middle/空）⇒ 算离开。
-        val closing = r.optBoolean("closing", false)
-        val left = if (top == shell) {
-            closing                                   // Selection 自己开始退场 = 生效
-        } else if (top.startsWith("DialogCommonSmall") && closing) {
-            false                                     // 只是导航确认框在退场，Selection 还活着 ⇒ 不算
-        } else {
-            true                                      // 真换页
-        }
-        return TapCheck.Probe(top = top, left = left, diag = diag)
+        // ★top != shell（换了页）或 Selection 自己开始收起（closing）⇒ 这一下生效。
+        //   （2026-11-20 曾加过"Small 收起不算离开"的三分判据，实测 Small 是 closing=false 停着、
+        //     那套没触发且无效，已回退；205 的真正根因是屏外卡片被过早直调，见上面 !onScreen 闸门。）
+        return TapCheck.Probe(
+            top = top,
+            left = top != shell || r.optBoolean("closing", false),
+            diag = diag,
+        )
     }
 
     private suspend fun closeTicketRewardChain(input: InputBackend) {
