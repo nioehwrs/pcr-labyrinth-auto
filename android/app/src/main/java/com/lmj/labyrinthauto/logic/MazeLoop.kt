@@ -1261,7 +1261,7 @@ object MazeLoop {
     private const val MOVE_CONFIRM_WAIT_MS = 500L
     /** ★★2026-11-20（用户："但应该多试几次"）：没框时再试几轮（500ms/轮）。
      *  每轮末尾读一次 `labMapBusy`：换区/移动动画在跑 ⇒ 点击已生效、直接收工；都没跑 ⇒ 才算被吞。 */
-    private const val MOVE_CONFIRM_NO_PTR_ROUNDS = 3
+    private const val MOVE_CONFIRM_NO_PTR_ROUNDS = 2
     private const val MOVE_CONFIRM_POLL_MS = 60L
     private const val MOVE_CONFIRM_GONE_MS = 450L
     private const val MOVE_NO_DIALOG_SETTLE_MS = 300L
@@ -1722,6 +1722,16 @@ object MazeLoop {
     private const val MOVE_BUSY_MAX_MS = 6_000L
     /** ★2026-11-20：最近一次 busy 由哪些句柄贡献（诊断用） */
     private var lastBusyTag = ""
+    /**
+     * ★★2026-11-20（用户质疑"普通节点为什么也报动画在跑"）：**默认关闭**。
+     *
+     * 实测结论：这些 IEnumerator 句柄"非空"≠"正在跑"。`unitMoveIE` 在角色走完目标后**不会立刻置 null**，
+     * 会持有上次移动的引用直到下次赋值 ⇒ 普通节点回地图（准备下一步）时照样非空
+     * （session_161111：节点 10303 在 area1，根本没有换区，却连报 busy 卡死 28s）。
+     * 换区动画确实只在区尾节点（x0601/x0701）之后发生，但这个信号区分不出来。
+     * ⇒ 关掉闸门，恢复"用确认框/页面状态判断"的原行为；将来要实测换区时序再打开（只认 areaSlide）。
+     */
+    private const val MOVE_BUSY_GATE = false
 
     /**
      * ★★2026-11-20（用户："你有能力读到换区动画吗？"）：**能**，但**不能只看"非空"**。
@@ -1737,9 +1747,10 @@ object MazeLoop {
      *      否则一旦误报就是永久卡死（比"盲点一下"严重得多）。
      */
     private suspend fun moveBusyNow(): Boolean {
+        if (!MOVE_BUSY_GATE) return false                   // 见 [MOVE_BUSY_GATE]：判据不可靠，默认不拦
         val b = runCatching { AgentApi.labMapBusy() }.getOrNull() ?: return false
         if (!b.optBoolean("ok")) return false
-        val busy = b.optBoolean("areaSlide") || b.optBoolean("unitMove")
+        val busy = b.optBoolean("areaSlide")                // 只认换区滑场（unitMove 会残留上次移动的引用）
         if (!busy) {
             moveBusySince = 0L
             moveBusyFalseReport = false
@@ -5236,15 +5247,17 @@ object MazeLoop {
             if (seenAt == 0L) {
                 if (now - roundAt >= MOVE_CONFIRM_WAIT_MS) {            // 这一轮 500ms 没等到框
                     val b = runCatching { AgentApi.labMapBusy() }.getOrNull()
-                    // ★★2026-11-20（用户纠正）：只有 `unitMove`（角色正走向目标）才算"这一下生效了"。
-                    //   `areaSlide` 是**游戏自动换区**（10601 结算完自动滑到 20101），此时还没到新区域、
-                    //   原本就什么都不能操作 ⇒ 不能当成"我们点的那下生效"；`finish` 同理。
-                    if (b?.optBoolean("ok") == true && b.optBoolean("unitMove")) {
-                        if (!busySaid) {
-                            busySaid = true
-                            AppState.addLog("… 没等到「是否前往」，但角色移动动画在跑 → 判定这次点击已生效，不再点节点")
-                        }
-                        return true
+                    // ★2026-11-20（实测回退）：曾用 `unitMove` 非空判"这次点击已生效"——但该句柄
+                    //   移动结束后**不置 null**（残留上次引用）⇒ 会把"没生效"误判成"已生效"、不再重试。
+                    //   现在只把它当诊断，判据仍用"多轮探测 + 确认框出现与否"。
+                    if (!busySaid && b?.optBoolean("ok") == true) {
+                        busySaid = true
+                        val tag = buildString {
+                            if (b.optBoolean("areaSlide")) append("areaSlide ")
+                            if (b.optBoolean("unitMove")) append("unitMove ")
+                            if (b.optBoolean("finish")) append("finish ")
+                        }.trim()
+                        AppState.addLog("… 没等到「是否前往」，此时地图句柄=[$tag]（仅诊断，不影响判定）")
                     }
                     rounds++
                     if (rounds >= MOVE_CONFIRM_NO_PTR_ROUNDS) break
