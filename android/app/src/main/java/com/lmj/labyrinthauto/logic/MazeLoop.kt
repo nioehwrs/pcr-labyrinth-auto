@@ -4345,6 +4345,17 @@ object MazeLoop {
             return
         }
         val lvlTxt = if (level == 0) "评分" else "L$level"
+        // ★★2026-11-20（205 根因·选卡前闸门）：进门票/选人页时，点节点那颗**导航确认框
+        //   DialogCommonSmall** 可能还在收起（退出 tween 3s，比选卡决策还慢），它盖在 Selection 上 ⇒
+        //   此时直调选卡，selProbe 读到 top=Small 误判"已离开" ⇒ 阶段2 等 Big 超时 ⇒ 重进重复选 ⇒ 205。
+        //   ⇒ 选卡前先看最上层：若是正在收起的 Small，本轮不点、等它退干净（下一轮 top 变回 Selection）。
+        val selTop = runCatching { AgentApi.labSelState() }.getOrNull()
+        if (selTop != null && selTop.optString("top").startsWith("DialogCommonSmall") &&
+            selTop.optBoolean("closing", false)
+        ) {
+            if (n <= 3) AppState.addLog("… $kind 页：导航确认框 DialogCommonSmall 还在收起 → 等它退场再选卡（本轮不点）")
+            if (n <= 15) return                         // 最多等 15 轮（≈20s）；超时放行，交 selNoDecide 处置
+        }
         val dx = chosen.optInt("decideX")
         val dy = chosen.optInt("decideY")
         val onScreen = dx in 0 until scrW && dy in 0 until scrH
@@ -9277,11 +9288,21 @@ object MazeLoop {
         val diag = "tw=${r.optString("tw")} proc=${r.optString("proc")}" +
             " selNum=${r.optString("selNum")} listN=${r.optString("listN")}" +
             " remain=${r.optString("remainText")}"
-        return TapCheck.Probe(
-            top = top,
-            left = top != shell || r.optBoolean("closing", false),
-            diag = diag,
-        )
+        // ★★2026-11-20（205 根因）：`top` 取的是**最上层对话框**，`closing` 是**最上层自己**的退出 tween。
+        //   点节点后导航确认框 `DialogCommonSmall` 收起慢、仍盖在 Selection 上时：
+        //   top=CommonSmall、closing=true ⇒ 旧判据 `top != shell || closing` 双重成立 ⇒ 误判"选卡已生效"，
+        //   实际 Big 根本没来 ⇒ 阶段2 空等 2s 超时 ⇒ 重进重复选 ⇒ 205（日志 `选0→[DialogCommonSmall] 探2次已离开`）。
+        //   ⇒ 分三种：① top 就是 shell：只有它自己收起才算生效；② top 是**正在收起的 Small**（导航框退场，
+        //   不是选卡结果）⇒ 不算离开，继续等；③ 真换了页（Big/Middle/空）⇒ 算离开。
+        val closing = r.optBoolean("closing", false)
+        val left = if (top == shell) {
+            closing                                   // Selection 自己开始退场 = 生效
+        } else if (top.startsWith("DialogCommonSmall") && closing) {
+            false                                     // 只是导航确认框在退场，Selection 还活着 ⇒ 不算
+        } else {
+            true                                      // 真换页
+        }
+        return TapCheck.Probe(top = top, left = left, diag = diag)
     }
 
     private suspend fun closeTicketRewardChain(input: InputBackend) {
