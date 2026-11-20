@@ -425,9 +425,6 @@ object MazeLoop {
         labResultDumps = 0                      // 迷宫结算页对象字段抓取（单独预算，每局 ≤2 次）
         saidRelicErr = ""                       // 持有遗物读取异常提示（本局重新报一次）
         resMemDiagKey = null                    // 结算按钮字段读诊断（每局重新抓一次）
-        moveTargetId = -1                       // ★移动投递台账（本局清零）
-        moveTargetFrom = -1
-        moveTargetAt = 0L
         dlgTapSig = null                        // 弹窗点击熔断（本局重新计数）
         dlgTapN = 0
         labResultSig = ""                       // 结算页"落位闸门"（连续两轮同坐标才点）
@@ -1244,9 +1241,9 @@ object MazeLoop {
      *   ⇒ 降到 150ms 起、450ms 封顶。正常节点点一下就切页，用不到这个间隔 ⇒ 无副作用。
      */
     // ★2026-11-20（清理）：原 NODE_TAP_GAP_MS / NODE_TAP_BACKOFF_MS / NODE_TAP_BURST_MAX /
-    //   NODE_TAP_BURST_COOLDOWN_MS 已删除 —— 那是"点几次再等"的频率妥协；
-    //   重复投递的根因是"没有投递台账 + 没有 expect"，现由 moveTargetId 台账（2.5s 同目标只投一次）
-    //   与 awaitLeaveNode（点完等真的离开节点）接管。
+    //   NODE_TAP_BURST_COOLDOWN_MS、以及后来的"移动投递台账（5s 时间窗）"全部删除 ——
+    //   那些都是拿**时间**猜"要不要再点"。现在只用**状态**：
+    //   `inAnimation`（换区动画在跑⇒不投）+ `awaitLeaveNode`（blockId/statusType 变没变）。
 
     /**
      * ★2026-11-10（用户方案）：点地图节点后「抓出现 + 抓消失」两步确认。
@@ -2222,33 +2219,9 @@ object MazeLoop {
     private var curTag: String? = null
 
     // ── 跨轮的"点击节流"记录（PC `_NODE_SAID_AT`，按节点记、**不清**）──
-    //   ★2026-11-20：`nodeTapAt/nodeTapN` 已删（由 moveTargetId 台账取代）。
+    //   ★2026-11-20：`nodeTapAt/nodeTapN` 已删（重复投递改由状态判据接管，见 [handleMove] 文档）。
     private val nodeSaidAt = HashMap<Int, Long>()
 
-    /**
-     * ★★2026-11-20（用户："点过 10301 就不要再点一次"）：**移动投递台账**。
-     *
-     * 原来只有"频率退避"（3 下 + 2s 冷却），那是限速不是去重 ⇒ 同一个目标会被投 2~3 次，
-     * 每次都真的提交一次移动请求 ⇒ 「是否前往」排队/205。
-     *
-     * 现在记"最近一次投递的目标 + 从哪个节点出发"：
-     * · 台账未结清（目标已投递、还没看到生效）⇒ **这一轮不点，只等**（每秒打一条等待日志）；
-     * · 结清条件 = `blockId` 相对出发节点发生变化（移动真的发生了）**或** 超过 [MOVE_PENDING_MS]（这次被吞了，允许重投）。
-     */
-    @Volatile private var moveTargetId = -1        // 最近投递的目标 blockId（-1 = 无）
-    @Volatile private var moveTargetFrom = -1      // 投递时所在的 blockId
-    @Volatile private var moveTargetAt = 0L        // 投递时刻（elapsedRealtime）
-    private var movePendingSaidAt = 0L
-    /**
-     * 投递后多久还没看到节点变化，就判"这次被吞"、允许重投一次。
-     *
-     * ★2026-11-20 实测修正：一次完整流程 = `awaitMoveConfirm`(≤1s) + `awaitLeaveNode`(≤2s) + 主循环 ≈ **3.8s**
-     * （日志 `超时 3834ms / 3797ms`）。原来设 2500ms 比它还短 ⇒ 每轮回来时台账早已过期，
-     * 立刻判"超时结清"并重投，台账退化成限速器（20203 仍被投 3 次）。
-     * ⇒ 提到 5s：覆盖一个完整 expect 周期，expect 失败后还要再等约 1.2s 才允许重投，
-     *    "点过就不再点"才真正成立。换区场景由 `inAnimation` 闸门兜住，不会因此变慢。
-     */
-    private const val MOVE_PENDING_MS = 5_000L
     /** 点完节点（含确认）后，最多等多久"真的离开当前节点" */
     private const val MOVE_EXPECT_MS = 2_000L
 
@@ -5143,8 +5116,8 @@ object MazeLoop {
      *
      *   ① 优先按**预计算路线**走：取路线里"当前节点的下一站"（这就是"局内按路线前进"）；
      *   ② 不可点/没路线 → [Route.pickNode] 兜底（按类型优先级），并标 `（偏离路线）`；
-     *   ③ **移动投递台账**（[moveTargetId]）：目标已投递、节点还没变 ⇒ 本轮不点只等，
-     *      2.5s 超时才判"被吞"允许重投一次（2026-11-20 用户："点过 10301 就不要再点一次"）；
+     *   ③ **换区闸门**（[moveBusyNow]）：`inAnimation == true`（换区过渡动画在跑）⇒ 本轮不投递，
+     *      动画结束（`inAnimation` 读不到/为 false）再点 —— 换区期间点必被吞；
      *   ④ 目标在屏外 → **横向拖动地图**把它拉进视野（最多 [DRAG_LIMIT] 次；时长越长=抬手越慢≈削弱惯性）；
      *   ⑤ 点完（含确认）后用 [awaitLeaveNode] 等"真的离开当前节点"（expect），
      *      避免主循环看到 statusType 仍是 0 就重复决策、重复点同一目标。
@@ -5227,34 +5200,14 @@ object MazeLoop {
             val nk = (t.opt("blockId") as? Number)?.toInt() ?: -1
             val nowE = SystemClock.elapsedRealtime()
             val curB = (st.opt("blockId") as? Number)?.toInt() ?: -1
-            // ★★2026-11-20（用户："点过 10301 就不要再点一次"）：**投递台账优先于任何重试逻辑**。
-            //   目标还没看到生效（节点没变）⇒ 这一轮不点、只等；结清条件见 [moveTargetId]。
-            if (moveTargetId > 0) {
-                val moved = curB != moveTargetFrom          // 节点变了 = 移动真的发生了（到了别处也算生效）
-                if (moved || nowE - moveTargetAt > MOVE_PENDING_MS) {
-                    AppState.addLog(
-                        "[移动] 台账结清：目标 $moveTargetId（" +
-                            (if (moved) "节点已变为 $curB" else "超时 ${nowE - moveTargetAt}ms ⇒ 判这次被吞，允许重投") +
-                            "）",
-                    )
-                    moveTargetId = -1
-                } else {
-                    if (nowE - movePendingSaidAt > 1_000L) {
-                        movePendingSaidAt = nowE
-                        AppState.addLog(
-                            "[移动] 目标 $moveTargetId 已投递 ${nowE - moveTargetAt}ms（出发 $moveTargetFrom）" +
-                                "→ 等待生效，本轮不重复点",
-                        )
-                    }
-                    delay(150)
-                    return true
-                }
-            }
             val now = System.currentTimeMillis()
-            // ★2026-11-20（清理）：原来这里的「3 下 burst + 2s 冷却」「150→450ms 退避」已删除。
-            //   那是**频率妥协**（点几次再等），而重复投递的根因是"没有投递台账/没有 expect"。
-            //   现在由 [moveTargetId] 台账（2.5s 内同一目标只投一次）+ [awaitLeaveNode] expect 接管，
-            //   语义正确且更强，不再需要按节点计数限速。
+            // ★2026-11-20（清理）：这里原来有「3 下 burst + 2s 冷却」「150→450ms 退避」「投递台账 5s」，
+            //   全部删除 —— 都是拿**时间**去猜"要不要再点"。
+            //   现在判据全在下面两处**状态**里：
+            //     · [moveBusyNow]：`inAnimation == true`（换区动画在跑）⇒ 本轮不投；
+            //     · [awaitLeaveNode]：点完等 `blockId/statusType` 变化（expect），没变就是被吞。
+            //   而且 `awaitMoveConfirm`+`awaitLeaveNode` 是**同步阻塞**的，主循环不会在中间插入决策，
+            //   重复投递的间隔天然由它们保证（约 3.8s），不需要额外时间窗。
             val bt = (t.opt("blockType") as? Number)?.toInt()
             val what = "前进到节点$nk[${Route.LAB_BLOCK_TYPE[bt] ?: Py.str(bt)}]$rt"
             OverlayStatus.setState("前往节点$nk")      // ★悬浮窗（细于 overlayTick 的默认描述）
@@ -5274,10 +5227,6 @@ object MazeLoop {
                 AppState.addLog("$what：格子直调失败（$err）→ 退回坐标点击")
                 tap(input, t.optInt("x"), t.optInt("y"), what)
             }
-            // ★★2026-11-20（台账）：记下这次投递 —— 之后每轮先看它，没结清就不许再点同一个目标。
-            moveTargetId = nk
-            moveTargetFrom = curB
-            moveTargetAt = nowE
             AppState.addLog("[移动] 投递 目标=$nk（出发=$curB）")
             nodeSaidAt[nk] = now                                         // 同一节点 30s 内只"重点"一次（PC 6425）
             // ★不再盲等 800ms：先**抓确认框出现**（2~4ms/拍），出现即点确认，再**抓它开始消失**；
