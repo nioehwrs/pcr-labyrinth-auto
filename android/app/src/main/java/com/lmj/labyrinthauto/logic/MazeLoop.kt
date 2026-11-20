@@ -2239,8 +2239,16 @@ object MazeLoop {
     @Volatile private var moveTargetFrom = -1      // 投递时所在的 blockId
     @Volatile private var moveTargetAt = 0L        // 投递时刻（elapsedRealtime）
     private var movePendingSaidAt = 0L
-    /** 投递后多久还没看到节点变化，就判"这次被吞"、允许重投一次 */
-    private const val MOVE_PENDING_MS = 2_500L
+    /**
+     * 投递后多久还没看到节点变化，就判"这次被吞"、允许重投一次。
+     *
+     * ★2026-11-20 实测修正：一次完整流程 = `awaitMoveConfirm`(≤1s) + `awaitLeaveNode`(≤2s) + 主循环 ≈ **3.8s**
+     * （日志 `超时 3834ms / 3797ms`）。原来设 2500ms 比它还短 ⇒ 每轮回来时台账早已过期，
+     * 立刻判"超时结清"并重投，台账退化成限速器（20203 仍被投 3 次）。
+     * ⇒ 提到 5s：覆盖一个完整 expect 周期，expect 失败后还要再等约 1.2s 才允许重投，
+     *    "点过就不再点"才真正成立。换区场景由 `inAnimation` 闸门兜住，不会因此变慢。
+     */
+    private const val MOVE_PENDING_MS = 5_000L
     /** 点完节点（含确认）后，最多等多久"真的离开当前节点" */
     private const val MOVE_EXPECT_MS = 2_000L
 
