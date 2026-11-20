@@ -1689,6 +1689,14 @@ object MazeLoop {
     private var dlgTapSig: String? = null
     private var dlgTapN = 0
     private var dlgTapAt = 0L
+    /**
+     * ★★2026-11-20（用户："前进确认有时会弹两次"）：**移动确认框**（`DialogCommonSmall` 的
+     * TwoButtonRight）每一下都是真实"确认"，会真的提交一次移动 ⇒ 连点会让游戏连着弹两次。
+     * 与奖励弹窗（可以多点救场）不同，这一颗按 [MOVE_CONFIRM_ONCE_MS] 只投一次。
+     */
+    private var dlgMoveSig: String? = null
+    private var dlgMoveAt = 0L
+    private const val MOVE_CONFIRM_ONCE_MS = 2_500L
 
     /** 上次见到的"游戏被杀次数"（[GameProcess.kills]）；一变 ⇒ 说明游戏被重建过，清编队/装备缓存 */
     private var seenKills = 0
@@ -3612,8 +3620,15 @@ object MazeLoop {
             val buyPage = (tgt.opt("page") as? Number)?.toInt() ?: (gi / ShopPlan.SHOP_GROUP_SIZE)
             val buyIdx = (tgt.opt("idx") as? Number)?.toInt() ?: (gi % ShopPlan.SHOP_GROUP_SIZE)
             val buyKey = "ShopBuy|Buy${buyPage}_${buyIdx}"
-            val directOK = !visOK && (runCatching { AgentApi.labPathPress(buyKey, probe = true) }
-                .getOrNull()?.optBoolean("ok") == true)
+            var directErr = ""
+            val directOK = !visOK && run {
+                val pr = runCatching { AgentApi.labPathPress(buyKey, probe = true) }.getOrNull()
+                if (pr?.optBoolean("ok") == true) true
+                else { directErr = pr?.optString("err").orEmpty().ifEmpty { "无回包" }; false }
+            }
+            if (!visOK && !directOK && n <= 2) {
+                AppState.addLog("商店：目标#$gi（$buyKey）直调 probe 未命中（$directErr）→ 退回上滑")
+            }
             if (!visOK && !directOK) {
                 // PC：目标在「可视窗口上方」(gi < 商品数-屏上槽数) 时下拉只会越跑越远 → 停手
                 if (vi == null && slots.size < items.size && gi < items.size - slots.size) {
@@ -4491,9 +4506,6 @@ object MazeLoop {
             } else if (!allCardsOnScreen && n <= 3) {
                 AppState.addLog("… $kind 页：还有卡片没进屏（三张依次出现）→ 等齐再选")
             }
-            if (n == 1) {
-                AppState.addLog("[!] $kind 页「决定」坐标 ($dx,$dy) 在屏外（大概在滑动动画中）→ 等下一轮重读")
-            }
             // ★诊断（2026-11-14）：判断到底是"页面还没落位"还是"读到的数据一直没变"。
             //   每 15 轮打一次 ptr（卡片对象指针）+ 坐标 + 卡片 id：ptr 不变 ⇒ agent 侧返回了旧对象；
             //   ptr 在变但坐标不变 ⇒ 页面本身如此。
@@ -5069,6 +5081,10 @@ object MazeLoop {
         //   直调是真 onClick ⇒ **只投一次**；后续拍只探测不重投（否则会重复提交移动，
         //   同三选一 205 事故）。直调失败才退回原坐标点击（多点只是点空，无害）。
         var directFired = false
+        // ★★2026-11-20（用户："前进确认有时会弹两次"）：坐标兜底**也只投一次**。
+        //   原来直调失败后每一拍都 `input.tap(x,y)`（最多 MOVE_CONFIRM_TAP_MAX 次）——
+        //   每一下都是一次真实"确认"，会真的提交多次移动 ⇒ 游戏连着弹两次「是否前往」。
+        var coordTapped = false
         while (true) {
             val now = SystemClock.elapsedRealtime()
             if (seenAt == 0L) {
@@ -5120,8 +5136,12 @@ object MazeLoop {
                         }.getOrNull()
                         if (pr?.optBoolean("ok") == true) {
                             directFired = true                 // 直调投递成功 → 后面只探不投
-                        } else {
-                            input.tap(x, y)                    // 直调失败 → 退回坐标（多点无害）
+                        } else if (!coordTapped) {
+                            coordTapped = true
+                            AppState.addLog(
+                                "确认框：直调失败（${pr?.optString("err").orEmpty().ifEmpty { "无回包" }}）→ 退回坐标点击一次",
+                            )
+                            input.tap(x, y)                    // 兜底也**只点一次**（重复点会重复提交移动）
                         }
                     }
                     // directFired 后这里不再投坐标：awaitDialogGone 只等框开始消失。
@@ -9821,6 +9841,16 @@ object MazeLoop {
             dlgTapN = 1
         }
         dlgTapAt = now
+        // ★★2026-11-20（用户："前进确认有时会弹两次"）：**移动确认框只投一次**。
+        //   每一下 TwoButtonRight 都是一次真实"确认"⇒ 真的提交一次移动；连点会让游戏排队弹两次。
+        //   （奖励弹窗仍允许连点救场，所以只对 CommonSmall + TwoButtonRight 单独限流。）
+        val shellNow = top.removeSuffix("(Clone)")
+        if (shellNow == "DialogCommonSmall" && hit.optString("name") == "TwoButtonRight") {
+            val mvSig = "mv|$tag"
+            if (mvSig == dlgMoveSig && now - dlgMoveAt < MOVE_CONFIRM_ONCE_MS) return true
+            dlgMoveSig = mvSig
+            dlgMoveAt = now
+        }
         // ★★2026-11-20（用户："钓鱼结束收获用的还是 tap"）：结果/收获类单按钮弹窗**先直调**。
         //   `DialogCommonBig`(获得印记/道具/遗物) 和 `DialogCommonMiddle`(收到角色) 的 OneButtonWhite
         //   都有固定路径 ⇒ 直调不投坐标、不受入场动画与叠层影响。
@@ -9837,6 +9867,14 @@ object MazeLoop {
                     AppState.addLog("对话框「OneButtonWhite」（直调 $oneKey）")
                     return true
                 }
+            }
+        }
+        // ★移动确认框也走直调（`MoveConfirm|TwoButtonRight`），失败才坐标点击
+        if (shellNow == "DialogCommonSmall" && hit.optString("name") == "TwoButtonRight") {
+            val pr = runCatching { AgentApi.labPathPress("MoveConfirm|TwoButtonRight") }.getOrNull()
+            if (pr?.optBoolean("ok") == true) {
+                AppState.addLog("确认框：前往（直调）")
+                return true
             }
         }
         tap(input, hit.optInt("x"), hit.optInt("y"), "对话框「${hit.optString("name")}」")
