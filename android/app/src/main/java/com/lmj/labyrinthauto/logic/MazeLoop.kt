@@ -1243,13 +1243,10 @@ object MazeLoop {
      *   用户口径："多点当手段，别拿等待换准确"、并明确"每 150ms 重点一次试试"
      *   ⇒ 降到 150ms 起、450ms 封顶。正常节点点一下就切页，用不到这个间隔 ⇒ 无副作用。
      */
-    private const val NODE_TAP_GAP_MS = 150L
-    private const val NODE_TAP_BACKOFF_MS = 450L
-    /** ★★2026-11-20（用户发现"前进确认有时会弹两次"）：同一节点**一轮最多快速点 3 下**。
-     *  每一下都会真的提交一次移动请求 ⇒ 点太多会让「是否前往」排成两条。
-     *  3 下都没反应（多半是换区动画在吞输入）⇒ 停 [NODE_TAP_BURST_COOLDOWN_MS] 再开一轮，别继续投。 */
-    private const val NODE_TAP_BURST_MAX = 3
-    private const val NODE_TAP_BURST_COOLDOWN_MS = 2_000L
+    // ★2026-11-20（清理）：原 NODE_TAP_GAP_MS / NODE_TAP_BACKOFF_MS / NODE_TAP_BURST_MAX /
+    //   NODE_TAP_BURST_COOLDOWN_MS 已删除 —— 那是"点几次再等"的频率妥协；
+    //   重复投递的根因是"没有投递台账 + 没有 expect"，现由 moveTargetId 台账（2.5s 同目标只投一次）
+    //   与 awaitLeaveNode（点完等真的离开节点）接管。
 
     /**
      * ★2026-11-10（用户方案）：点地图节点后「抓出现 + 抓消失」两步确认。
@@ -2219,9 +2216,8 @@ object MazeLoop {
     /** 本轮"现场指纹"（主循环每轮写；`lastTag` 是 `run()` 的局部变量，[tap] 里够不着，所以另存一份） */
     private var curTag: String? = null
 
-    // ── 跨轮的"点击节流"记录（PC `_NODE_TAP_AT/_NODE_TAP_N/_NODE_SAID_AT`，按节点记、**不清**）──
-    private val nodeTapAt = HashMap<Int, Long>()
-    private val nodeTapN = HashMap<Int, Int>()
+    // ── 跨轮的"点击节流"记录（PC `_NODE_SAID_AT`，按节点记、**不清**）──
+    //   ★2026-11-20：`nodeTapAt/nodeTapN` 已删（由 moveTargetId 台账取代）。
     private val nodeSaidAt = HashMap<Int, Long>()
 
     /**
@@ -2240,6 +2236,44 @@ object MazeLoop {
     private var movePendingSaidAt = 0L
     /** 投递后多久还没看到节点变化，就判"这次被吞"、允许重投一次 */
     private const val MOVE_PENDING_MS = 2_500L
+    /** 点完节点（含确认）后，最多等多久"真的离开当前节点" */
+    private const val MOVE_EXPECT_MS = 2_000L
+
+    /**
+     * ★★2026-11-20（用户）：**点节点后的 expect** —— 等"真的离开当前节点"。
+     *
+     * 原来点完确认就 `return`，主循环下一轮看到 `statusType` 还是 0（页面还没切）就以为
+     * "又该前进了" ⇒ 重新决策、再点同一个目标 ⇒ 多次提交移动 ⇒ 205。
+     * 判据（任一成立即算生效）：
+     *  · `statusType != 0`：进了对应节点的页面（QUEST/SHOP/TICKET…）或战斗
+     *  · `blockId` 相对**出发节点**变了：移动真的发生了
+     *
+     * @return true = 已离开；false = 超时（交回主循环，由投递台账决定是否重投）
+     */
+    private suspend fun awaitLeaveNode(fromBlock: Int, what: String, maxMs: Long = MOVE_EXPECT_MS): Boolean {
+        val t0 = SystemClock.elapsedRealtime()
+        var lastSt = -1
+        var lastB = fromBlock
+        while (SystemClock.elapsedRealtime() - t0 < maxMs) {
+            val s = runCatching { AgentApi.labStatusLite() }.getOrNull()
+            if (s != null) {
+                val stt = s.optInt("statusType", 0)
+                val b = s.optInt("blockId", -1)
+                lastSt = stt; lastB = b
+                if (stt != 0 || (b > 0 && b != fromBlock)) {
+                    AppState.addLog(
+                        "[移动] $what 已生效（${SystemClock.elapsedRealtime() - t0}ms：状态=$stt 节点=$b）",
+                    )
+                    return true
+                }
+            }
+            delay(100)
+        }
+        AppState.addLog(
+            "[移动] $what ${maxMs}ms 内没看到生效（状态=$lastSt 节点=$lastB）→ 交回主循环",
+        )
+        return false
+    }
 
     /** PC `drag_count`(5966)：本节点已拖动次数（**换页清零**，见 maze_loop 6013） */
     @Volatile
@@ -5096,9 +5130,11 @@ object MazeLoop {
      *
      *   ① 优先按**预计算路线**走：取路线里"当前节点的下一站"（这就是"局内按路线前进"）；
      *   ② 不可点/没路线 → [Route.pickNode] 兜底（按类型优先级），并标 `（偏离路线）`；
-     *   ③ 同一节点 [NODE_TAP_GAP_MS] 内不重复点，间隔按 **150→300→450ms 退避**（2026-11-20 用户改；
-     *      原 1→2→3s 是为了防无意义点击，但换区动画吞点击时退避太长 ⇒ 首节点卡 6s）；
-     *   ④ 目标在屏外 → **横向拖动地图**把它拉进视野（最多 [DRAG_LIMIT] 次；时长越长=抬手越慢≈削弱惯性）。
+     *   ③ **移动投递台账**（[moveTargetId]）：目标已投递、节点还没变 ⇒ 本轮不点只等，
+     *      2.5s 超时才判"被吞"允许重投一次（2026-11-20 用户："点过 10301 就不要再点一次"）；
+     *   ④ 目标在屏外 → **横向拖动地图**把它拉进视野（最多 [DRAG_LIMIT] 次；时长越长=抬手越慢≈削弱惯性）；
+     *   ⑤ 点完（含确认）后用 [awaitLeaveNode] 等"真的离开当前节点"（expect），
+     *      避免主循环看到 statusType 仍是 0 就重复决策、重复点同一目标。
      *
      * @return true = 本轮点了或拖了（有效动作）；false = 什么也没找到（调用方据此加 `idle`）
      */
@@ -5202,25 +5238,10 @@ object MazeLoop {
                 }
             }
             val now = System.currentTimeMillis()
-            val last = nodeTapAt[nk] ?: 0L
-            if (now - last > 30_000) nodeTapN[nk] = 0                    // 很久没碰过 → 计数从头来
-            // ★★2026-11-20（用户："前进确认有时会弹两次"）：同一节点**一轮最多快速点 3 下**。
-            //   每一下都真的提交一次移动请求 ⇒ 点太多会让「是否前往」排两条。
-            //   3 下仍没反应（多半是换区动画在吞输入）⇒ 停 2s 再开一轮。
-            if ((nodeTapN[nk] ?: 0) >= NODE_TAP_BURST_MAX) {
-                if (now - last < NODE_TAP_BURST_COOLDOWN_MS) {
-                    delay(150)
-                    return true
-                }
-                nodeTapN[nk] = 0
-            }
-            val gap = minOf(NODE_TAP_GAP_MS * (1 + (nodeTapN[nk] ?: 0)), NODE_TAP_BACKOFF_MS)
-            if (now - last < gap) {
-                delay(150)                                               // 刚点过 → 等游戏把它打开，别重复点
-                return true
-            }
-            nodeTapN[nk] = (nodeTapN[nk] ?: 0) + 1
-            nodeTapAt[nk] = now
+            // ★2026-11-20（清理）：原来这里的「3 下 burst + 2s 冷却」「150→450ms 退避」已删除。
+            //   那是**频率妥协**（点几次再等），而重复投递的根因是"没有投递台账/没有 expect"。
+            //   现在由 [moveTargetId] 台账（2.5s 内同一目标只投一次）+ [awaitLeaveNode] expect 接管，
+            //   语义正确且更强，不再需要按节点计数限速。
             val bt = (t.opt("blockType") as? Number)?.toInt()
             val what = "前进到节点$nk[${Route.LAB_BLOCK_TYPE[bt] ?: Py.str(bt)}]$rt"
             OverlayStatus.setState("前往节点$nk")      // ★悬浮窗（细于 overlayTick 的默认描述）
@@ -5249,6 +5270,9 @@ object MazeLoop {
             // ★不再盲等 800ms：先**抓确认框出现**（2~4ms/拍），出现即点确认，再**抓它开始消失**；
             //   没有框（直接移动/进战斗）就短等回主循环。
             if (!awaitMoveConfirm(input, basePtr)) delay(MOVE_NO_DIALOG_SETTLE_MS)
+            // ★★2026-11-20（用户）：**expect** —— 点完（含确认）后等真的离开当前节点，
+            //   别回主循环又看见"statusType=0"就再点一次同一个目标。
+            awaitLeaveNode(curB, "目标$nk")
             return true
         }
         // ③ 目标在屏外 → 横向拖动地图，把它拉进视野
