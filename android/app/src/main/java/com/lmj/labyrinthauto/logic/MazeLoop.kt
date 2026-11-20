@@ -4348,17 +4348,11 @@ object MazeLoop {
         val dx = chosen.optInt("decideX")
         val dy = chosen.optInt("decideY")
         val onScreen = dx in 0 until scrW && dy in 0 until scrH
-        // ★2026-11-20（用户）：结果页弹出即网络已完成，这段没有演出——DecideButton 是 prefab 自带节点，
-        //   对话框一弹出它就存在，(dx,dy) 只是 transform 还在做滑入动画。
-        //   ⇒ 能直调时（SelectRole/SelectTicket 走 UI 树结构链、不看坐标）跳过"等坐标落位"这道闸门，
-        //     直接进 tapAndCheck 让 pressFn 直调；只有坐标点击兜底路径才需要等屏内（否则点空、白烧次数）。
+        // ★★2026-11-20（根因修复）：`_pathBtnNow` 已去掉"不在屏内就拒"的坐标护栏（cs112）——
+        //   直调走 EventDelegate.Execute 直接执行 onClick，与屏幕坐标无关，屏外按钮照样能触发。
+        //   所以「坐标在屏外」对直调不再是失败信号，这道闸门只对**坐标点击兜底**（非直调）有意义。
+        //   能直调时跳过；只有坐标路径才等落位（15 轮）→ 再退节点树兜底。
         val canDirect = CharaPick.AUTO && !viaTree
-        if (!onScreen && canDirect && n == 1) {
-            AppState.addLog("… $kind 页「决定」坐标 ($dx,$dy) 在屏外，但有直调 → 不等落位，直接投")
-        }
-        // ★坐标在屏外：卡片/按钮常带"从屏外滑入"的动画，某时刻读到还在屏外。
-        //   处理策略 = **先别点、也别标记已选**，等下一轮重读（动画停稳坐标就回屏内）；
-        //   停太久（本例 8 轮 ≈ 1~2s）才退化为节点树找「选择」按钮兜底。
         if (!onScreen && !canDirect) {
             if (n == 1) {
                 AppState.addLog("[!] $kind 页「决定」坐标 ($dx,$dy) 在屏外（大概在滑动动画中）→ 等下一轮重读")
@@ -4521,23 +4515,20 @@ object MazeLoop {
                         val cidx = res.index
                         val pkey = (if (kind == "门票") "SelectTicket|Ticket" else "SelectRole|Role") + cidx
                         val pr = runCatching { AgentApi.labPathPress(pkey) }.getOrNull()
-                        if (pr?.optBoolean("ok") == true) return@press true
-                        // 直调不可用（表外 / 投递失败）⇒ 退回**原逻辑**：现取坐标再点
+                        if (pr?.optBoolean("ok") == true) {
+                            xyOk++   // ★直调成功也算"点出去过"（lastSelTaps/viaTree 兜底依赖它）
+                            return@press true
+                        }
+                        // ★★2026-11-20（用户）：直调失败 = **时机/条件不对的信号**（最常见「不在屏内」
+                        //   = 按钮还在滑入动画），不是回退坐标的理由。坐标点击才会点穿/点错——
+                        //   在错误时机退回坐标硬点是意外来源。⇒ 这一拍返回 null（不消耗 retries），
+                        //   等下一拍落位后重试直调；连续 6 拍都不行则 tapAndCheck 收工、外层重进重决策。
+                        xyNull++
                         AppState.addLog(
-                            "$kind：路径直调失败（$pkey / ${pr?.optString("err").orEmpty().ifEmpty { "无回包" }}）→ 退回坐标点击",
+                            "$kind：路径直调失败（$pkey / ${pr?.optString("err").orEmpty().ifEmpty { "无回包" }}）" +
+                                "→ 等下一拍重试直调（不退回坐标硬点）",
                         )
-                        val xy = selDecideXY(
-                            // ★与**决策**同一个读法：门票页走 labChoices，选人页走 labSelection
-                            reread = {
-                                if (kind == "门票") AgentApi.labChoices(force = true)?.optJSONArray("cards")
-                                else AgentApi.labSelection(force = true)?.optJSONArray("cards")
-                            },
-                            rid = chosen.opt("rewardId"),
-                            idx = res.index,
-                        ) ?: if (dx in 0 until scrW && dy in 0 until scrH) dx to dy else null
-                        if (xy != null) xyOk++ else xyNull++
-                        if (xy == null) return@press null
-                        tap(input, xy.first, xy.second, "$kind：选 $cid")
+                        return@press null
                     },
                     probeState = { selProbe("DialogLabyrinthSelection") },
                 )
