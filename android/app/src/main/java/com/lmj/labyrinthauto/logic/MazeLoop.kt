@@ -1245,15 +1245,12 @@ object MazeLoop {
      *   · [MOVE_CONFIRM_GONE_MS]：点确认后等「开始消失」的上限；
      *   · [MOVE_NO_DIALOG_SETTLE_MS]：没有确认框时给游戏推进画面的短静置（原来固定 800ms）。
      */
-    private const val MOVE_CONFIRM_WAIT_MS = 1_200L
-    /**
-     * ★★2026-11-20（用户"前进确认有时会弹两次"·真根因）：**等框上限原本只有 500ms**。
-     *  这个 [MOVE_CONFIRM_WAIT_MS] 先于下面的 NO_PTR 生效 ⇒ 上轮把 NO_PTR 改 900ms 实际走不到。
-     *  实测：确认框常在点击后 300~700ms 才弹（换区/慢帧更久），500ms 一到就判"没框" ⇒ 重试点节点
-     *  ⇒ 又提交一次移动请求 ⇒ 游戏把多个「是否前往」排队逐个弹出来（用户看到"弹两次"）。
-     *  ⇒ 两个上限都拉到 1.2s，并且坐标兜底只投一次（见 [awaitMoveConfirm]）。
-     */
-    private const val MOVE_CONFIRM_NO_PTR_MS = 1_200L
+    /** ★2026-11-20（用户："每次 500ms 是对的，反应快"）：**单轮**等框上限保持 500ms。
+     *  框一出现就点、不等满；只有"一直没框"才走 [MOVE_CONFIRM_NO_PTR_ROUNDS] 轮。 */
+    private const val MOVE_CONFIRM_WAIT_MS = 500L
+    /** ★★2026-11-20（用户："但应该多试几次"）：没框时再试几轮（500ms/轮）。
+     *  每轮末尾读一次 `labMapBusy`：换区/移动动画在跑 ⇒ 点击已生效、直接收工；都没跑 ⇒ 才算被吞。 */
+    private const val MOVE_CONFIRM_NO_PTR_ROUNDS = 3
     private const val MOVE_CONFIRM_POLL_MS = 60L
     private const val MOVE_CONFIRM_GONE_MS = 450L
     private const val MOVE_NO_DIALOG_SETTLE_MS = 300L
@@ -1701,6 +1698,20 @@ object MazeLoop {
     private var dlgMoveSig: String? = null
     private var dlgMoveAt = 0L
     private const val MOVE_CONFIRM_ONCE_MS = 2_500L
+    /** ★2026-11-20：地图动画（换区/移动）提示的节流时间戳 */
+    private var moveBusySaidAt = 0L
+
+    /**
+     * ★★2026-11-20（用户："你有能力读到换区动画吗？"）：**能**。
+     * `ViewLabyrinthMap` 的协程句柄非空即"在跑"：
+     * `+0x100 unitMoveIE`（角色移动）/ `+0x108 areaChangeMapSlideIE`（**换区滑场**）/ `+0x110 mapModeFinish`。
+     * 读失败返回 false（不拦，保持原行为）。
+     */
+    private suspend fun moveBusyNow(): Boolean {
+        val b = runCatching { AgentApi.labMapBusy() }.getOrNull() ?: return false
+        if (!b.optBoolean("ok")) return false
+        return b.optBoolean("busy")
+    }
 
     /** 上次见到的"游戏被杀次数"（[GameProcess.kills]）；一变 ⇒ 说明游戏被重建过，清编队/装备缓存 */
     private var seenKills = 0
@@ -4950,6 +4961,17 @@ object MazeLoop {
             return true
         }
         moveBlockedTop = ""
+        // ★★2026-11-20（用户）：**换区滑场 / 角色移动动画在跑 ⇒ 现在点节点只会被吞**（还会排多个确认框）。
+        //   直接读 `ViewLabyrinthMap` 的协程句柄（`labMapBusy`，几 ms）⇒ 动画期间这一轮不点。
+        if (moveBusyNow()) {
+            val nowB = SystemClock.elapsedRealtime()
+            if (nowB - moveBusySaidAt > 3_000L) {
+                moveBusySaidAt = nowB
+                AppState.addLog("… 地图动画在跑（换区滑场/移动中）→ 等它结束再点节点")
+            }
+            delay(150)
+            return true
+        }
         val nodesArr = AgentApi.labNodes()
         // ★别用 optJSONObject(Int)：各 org.json 实现里这个重载不一样（Android 运行时 / 单测的 json-java
         //   甚至会被解析成 "optJSONObject(String)"）→ 统一走 opt(i) as? JSONObject
@@ -5093,7 +5115,14 @@ object MazeLoop {
      */
     private suspend fun awaitMoveConfirm(input: InputBackend, basePtr: String): Boolean {
         val t0 = SystemClock.elapsedRealtime()
-        var noPtrAt = 0L
+        // ★★2026-11-20（用户："每次 500ms 是对的，反应快，但应该多试几次"）：
+        //   每轮仍只等 [MOVE_CONFIRM_WAIT_MS]=500ms（**框一出现就点，不等满**），没框就再试几轮；
+        //   每轮结束读一次 `labMapBusy`（协程句柄，几 ms）：
+        //     · 换区滑场 / 角色移动在跑 ⇒ 点击其实**已生效**，直接收工（不再等、更不再点）
+        //     · 都没在跑 ⇒ 这一下确实被吞了，继续下一轮探测（总窗口 500×3=1.5s）
+        var roundAt = t0
+        var rounds = 0
+        var busySaid = false
         var seenAt = 0L
         var taps = 0
         var lastDiag = "未读到"
@@ -5108,7 +5137,27 @@ object MazeLoop {
         while (true) {
             val now = SystemClock.elapsedRealtime()
             if (seenAt == 0L) {
-                if (now - t0 >= MOVE_CONFIRM_WAIT_MS) break             // 一直没出现
+                if (now - roundAt >= MOVE_CONFIRM_WAIT_MS) {            // 这一轮 500ms 没等到框
+                    val b = runCatching { AgentApi.labMapBusy() }.getOrNull()
+                    if (b?.optBoolean("ok") == true && b.optBoolean("busy")) {
+                        if (!busySaid) {
+                            busySaid = true
+                            val tag = buildString {
+                                if (b.optBoolean("areaSlide")) append("换区滑场")
+                                if (b.optBoolean("unitMove")) { if (isNotEmpty()) append("＋"); append("角色移动") }
+                                if (b.optBoolean("finish")) { if (isNotEmpty()) append("＋"); append("收尾") }
+                            }
+                            AppState.addLog("… 没等到「是否前往」，但地图动画在跑（$tag）→ 判定移动已生效，不再点节点")
+                        }
+                        return true
+                    }
+                    rounds++
+                    if (rounds >= MOVE_CONFIRM_NO_PTR_ROUNDS) break
+                    if (rounds == 1) {
+                        AppState.addLog("… 还没等到「是否前往」→ 多试一轮（${rounds + 1}/$MOVE_CONFIRM_NO_PTR_ROUNDS）")
+                    }
+                    roundAt = now
+                }
             } else if (taps >= MOVE_CONFIRM_TAP_MAX) {
                 AppState.addLog("确认框：点了 $taps 次仍没开始消失 → 回主循环再看")
                 return false
@@ -5122,13 +5171,10 @@ object MazeLoop {
             lastDiag = if (r == null) "RPC 超时/空"
             else "path=${r.optString("path")} ms=${r.optLong("ms")} comp=${r.optString("compCls")}"
             if (ptr.isEmpty() || top.isEmpty() || ptr == basePtr) {
-                // 还没有**新**对话框：给 [MOVE_CONFIRM_NO_PTR_MS] 宽限，多数"直接移动"到这就够了
-                if (noPtrAt == 0L) noPtrAt = SystemClock.elapsedRealtime()
-                if (SystemClock.elapsedRealtime() - noPtrAt >= MOVE_CONFIRM_NO_PTR_MS) break
+                // 还没有**新**对话框 ⇒ 继续探（轮次/动画判定都在上面 `seenAt==0` 分支里）
                 delay(MOVE_CONFIRM_POLL_MS)
                 continue
             }
-            noPtrAt = 0L
             if (!top.startsWith("DialogCommon")) {
                 AppState.addLog("确认框：点节点后出现了「$top」→ 不是前往确认框，交给主循环")
                 return false
@@ -5172,7 +5218,8 @@ object MazeLoop {
             delay(MOVE_CONFIRM_POLL_MS)
         }
         AppState.addLog(
-            "确认框：点节点后 ${MOVE_CONFIRM_WAIT_MS}ms 内没等到「是否前往」（直接移动/进战斗）｜最后：$lastDiag",
+            "确认框：点节点后 ${MOVE_CONFIRM_WAIT_MS * MOVE_CONFIRM_NO_PTR_ROUNDS}ms" +
+                "（${MOVE_CONFIRM_NO_PTR_ROUNDS} 轮）内没等到「是否前往」，动画也没在跑（直接移动/进战斗）｜最后：$lastDiag",
         )
         return false
     }

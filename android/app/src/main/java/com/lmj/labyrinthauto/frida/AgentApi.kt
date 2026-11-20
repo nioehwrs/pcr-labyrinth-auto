@@ -310,6 +310,17 @@ object AgentApi {
      * @return `{ok, selectable, current, total}`；`ok=false` 表示读不到（调用方应**不拦**）。
      */
     suspend fun labMoveReady(): JSONObject? = obj("labMoveReady", timeoutMs = T_FAST)
+
+    /**
+     * ★★2026-11-20（用户）：**地图动画状态**（`ViewLabyrinthMap` 的协程句柄）。
+     *
+     * - `unitMove`     ← `+0x100 unitMoveIE`：角色正在走向目标节点
+     * - `areaSlide`    ← `+0x108 areaChangeMapSlideIE`：**换区滑场动画中**
+     * - `finish`       ← `+0x110 mapModeFinishProcessIE`：收尾处理
+     *
+     * @return `{ok, unitMove, areaSlide, finish, moveEventNotFired, busy}`；`ok=false` 表示读不到（**不拦**）。
+     */
+    suspend fun labMapBusy(): JSONObject? = obj("labMapBusy", timeoutMs = T_FAST)
     suspend fun labEvent(): JSONObject? = obj("labEvent", timeoutMs = T_SLOW)
 
     /**
