@@ -1245,11 +1245,15 @@ object MazeLoop {
      *   · [MOVE_CONFIRM_GONE_MS]：点确认后等「开始消失」的上限；
      *   · [MOVE_NO_DIALOG_SETTLE_MS]：没有确认框时给游戏推进画面的短静置（原来固定 800ms）。
      */
-    private const val MOVE_CONFIRM_WAIT_MS = 500L
-    /** ★★2026-11-20（用户"前进确认有时弹两次"）：无框宽限 260→900ms。
-     *  确认框常在 300~700ms 后才弹（换区/慢帧更久）；宽限只有 260ms 时会误判"没框"⇒ 重试点节点
-     *  ⇒ 又提交一次移动请求 ⇒ 弹两次。给到 900ms 后，绝大多数情况一次点击就等到框，不再重复投。 */
-    private const val MOVE_CONFIRM_NO_PTR_MS = 900L
+    private const val MOVE_CONFIRM_WAIT_MS = 1_200L
+    /**
+     * ★★2026-11-20（用户"前进确认有时会弹两次"·真根因）：**等框上限原本只有 500ms**。
+     *  这个 [MOVE_CONFIRM_WAIT_MS] 先于下面的 NO_PTR 生效 ⇒ 上轮把 NO_PTR 改 900ms 实际走不到。
+     *  实测：确认框常在点击后 300~700ms 才弹（换区/慢帧更久），500ms 一到就判"没框" ⇒ 重试点节点
+     *  ⇒ 又提交一次移动请求 ⇒ 游戏把多个「是否前往」排队逐个弹出来（用户看到"弹两次"）。
+     *  ⇒ 两个上限都拉到 1.2s，并且坐标兜底只投一次（见 [awaitMoveConfirm]）。
+     */
+    private const val MOVE_CONFIRM_NO_PTR_MS = 1_200L
     private const val MOVE_CONFIRM_POLL_MS = 60L
     private const val MOVE_CONFIRM_GONE_MS = 450L
     private const val MOVE_NO_DIALOG_SETTLE_MS = 300L
@@ -3065,7 +3069,15 @@ object MazeLoop {
             AppState.addLog("事件演出：跳过（直调）")
             return
         }
-        if (skPr?.optBoolean("offscreen") == true) return    // 跳过按钮还没上屏 ⇒ 等下一轮
+        // ★2026-11-20（用户）：直调没成功时**不要退回文本搜索**（那会命中屏幕正中的容器、
+        //   白点一下，日志实测 `点了 事件演出·跳过 (640,360)`）。演出刚起/实例还没就绪 ⇒ 等下一轮即可
+        //   （实测下一轮 0.5s 后直调就成功）。只在"旧版 agent 没这个 RPC"（skPr==null）时才退回文本搜索。
+        if (skPr != null) {
+            val se = skPr.optString("err")
+            if (skPr.optBoolean("offscreen") || se.contains("没找到活的") || se.contains("dramaSkipButton 为空")) {
+                return
+            }
+        }
         // 直调不可用（旧版 agent / 演出已结束）⇒ 退回原来的文本搜索 + 坐标点击
         // ★根顺序（2026-10-17 四次改）：`dialog`（DialogArea 子树）→ `layer`（DialogArea 的父层）。
         //   去掉 `view`（2026-10-17 实机 13:28:25：一次 **2156ms** ✗）：演出页的 `view` 根 = 整张地图页，
