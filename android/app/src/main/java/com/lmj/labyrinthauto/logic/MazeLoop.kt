@@ -5963,9 +5963,15 @@ object MazeLoop {
                         //   也省掉 `input tap` 的 ~110ms）。直调失败才退回坐标点击。
                         partyBtnOrTap(input, "exequip", eq.optInt("x"), eq.optInt("y"),
                             "打开特别装备${if (sess.exShare) "" else "（第2/3队：不共用其他角色装备）"}")
-                        // ★2026-11-18（用户）：点开特别装备后的这一拍等待，1×→1.5×
-                        //   （只改这一处，不动编组页其它共用 LAB_PARTY_TAP_MS 的点击）
-                        delay((PartyPlan.LAB_PARTY_TAP_MS * 3L) / 2L)
+                        // ★★2026-11-20（用户）：不再死等 525ms（LAB_PARTY_TAP_MS×1.5）——
+                        //   改成**轮询 EX 三连页出现**（签名非空即到），最快几十 ms 就能往下走。
+                        //   实测这 525ms 白等占了"打开→自动装备"731ms 的大头；上限 1.5s 兜底。
+                        val exOpenT0 = android.os.SystemClock.elapsedRealtime()
+                        while (android.os.SystemClock.elapsedRealtime() - exOpenT0 < 1_500L) {
+                            val s0 = exeqSigNow()
+                            if (s0.isNotEmpty() && s0 != EXEQ_UNKNOWN) break
+                            delay(50)
+                        }
                         // ★★2026-11-08：三连页改成**打包跑完**（原来是"点开就交回主循环、由 handleExequip 单步接管"）。
                         //   现在在**同一次调用里**把①②③走完 ⇒ 走完就回到编组页 ⇒ 下一轮重新读页再点「战斗开始」。
                         //   （旧做法的坑：主循环下一轮看到的是 EX 页，顶框 DialogCommonBig ⇒ 通用弹窗白名单

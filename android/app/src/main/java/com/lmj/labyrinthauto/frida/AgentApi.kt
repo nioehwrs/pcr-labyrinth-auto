@@ -450,7 +450,9 @@ object AgentApi {
         if (!st.optBoolean("queued", false)) return st        // 投递失败（钩子装不上/参数非法）→ 直接回错误对象
         val t0 = SystemClock.elapsedRealtime()
         while (SystemClock.elapsedRealtime() - t0 < timeoutMs) {
-            delay(120)
+            // ★2026-11-20（用户）：轮询 120→60ms —— 直调本身在游戏线程几十 ms 就跑完，
+            //   120ms 一等等于每次点击白加 60~120ms（一趟 EX 六击 ≈ 省 360ms）。pressNodePoll 只读内存。
+            delay(60)
             val r = obj("pressNodePoll", emptyList(), T_FAST) ?: continue
             if (!r.optBoolean("pending", true)) return r
         }

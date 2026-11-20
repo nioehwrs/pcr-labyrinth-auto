@@ -50,6 +50,14 @@ object TapCheck {
     @Volatile
     private var probeMsValue = 150L
 
+    /**
+     * ★★2026-11-20（用户）：**直调档**的探测间隔（60ms）。
+     *   直调不点穿、不怕"探太快"（那是坐标点击的风险），而 `labExEquipSig` 这类签名读只要 10~20ms，
+     *   150ms 一探等于每次"页面变了没"最多晚 150ms 才发现。配合 [run] 里直调档把探针次数放大
+     *   （≥10 次），总窗口仍是 600ms+，但检测粒度细一倍多。坐标点击路径不受影响。
+     */
+    private const val DIRECT_PROBE_MS = 60L
+
     fun setProbeMs(ms: Long) {
         probeMsValue = ms.coerceIn(150L, 350L)
     }
@@ -136,7 +144,7 @@ object TapCheck {
         //   · 阶段2 expect/arrived（等游戏切页）、pressMax（防重复 onClick）保留。
         val isDirect = pressFn != null
         val fast = isDirect && directFast
-        val effProbeMs = if (fast) currentProbeMs() else probeMs   // 直调忽略调用点的 ×2（EX），回到基础挡位
+        val effProbeMs = if (fast) DIRECT_PROBE_MS else probeMs   // 直调档细探 60ms（忽略调用点的 ×2）
         val effSkipFirstHits = if (fast) 0 else skipFirstHits
         val effSkipDelayMs = if (fast) 30L else skipDelayMs   // 直调跳拍留 30ms 窗口（0 会让 6 次跳拍几毫秒跑完）
         // ── 阶段 1：反复点，直到**离开 from**（证明这一下生效了）──
@@ -148,7 +156,9 @@ object TapCheck {
         var directFired = 0                 // ★直调已经真正投递过几次（受 [pressMax] 限制）
         var left = false
         var nowTop = ""
-        val maxProbe = probe.coerceAtLeast(1)
+        // ★直调档细探（60ms）⇒ 探针次数放大到 ≥10，保证总窗口仍 ≥600ms（原来 4×150）。
+        //   窗口不缩是**必须**的：窗口太短会判"没生效"⇒ 外层重进 ⇒ pressMax 额度重置 ⇒ 重复 onClick。
+        val maxProbe = if (fast) maxOf(probe.coerceAtLeast(1), 10) else probe.coerceAtLeast(1)
         while (attempt < retries.coerceAtLeast(1)) {
             // ★2026-11-12（用户）：新页刚出现时按钮还在入场动画（RectTransform 未落位）⇒
             //   首次点击前先**只读不点**跳几拍，下一拍 `xyAt` 会重新取落位后的坐标再点。
