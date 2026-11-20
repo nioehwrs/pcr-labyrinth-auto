@@ -1240,45 +1240,6 @@ object MazeLoop {
      *   用户口径："多点当手段，别拿等待换准确"、并明确"每 150ms 重点一次试试"
      *   ⇒ 降到 150ms 起、450ms 封顶。正常节点点一下就切页，用不到这个间隔 ⇒ 无副作用。
      */
-    // ★2026-11-20（清理）：原 NODE_TAP_GAP_MS / NODE_TAP_BACKOFF_MS / NODE_TAP_BURST_MAX /
-    //   NODE_TAP_BURST_COOLDOWN_MS、以及后来的"移动投递台账（5s 时间窗）"全部删除 ——
-    //   那些都是拿**时间**猜"要不要再点"。现在只用**状态**：
-    //   `inAnimation`（换区动画在跑⇒不投）+ `awaitLeaveNode`（blockId/statusType 变没变）。
-
-    /**
-     * ★2026-11-10（用户方案）：点地图节点后「抓出现 + 抓消失」两步确认。
-     *   · [MOVE_CONFIRM_WAIT_MS]：等「是否前往」确认框出现的上限（出现即点，不等满）；
-     *   · [MOVE_CONFIRM_NO_PTR_MS]：连顶层对话框都没有时的宽限 —— 超过就当"直接移动/进战斗"，
-     *     不为了等框白耗满 500ms；
-     *   · [MOVE_CONFIRM_POLL_MS]：探针间隔（`labDlgPair` 2~4ms、`labDlgClosing` 3~6ms，60ms 足够）；
-     *   · [MOVE_CONFIRM_GONE_MS]：点确认后等「开始消失」的上限；
-     *   · [MOVE_NO_DIALOG_SETTLE_MS]：没有确认框时给游戏推进画面的短静置（原来固定 800ms）。
-     */
-    /** ★2026-11-20（用户："每次 500ms 是对的，反应快"）：**单轮**等框上限保持 500ms。
-     *  框一出现就点、不等满；只有"一直没框"才走 [MOVE_CONFIRM_NO_PTR_ROUNDS] 轮。 */
-    private const val MOVE_CONFIRM_WAIT_MS = 500L
-    /** ★★2026-11-20（用户："但应该多试几次"）：没框时再试几轮（500ms/轮）。
-     *  每轮末尾读一次 `labMapBusy`：换区/移动动画在跑 ⇒ 点击已生效、直接收工；都没跑 ⇒ 才算被吞。 */
-    private const val MOVE_CONFIRM_NO_PTR_ROUNDS = 2
-    private const val MOVE_CONFIRM_POLL_MS = 60L
-    private const val MOVE_CONFIRM_GONE_MS = 450L
-    private const val MOVE_NO_DIALOG_SETTLE_MS = 300L
-
-    /** ★出现后最多点几次（点空就用下一拍的新坐标再点；**多点当手段**，不等按钮落位） */
-    private const val MOVE_CONFIRM_TAP_MAX = 8
-
-    /**
-     * ★每次点完探这么久有没有"开始消失"（入场动画期点空是正常代价）。
-     * ★2026-11-12 实测：180ms 太短（tween 在 +200~300ms 才启动）⇒ 每次都连点到 #4 才探到；
-     *   放到 400ms，点中后一次就够，点空也只是晚 220ms 补点。
-     */
-    private const val MOVE_CONFIRM_PROBE_MS = 400L
-
-    /** 探测"是否开始消失"时的轮询间隔 */
-    private const val MOVE_CONFIRM_PROBE_POLL_MS = 60L
-
-    /** ★出现后的总预算（最多 5 次点击 + 各自探测），超时交回主循环 */
-    private const val MOVE_CONFIRM_TOTAL_MS = 1_200L
 
     /** PC `MAZE_DRAG_LIMIT`(339) / `MAZE_DRAG_MS_MIN,MAX`(340) / `MAZE_DRAG_SETTLE`(341)：屏外节点 → 横向拖动地图 */
     private const val DRAG_LIMIT = 6
@@ -2222,44 +2183,6 @@ object MazeLoop {
     //   ★2026-11-20：`nodeTapAt/nodeTapN` 已删（重复投递改由状态判据接管，见 [handleMove] 文档）。
     private val nodeSaidAt = HashMap<Int, Long>()
 
-    /** 点完节点（含确认）后，最多等多久"真的离开当前节点" */
-    private const val MOVE_EXPECT_MS = 2_000L
-
-    /**
-     * ★★2026-11-20（用户）：**点节点后的 expect** —— 等"真的离开当前节点"。
-     *
-     * 原来点完确认就 `return`，主循环下一轮看到 `statusType` 还是 0（页面还没切）就以为
-     * "又该前进了" ⇒ 重新决策、再点同一个目标 ⇒ 多次提交移动 ⇒ 205。
-     * 判据（任一成立即算生效）：
-     *  · `statusType != 0`：进了对应节点的页面（QUEST/SHOP/TICKET…）或战斗
-     *  · `blockId` 相对**出发节点**变了：移动真的发生了
-     *
-     * @return true = 已离开；false = 超时（交回主循环，由投递台账决定是否重投）
-     */
-    private suspend fun awaitLeaveNode(fromBlock: Int, what: String, maxMs: Long = MOVE_EXPECT_MS): Boolean {
-        val t0 = SystemClock.elapsedRealtime()
-        var lastSt = -1
-        var lastB = fromBlock
-        while (SystemClock.elapsedRealtime() - t0 < maxMs) {
-            val s = runCatching { AgentApi.labStatusLite() }.getOrNull()
-            if (s != null) {
-                val stt = s.optInt("statusType", 0)
-                val b = s.optInt("blockId", -1)
-                lastSt = stt; lastB = b
-                if (stt != 0 || (b > 0 && b != fromBlock)) {
-                    AppState.addLog(
-                        "[移动] $what 已生效（${SystemClock.elapsedRealtime() - t0}ms：状态=$stt 节点=$b）",
-                    )
-                    return true
-                }
-            }
-            delay(100)
-        }
-        AppState.addLog(
-            "[移动] $what ${maxMs}ms 内没看到生效（状态=$lastSt 节点=$lastB）→ 交回主循环",
-        )
-        return false
-    }
 
     /** PC `drag_count`(5966)：本节点已拖动次数（**换页清零**，见 maze_loop 6013） */
     @Volatile
@@ -5211,30 +5134,54 @@ object MazeLoop {
             val bt = (t.opt("blockType") as? Number)?.toInt()
             val what = "前进到节点$nk[${Route.LAB_BLOCK_TYPE[bt] ?: Py.str(bt)}]$rt"
             OverlayStatus.setState("前往节点$nk")      // ★悬浮窗（细于 overlayTick 的默认描述）
-            // ★2026-11-10（用户方案）：点前先记顶层指针基线 —— 只认"点完之后**新出现**的框"，
-            //   避免把上一页残留的对话框当成"是否前往"点掉。
-            val basePtr = runCatching { AgentApi.labDlgPair() }.getOrNull()?.optString("ptr").orEmpty()
-            // ★★2026-11-19（并入 feat/direct-trigger）：**地图格子按 blockId 直调**（不投坐标）。
-            //   可视面板全叫 `PartsLabyrinthPanel(Clone)`、指针每帧变，只能靠 blockId 定位；
-            //   agent 侧复用 `_moveLocate` + `UIButton.onClick`（兜底 `onPanelButtonClick`）。
-            //   直调不可用（面板不在可视列表 / agent 未就绪）才退回坐标点击，行为与之前一致。
-            val pnl = runCatching { AgentApi.pressPanel(nk) }.getOrNull()
-            // ★注意：`pressTwoPhase` 返回的是**轮询后的最终结果**（含 ok/via/err，没有 queued）
-            if (pnl?.optBoolean("ok") == true) {
-                AppState.addLog("$what（直调）")
-            } else {
-                val err = pnl?.optString("err").orEmpty().ifEmpty { "无 blockId 或无回包" }
-                AppState.addLog("$what：格子直调失败（$err）→ 退回坐标点击")
-                tap(input, t.optInt("x"), t.optInt("y"), what)
-            }
+            // ★★2026-11-20（用户方案）：**两级直调、各投一次、用 expect 串起来**，全程无时间窗。
+            //   理想流程（以 20201 → 20301 战斗为例）：
+            //     ① 直调节点 `onClickPanel`  ⇒ expect = **离开地图**（顶框非空 / 已进战斗）
+            //     ② 若弹「是否前往」确认窗   ⇒ 直调【确认】   ⇒ expect = **离开确认窗**（进目标页/战斗）
+            //   两级各自 `pressMax=1`（固定只投一次），靠状态推进，主流程不会在中间介入重投同一个节点。
             AppState.addLog("[移动] 投递 目标=$nk（出发=$curB）")
             nodeSaidAt[nk] = now                                         // 同一节点 30s 内只"重点"一次（PC 6425）
-            // ★不再盲等 800ms：先**抓确认框出现**（2~4ms/拍），出现即点确认，再**抓它开始消失**；
-            //   没有框（直接移动/进战斗）就短等回主循环。
-            if (!awaitMoveConfirm(input, basePtr)) delay(MOVE_NO_DIALOG_SETTLE_MS)
-            // ★★2026-11-20（用户）：**expect** —— 点完（含确认）后等真的离开当前节点，
-            //   别回主循环又看见"statusType=0"就再点一次同一个目标。
-            awaitLeaveNode(curB, "目标$nk")
+            val nkx = t.optInt("x")
+            val nky = t.optInt("y")
+            // ① 点节点：直调优先（失败才退坐标），expect = 离开地图
+            val leftMap = tapAndCheck(
+                input, nkx, nky, what,
+                from = setOf(""),
+                expectTimeoutMs = 2_500L,
+                retries = 3, probe = 2,
+                pressFn = { AgentApi.pressPanel(nk)?.optBoolean("ok") == true },
+                pressMax = 1,
+                probeState = {
+                    val tp = runCatching { AgentApi.labTop() }.getOrNull().orEmpty()
+                    val bt2 = runCatching { AgentApi.labInBattle() }.getOrDefault(false)
+                    TapCheck.Probe(
+                        top = tp,
+                        left = tp.isNotEmpty() || bt2,
+                        diag = "top=" + (if (tp.isEmpty()) "空" else tp) + " battle=" + bt2,
+                    )
+                },
+            )
+            // ② 若第一级等来的是「是否前往」确认窗 ⇒ 直调确认，expect = 离开它
+            if (leftMap) {
+                val topNow = runCatching { AgentApi.labTop() }.getOrNull().orEmpty()
+                if (topNow.startsWith("DialogCommonSmall")) {
+                    tapAndCheck(
+                        input, nkx, nky, "确认前往$nk",
+                        from = setOf("DialogCommonSmall"),
+                        expectTimeoutMs = 4_000L,
+                        retries = 2, probe = 3,
+                        pressFn = {
+                            AgentApi.labPathPress("MoveConfirm|TwoButtonRight")?.optBoolean("ok") == true
+                        },
+                        pressMax = 1,
+                        // 到达判据：离开 Small（任何非空且非 Small 的页面）或已进战斗
+                        arrived = suspend@{ top: String ->
+                            (top.isNotEmpty() && !top.startsWith("DialogCommonSmall")) ||
+                                runCatching { AgentApi.labInBattle() }.getOrDefault(false)
+                        },
+                    )
+                }
+            }
             return true
         }
         // ③ 目标在屏外 → 横向拖动地图，把它拉进视野
@@ -5271,160 +5218,6 @@ object MazeLoop {
         return false
     }
 
-    /**
-     * ★2026-11-10（用户方案）：点地图节点后的「**抓出现** + **抓消失**」两步。
-     *
-     * 第一步「出现」：`labDlgPair` 轻读（2~4ms/拍）——
-     *   · 顶层对话框指针**变了**（≠点前基线）+ `top` 是 `DialogCommon*` + `TwoButtonLeft/Right` 都在
-     *     ⇒ 就是「取消/确认」框，直接取 `right` 点确认，不再等主循环下一轮；
-     *   · 只认 `DialogCommon*`：别的框（遗物/选人/事件）出现不算，交给主循环对应 handler，避免误点；
-     *   · 窗口/按钮一出现就点（**多点是一种手段**）；入场动画期坐标会变、点空是正常代价，
-     *     点完只探 [MOVE_CONFIRM_PROBE_MS]，没开始消失就**用下一拍的新坐标再点**（最多 3 次），
-     *     不为了"点得准"去等按钮落位 —— 那等于拿等待换准确。
-     * 第二步「消失」：`labDlgClosing`（outMainTweenAlpha，3~6ms）—— 框**开始收起**就继续，不等它真没了。
-     *
-     * @param basePtr 点节点**之前**的顶层对话框指针；空串 = 点前没有对话框（正常情况）。
-     * @return true = 处理了确认框（已点确认）；false = 这段时间没出现新确认框（直接移动/进战斗）
-     */
-    private suspend fun awaitMoveConfirm(input: InputBackend, basePtr: String): Boolean {
-        val t0 = SystemClock.elapsedRealtime()
-        // ★★2026-11-20（用户："每次 500ms 是对的，反应快，但应该多试几次"）：
-        //   每轮仍只等 [MOVE_CONFIRM_WAIT_MS]=500ms（**框一出现就点，不等满**），没框就再试几轮；
-        //   每轮结束读一次 `labMapBusy`（协程句柄，几 ms）：
-        //     · `unitMove` 在跑（角色正走向目标）⇒ 这次点击**已生效**，直接收工
-        //     · `areaSlide`（游戏自动换区：10601 结算完滑到 20101）**不算已生效** ——
-        //       那时还没到新区域、本来就什么都不能操作；`finish` 同理
-        //     · 都不在跑 ⇒ 这一下确实被吞了，继续下一轮探测（总窗口 500×3=1.5s）
-        var roundAt = t0
-        var rounds = 0
-        var busySaid = false
-        var seenAt = 0L
-        var taps = 0
-        var lastDiag = "未读到"
-        // ★2026-11-20：地图节点的「前往确认」改直调（labPathPress MoveConfirm|TwoButtonRight）。
-        //   直调是真 onClick ⇒ **只投一次**；后续拍只探测不重投（否则会重复提交移动，
-        //   同三选一 205 事故）。直调失败才退回原坐标点击（多点只是点空，无害）。
-        var directFired = false
-        // ★★2026-11-20（用户："前进确认有时会弹两次"）：坐标兜底**也只投一次**。
-        //   原来直调失败后每一拍都 `input.tap(x,y)`（最多 MOVE_CONFIRM_TAP_MAX 次）——
-        //   每一下都是一次真实"确认"，会真的提交多次移动 ⇒ 游戏连着弹两次「是否前往」。
-        var coordTapped = false
-        while (true) {
-            val now = SystemClock.elapsedRealtime()
-            if (seenAt == 0L) {
-                if (now - roundAt >= MOVE_CONFIRM_WAIT_MS) {            // 这一轮 500ms 没等到框
-                    val b = runCatching { AgentApi.labMapBusy() }.getOrNull()
-                    // ★2026-11-20（实测回退）：曾用 `unitMove` 非空判"这次点击已生效"——但该句柄
-                    //   移动结束后**不置 null**（残留上次引用）⇒ 会把"没生效"误判成"已生效"、不再重试。
-                    //   现在只把它当诊断，判据仍用"多轮探测 + 确认框出现与否"。
-                    if (!busySaid && b?.optBoolean("ok") == true) {
-                        busySaid = true
-                        val tag = buildString {
-                            if (b.optBoolean("areaSlide")) append("areaSlide ")
-                            if (b.optBoolean("unitMove")) append("unitMove ")
-                            if (b.optBoolean("finish")) append("finish ")
-                        }.trim()
-                        AppState.addLog("… 没等到「是否前往」，此时地图句柄=[$tag]（仅诊断，不影响判定）")
-                    }
-                    rounds++
-                    if (rounds >= MOVE_CONFIRM_NO_PTR_ROUNDS) break
-                    if (rounds == 1) {
-                        val tag = buildString {
-                            if (b?.optBoolean("areaSlide") == true) append("换区滑场中")
-                            if (b?.optBoolean("finish") == true) { if (isNotEmpty()) append("＋"); append("收尾中") }
-                        }.ifEmpty { "动画没在跑" }
-                        AppState.addLog("… 还没等到「是否前往」（$tag）→ 多试一轮（${rounds + 1}/$MOVE_CONFIRM_NO_PTR_ROUNDS）")
-                    }
-                    roundAt = now
-                }
-            } else if (taps >= MOVE_CONFIRM_TAP_MAX) {
-                AppState.addLog("确认框：点了 $taps 次仍没开始消失 → 回主循环再看")
-                return false
-            } else if (now - seenAt >= MOVE_CONFIRM_TOTAL_MS) {
-                AppState.addLog("确认框：出现后 ${MOVE_CONFIRM_TOTAL_MS}ms 还没关掉 → 回主循环再看")
-                return false
-            }
-            val r = runCatching { AgentApi.labDlgPair() }.getOrNull()
-            val top = r?.optString("top").orEmpty()
-            val ptr = r?.optString("ptr").orEmpty()
-            lastDiag = if (r == null) "RPC 超时/空"
-            else "path=${r.optString("path")} ms=${r.optLong("ms")} comp=${r.optString("compCls")}"
-            if (ptr.isEmpty() || top.isEmpty() || ptr == basePtr) {
-                // 还没有**新**对话框 ⇒ 继续探（轮次/动画判定都在上面 `seenAt==0` 分支里）
-                delay(MOVE_CONFIRM_POLL_MS)
-                continue
-            }
-            if (!top.startsWith("DialogCommon")) {
-                AppState.addLog("确认框：点节点后出现了「$top」→ 不是前往确认框，交给主循环")
-                return false
-            }
-            if (r?.optBoolean("ok") == true) {
-                val right = r.optJSONObject("right")
-                val x = (right?.opt("x") as? Number)?.toInt()
-                val y = (right?.opt("y") as? Number)?.toInt()
-                if (x != null && y != null) {
-                    if (seenAt == 0L) {
-                        seenAt = now
-                        // ★2026-11-19（日志精简）：正常"出现就点、一下就过"不再打日志；
-                        //   只在需要多点（异常）时由下面 #2 起的行体现。
-                    }
-                    // ★★2026-11-10（用户口径：**多点是一种手段**，不要等完全出现才点）：
-                    //   出现就点。入场动画期间坐标会变、点空是正常代价 —— 点完只探
-                    //   [MOVE_CONFIRM_PROBE_MS]；没开始消失就**用下一拍的新坐标再点**，
-                    //   而不是等按钮落位（那等于拿等待换准确）。
-                    taps++
-                    // ★2026-11-19（日志精简）：不再逐次打「点「确认」#N」—— 需要多点时
-                    //   由 awaitDialogGone 汇总成一条「点了 N 次后开始消失」。
-                    if (!directFired) {
-                        val pr = runCatching {
-                            AgentApi.labPathPress("MoveConfirm|TwoButtonRight")
-                        }.getOrNull()
-                        if (pr?.optBoolean("ok") == true) {
-                            directFired = true                 // 直调投递成功 → 后面只探不投
-                            dlgMoveAt = SystemClock.elapsedRealtime()   // ★同步给通用弹窗的限流窗口
-                        } else if (!coordTapped) {
-                            coordTapped = true
-                            dlgMoveAt = SystemClock.elapsedRealtime()   // ★同上
-                            AppState.addLog(
-                                "确认框：直调失败（${pr?.optString("err").orEmpty().ifEmpty { "无回包" }}）→ 退回坐标点击一次",
-                            )
-                            input.tap(x, y)                    // 兜底也**只点一次**（重复点会重复提交移动）
-                        }
-                    }
-                    // directFired 后这里不再投坐标：awaitDialogGone 只等框开始消失。
-                    if (awaitDialogGone(t0, MOVE_CONFIRM_PROBE_MS, taps)) return true
-                    continue
-                }
-            }
-            delay(MOVE_CONFIRM_POLL_MS)
-        }
-        AppState.addLog(
-            "确认框：点节点后 ${MOVE_CONFIRM_WAIT_MS * MOVE_CONFIRM_NO_PTR_ROUNDS}ms" +
-                "（${MOVE_CONFIRM_NO_PTR_ROUNDS} 轮）内没等到「是否前往」，动画也没在跑（直接移动/进战斗）｜最后：$lastDiag",
-        )
-        return false
-    }
-
-    /** 第二步：等确认框**开始消失**（`labDlgClosing`）；[timeoutMs] 内没动静返回 false（调用方重试）。 */
-    private suspend fun awaitDialogGone(
-        t0: Long,
-        timeoutMs: Long = MOVE_CONFIRM_GONE_MS,
-        /** 本轮已经点了几下：≥2 = 需要多点（异常）才打日志，正常一下就过不刷屏（2026-11-19） */
-        taps: Int = 1,
-    ): Boolean {
-        val g0 = SystemClock.elapsedRealtime()
-        while (SystemClock.elapsedRealtime() - g0 < timeoutMs) {
-            delay(MOVE_CONFIRM_PROBE_POLL_MS)
-            val c = runCatching { AgentApi.labDlgClosing() }.getOrNull()
-            if (c == null || c.optBoolean("closing", false) || c.optString("top").isEmpty()) {
-                if (taps >= 2) {
-                    AppState.addLog("确认框：点了 $taps 次后开始消失（+${SystemClock.elapsedRealtime() - t0}ms）")
-                }
-                return true
-            }
-        }
-        return false
-    }
 
     // ────────────────────────── handler：QUEST(5)/BOSS(6) 战斗 ──────────────────────────
 
