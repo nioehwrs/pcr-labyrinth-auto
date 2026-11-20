@@ -4541,10 +4541,13 @@ object MazeLoop {
                         //   在错误时机退回坐标硬点是意外来源。⇒ 这一拍返回 null（不消耗 retries），
                         //   等下一拍落位后重试直调；连续 6 拍都不行则 tapAndCheck 收工、外层重进重决策。
                         xyNull++
-                        AppState.addLog(
-                            "$kind：路径直调失败（$pkey / ${pr?.optString("err").orEmpty().ifEmpty { "无回包" }}）" +
-                                "→ 等下一拍重试直调（不退回坐标硬点）",
-                        )
+                        // ★2026-11-20（用户）：只在头 3 次失败时提示，避免同一页刷屏（曾一次刷 7 行）
+                        if (xyNull <= 3) {
+                            AppState.addLog(
+                                "$kind：路径直调失败（$pkey / ${pr?.optString("err").orEmpty().ifEmpty { "无回包" }}）" +
+                                    "→ 等下一拍重试直调（不退回坐标硬点）",
+                            )
+                        }
                         return@press null
                     },
                     probeState = { selProbe("DialogLabyrinthSelection") },
@@ -6139,17 +6142,6 @@ object MazeLoop {
                         if (pidx1 > 0 && needBackup) return PARTY_STEP_AGAIN
                         return PARTY_STEP_DONE
                     } else {
-                        // ★2026-11-20 诊断：EX 提前收工后到「战斗开始」这段到底花在哪
-                        //   （只在收工后 5s 内打，平时不产生日志）。
-                        val _exAt = exeqSess().earlyExitAt
-                        val _postEx = _exAt > 0 && System.currentTimeMillis() - _exAt < 5_000L
-                        if (_postEx) {
-                            AppState.addLog(
-                                "… [EX后] 战斗开始前距收工 ${System.currentTimeMillis() - _exAt}ms" +
-                                    "｜本轮已用 ${SystemClock.elapsedRealtime() - _tParty}ms" +
-                                    "（读页 ${_readMs}｜遗物 ${_relMs}｜持有池 ${_ctxMs}｜算队伍 ${_planMs}）",
-                            )
-                        }
                         // ★普通战：「战斗开始」的终点是**战斗中**（顶框为空）——离开编组页即算生效
                         // ★★2026-11-08 改成**探针制**（原来是 settleMs=800 固定等一次）：
                         //   · 原来"点完死等 800ms 再读一次"——切走了也得等满；而 2026-11-07 实测
@@ -6176,15 +6168,10 @@ object MazeLoop {
                             //   （`DialogCommonPartyEdit+0x110`）。⚠不能直接调 `onClickDecide`（实测 NPE）。
                             //   直调整个失败时 partyBtnOrTap 内部会退回坐标点击。
                             pressFn = {
-                                val _tPB = SystemClock.elapsedRealtime()
-                                val _r = partyBtnOrTap(
+                                partyBtnOrTap(
                                     input, "decide",
                                     dec.optInt("x"), dec.optInt("y"), "战斗开始",
                                 )
-                                if (_postEx) {
-                                    AppState.addLog("… [EX后] 战斗开始直调耗时 ${SystemClock.elapsedRealtime() - _tPB}ms")
-                                }
-                                _r
                             },
                         )
                         return PARTY_STEP_EXITED
@@ -6268,7 +6255,8 @@ object MazeLoop {
                 if (EXEQ_EARLY_EXIT && sess.finalPressOk) {
                     sess.earlyExitAt = System.currentTimeMillis()
                     AppState.addLog(
-                        "    ✓ 特别装备走完（「装备确定」已确认投递成功 → 提前收工，不等容器消失）" +
+                        // ★文案不写死「装备确定」：最后一击可能是它，也可能是「取消（自动装备后无改动）」
+                        "    ✓ 特别装备走完（最后一击已确认投递成功 → 提前收工，不等容器消失）" +
                             "｜从最后一次点击算起 ${System.currentTimeMillis() - sess.lastTapAt}ms",
                     )
                     sess.pending = false
