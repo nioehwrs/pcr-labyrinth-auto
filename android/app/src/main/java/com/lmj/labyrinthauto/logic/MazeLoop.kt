@@ -980,7 +980,11 @@ object MazeLoop {
             //   纳入后走 [DLG_OWN_PAGE_EVERY] 节流；真卡住时仍有 `idle >= DLG_FORCE_AFTER_IDLE` 兜底强制扫描。
             val ownPage = PAGE_LAB_SELECTION in top || PAGE_PARTY_EDIT in top ||
                 PAGE_QUEST_DETAIL in top || PAGE_QUEST_FAILED in top ||
-                PAGE_LAB_RESULT in top          // ★迷宫结算页也算（2026-10-17：它上面跑一次 dialog() 实测 3.2s ✗）
+                PAGE_LAB_RESULT in top ||        // ★迷宫结算页也算（2026-10-17：它上面跑一次 dialog() 实测 3.2s ✗）
+                // ★★2026-11-20（205 事故）：**商店页也算 own page**。它有自己的 handler（handleShop），
+                //   原来漏了 ⇒ 每轮都跑通用弹窗扫描 ⇒ 把商店里的 `OneButtonBlue` 当弹窗点了
+                //   （实测：进店 0.4s 后又点一次 ⇒ 重复进店 ⇒ 205 回标题）。
+                PAGE_SHOP in top
             // ★own page 上只有"**真的弹窗壳**压上来"才查通用弹窗（2026-10-17 用户："弹窗检查在编队页
             //   1.5~1.9s，这个是必要的还是多余的？"——**答：多余**）：编队/选人/预览/失败页本身就是
             //   一个对话框，`dialog()` 走一遍 DialogArea 子树实测 1.5~1.9s（别处才 500ms），
@@ -1391,6 +1395,9 @@ object MazeLoop {
     /** PC `PAGE_LAB_RESULT`(416)：迷宫结算页（打完最终 Boss 的 RESULT ①②屏）——靠 pageTop 认，
      *  它的 `statusType` 是 **NONE(0)**，不认它就会落进"移动"分支一直干等（2026-10-16 实测卡 186s） */
     private const val PAGE_LAB_RESULT = "DialogLabyrinthResult"
+
+    /** 商店页（有自己的 handler `handleShop`；★2026-11-20 纳入 ownPage，防止通用弹窗误点其按钮） */
+    private const val PAGE_SHOP = "DialogLabyrinthShop"
 
     /** PC `LAB_RESULT_TAP_MAX`(417)：结算页最多点几次（①②两屏各一次即可；点不动就不再砸）。
      *  ⚠数的是**真点下去的次数**（2026-10-16 修：原来数的是轮数，读不到按钮时 6 轮就把额度耗光）。 */
@@ -9838,6 +9845,16 @@ object MazeLoop {
      * @return true = 点了
      */
     private suspend fun tapDialogConfirm(input: InputBackend, top: String, tag: String = ""): Boolean {
+        // ★★2026-11-20（205 事故·硬闸门）：**只处理通用弹窗壳**。业务页（商店/选人/编组/事件/
+        //   预览/迷宫结算）上的按钮由各自 handler 负责；在这里按"按钮名白名单"点会误触——
+        //   实测进商店 0.4s 后把商店里的 `OneButtonBlue` 当弹窗点了 ⇒ 重复进店 ⇒ 205 回标题。
+        val shellTop = top.removeSuffix("(Clone)")
+        if (shellTop.startsWith(PAGE_SHOP) || shellTop.startsWith(PAGE_LAB_SELECTION) ||
+            shellTop.startsWith(PAGE_PARTY_EDIT) || shellTop.startsWith("DialogLabyrinthEvent") ||
+            shellTop.startsWith(PAGE_QUEST_DETAIL) || shellTop.startsWith(PAGE_LAB_RESULT)
+        ) {
+            return false
+        }
         // ★2026-11-13（用户："走了几个节点之后闪退" + "消失中的按钮位置"）：
         //   弹窗**已经在收起**（out tween 启动 / factor 开始降）就别再点 —— 按钮位置在飘，
         //   点下去等于点在空处（日志 00:48:48：`确认框：开始消失 +893ms` 之后又点了
