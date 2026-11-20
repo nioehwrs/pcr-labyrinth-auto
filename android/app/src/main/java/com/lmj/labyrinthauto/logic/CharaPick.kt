@@ -444,7 +444,15 @@ class CharaPick(
         if (act.done) return
         val now = System.currentTimeMillis()
         if (BURST) {
-            if (now < act.at) return                       // 连点后的静置：等游戏把这批点击吃进去
+            if (now < act.at) {
+                // ★★2026-11-20（用户："初始选角色点完后会愣一下才点确定"）：静置窗口是为了
+                //   等游戏把这一批点击吃进去；但如果**回读已经齐了**，就说明点击已生效，没必要再等。
+                //   实测 3 张一次点完后 `已选 3/3` 立即可读，却要被 BURST_SETTLE_MS(600ms) 挡 4 轮
+                //   （日志 06.147 已齐 → 06.644 才点去邀请）。⇒ 齐了就直接往下走。
+                val pkNow = intList(q, "picked")
+                val allIn = ids.all { it in pkNow } && pkNow.size >= ids.size
+                if (!allIn) return
+            }
         } else if (now - act.at < TAP_GAP_MS) {
             return
         }
