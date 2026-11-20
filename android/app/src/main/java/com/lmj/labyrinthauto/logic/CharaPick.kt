@@ -6,6 +6,7 @@ import com.lmj.labyrinthauto.labmodel.LabModel
 import com.lmj.labyrinthauto.data.GuildPoolData
 import com.lmj.labyrinthauto.data.RelicTables
 import com.lmj.labyrinthauto.data.Tables
+import com.lmj.labyrinthauto.frida.AgentApi
 import com.lmj.labyrinthauto.input.InputBackend
 import com.lmj.labyrinthauto.logic.team.Rules
 import com.lmj.labyrinthauto.logic.team.TagIds
@@ -63,6 +64,13 @@ class CharaPick(
         get() = invitedPending
         set(v) { invitedPending = v }
 
+    /**
+     * ★★2026-11-20（用户）：直调是**真 onClick**，同一个 unitId 重复投 = 重复选中/取消。
+     * 这里记"刚投过的 uid + 时刻"，[PRESS_HOLD_MS] 内不再投（等下一轮回读 `picked` 复核）。
+     */
+    private val pressedAt = HashMap<Int, Long>()
+    private val loggedNoWin = HashSet<Int>()
+
     /** 取走「刚点过去邀请」标志（取一次就清，避免重复进收框链） */
     fun consumeInvited(): Boolean {
         val v = invitedPending
@@ -97,6 +105,9 @@ class CharaPick(
          *  早期实现一见没坐标就 `done=true` 永久停手 ⇒ 新模拟器（首读略慢）必现「卡在选角色页不点」。
          *  现在**没坐标就下一轮再读**，只有连这么多轮都读不到才真停手（≈12s，防真坏页面死循环）。 */
         const val MAX_NO_XYZ_ROUNDS = 12
+
+        /** ★2026-11-20：同一 uid 的直调去重窗口（直调=真 onClick，重复投会重复选中）。 */
+        const val PRESS_HOLD_MS = 2_000L
 
         // ── 选人策略常量（PC pcr_auto.py 常量区 420~443 逐字）──
         const val PICK_MIN_TIER = 0            // PICK_MIN_TIER：特殊优先只对够格候选举手（0=不限）
@@ -488,8 +499,27 @@ class CharaPick(
                     delay(FIRST_TAP_DELAY_MS)
                 }
                 for ((_, u) in seq) {
-                    val c = cellOf[u]!!
-                    tap(input, c.optInt("x"), c.optInt("y"), "$u ${uname(u)}")
+                    // ★★2026-11-20（用户）：**直调优先** —— `onClickUnitIconCallback(IUnitIcon)`，
+                    //   按 uid 在当前滑窗里定位，不投坐标（不吃滑入动画、不会点歪）。
+                    //   ★同一 uid [PRESS_HOLD_MS] 内只投一次；投过就不再投、也不再补坐标点击。
+                    val nowP = SystemClock.elapsedRealtime()
+                    val lastP = pressedAt[u] ?: 0L
+                    var handled = false
+                    if (nowP - lastP >= PRESS_HOLD_MS) {
+                        val pr = runCatching { AgentApi.labCharaPagePress("pick", u) }.getOrNull()
+                        if (pr?.optBoolean("ok") == true) {
+                            pressedAt[u] = nowP
+                            handled = true
+                        } else if (pr?.optBoolean("notInWindow") == true && loggedNoWin.add(u)) {
+                            AppState.addLog("… 选角色 $u 不在当前滑窗内 → 退回坐标点击")
+                        }
+                    } else {
+                        handled = true      // 刚投过，这一轮不重复投
+                    }
+                    if (!handled) {
+                        val c = cellOf[u]!!
+                        tap(input, c.optInt("x"), c.optInt("y"), "$u ${uname(u)}")
+                    }
                     if (TAP_MS > 0) delay(TAP_MS)
                 }
                 return
@@ -515,15 +545,26 @@ class CharaPick(
         }
 
         if (INVITE && !act.invited) {                      // ② 齐了 → 去邀请（decideButton+0xA8）
+            act.at = now + 3_000L                          // 邀请后多等一会（页面要变）
+            // ★★2026-11-20（用户）：**直调优先** —— `onClickDecideButton()`（先探 isEnableDecideButton），
+            //   不投坐标；失败才退回坐标点击。
+            val pr = runCatching { AgentApi.labCharaPagePress("decide") }.getOrNull()
+            if (pr?.optBoolean("ok") == true) {
+                act.invited = true
+                AppState.addLog("邀请角色（直调 onClickDecideButton）")
+                justInvited = true                         // ★交给 [MazeLoop] 把「收到角色」框点掉
+                return
+            }
             val fb = q.optJSONObject("buttons")?.optJSONObject("decide")
             if (!hasX(fb)) {
                 act.done = true
-                AppState.addLog("[!] 没读到「去邀请」(decideButton+0xA8) 坐标 → 不点")
+                AppState.addLog(
+                    "[!] 「去邀请」直调失败（${pr?.optString("err").orEmpty().ifEmpty { "无回包" }}）且没读到坐标 → 不点",
+                )
                 return
             }
             act.invited = true
-            act.at = now + 3_000L                          // 邀请后多等一会（页面要变）
-            AppState.addLog("邀请角色")
+            AppState.addLog("邀请角色（坐标兜底）")
             tap(input, fb!!.optInt("x"), fb.optInt("y"), "去邀请")
             justInvited = true                             // ★交给 [MazeLoop] 把「收到角色」框点掉
             return

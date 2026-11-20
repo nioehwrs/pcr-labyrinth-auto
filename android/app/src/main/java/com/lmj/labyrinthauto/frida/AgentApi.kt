@@ -547,6 +547,17 @@ object AgentApi {
     suspend fun uiSig(): JSONObject? = obj("uiSig", timeoutMs = T_FAST)
     suspend fun labCharaPageQuick(): JSONObject? = obj("labCharaPageQuick", timeoutMs = T_SLOW)
 
+    /**
+     * ★★2026-11-20（用户）：**开局选角色页直调**（不投坐标）。
+     * - `kind="pick"` + [uid]：选/取消一张卡（`onClickUnitIconCallback(IUnitIcon)`）
+     * - `kind="decide"`：点「去邀请」（`onClickDecideButton()`，先探 `isEnableDecideButton`）
+     *
+     * @return `{ok, kind, uid, via, ex, picked, err, notInWindow}`；
+     *         `notInWindow=true` = 该卡不在当前滑窗内（虚拟列表 8 格，需滚动）。
+     */
+    suspend fun labCharaPagePress(kind: String, uid: Int = 0, timeoutMs: Long = 4_000L): JSONObject? =
+        pressTwoPhase("labCharaPagePress", listOf(kind, uid, false), timeoutMs)
+
     /** 编队页只读快照；`diag=true` 带现场 dump */
     /**
      * 编队页全量快照。

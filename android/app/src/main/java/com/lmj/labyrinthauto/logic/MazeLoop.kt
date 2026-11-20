@@ -2348,7 +2348,14 @@ object MazeLoop {
             taps++
             AppState.addLog("选角后：收到角色 → 点掉（第 $taps 个框，$top）")
             // ★2026-11-19：走 `SelectConfirm|OneButtonWhite`（Middle 单白按钮），直调优先
-            tapBoxButton(input, keys, "收到角色", pathKey = "SelectConfirm|OneButtonWhite")
+            // ★★2026-11-20（用户）：某些公会/场景这一层是 `DialogCommonBig`（获得道具/角色），
+            //   路径与 Middle 不同（[0,2,6] vs [0,2,3]）⇒ 按**实际顶框**选 key，避免 path-miss 退坐标。
+            val boxKey = if (top.startsWith("DialogCommonBig")) {
+                "ResultBig|OneButtonWhite"
+            } else {
+                "SelectConfirm|OneButtonWhite"
+            }
+            tapBoxButton(input, keys, "收到角色", pathKey = boxKey)
             delay(150)
         }
         AppState.addLog("选角后：收到角色处理结束（$taps 个框）")
