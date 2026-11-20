@@ -2476,8 +2476,8 @@ object MazeLoop {
         AppState.addLog("选角后：收到角色处理结束（$taps 个框）")
     }
 
-    /** PC `EVENT_SKIP_RE`(462)：事件演出页的「跳过」按钮名（找不到才退点屏幕中心） */
-    private const val EVENT_SKIP_RE = "skip|Skip|SKIP|スキップ|早送|跳过"
+    // ★2026-11-20（已删）：`EVENT_SKIP_RE` —— 事件跳过改用 `labEventSkip()` 直调
+    //   （`DialogLabyrinthEvent.dramaSkipButton+0x160`），不再靠名字搜节点。见 [handleEventEffect]。
 
     /**
      * PC `EVENT_BTN_RE`(321)：事件选项卡上每张卡的「选择」按钮（按 x 升序 = choice_id_1/2/3）。
@@ -3172,42 +3172,20 @@ object MazeLoop {
             AppState.addLog("事件演出：跳过（直调）")
             return
         }
-        // ★2026-11-20（用户）：直调没成功时**不要退回文本搜索**（那会命中屏幕正中的容器、
-        //   白点一下，日志实测 `点了 事件演出·跳过 (640,360)`）。演出刚起/实例还没就绪 ⇒ 等下一轮即可
-        //   （实测下一轮 0.5s 后直调就成功）。
-        // ★★2026-11-20（实测 _s27）：直调失败的 err 五花八门（`算不出屏幕坐标`/`取不到相机环境`/
-        //   `按钮组件为空`…），逐个匹配必然漏 —— 但它们全是"这一拍不行"的**时机问题**。
-        //   ⇒ 不再逐条判断：只要直调没成功，前 3 轮一律等下一轮；第 4 轮才退回文本搜索兜底。
-        if (n <= 3) {
-            if (n == 1) {
-                AppState.addLog(
-                    "… 事件跳过：直调未成功（" + skPr?.optString("err").orEmpty().ifEmpty { "无回包" } +
-                        "）→ 等下一轮重试（不退回文本搜索）",
-                )
-            }
-            return
+        // ★★2026-11-20（用户："为什么事件中需要点击屏幕中心？好像没有这个设计"）：
+        //   **那个点屏幕中心是旧"文本搜索兜底"的残留** —— `findTextList("跳过|skip")` 命中的是整块
+        //   对话框容器（坐标正好是屏幕正中 (640,360)），点了等于点对话框背景：既不是跳过，还可能误触。
+        //   （2026-10-17 用户就说过"事件跳过不要点屏幕中心"；但当时代码只判"搜索为空"才不点，
+        //     而容器有坐标 ⇒ 照样点了。）
+        //   直调已能可靠跳过（实测每次下一轮就成功）⇒ **整段文本搜索/坐标兜底删除**：失败就等下一轮，
+        //   最坏情况演出自己结束（statusType→0），不会卡死。
+        if (n <= 2) {
+            AppState.addLog(
+                "… 事件跳过：直调未成功（" + skPr?.optString("err").orEmpty().ifEmpty { "无回包" } +
+                    "）→ 等下一轮（不点坐标）",
+            )
         }
-        // 直调不可用（旧版 agent / 演出已结束）⇒ 退回原来的文本搜索 + 坐标点击
-        // ★根顺序（2026-10-17 四次改）：`dialog`（DialogArea 子树）→ `layer`（DialogArea 的父层）。
-        //   去掉 `view`（2026-10-17 实机 13:28:25：一次 **2156ms** ✗）：演出页的 `view` 根 = 整张地图页，
-        //   而「跳过」按钮在对话框里（实测命中 (1752,82)）⇒ 这个根又贵又没必要。
-        var skip = AgentApi.findTextList(EVENT_SKIP_RE, max = 40, root = "dialog")
-        if (skip == null || skip.length() == 0) skip = AgentApi.findTextList(EVENT_SKIP_RE, max = 40, root = "layer")
-        var hit: JSONObject? = null
-        if (skip != null) for (i in 0 until skip.length()) {
-            val b = skip.optJSONObject(i) ?: continue
-            if (hasXY(b)) { hit = b; break }
-        }
-        if (hit != null) {
-            tap(input, hit.optInt("x"), hit.optInt("y"), "事件演出·跳过")
-            if (n == 1) AppState.addLog("事件演出：跳过")
-        } else {
-            // ★没有「跳过」就**不点**（2026-10-17 用户："事件跳过不要点屏幕中心，没有跳过就不点"）：
-            //   原来退回点屏幕中心，那既不是跳过、又可能误触；演出会自己结束（statusType→0），等就行 ✓
-            if (n == 1) {
-                AppState.addLog("[!] 事件演出没找到「跳过」按钮 → **不点**（等演出自己结束）")
-            }
-        }
+        return
     }
 
     // ── 商店页跨轮状态（模拟 PC 模块级 _shop_drag / _shop_rr）──
