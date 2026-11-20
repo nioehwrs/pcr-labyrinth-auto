@@ -3174,12 +3174,20 @@ object MazeLoop {
         }
         // ★2026-11-20（用户）：直调没成功时**不要退回文本搜索**（那会命中屏幕正中的容器、
         //   白点一下，日志实测 `点了 事件演出·跳过 (640,360)`）。演出刚起/实例还没就绪 ⇒ 等下一轮即可
-        //   （实测下一轮 0.5s 后直调就成功）。只在"旧版 agent 没这个 RPC"（skPr==null）时才退回文本搜索。
+        //   （实测下一轮 0.5s 后直调就成功）。
         if (skPr != null) {
             val se = skPr.optString("err")
-            if (skPr.optBoolean("offscreen") || se.contains("没找到活的") || se.contains("dramaSkipButton 为空")) {
+            if (skPr.optBoolean("offscreen") || se.isEmpty() ||
+                se.contains("没找到活的") || se.contains("dramaSkipButton 为空")
+            ) {
                 return
             }
+        } else if (n <= 3) {
+            // ★★2026-11-20（实测补充）：`skPr == null` = RPC **无回包**（agent 忙/超时），
+            //   原来这时也会退回文本搜索 ⇒ 又白点一次屏幕中心（_s26 三次事件全中）。
+            //   它和"实例没就绪"是同一类**时机问题**，同样等下一轮即可；等 3 轮还拿不到才退回文本搜索。
+            if (n == 1) AppState.addLog("… 事件跳过：直调无回包 → 先等下一轮重试（不退回文本搜索）")
+            return
         }
         // 直调不可用（旧版 agent / 演出已结束）⇒ 退回原来的文本搜索 + 坐标点击
         // ★根顺序（2026-10-17 四次改）：`dialog`（DialogArea 子树）→ `layer`（DialogArea 的父层）。
