@@ -1697,7 +1697,7 @@ object MazeLoop {
      * ★★2026-11-20（用户）：**地图信号诊断开关** —— 跑一局观察换区时到底哪个字段在变。
      * 每 250ms 打一行 `[信号] …`。确认完把这里改 false 重编译即可停（不影响逻辑）。
      */
-    private const val MAP_SIGNAL_LOG = true
+    private const val MAP_SIGNAL_LOG = false
     private var mapSignalAt = 0L
 
     /**
@@ -3752,7 +3752,9 @@ object MazeLoop {
             }
             // 可见 / 直调 probe 命中 → 直接点（目标可点后计数复位）
             //   ★directOK 时 vi 仍在（4 层 slots=items，vi=gi），s 的坐标仅作直调失败兜底用。
-            if (directOK) AppState.addLog("商店：目标#$gi（$buyKey）被裁剪但直调 probe 命中 → 不上滑，直接直调")
+            // ★2026-11-20（用户"太快了看不清"）：这里原来每件商品都打一条
+            //   「被裁剪但直调 probe 命中 → 不上滑」，看着像"又点了一次"（其实 probe 是只读）。
+            //   现在不打了 —— 没出现"上滑商店列表"就说明走的是直调，且下一行 `买#N 确认` 才是真点。
             shopDragCount = 0; shopDragTarget = null
             val idx = vi ?: return
             val s = slots[idx]
