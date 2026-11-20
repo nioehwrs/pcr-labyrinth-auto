@@ -1718,8 +1718,10 @@ object MazeLoop {
     private var moveBusySince = 0L
     /** ★2026-11-20：本次 busy 已被判成误报（放行到 busy 消失为止，避免反复判） */
     private var moveBusyFalseReport = false
-    /** ★2026-11-20：动画标记持续多久就判"误报"（正常换区 2~4s；超过就是句柄没清） */
-    private const val MOVE_BUSY_MAX_MS = 6_000L
+    /** ★2026-11-20：`inAnimation` 持续多久就判"粘住"。
+     *  实测换区从 `inAnim=true`（20101 出现）到消失约 **7.6s**（session_164525 16:47:11.8→19.4）
+     *  ⇒ 设 9s 覆盖正常换区，同时保留"真粘住也不永久卡死"的兜底。 */
+    private const val MOVE_BUSY_MAX_MS = 9_000L
     /** ★2026-11-20：最近一次 busy 由哪些句柄贡献（诊断用） */
     private var lastBusyTag = ""
     /**
@@ -1731,7 +1733,7 @@ object MazeLoop {
      * 换区动画确实只在区尾节点（x0601/x0701）之后发生，但这个信号区分不出来。
      * ⇒ 关掉闸门，恢复"用确认框/页面状态判断"的原行为；将来要实测换区时序再打开（只认 areaSlide）。
      */
-    private const val MOVE_BUSY_GATE = false
+    private const val MOVE_BUSY_GATE = true
 
     /**
      * ★★2026-11-20（用户）：**地图信号诊断开关** —— 跑一局观察换区时到底哪个字段在变。
@@ -1780,18 +1782,21 @@ object MazeLoop {
         if (!MOVE_BUSY_GATE) return false                   // 见 [MOVE_BUSY_GATE]：判据不可靠，默认不拦
         val b = runCatching { AgentApi.labMapBusy() }.getOrNull() ?: return false
         if (!b.optBoolean("ok")) return false
-        val busy = b.optBoolean("areaSlide")                // 只认换区滑场（unitMove 会残留上次移动的引用）
+        // ★★2026-11-20（实测验证）：**只认 `inAnimation`**（PartsLabyrinthMapTransition.inAnimation）。
+        //   session_164525 日志证实：
+        //     16:47:11.778 area1→2 换区后 inAnim=true → 投递 20203 被吞
+        //     16:47:15.767 仍 inAnim=true → 再投仍被吞
+        //     16:47:19.565 inAnim=?（动画对象已销毁）→ 再投 131ms 生效
+        //   而普通节点（20402→20503、20203→20303）始终 inAnim=? ⇒ 从不误拦。
+        //   IE 句柄（unitMove/areaSlide/finish）实测全为空、不可用，不再参与判定。
+        val busy = b.optBoolean("inAnimation")
         if (!busy) {
             moveBusySince = 0L
             moveBusyFalseReport = false
             return false
         }
-        // 诊断：记住到底哪个句柄在"非空"（下次一眼看出是哪个字段粘住）
-        lastBusyTag = buildString {
-            if (b.optBoolean("areaSlide")) append("areaSlide ")
-            if (b.optBoolean("unitMove")) append("unitMove ")
-            if (b.optBoolean("finish")) append("finish ")
-        }.trim()
+        // 诊断：换区过渡动画在跑
+        lastBusyTag = "换区过渡动画 inAnimation"
         if (moveBusyFalseReport) return false              // 本轮 busy 已判误报 → 一直放行
         val now = SystemClock.elapsedRealtime()
         if (moveBusySince == 0L) moveBusySince = now
