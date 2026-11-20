@@ -336,6 +336,128 @@ object AgentApi {
      */
     suspend fun battleResultPath(): JSONObject? = obj("battleResultPath", timeoutMs = T_FAST)
 
+    // ────────────────────────── 直调（feat/direct-trigger 并入，2026-11-19）──────────────────────────
+    // "直调" = 不投屏幕坐标，直接压按钮组件的 `onClick` → `EventDelegate.Execute`。
+    // 好处：不用等窗口稳定、不受入场动画/遮挡影响、也不会有"点了但没点到"。
+    // 两段式骨架见 [pressTwoPhase]（runtime_invoke 必须在游戏线程）。
+
+    /** 编组页加/减角色的**轻读** `{ok, party, slots, pool, ms}`（字段直取、零遍历）。 */
+    suspend fun labPartySlots(timeoutMs: Long = T_SLOW): JSONObject? =
+        obj("labPartySlots", timeoutMs = timeoutMs)
+
+    /**
+     * ★编组页**加/减角色直调**（不点屏幕）。
+     *
+     * 同一颗 `UnitIcon` 打给不同对象是两种语义：
+     *   - `"add"`    → `PartsPartyEditScrollController.onClickUnitIcon(UnitIcon)`
+     *   - `"remove"` → `PartsPartyEditPlate.onClickUnitIcon(UnitIcon)`
+     *
+     * ★`ok=true` 只代表"没抛异常"，**不代表队伍变了** ⇒ 调用方要读队伍复核、差的补一遍。
+     * ★改完视图不重排（池子留白）⇒ 要么重开编组页，要么直接 decide。
+     *
+     * @param opts 可选 `{"gap":<ms>,"checked":<bool>}`
+     * @return `{pending:false, done, total, gap, msTotal, log:[{uid, ok, via, ex, err, idx, ms}]}`
+     */
+    suspend fun labPartyPress(
+        kind: String,
+        uids: List<Int>,
+        opts: JSONObject? = null,
+        timeoutMs: Long = 6_000L,
+    ): JSONObject? {
+        val args = if (opts == null) listOf(kind, uids) else listOf(kind, uids, opts)
+        return pressTwoPhase("labPartyPress", args, timeoutMs)
+    }
+
+    /**
+     * ★★**编组页滚动预热**（2026-11-20，替代"滑动列表找角色"）。
+     *
+     * 角色一览是虚拟列表：一屏 8 个、滑走就换内容。但格子对象是**累积扩容**的
+     * （实测滚到底 List 16→24、滚过的角色不会被踢出）⇒ 进页面先
+     * `SetScrollBarValue(0.5)` → `(0.9)` 走一遍，把后面的格子都建出来，
+     * 之后 [labPartyPress] 按 unitId 直调任意角色都不必再滑动。
+     *
+     * @param gap 两步之间的间隔 ms（默认 100）
+     * @return `{pending:false, ok, steps, poolN, scrollDataMax, bar, err, ms}`
+     */
+    suspend fun labPartyScrollPrime(
+        gap: Int = 100,
+        values: List<Float>? = null,
+        readback: Boolean = false,
+        timeoutMs: Long = 8_000L,
+    ): JSONObject? {
+        val o = JSONObject().put("gap", gap)
+        if (values != null) {
+            val arr = org.json.JSONArray()
+            values.forEach { arr.put(it) }
+            o.put("values", arr)
+        }
+        if (readback) o.put("readback", true)
+        return pressTwoPhase("labPartyScrollPrime", listOf(o), timeoutMs)
+    }
+
+    /** ★滚动到单个位置 v（0~1），用于「反馈式分段加人」：跳一次 → 读池子 → 直调池内缺员。 */
+    suspend fun labPartyScrollTo(v: Float, gap: Int = 100, timeoutMs: Long = 8_000L): JSONObject? =
+        labPartyScrollPrime(gap = gap, values = listOf(v), timeoutMs = timeoutMs)
+
+    /**
+     * ★**按固定路径直调**（agent 侧 `LAB_PATHS` 的 key，稳态 6~12ms）——不投坐标。
+     *
+     * 表里没有的按钮才回退 [pressNode]。`probe = true` 只校验路径能否命中、不点。
+     *
+     * key 形如 `"<页名>|<按钮名>"`，例：`QDStart|UIButton_Unit`、`PartyDecide|ButtonDecide`、
+     * `SelectRole|Role0`、`QuestFailedNext|UIButton_Next`、`EndConfirm|ThreeButtonCenter`（无报酬）。
+     */
+    suspend fun labPathPress(key: String, probe: Boolean = false, timeoutMs: Long = 4_000L): JSONObject? =
+        pressTwoPhase("labPathPress", listOf("", emptyList<Int>(), "", probe, false, key), timeoutMs)
+
+    /** ★特别装备三连页直调（key 与 `labExBtn` 完全一致）。 */
+    suspend fun labExPress(key: String, preferId: String? = null, timeoutMs: Long = 4_000L): JSONObject? =
+        pressTwoPhase("labExPress", listOf(key, preferId ?: ""), timeoutMs)
+
+    /** ★编组页三颗按钮直调：`decide`（战斗开始，提交）/ `cancel`（丢弃）/ `exequip`（打开特别装备）。 */
+    suspend fun labPartyBtn(which: String, timeoutMs: Long = 4_000L): JSONObject? =
+        pressTwoPhase("labPartyBtn", listOf(which), timeoutMs)
+
+    /** ★结算页按钮直调（失败=重新挑战 / 胜利=下一步 / BOSS·EX 双态）。 */
+    suspend fun battleResultPress(timeoutMs: Long = 4_000L): JSONObject? =
+        pressTwoPhase("battleResultPress", emptyList(), timeoutMs)
+
+    /** ★直调按钮：按名字正则（+可选根）找节点并触发 `onClick`；`probe` = 只探不点。 */
+    suspend fun pressNode(
+        nameRe: String,
+        root: String? = null,
+        probe: Boolean = false,
+        timeoutMs: Long = 4_000L,
+    ): JSONObject? =
+        pressTwoPhase("pressNodeStart", listOf(nameRe, root, JSONObject().put("probe", probe)), timeoutMs)
+
+    /** 直调链路状态（诊断）：`{hooked, where, frames, jobs, queuedCount, err}` */
+    suspend fun pressState(): JSONObject? = obj("pressState", emptyList(), T_FAST)
+
+    /** ★地图格子**按 BlockId** 直调（`UIButton.onClick` 优先，`onPanelButtonClick` 兜底）。 */
+    suspend fun pressPanel(blockId: Int, probe: Boolean = false, timeoutMs: Long = 4_000L): JSONObject? =
+        pressTwoPhase("pressPanelStart", listOf(blockId, JSONObject().put("probe", probe)), timeoutMs)
+
+    /** 只定位不点（诊断）：确认某个 blockId 能否拿到面板。 */
+    suspend fun panelLocate(blockId: Int): JSONObject? = obj("panelLocate", listOf(blockId), T_SLOW)
+
+    /**
+     * 两段式直调的公共骨架：投递 → 轮询 `pressNodePoll` 取结果。
+     * `runtime_invoke` 必须在游戏线程，而 RPC 里同步等主线程会死锁 ⇒ agent 一律先回 `queued`。
+     */
+    private suspend fun pressTwoPhase(fn: String, args: List<Any?>, timeoutMs: Long): JSONObject? {
+        val st = obj(fn, args, T_FAST) ?: return null
+        if (!st.optBoolean("queued", false)) return st        // 投递失败（钩子装不上/参数非法）→ 直接回错误对象
+        val t0 = SystemClock.elapsedRealtime()
+        while (SystemClock.elapsedRealtime() - t0 < timeoutMs) {
+            delay(120)
+            val r = obj("pressNodePoll", emptyList(), T_FAST) ?: continue
+            if (!r.optBoolean("pending", true)) return r
+        }
+        return JSONObject().put("ok", false).put("pending", false)
+            .put("err", "投递超时：游戏线程 ${timeoutMs}ms 内没执行")
+    }
+
     /** ★★结算按钮"**学一次、之后只校验**"（2026-10-16）：`{ok,hit,name,x,y,label}`。
      *  首次走一次"只限 DialogArea"的遍历学习并记住节点指针；之后只做"读指针 + 校验 + 算坐标"（零遍历）。 */
     suspend fun battleResultBtn(minY: Int): JSONObject? =

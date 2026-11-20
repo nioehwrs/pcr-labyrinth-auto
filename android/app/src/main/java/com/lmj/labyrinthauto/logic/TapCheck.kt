@@ -88,6 +88,12 @@ object TapCheck {
         probe: Int = 0,
         probeMs: Long = currentProbeMs(),
         reached: (suspend (String) -> Boolean)? = null,
+        /**
+         * ★阶段2**自定义到达判据**（2026-11-20，Boss 两轮选人）：每拍用当前 top 调一次，
+         * 返回 true 就算"到达下一阶段"，不必等 `t in expect` 或超时。
+         * 典型用法：top 还是同一个 Selection、但卡片签名已变 ⇒ Boss 第一轮完成，立即进入第二轮。
+         */
+        arrived: (suspend (String) -> Boolean)? = null,
         /** ★给了它就**只调它一次**（同一次快照同时给 top + 判据），不再读 readTop / reached。 */
         probeState: (suspend () -> Probe)? = null,
         skipMax: Int = 6,
@@ -96,6 +102,26 @@ object TapCheck {
         /** ★首点前先「只读不点」几拍（新页入场动画期间按钮坐标还在动，第一下必空）；每拍 [skipDelayMs]。
          *  2026-11-17 用户：默认 1 拍（= 1×probeMs）先试试，抑制"第一下点空"。 */
         skipFirstHits: Int = 1,
+        /**
+         * ★★**直调执行器**（2026-11-19）：给了它就**代替** [tapFn]（[x] / [y] / [xyAt] 全部忽略）。
+         *
+         * 复用本模型而不是另写一套：重试、探针节奏、到达目标页的判据全都一样，
+         * 直调只是**换一个触发方式** —— 不投屏幕坐标 ⇒ 不受前台/遮挡/叠层影响，也省掉 `input tap` 的 ~110ms。
+         *
+         * @return `true` = 已投递到游戏线程；`false` = 投递失败（直接收工）；
+         *         `null` = 这一刻不该点（页面在切 / 按钮没定位到）⇒ 跳过并重试，**不消耗** [retries]
+         */
+        pressFn: (suspend () -> Boolean?)? = null,
+        /**
+         * ★★**直调最多真正投递几次**（默认 1）。
+         *
+         * 2026-11-19 实测事故：三选一的卡片动画慢（约 1s），探针在动画期间判"没到达"⇒ 按 [retries]
+         * 连着直调了 8 次。而**直调是真执行 `onClick`**，不像坐标点击"点在动画里=点空"——
+         * 游戏真的收到 8 次"选中"，直接状态错乱（错误码 205 回标题）。
+         *
+         * ⇒ 直调只投一次，之后**只探测不再投**（把 [retries] 当成纯探测窗口用）。
+         */
+        pressMax: Int = 1,
         verbose: Boolean = true,
     ): Boolean {
         // ── 阶段 1：反复点，直到**离开 from**（证明这一下生效了）──
@@ -105,6 +131,7 @@ object TapCheck {
         var attempt = 0
         var skip = 0                        // "这一刻不该点"的次数（不消耗 retries，但要有上限防死循环）
         var firstSkip = 0                   // 首点前已经跳过的拍数
+        var directFired = 0                 // ★直调已经真正投递过几次（受 [pressMax] 限制）
         var left = false
         var nowTop = ""
         val maxProbe = probe.coerceAtLeast(1)
@@ -122,19 +149,38 @@ object TapCheck {
             // 坐标：给了 xyAt 就**每次点击前现取**（切页动画期间坐标在动 ⇒ 旧坐标会点空）。
             var px = x
             var py = y
-            if (xyAt != null) {
-                val p = runCatching { xyAt() }.getOrNull()
-                if (p == null) {
-                    skip++
-                    if (skip > skipMax) return false
-                    delay(skipDelayMs)
-                    continue
+            if (pressFn != null) {
+                if (directFired >= pressMax.coerceAtLeast(1)) {
+                    // ★★已经直调过了 ⇒ **只探测、绝不再投**（直调多点会真的重复执行游戏逻辑）
+                    attempt++
+                } else {
+                    // ★直调：null = 这一刻不该点（页面在切 / 按钮没定位到）⇒ 跳过并重试，不消耗 retries
+                    val fired = runCatching { pressFn() }.getOrNull()
+                    if (fired == null) {
+                        skip++
+                        if (skip > skipMax) return false
+                        delay(skipDelayMs)
+                        continue
+                    }
+                    attempt++
+                    if (!fired) return false
+                    directFired++
                 }
-                px = p.first
-                py = p.second
+            } else {
+                if (xyAt != null) {
+                    val p = runCatching { xyAt() }.getOrNull()
+                    if (p == null) {
+                        skip++
+                        if (skip > skipMax) return false
+                        delay(skipDelayMs)
+                        continue
+                    }
+                    px = p.first
+                    py = p.second
+                }
+                attempt++
+                if (!tapFn(px, py, what)) return false
             }
-            attempt++
-            if (!tapFn(px, py, what)) return false
             // ★2026-11-19（日志精简）：删掉「⏱ probe … 轨迹」输出（每次探测一行、纯诊断噪音）；
             //   命中与否由下面的 `⤷ …` 一行体现。
             // ── 点完**探**一下"页面变没变" ──
@@ -198,6 +244,16 @@ object TapCheck {
                 runCatching { readTop() }.getOrDefault(unknownTop)
             } else {
                 runCatching { AgentApi.labTop() }.getOrNull() ?: ""
+            }
+            // ★自定义到达判据优先（如"卡片签名变了"）：top 没变也能立即算到达（Boss 两轮选人）。
+            if (arrived != null && runCatching { arrived(t) }.getOrDefault(false)) {
+                if (verbose) {
+                    AppState.addLog(
+                        "⤷ 阶段2 [${from.joinToString("/")}] --$what--> 自定义到达（卡片刷新，top=$t）" +
+                            "用时 ${android.os.SystemClock.elapsedRealtime() - t0}ms",
+                    )
+                }
+                return true
             }
             if (t in expect) {
                 if (verbose) {
