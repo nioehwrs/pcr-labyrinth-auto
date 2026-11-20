@@ -577,6 +577,15 @@ object AgentApi {
     suspend fun labCharaPagePress(kind: String, uid: Int = 0, timeoutMs: Long = 4_000L): JSONObject? =
         pressTwoPhase("labCharaPagePress", listOf(kind, uid, false), timeoutMs)
 
+    /**
+     * ★★2026-11-20（用户）：**批量直调**（仿编组页"一次全点"）。
+     * 在同一个游戏线程任务里按 uid 依次点完，省掉每个一次的 RPC 往返 + 轮询。
+     *
+     * @return `{ok, kind, results:[{ok,uid,err,notInWindow}], n, ms}`
+     */
+    suspend fun labCharaPagePressMany(kind: String, uids: List<Int>, timeoutMs: Long = 4_000L): JSONObject? =
+        pressTwoPhase("labCharaPagePress", listOf(kind, uids, false), timeoutMs)
+
     /** 编队页只读快照；`diag=true` 带现场 dump */
     /**
      * 编队页全量快照。

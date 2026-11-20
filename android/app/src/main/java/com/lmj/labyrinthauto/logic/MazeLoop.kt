@@ -2371,6 +2371,7 @@ object MazeLoop {
         val t0 = SystemClock.elapsedRealtime()
         var idle = 0
         var taps = 0
+        var lastBoxPtr = ""            // ★刚点过的框（ptr 不变 = 还没走，别重复点）
         while (SystemClock.elapsedRealtime() - t0 < 8_000L && taps < 6) {
             // ★★2026-11-20（用户："选角后等待时间有点长"）：先用**轻读** `labTop()`（几 ms）看还有没有对话框；
             //   没有就直接算一拍收手。原来每拍都调 `dlgBoxNow()`（`labDlgBox` 实测 500ms+）⇒
@@ -2396,6 +2397,18 @@ object MazeLoop {
                 delay(120)
                 continue
             }
+            // ★★2026-11-20（用户："额外获得物弹窗没响应到，可能后面主循环点掉的"）：
+            //   刚点过的**同一个框**（ptr 不变）不再重复点，等它退场/换框。
+            val ptr = b.optString("ptr")
+            if (ptr.isNotEmpty() && ptr == lastBoxPtr) {
+                idle++
+                if (idle >= SUMMON_RECEIPT_IDLE) {
+                    AppState.addLog("选角后：同一个框点了没走（$top）→ 交回主循环")
+                    return
+                }
+                delay(120)
+                continue
+            }
             idle = 0
             if (pickBoxBtn(b, keys) == null) { delay(120); continue }
             taps++
@@ -2408,8 +2421,16 @@ object MazeLoop {
             } else {
                 "SelectConfirm|OneButtonWhite"
             }
-            tapBoxButton(input, keys, "收到角色", pathKey = boxKey)
-            delay(150)
+            // ★★2026-11-20：直调成功就**短等推进**，不再走 [tapBoxButton] 的长等待
+            //   （它内部 `tapAndCheck` 没看到框消失会白探 8×600ms≈4.8s —— 实测 3 个框耗 12.3s 的主因）。
+            val prOk = runCatching { AgentApi.labPathPress(boxKey) }.getOrNull()?.optBoolean("ok") == true
+            if (prOk) {
+                lastBoxPtr = ptr
+                delay(250)
+            } else {
+                tapBoxButton(input, keys, "收到角色", pathKey = boxKey)
+                delay(150)
+            }
         }
         AppState.addLog("选角后：收到角色处理结束（$taps 个框）")
     }

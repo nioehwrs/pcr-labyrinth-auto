@@ -498,28 +498,34 @@ class CharaPick(
                     AppState.addLog("… 选角色页：第一次点前等 ${FIRST_TAP_DELAY_MS}ms 让格子落位")
                     delay(FIRST_TAP_DELAY_MS)
                 }
-                for ((_, u) in seq) {
-                    // ★★2026-11-20（用户）：**直调优先** —— `onClickUnitIconCallback(IUnitIcon)`，
-                    //   按 uid 在当前滑窗里定位，不投坐标（不吃滑入动画、不会点歪）。
-                    //   ★同一 uid [PRESS_HOLD_MS] 内只投一次；投过就不再投、也不再补坐标点击。
-                    val nowP = SystemClock.elapsedRealtime()
-                    val lastP = pressedAt[u] ?: 0L
-                    var handled = false
-                    if (nowP - lastP >= PRESS_HOLD_MS) {
-                        val pr = runCatching { AgentApi.labCharaPagePress("pick", u) }.getOrNull()
-                        if (pr?.optBoolean("ok") == true) {
-                            pressedAt[u] = nowP
-                            handled = true
-                        } else if (pr?.optBoolean("notInWindow") == true && loggedNoWin.add(u)) {
-                            AppState.addLog("… 选角色 $u 不在当前滑窗内 → 退回坐标点击")
+                // ★★2026-11-20（用户："选角色是一次性读完、一次性全点的，5 个角色 200~300ms"）：
+                //   **一次 RPC 里把这批 uid 全点完**（仿编组页）。原来每个 uid 一次 pressTwoPhase
+                //   （投递 + 60ms 轮询往返）⇒ 3 个角色要 845ms。
+                val nowB = SystemClock.elapsedRealtime()
+                val wantPress = seq.map { it.second }
+                val toPress = wantPress.filter { nowB - (pressedAt[it] ?: 0L) >= PRESS_HOLD_MS }
+                val okUids = HashSet<Int>()
+                if (toPress.isNotEmpty()) {
+                    val pr = runCatching { AgentApi.labCharaPagePressMany("pick", toPress) }.getOrNull()
+                    val resArr = pr?.optJSONArray("results")
+                    if (resArr != null) {
+                        for (i in 0 until resArr.length()) {
+                            val o = resArr.optJSONObject(i) ?: continue
+                            val u = o.optInt("uid", toPress.getOrElse(i) { 0 })
+                            if (o.optBoolean("ok")) {
+                                okUids.add(u)
+                            } else if (o.optBoolean("notInWindow") && loggedNoWin.add(u)) {
+                                AppState.addLog("… 选角色 $u 不在当前滑窗内 → 退回坐标点击")
+                            }
                         }
-                    } else {
-                        handled = true      // 刚投过，这一轮不重复投
                     }
-                    if (!handled) {
-                        val c = cellOf[u]!!
-                        tap(input, c.optInt("x"), c.optInt("y"), "$u ${uname(u)}")
-                    }
+                    okUids.forEach { pressedAt[it] = nowB }
+                }
+                // 批量里没成功的（旧版 agent / 不在窗内）⇒ 退回坐标点击
+                for (u in toPress) {
+                    if (u in okUids) continue
+                    val c = cellOf[u] ?: continue
+                    tap(input, c.optInt("x"), c.optInt("y"), "$u ${uname(u)}")
                     if (TAP_MS > 0) delay(TAP_MS)
                 }
                 return
