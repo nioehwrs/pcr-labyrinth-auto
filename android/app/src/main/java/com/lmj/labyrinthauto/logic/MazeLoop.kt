@@ -1714,17 +1714,54 @@ object MazeLoop {
     private const val MOVE_CONFIRM_ONCE_MS = 2_500L
     /** ★2026-11-20：地图动画（换区/移动）提示的节流时间戳 */
     private var moveBusySaidAt = 0L
+    /** ★2026-11-20：本次"动画标记"开始时刻（0 = 没在忙） */
+    private var moveBusySince = 0L
+    /** ★2026-11-20：本次 busy 已被判成误报（放行到 busy 消失为止，避免反复判） */
+    private var moveBusyFalseReport = false
+    /** ★2026-11-20：动画标记持续多久就判"误报"（正常换区 2~4s；超过就是句柄没清） */
+    private const val MOVE_BUSY_MAX_MS = 6_000L
+    /** ★2026-11-20：最近一次 busy 由哪些句柄贡献（诊断用） */
+    private var lastBusyTag = ""
 
     /**
-     * ★★2026-11-20（用户："你有能力读到换区动画吗？"）：**能**。
-     * `ViewLabyrinthMap` 的协程句柄非空即"在跑"：
+     * ★★2026-11-20（用户："你有能力读到换区动画吗？"）：**能**，但**不能只看"非空"**。
+     *
+     * `ViewLabyrinthMap` 的协程句柄：
      * `+0x100 unitMoveIE`（角色移动）/ `+0x108 areaChangeMapSlideIE`（**换区滑场**）/ `+0x110 mapModeFinish`。
-     * 读失败返回 false（不拦，保持原行为）。
+     *
+     * ⚠session_161111 实测：节点 10303（area1，回地图后根本没有换区）`busy` 一直为真，
+     *   「等它结束再点节点」连打 9 次、卡死 28s。说明**这些句柄字段会长期持有对象**，
+     *   "非空"不等于"正在跑"。⇒ 两条修正：
+     *   ① 只认 `areaSlide` / `unitMove`（`mapModeFinishProcessIE` 长期非空，踢出判据）；
+     *   ② 加时长兜底：同一段 busy 持续超 [MOVE_BUSY_MAX_MS] ⇒ 判误报、放行，直到 busy 自行消失。
+     *      否则一旦误报就是永久卡死（比"盲点一下"严重得多）。
      */
     private suspend fun moveBusyNow(): Boolean {
         val b = runCatching { AgentApi.labMapBusy() }.getOrNull() ?: return false
         if (!b.optBoolean("ok")) return false
-        return b.optBoolean("busy")
+        val busy = b.optBoolean("areaSlide") || b.optBoolean("unitMove")
+        if (!busy) {
+            moveBusySince = 0L
+            moveBusyFalseReport = false
+            return false
+        }
+        // 诊断：记住到底哪个句柄在"非空"（下次一眼看出是哪个字段粘住）
+        lastBusyTag = buildString {
+            if (b.optBoolean("areaSlide")) append("areaSlide ")
+            if (b.optBoolean("unitMove")) append("unitMove ")
+            if (b.optBoolean("finish")) append("finish ")
+        }.trim()
+        if (moveBusyFalseReport) return false              // 本轮 busy 已判误报 → 一直放行
+        val now = SystemClock.elapsedRealtime()
+        if (moveBusySince == 0L) moveBusySince = now
+        if (now - moveBusySince > MOVE_BUSY_MAX_MS) {
+            moveBusyFalseReport = true
+            AppState.addLog(
+                "[!] 地图动画标记（areaSlide/unitMove）持续 ${MOVE_BUSY_MAX_MS}ms 不消失 → 判误报，放行点节点",
+            )
+            return false
+        }
+        return true
     }
 
     /** 上次见到的"游戏被杀次数"（[GameProcess.kills]）；一变 ⇒ 说明游戏被重建过，清编队/装备缓存 */
@@ -5025,7 +5062,7 @@ object MazeLoop {
             val nowB = SystemClock.elapsedRealtime()
             if (nowB - moveBusySaidAt > 3_000L) {
                 moveBusySaidAt = nowB
-                AppState.addLog("… 地图动画在跑（换区滑场/移动中）→ 等它结束再点节点")
+                AppState.addLog("… 地图动画在跑（$lastBusyTag）→ 等它结束再点节点")
             }
             delay(150)
             return true
