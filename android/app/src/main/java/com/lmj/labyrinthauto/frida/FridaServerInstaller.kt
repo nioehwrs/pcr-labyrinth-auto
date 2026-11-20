@@ -202,9 +202,25 @@ object FridaServerInstaller {
 
     // ────────────────────────── 启动 ──────────────────────────
 
+    /**
+     * ★cs128：组件**僵死**时强杀重启（2026-11-21 实测：上一局游戏被 force-stop 时，eternalize
+     * 的 agent 会话随进程一起死，frida-server 被卡死 —— 端口还在 LISTEN ⇒ [ensure]/portOpen
+     * 一直判"活着"、永远不会重启它；后续 attach 全部 16s 超时。杀游戏治不了组件的病，必须重启组件本身）。
+     */
+    suspend fun restart(ctx: Context, port: Int = DEFAULT_PORT): Boolean {
+        AppState.addLog("重启运行组件：root 杀旧进程（$DEVICE_PATH）…")
+        RootShell.exec("pkill -f huabanxie-base", 8_000L, direct = true)
+        var waited = 0
+        while (waited < 5_000) {           // ★repeat{} 是 lambda，里面不能 break（2026-11-21 踩过）
+            if (!portOpen(port)) break
+            delay(500)
+            waited += 500
+        }
+        return ensure(ctx, port)
+    }
+
     /** 保证服务在跑；true = 端口已经通了。 */
-    suspend fun ensure(ctx: Context, port: Int = DEFAULT_PORT): Boolean {
-        // ★运行组件（2026-11-4 从 APK 摘出）：注入前必须就绪 —— 用户点"开始"就是在等这个，
+    suspend fun ensure(ctx: Context, port: Int = DEFAULT_PORT): Boolean {        // ★运行组件（2026-11-4 从 APK 摘出）：注入前必须就绪 —— 用户点"开始"就是在等这个，
         //   所以这里**不限制网络**（wifiOnly=false），下完/校验通过才往下走。
         val bridge = prepareBridge(ctx, wifiOnly = false)
         if (bridge == null || !FridaCore.ensureLoaded(ctx)) {

@@ -313,6 +313,7 @@ object FridaInjector {
         var launchTries = 0
         var injectFails = 0
         var injectCycles = 0              // ★"注入失败 → 杀游戏重开"的连续圈数（见 [MAX_INJECT_CYCLES]）
+        var serverRestarts = 0            // ★cs128：注入失败时"重启运行组件"已连做几次（防重启死循环）
         var agentLostSince = 0L          // 非 0 = 正处在"agent 掉线"状态（自愈计时）
         var lastReinjectAt = 0L          // 上次"原地重注入"的时刻（间隔节流）
         var reinjectN = 0                // 本次掉线已原地重注入几次
@@ -610,6 +611,7 @@ object FridaInjector {
                     launchTries = 0                  // 游戏活了（被注入成功）→ 调起计数清零
                     injectFails = 0
                     injectCycles = 0
+                    serverRestarts = 0
                     pidChangeTries = 0
                     forceLaunch = false
                     stalePid = -1
@@ -623,6 +625,29 @@ object FridaInjector {
                     stage = "注入失败（第 $injectFails 次）：${err.take(60)}"
                     AppState.addLog("注入失败（第 $injectFails 次）：$err")
                     AppState.setFridaStatus("注入失败：${err.take(72)}")
+                    // ★cs128（2026-11-21 实测：上一局游戏被 force-stop 时 eternalize 会话随进程死掉，
+                    //   frida-server 被卡死 —— 端口还在 LISTEN ⇒ ensureFridaServer/portOpen 判"活着"
+                    //   永远不会重启它；后续 attach 连 3 次 16s 超时，最后整局停手）。
+                    //   注入失败先探**运行组件**是否还响应；僵了 ⇒ 重启组件、本轮不杀游戏
+                    //   （杀游戏治不了组件的病），下一轮直接重注入。
+                    if (!fridaServerAlive()) {
+                        if (serverRestarts < 2) {
+                            serverRestarts++
+                            AppState.addLog(
+                                "注入失败且运行组件没响应（探测 systemui 5s 无回包）⇒ 组件僵了 → " +
+                                    "重启运行组件（第 $serverRestarts 次，不杀游戏）",
+                            )
+                            stage = "重启运行组件"
+                            val ok = FridaServerInstaller.restart(ctx, FRIDA_SERVER_PORT)
+                            AppState.addLog(
+                                if (ok) "运行组件已重启 → 下一轮重注入（pid 不变不用等映射）"
+                                else "运行组件重启失败 → 下一轮 ensure 再试",
+                            )
+                            delay(2_000)
+                            continue
+                        }
+                        AppState.addLog("运行组件已重启 $serverRestarts 次仍注入失败 → 放弃组件路线，走杀游戏自愈")
+                    }
                     // ptrace 类失败 => 进程大概率已僵死（2026-10-21 uuz 设备实测）：attach 写内存
                     //   失败后进程进 T 状态——gamePid 还看得见、maps 里却连 libil2cpp 都没有，
                     //   不自愈就会卡在"等映射 120s"。这类错误立即杀游戏重开，别攒次数。
@@ -825,13 +850,30 @@ object FridaInjector {
     }
 
     /**
+     * ★cs128（2026-11-21）：探**运行组件**（frida-server）是否还在正常应答。
+     * 端口通 ≠ 组件活着 —— 组件可能被上一局死掉的游戏进程（eternalize 会话）卡死：
+     * 端口还在 LISTEN ⇒ `portOpen`/`ensureFridaServer` 永远判"活着"，而 attach 全部挂起。
+     * 做法：借 findPid 对 **systemui**（Android 上必然存在的进程）做一次 frida-server 往返，
+     * 5s 内应答（哪怕回 -1"没找到"）= 组件活着；5s 没回包 = 僵了。
+     * ⚠`withTimeoutOrNull` 取消不了已经进 JNI 的阻塞调用（泄漏一个 IO 线程）——
+     *   所以探测本身只在"注入失败"之后才做，频度极低；泄漏可接受。
+     */
+    private suspend fun fridaServerAlive(): Boolean {
+        val r = withTimeoutOrNull(5_000L) {
+            runCatching { FridaCore.findPid(FRIDA_SERVER, "com.android.systemui") }.getOrDefault(-1)
+        }
+        return r != null && r > 0
+    }
+
+    /**
      * 注入失败的现场快照（2026-10-29 用户报障后加）。
      *
      * 用户只能把日志发过来，所以日志必须**自己说清**失败原因 —— 下面几个值能把三种情况分开：
      *  * 进程到底还在不在：`pidof` + `/proc/<pid>/status` 的 State（T/D/t = 僵死）；
      *  * 游戏是不是 arm64 包在 x86 模拟器上跑：`primaryCpuAbi=arm64-v8a` ⇒ Houdini 转译，
      *    这种情况下注入"看起来成功"也读不到 il2cpp（见 2026-10-29 那台 MuMu 的实测）；
-     *  * 是崩了还是被反作弊干掉：logcat 里的 FATAL / has died / Force finishing。
+     *  * 是崩了还是被反作弊干掉：logcat 里的 FATAL / has died / Force finishing；
+     *  * ★cs128：运行组件还响应吗（端口通 ≠ 组件活着，attach 挂起时组件可能已僵）。
      */
     private suspend fun diagnoseInject(pid: Int): String {
         val parts = ArrayList<String>()
@@ -840,6 +882,8 @@ object FridaInjector {
             parts.add("pidof=$alive" + if (alive == pid) "（同 pid）" else "（≠$pid）")
             val state = RootShell.exec("awk '/^State:/{print \$2}' /proc/$pid/status", 3_000L, direct = true).out.trim()
             parts.add("state=${state.ifBlank { "已退出" }}")
+            // ★cs128：把"运行组件还响应吗"写进诊断（端口通 ≠ 组件活着，attach 挂起时组件可能已僵）
+            parts.add("组件=" + if (fridaServerAlive()) "有响应" else "没响应（僵）")
             val abi = RootShell.exec("dumpsys package ${GameProcess.pkg()} | grep -m1 primaryCpuAbi", 8_000L)
                 .out.substringAfter("primaryCpuAbi=", "").trim()
             parts.add("游戏ABI=${abi.ifBlank { "?" }}")

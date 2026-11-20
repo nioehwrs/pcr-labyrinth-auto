@@ -425,12 +425,10 @@ object MazeLoop {
         selNoCardHeals.clear()                  // 选人页"读不到卡片"的自愈计数
         relicBadHeals.clear()                   // 遗物候选"读数全是垃圾"的自愈计数
         battleDumps = 0                         // 战斗结算页对象字段抓取（每场一次、每局上限）
-        labResultDumps = 0                      // 迷宫结算页对象字段抓取（单独预算，每局 ≤2 次）
         saidRelicErr = ""                       // 持有遗物读取异常提示（本局重新报一次）
         resMemDiagKey = null                    // 结算按钮字段读诊断（每局重新抓一次）
         dlgTapSig = null                        // 弹窗点击熔断（本局重新计数）
         dlgTapN = 0
-        labResultSig = ""                       // 结算页"落位闸门"（连续两轮同坐标才点）
         seenKills = GameProcess.kills           // 本局开始时的"游戏被杀次数"基线（见主循环 0.35）
         // ★2026-11-10（用户反馈：新局商店里出现了"上一局的 3★ 清单"）：
         //   `shopQuota` 等是**单例字段**，跨局必须清 —— 否则新局进同一家店（blockId/area 相同）
@@ -1593,25 +1591,6 @@ object MazeLoop {
      *  对决策没有任何帮助 ✗。代码与预算计数都留着，改这一个常量就能再打开（排新偏移时用）。 */
     private const val AUTO_RESULT_DUMP = false
 
-    /** ★**迷宫结算页**（`DialogLabyrinthResult`）单独一份抓取预算（2026-10-16 用户："你抓到迷宫结算的字段了？"）。
-     *  ⚠为什么必须**单独**：原来它和战斗结算共用 [battleDumps]/[BATTLE_DUMP_MAX]（每局 3 次），而一局里
-     *  普通战 + Boss 战 + 失败页就能把 3 次用完 ⇒ **走到最后的迷宫结算页时额度已空、一次都抓不到** ✗。
-     *  这页每局最多出现 2 屏（①「加入的角色」②「CLEAR+总分」），各抓一次足够。 */
-    private var labResultDumps = 0
-
-    /** 迷宫结算页每局最多抓 2 次（两屏各一次） */
-    private const val LAB_RESULT_DUMP_MAX = 2
-
-    /** ★结算页"连续几轮定位不到按钮"才允许走树兜底（2026-10-17）：入场动画期间前几轮空是正常的，
-     *  立刻遍历既慢又是卡死风险的来源。 */
-    private const val LAB_RESULT_TREE_AFTER_N = 4
-
-    /** ★同上前提下才**补抓**对象字段（原来在函数开头抓 ⇒ 每局白花 2~7s，还把第一次点击拖后 ✗） */
-    private const val LAB_RESULT_DUMP_AFTER_N = 6
-
-    /** ★结算页"落位闸门"用：上一次看到的 `tag|label@x,y`（连续两次一致才点） */
-    private var labResultSig = ""
-
     /** ★本局是否**完整跑完**（见到结算页并走到"本局结束"那条 return）—— 决定日志存成 `__DONE` 还是 `__ABORT_*` */
     private var runFinished = false
 
@@ -1679,8 +1658,17 @@ object MazeLoop {
      *  不能再只在开局那一次传（见 [handleMove] 里的说明）。 */
     private var rerollRoutes: Map<Int, List<Int>>? = null
 
-    /** ★最多等几轮让按钮落位（超过 ⇒ 不再等，直接点；防"坐标每轮抖 1px"死等） */
-    private const val LAB_RESULT_SETTLE_N = 8
+    /** ★cs127（用户 2026-11-21 定口径"每个直调只调一次"+ 改用 tapAndCheck）：直调投出后**等推进**的秒数；
+     *  超过 ⇒ pressFn 内退**一次**坐标兜底（每屏也只投一次）。 */
+    private const val LAB_RESULT_DIRECT_WAIT_S = 3
+
+    /** ★cs127：直调+坐标兜底**都投过**仍没推进时，再等这么多秒就停手交人工（防永久空转）。 */
+    private const val LAB_RESULT_BOTH_SPENT_S = 10
+
+    /** ★cs127：tapAndCheck 探测窗口的 retries。直调档每轮 ≈10×60ms 探测 ⇒ 总窗口 ≈ 3.8s，
+     *  必须盖过换屏动画（①→②约 0.5~1s），否则窗口外判"没生效"→ 主循环重进 → pressFn 的已投标记
+     *  会放行坐标兜底，等于变相多点。 */
+    private const val LAB_RESULT_PROBE_ROUNDS = 6
 
     /** ★弹窗点击熔断（2026-10-17）：同一颗按钮最多连点 [DLG_TAP_MAX] 次（防"幽灵弹窗"无限连点）。
      *  ★2026-11-14（用户）：3 → **8** —— 这类"提前点/点空再点"是安全动作，代价只是一次 tap；
@@ -5489,13 +5477,19 @@ object MazeLoop {
     private const val PARTY_STEP_EXITED = 2    // 页面已经离开编组页（开打/退出）
 
     /**
-     * ★2026-11-20：反馈式「分段加人」的滚动位置序列（探测后定的，见 tools/daemon_probe.log 思路）。
-     * 虚拟池是滑窗、滑走换内容，不存在一个 v 能装下全部角色 ⇒ 按这几个位置跳，每段把池内缺员直调掉。
-     * - 0.35 / 0.85：让滑窗分别落在靠上、靠下的三行（各约 24 格、有重叠）⇒ 覆盖两端；
-     * - 0.60：补中间三行。
-     * 顺序按"覆盖效率"排：先两端后中间；每步都读池子校正，所以偏差只会多跳、不会漏。
+     * ★2026-11-20：反馈式「分段加人」的滚动位置序列。
+     * 虚拟池是滑窗（一屏 8 格、滑走换内容），不存在一个 v 能装下全部角色 ⇒ 按这几个位置跳，
+     * 每段把池内缺员直调加掉。
+     *
+     * ★★2026-11-22（50801 Boss 卡死实测重定，用户口径）：旧 3 段 (0.35/0.85/0.60) **漏掉顶部区**——
+     *   普通编组页池 ≤24 格全量可见时没事，Boss 页 scrollDataMax=56（7 行）、池上限 24 ⇒ 内容随位置换，
+     *   107101 恰好在第一行，三段永远够不着 ⇒ 无限滚动"找不到角色"。
+     *   实测：视窗 3 行；用户定的 0.21 —— 0.25 在 7 行时刚好能看到第一行、8 行时就不行了，
+     *   0.21 留出头量（行数变多也够得着第一行）。序列 0.21/0.85/0.53：
+     *   0.21 看第一~三行（含第一行），0.85 看尾部，0.53 补中间。加上池子**累积**特性
+     *   （滚过的格子暂不回收、池上限 24），第一段的命中会在后续段保留。
      */
-    private val PARTY_SCROLL_STEPS = floatArrayOf(0.35f, 0.85f, 0.60f)
+    private val PARTY_SCROLL_STEPS = floatArrayOf(0.21f, 0.85f, 0.53f)
 
     /**
      * 编组页主入口（2026-11-07 重做）：**一次调用内把整个流程跑完**。
@@ -5969,7 +5963,7 @@ object MazeLoop {
             }
             // ★★2026-11-20（用户确认）：**反馈式分段直调** —— 整套方案，不是"把 tap 换成直调"。
             //   虚拟池是滑窗（一屏 8 个、滑走换内容），不存在一个滚动位置能装下全部角色 ⇒
-            //   按 PARTY_SCROLL_STEPS（0.31/0.85/0.58）逐段跳：每段读当前池子 uid，把池内还缺的
+            //   按 PARTY_SCROLL_STEPS（8 段均匀 0→1，见字段注释）逐段跳：每段读当前池子 uid，把池内还缺的
             //   按 unitId 直调加掉，remaining 递减；某段没命中就跳下一段。每步读池子校正 ⇒ 偏差只会多跳、不漏。
             //   顺序：撤人(①a 已完成，队伍区常驻可见) → 分段跳+直调加人 → 剩余可见项坐标兜底。
             val remaining = (adds.map { it.unit } + offAddUids)
@@ -6098,6 +6092,41 @@ object MazeLoop {
             if (ps.lastVis != null && vis == ps.lastVis) ps.still++ else ps.still = 0
             ps.lastVis = vis
             val off = plan.offscreen.filter { it.unit !in ps.noScroll }
+            // ★cs127（2026-11-21，用户："不要退化 swipe"）：进滚动分支前先跑一遍**分段直调**。
+            //   现场复盘（Boss_319401 三队）：上一队把滚动条停在半路 → 这一队目标整批屏外
+            //   ⇒ ops 全空直接掉进滚动分支，白 swipe 3 次（3.3s，还触发"方向反复"惩罚），
+            //   而下一轮分段跳一次全中。直调不吃坐标、池子累积 ⇒ 先按 PARTY_SCROLL_STEPS
+            //   跳一遍清缺员，清干净的这轮就不滚了；一个都没命中的才照旧 swipe。
+            if (off.isNotEmpty()) {
+                var remain = off.map { it.unit }.distinct().toMutableSet()
+                var anyHit = false
+                for (v in PARTY_SCROLL_STEPS) {
+                    if (remain.isEmpty()) break
+                    val sr = runCatching { AgentApi.labPartyScrollTo(v) }.getOrNull()
+                    if (sr?.optBoolean("ok") != true) continue
+                    val slots = runCatching { AgentApi.labPartySlots() }.getOrNull()
+                    val poolUids = slots?.optJSONArray("pool")?.let { arr ->
+                        (0 until arr.length()).mapNotNull { i -> arr.optJSONObject(i)?.optInt("unitId") }
+                    }.orEmpty()
+                    val hit = remain.intersect(poolUids.toHashSet()).toList()
+                    if (hit.isEmpty()) continue
+                    val done = partyDirectPress("add", hit) ?: emptySet()
+                    if (done.isNotEmpty()) anyHit = true
+                    remain -= done
+                    AppState.addLog(
+                        "编队：滚动前分段跳 $v（池 ${poolUids.size}）命中 ${hit.size} → 直调 ${done.size} 个" +
+                            "（${done.joinToString(",")}），剩 ${remain.size}",
+                    )
+                }
+                if (anyHit) {
+                    // 直调清掉过人 ⇒ 这一轮不滚（下轮重算 offscreen，清剩下的再决定滚不滚）
+                    AppState.addLog(
+                        if (remain.isEmpty()) "编队：滚动前分段直调已清完缺员 → 不再滚动"
+                        else "编队：滚动前分段直调清了 ${off.size - remain.size}/${off.size} 个，剩 $remain 下轮再试",
+                    )
+                    return PARTY_STEP_AGAIN
+                }
+            }
             when {
                 // ★唯一停机判据：连续两次滚完"屏上图标集合"没变 ⇒ 这些缺员在本页翻不到（PC 同款）。
                 //   **不设滚动次数上限**（用户 2026-10-16）：次数到顶并不代表"翻不出来"，只有"滚了屏上没变化"
@@ -7130,14 +7159,26 @@ object MazeLoop {
             val members = plan.members.filter { it != 0 }
             val left = members.size
             if (left == 0) return
-            // ★1 号位 = 站位序第一个人（`nowMember[0]`，= 画面上**最右**那个槽位）。
+            // ★★2026-11-22（用户）：拆人改**直调**（同主流程撤人那套：按 uid 一次全点完 +
+            //   Plate.onClickUnitIcon + 复核）；坐标连点 1 号位那条路退为兜底。
+            if (round == 0) AppState.addLog("清队伍$teamNo：$left 人直调撤下（Plate.onClickUnitIcon）")
+            val done = partyDirectPress("remove", members)
+            if (done != null) {
+                delay(PartyPlan.LAB_PARTY_BATCH_SETTLE)
+                val after = AgentApi.labPartyPlan()?.members?.count { it != 0 } ?: -1
+                if (after == 0) return
+                AppState.addLog("清队伍$teamNo：直调后还剩 $after 人 → 再补一轮（第 ${round + 2}/3 轮）")
+                return@repeat
+            }
+            // ── 坐标兜底（原路线）：1 号位 = 站位序第一个人（`nowMember[0]`，= 画面上**最右**那个槽位），
+            //    撤下后后面的人往右补位 ⇒ 对着同一格连点即可。
             val c = runCatching { AgentApi.labPartyIconPos(members.first(), "槽位") }.getOrNull()
             if (c == null) {
                 AppState.addLog("[!] 清队伍$teamNo：读不到 1 号位坐标 → 停止清这队")
                 return
             }
             val n = left.coerceAtMost(5)
-            if (round == 0) AppState.addLog("清队伍$teamNo：对着 1 号位（最右）连点 $n 次（撤下后后面的人往右补位）")
+            AppState.addLog("清队伍$teamNo：直调不可用 → 对着 1 号位（最右）连点 $n 次")
             for (i in 1..n) {
                 tap(input, c.first, c.second, "清队伍$teamNo·1 号位（$i/$n）")
                 delay(PartyPlan.LAB_PARTY_TAP_MS)
@@ -8070,7 +8111,6 @@ object MazeLoop {
             tries["$tag|rw"] = 1
             maybeLogRewards("结算页")
         }
-        val n = bump(tries, tag)
         // ★"点了几次"要数**真点下去的按钮**（2026-10-16）：上一版数的是**轮数** ⇒ 读不到按钮时
         //   6 轮就把额度耗光（日志里"结算页点了 6 次"其实是 6 次空点）。轮数只用来打进度。
         val taps0 = tries.getOrPut("$tag|rtaps", { 0 })
@@ -8091,28 +8131,154 @@ object MazeLoop {
             }
             return
         }
-        // ★★★直调优先（cs124，2026-11-20 探测实测）：50801 迷宫结算两屏的按钮——
-        //   ①「下一步」= NextButton → PartsLabyrinthResultItemView.onClickNextButton
-        //   ②「关闭」  = CloseButton → PartsLabyrinthResultScoreView.onClickCloseButton
-        //   agent 已把 `DialogLabyrinthResult` 壳纳入 battleResultPathBtn 扫描（stage=scan、kind=lab，
-        //   label「下一步/关闭」区分屏）。直调 4~16ms、无 input-tap 风险；失败退回下面 ①②③ 字段/树链。
-        runCatching { AgentApi.battleResultPress() }.getOrNull()?.takeIf { it.optBoolean("ok") == true }?.let { pr ->
-            val lab = jStr(pr, "label") ?: "?"
-            tries["$tag|rtaps"] = taps0 + 1
-            AppState.addLog("… 结算页「$lab」（直调 ${jStr(pr, "compCls") ?: "CustomUIButton"}）")
-            return
+        // ★★★2026-11-21（用户定口径"每个直调只调一次" + 用户指路）：改用 **tapAndCheck 链**
+        //   （与"重新挑战/小窗关闭"同一模型），替代手搓的标记+等待窗口。
+        //   50801 迷宫结算两屏：①「下一步」= PartsLabyrinthResultItemView.onClickNextButton、
+        //   ②「关闭」= PartsLabyrinthResultScoreView.onClickCloseButton。
+        //   · "只调一次"由 TapCheck 的 **pressMax=1** 内置保证：投一次后纯探测、绝不重投；
+        //     重投额度只在**换屏**（which 变了 = 新屏，投它自己的那一次）时刷新。
+        //   · ①→② 是**同壳换屏**（top 不变）⇒ 窗口名 expect 判不出 ⇒ 用 probeState 一次快照判
+        //     （left = 读链 which 变成 "close"，与 [labResultSnapshot] 同源）。
+        //   · 屏判定以读链为准；agent cs127 也改成同源判屏（+0x248/+0x250 部件激活态），
+        //     不再认错屏（旧扫描只认"节点 active"，②屏上①屏节点仍 active ⇒ 认成「下一步」白投）。
+        //   · 直调投出 [LAB_RESULT_DIRECT_WAIT_S]s 没推进 → pressFn 内退**一次**坐标兜底（[labResultCoord]）；
+        //     直调+坐标都投过仍没推进 → [LAB_RESULT_BOTH_SPENT_S]s 后停手交人工（见 [labResultPressFn]）。
+        val wantScr = jStr(r, "which").ifEmpty { "next" }
+        if (wantScr == "close") {
+            // ★②屏处理前：分数还没读到就先用内存补 + 截图留证（2026-10-23 / 2026-11-10，只做一次）
+            if (tries.getOrPut("$tag|shot", { 0 }) == 0) {
+                tries["$tag|shot"] = 1
+                maybeFillScoreFromLtd("关闭前")
+                captureScoreShot(score)
+            }
+            // ②「关闭」→ 出壳（演出壳/白名单弹窗由通用分支接管）⇒ expect 空 = 离开结算壳就算完成
+            tapAndCheck(
+                input, 0, 0, "结算②「关闭」",
+                from = setOf(PAGE_LAB_RESULT),
+                pressFn = labResultPressFn(input, tag, tries, "close", score, r),
+                pressMax = 1,
+                directFast = true,
+                probe = 10,
+                retries = LAB_RESULT_PROBE_ROUNDS,
+            )
+        } else {
+            // ①「下一步」→ ②屏（同壳换屏，probeState 判 which）
+            tapAndCheck(
+                input, 0, 0, "结算①「下一步」",
+                from = setOf(PAGE_LAB_RESULT),
+                pressFn = labResultPressFn(input, tag, tries, "next", score, r),
+                pressMax = 1,
+                directFast = true,
+                probe = 10,
+                retries = LAB_RESULT_PROBE_ROUNDS,
+                probeState = {
+                    val rr = runCatching { AgentApi.labResult() }.getOrNull()
+                    TapCheck.Probe(
+                        top = if (rr?.optBoolean("ok") == true) PAGE_LAB_RESULT else "",
+                        left = rr?.optBoolean("ok") == true && jStr(rr, "which") == "close",
+                        diag = "src=${rr?.optString("src")?.ifEmpty { "?" }}",
+                    )
+                },
+            )
         }
-        // ★按钮定位：**对象字段为主、节点树兜底**（2026-10-16 修：上一版照搬 PC 第 1 档的
-        //   "`on`=子视图激活"却**没做兜底** ⇒ 实测这页 `next`/`close` 的 `on` 都是假 ⇒ 永远点不了，
-        //   只能空点中间，最后"点了 6 次仍没离开"。PC 那边 `on` 只是**第 1 档快路径**，
-        //   后面还有"按结算子树名字找"⇒ 这里补上同款链条）：
-        //     ① `cands` 里 `which` 那颗、`on=true`、且在屏内（最准：也避免点到**上一屏**那颗）；
-        //     ② `cands` 里任何一颗、只要在屏内（**`on` 只作优选、不作闸**）——「下一步/关闭」的字段
-        //        坐标本来就只属于这两颗，点错的风险极低；
-        //     ③ 节点树里按名字找 `NextButton|ButtonNext` / `CloseButton|ButtonClose`（屏内、下半屏）。
-        //   ⚠「撤退（无报酬）」「返回（有报酬）」都不在这三个来源里 ⇒ 依然点不到。
+    }
+
+    /**
+     * ★cs127：结算页 pressFn 工厂（[tapAndCheck] 链用）。一屏（`scr` = "next"/"close"）的生命周期：
+     *   ① 未投过 → 投直调（`AgentApi.battleResultPress`，agent cs127 自己同源判屏）；投出 = true。
+     *     没投出去（agent 报错/超时没回包）也**算已投**：不重投，等窗口走完退坐标。
+     *   ② 直调已投、[LAB_RESULT_DIRECT_WAIT_S]s 内 → null（纯探测，tapAndCheck 的 probe 在跑）。
+     *   ③ 窗口走完 → 坐标兜底**一次**（[labResultCoord]）→ tap（「关闭」先补分数 + 截图）。
+     *   ④ 直调+坐标都投过 → 再等 [LAB_RESULT_BOTH_SPENT_S]s 没推进就停手交人工；之后纯探测（null）。
+     *   ★已投标记存 [tries]（跨轮/跨 tapAndCheck 调用持久）——TapCheck 每次重入 pressMax 会重置，
+     *     "只调一次"必须靠自己的标记，不能靠它的额度。
+     */
+    private fun labResultPressFn(
+        input: InputBackend,
+        tag: String,
+        tries: MutableMap<String, Int>,
+        scr: String,
+        score: String,
+        r: JSONObject,
+    ): suspend () -> Boolean? {
+        val dirKey = "$tag|dir_$scr"
+        val coordKey = "$tag|coord_$scr"
+        return {
+            val nowS = (SystemClock.elapsedRealtime() / 1000L).toInt()
+            if (!tries.containsKey(dirKey)) {
+                tries[dirKey] = 1
+                tries["$tag|dirat_$scr"] = nowS
+                val pr = runCatching { AgentApi.battleResultPress() }.getOrNull()
+                if (pr?.optBoolean("ok") == true) {
+                    tries["$tag|rtaps"] = (tries["$tag|rtaps"] ?: 0) + 1
+                    AppState.addLog(
+                        "… 结算页「${jStr(pr, "label")?.ifEmpty { "?" } ?: "?"}」" +
+                            "（直调 ${jStr(pr, "compCls")?.ifEmpty { "CustomUIButton" } ?: "CustomUIButton"}）",
+                    )
+                    true
+                } else {
+                    null
+                }
+            } else if (!tries.containsKey(coordKey)) {
+                val at = tries["$tag|dirat_$scr"] ?: 0
+                if (nowS - at < LAB_RESULT_DIRECT_WAIT_S) {
+                    // 直调窗口内：纯探测。★null 会吃 skipMax(6)×30ms 的跳拍额度 ⇒ 先垫 400ms
+                    //   让一次 tapAndCheck 调用的 null 轮覆盖 ~2.5s，少几次"返回 false→主循环重进"的空转
+                    delay(400)
+                    null
+                } else {
+                    // 窗口走完 ⇒ 坐标兜底**一次**
+                    tries[coordKey] = 1
+                    tries["$tag|coordat_$scr"] = nowS
+                    AppState.addLog(
+                        "… 结算页「${if (scr == "close") "关闭" else "下一步"}」直调已投、${nowS - at}s 没推进 → 坐标兜底（一次）",
+                    )
+                    val c = labResultCoord(r, scr, tag, tries)
+                    if (c == null) {
+                        if (tries.getOrPut("$tag|cnb_$scr", { 0 }) == 0) {
+                            AppState.addLog("… 结算页坐标兜底也没读到屏内坐标（$scr）→ 下一轮再看")
+                        }
+                        null
+                    } else {
+                        val (lab, pxy) = c
+                        if (lab == "关闭") maybeFillScoreFromLtd("关闭前")
+                        if (lab == "关闭") captureScoreShot(score)
+                        tries["$tag|rtaps"] = (tries["$tag|rtaps"] ?: 0) + 1
+                        AppState.addLog("迷宫结算：点了「$lab」(${pxy.first},${pxy.second})")
+                        tap(input, pxy.first, pxy.second, "结算·$lab", learnKey = "settle|result")
+                        true
+                    }
+                }
+            } else {
+                // 直调+坐标都投过：再等 BOTH_SPENT 就停手（防永久空转）
+                val at = tries["$tag|coordat_$scr"] ?: 0
+                if (nowS - at >= LAB_RESULT_BOTH_SPENT_S &&
+                    tries.getOrPut("$tag|bothstop_$scr", { 0 }) == 0
+                ) {
+                    AppState.addLog("[✗] 结算页直调+坐标都投过、${nowS - at}s 仍没推进 → 停手（这一页请人工点掉）")
+                    stopRequested = true
+                }
+                delay(400)                     // 同上：垫掉 null 跳拍额度，减少外层空转
+                null
+            }
+        }
+    }
+
+    /**
+     * ★cs127：结算页坐标兜底定位（[labResultPressFn] 的坐标档用，每屏只投一次）。
+     * 链条（2026-10-16 定）：① `cands` 里 which 那颗、`on=true`、屏内（最准，避免点到上一屏那颗）
+     * → ② `cands` 任何一颗只要屏内（`on` 只作优选、不作闸）→ ③ 节点树按名字找（屏内、下半屏）。
+     * ⚠「撤退（无报酬）」「返回（有报酬）」不在这三个来源里 ⇒ 天然点不到。
+     * ★③不再需要旧的轮数闸门：坐标兜底只在"直调窗口走完"（≥[LAB_RESULT_DIRECT_WAIT_S]s）后才跑，
+     *   入场动画早已结束。
+     */
+    private suspend fun labResultCoord(
+        r: JSONObject,
+        want: String,
+        tag: String,
+        tries: MutableMap<String, Int>,
+    ): Pair<String, Pair<Int, Int>>? {
         val cands = r.optJSONObject("cands")
-        val want = jStr(r, "which")
         val order = listOf(want, "next", "close").filter { it == "next" || it == "close" }.distinct()
         val inBox = { x: Int, y: Int -> x in 0 until scrW && y in 0 until scrH }
         var label = ""
@@ -8140,79 +8306,26 @@ object MazeLoop {
             }
             break
         }
-        // ★★树兜底加"等一下"闸门（2026-10-17）：按钮有入场动画，字段坐标可能**先空/先屏外** ⇒
-        //   前几轮只是"还没就绪"，不该立刻去遍历 ✗（这页遍历是重活、也是卡死风险的来源）。
-        //   连续 [LAB_RESULT_TREE_AFTER_N] 轮都拿不到才允许走树。
-        if (xy == null && n >= LAB_RESULT_TREE_AFTER_N) {     // ③ 兜底：节点树按名字找
+        if (xy == null) {                                    // ③ 兜底：节点树按名字找
             val half = (scrH * 0.5).toInt()
             for ((re, lab) in listOf(LAB_RESULT_NEXT_RE to "下一步", LAB_RESULT_CLOSE_RE to "关闭")) {
                 val lst = AgentApi.findTextIn(re, "top", 6, half) ?: continue
-                var hit: Pair<Int, Int>? = null
                 for (i in 0 until lst.length()) {
                     val b = lst.opt(i) as? JSONObject ?: continue
                     val x = (b.opt("x") as? Number)?.toInt() ?: continue
                     val y = (b.opt("y") as? Number)?.toInt() ?: continue
                     if (!inBox(x, y)) continue
-                    hit = x to y
-                    break
-                }
-                if (hit != null) {
                     label = lab
-                    xy = hit
+                    xy = x to y
                     if (tries.getOrPut("$tag|rb2", { 0 }) == 0) {
-                        AppState.addLog(
-                            "… 结算页对象字段拿不到按钮（$bad）→ 改用节点树按名字找到「$label」@${hit.first},${hit.second}",
-                        )
+                        AppState.addLog("… 结算页对象字段拿不到按钮（$bad）→ 节点树按名字找到「$label」@$x,$y")
                     }
                     break
                 }
+                if (xy != null) break
             }
         }
-        val p = xy
-        if (p == null) {
-            // ★按需补抓（见函数开头）：只有**连续多轮**定位不到按钮时才抓一次对象字段
-            //   ★默认不抓（[AUTO_RESULT_DUMP]=false）：结算页字段读已打通（3ms），dump 只是噪音。
-            if (AUTO_RESULT_DUMP && n >= LAB_RESULT_DUMP_AFTER_N && labResultDumps < LAB_RESULT_DUMP_MAX) {
-                labResultDumps++
-                AppState.addLog("（结算页连续 $n 轮定位不到按钮 → 抓一次对象字段，约 2~7s）")
-                dumpBattleResult()
-            }
-            // ★读不到坐标 ⇒ **不空点屏幕中心**（用户 2026-10-16：那是"过渡操作"，不该顶替「下一步」；
-            //   实测空点对结算页毫无作用，只会把"点了几次"的额度耗光）。只报进度，等按钮就绪。
-            if (n <= 3 || n % 20 == 0) {
-                AppState.addLog("… 结算页（第 $n 轮）还没读到可点按钮（which=$want${if (bad.isEmpty()) "" else "，$bad"}）→ 下一轮再看")
-            }
-            return
-        }
-        // ★★落位闸门（2026-10-17 用户："按钮可能不会第一时间弹出来"）：**连续两轮读到同一坐标**才点。
-        //   这页按钮带 `TweenScale/TweenAlpha` 入场动画 —— 字段坐标可能"早就有、但按钮还没可点" ⇒
-        //   立刻点就是空点（和选人页那次同一形状）。只多等一轮（≈ 一次 labResult，几十 ms）✓；
-        //   ①→②换屏时 label/坐标会变 ⇒ 自动重新等一轮 ✓（sig 里带 tag，换页也不会误判）。
-        val sig = "$tag|$label@${p.first},${p.second}"
-        if (labResultSig != sig && n < LAB_RESULT_SETTLE_N) {
-            labResultSig = sig
-            if (n <= 2) {
-                AppState.addLog("… 结算页「$label」@${p.first},${p.second} 先记一轮（等按钮落位）→ 下轮一致就点")
-            }
-            return
-        }
-        // ★兜底安全阀：万一坐标每轮抖 1px（永远"不一致"），等满 [LAB_RESULT_SETTLE_N] 轮就不再等、直接点 ✓
-        if (n == LAB_RESULT_SETTLE_N && labResultSig != sig) {
-            AppState.addLog("… 结算页坐标 $LAB_RESULT_SETTLE_N 轮仍未稳定（每次都在变）→ 不再等，照点")
-            labResultSig = sig
-        }
-        // ★★「关闭」= ②屏（总分屏）点完就没了 ⇒ 分数还没读到就**先用内存补**（2026-10-23）。
-        //   实测问题：奖励页出来了、分数却是空的 —— 因为 ②屏的 UI 文本没赶上（CountUp 滚动/换屏太快），
-        //   而奖励走的是 LTD 内存。这里在离开这页之前把 LTD.ResultInfo 的总分落下来，避免整局白跑。
-        if (label == "关闭") maybeFillScoreFromLtd("关闭前")
-        // ★2026-11-10（用户要求）：**按钮已经定位、即将按下**的这一刻，先把分数屏截一张图留证，
-        //   然后再按按钮进下一步（不是刚进页面就截：那时 CountUp 可能还在滚、按钮也还没落位）。
-        //   只截 ②屏（CLEAR + 总分，按钮是「关闭」）；①屏「加入的角色」没有分数，不截。
-        if (label == "关闭") captureScoreShot(score)
-        tries["$tag|rtaps"] = taps0 + 1
-        AppState.addLog("迷宫结算：点了「$label」(${p.first},${p.second})")
-        tap(input, p.first, p.second, "结算·$label", learnKey = "settle|result")
-        delay(1_200)
+        return xy?.let { label to it }
     }
 
     /**
