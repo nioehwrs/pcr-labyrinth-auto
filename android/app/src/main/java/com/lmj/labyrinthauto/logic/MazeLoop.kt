@@ -3640,12 +3640,20 @@ object MazeLoop {
                     if (n <= 2 || n % 20 == 0) AppState.addLog("[!] 商店目标（全局槽#$gi）上滑 $shopDragCount 次后仍不可见 → 停手（留人工）")
                     return
                 }
-                val x = screenW / 2
-                val y1 = screenH * 800 / 1080                     // 固定一条横线拖动（PC 800→300 按比例缩放）
-                val y2 = screenH * 300 / 1080
+                // ★★2026-11-20（用户，C 方案）：**用 SetScrollBarValue(1.0) 滚到底**，不再真实 swipe。
+                //   可复现、不依赖手势时长；滚完下一轮重读 slots，第 3 行就 `vis=true`，随后直调 `Buy2_x`。
+                //   滚动条调不动（拿不到 controller）才退回真实上滑兜底。
                 shopDragCount++
-                AppState.addLog("上滑商店列表（第 $shopDragCount 次，目标 $tgtTag）")
-                input.swipe(x, y1, x, y2, SHOP_DRAG_MS)
+                AppState.addLog("商店：列表滚到底 SetScrollBarValue(1.0)（第 $shopDragCount 次，目标 $tgtTag）")
+                val sr = runCatching { AgentApi.labShopScrollTo(1.0f) }.getOrNull()
+                if (sr?.optBoolean("ok") != true) {
+                    AppState.addLog("商店：SetScrollBarValue 失败（${sr?.optString("err").orEmpty().ifEmpty { "无回包" }}）→ 退回真实上滑")
+                    val x = screenW / 2
+                    val y1 = screenH * 800 / 1080
+                    val y2 = screenH * 300 / 1080
+                    input.swipe(x, y1, x, y2, SHOP_DRAG_MS)
+                }
+                delay(250)                                        // 给列表一帧重建时间
                 return
             }
             // 可见 / 直调 probe 命中 → 直接点（目标可点后计数复位）

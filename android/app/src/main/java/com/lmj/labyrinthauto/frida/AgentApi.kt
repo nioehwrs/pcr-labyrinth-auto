@@ -337,6 +337,14 @@ object AgentApi {
     suspend fun labChoices(force: Boolean = false): JSONObject? =
         obj("labChoices", listOf(force), timeoutMs = T_SLOW)
     suspend fun labShop(): JSONObject? = obj("labShop", timeoutMs = T_SLOW)
+
+    /**
+     * ★★2026-11-20（用户，C 方案）：**商店列表滚动条定位**。
+     * `DialogLabyrinthShop+0x100 controller` 继承 `CustomUIScrollContentController`，
+     * 调 `SetScrollBarValue(v)`；`v=1.0` = 滚到底（4 层 3×3 第 3 行进入屏内，之后直调 `Buy2_x`）。
+     */
+    suspend fun labShopScrollTo(v: Float, timeoutMs: Long = 4_000L): JSONObject? =
+        pressTwoPhase("labShopScrollTo", listOf(v), timeoutMs)
     suspend fun labResult(): JSONObject? = obj("labResult", timeoutMs = T_SLOW)
 
     /** ★结算奖励（LabyrinthTempData 内存字段）：`{ok, result:{...}, questFinish[], challenge[], rewardInfo[], normalBox[[]], rareBox[[]]}` */
