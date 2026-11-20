@@ -425,6 +425,9 @@ object MazeLoop {
         labResultDumps = 0                      // 迷宫结算页对象字段抓取（单独预算，每局 ≤2 次）
         saidRelicErr = ""                       // 持有遗物读取异常提示（本局重新报一次）
         resMemDiagKey = null                    // 结算按钮字段读诊断（每局重新抓一次）
+        moveTargetId = -1                       // ★移动投递台账（本局清零）
+        moveTargetFrom = -1
+        moveTargetAt = 0L
         dlgTapSig = null                        // 弹窗点击熔断（本局重新计数）
         dlgTapN = 0
         labResultSig = ""                       // 结算页"落位闸门"（连续两轮同坐标才点）
@@ -2220,6 +2223,23 @@ object MazeLoop {
     private val nodeTapAt = HashMap<Int, Long>()
     private val nodeTapN = HashMap<Int, Int>()
     private val nodeSaidAt = HashMap<Int, Long>()
+
+    /**
+     * ★★2026-11-20（用户："点过 10301 就不要再点一次"）：**移动投递台账**。
+     *
+     * 原来只有"频率退避"（3 下 + 2s 冷却），那是限速不是去重 ⇒ 同一个目标会被投 2~3 次，
+     * 每次都真的提交一次移动请求 ⇒ 「是否前往」排队/205。
+     *
+     * 现在记"最近一次投递的目标 + 从哪个节点出发"：
+     * · 台账未结清（目标已投递、还没看到生效）⇒ **这一轮不点，只等**（每秒打一条等待日志）；
+     * · 结清条件 = `blockId` 相对出发节点发生变化（移动真的发生了）**或** 超过 [MOVE_PENDING_MS]（这次被吞了，允许重投）。
+     */
+    @Volatile private var moveTargetId = -1        // 最近投递的目标 blockId（-1 = 无）
+    @Volatile private var moveTargetFrom = -1      // 投递时所在的 blockId
+    @Volatile private var moveTargetAt = 0L        // 投递时刻（elapsedRealtime）
+    private var movePendingSaidAt = 0L
+    /** 投递后多久还没看到节点变化，就判"这次被吞"、允许重投一次 */
+    private const val MOVE_PENDING_MS = 2_500L
 
     /** PC `drag_count`(5966)：本节点已拖动次数（**换页清零**，见 maze_loop 6013） */
     @Volatile
@@ -5156,6 +5176,31 @@ object MazeLoop {
         if (t != null) {
             dragCount = 0
             val nk = (t.opt("blockId") as? Number)?.toInt() ?: -1
+            val nowE = SystemClock.elapsedRealtime()
+            val curB = (st.opt("blockId") as? Number)?.toInt() ?: -1
+            // ★★2026-11-20（用户："点过 10301 就不要再点一次"）：**投递台账优先于任何重试逻辑**。
+            //   目标还没看到生效（节点没变）⇒ 这一轮不点、只等；结清条件见 [moveTargetId]。
+            if (moveTargetId > 0) {
+                val moved = curB != moveTargetFrom          // 节点变了 = 移动真的发生了（到了别处也算生效）
+                if (moved || nowE - moveTargetAt > MOVE_PENDING_MS) {
+                    AppState.addLog(
+                        "[移动] 台账结清：目标 $moveTargetId（" +
+                            (if (moved) "节点已变为 $curB" else "超时 ${nowE - moveTargetAt}ms ⇒ 判这次被吞，允许重投") +
+                            "）",
+                    )
+                    moveTargetId = -1
+                } else {
+                    if (nowE - movePendingSaidAt > 1_000L) {
+                        movePendingSaidAt = nowE
+                        AppState.addLog(
+                            "[移动] 目标 $moveTargetId 已投递 ${nowE - moveTargetAt}ms（出发 $moveTargetFrom）" +
+                                "→ 等待生效，本轮不重复点",
+                        )
+                    }
+                    delay(150)
+                    return true
+                }
+            }
             val now = System.currentTimeMillis()
             val last = nodeTapAt[nk] ?: 0L
             if (now - last > 30_000) nodeTapN[nk] = 0                    // 很久没碰过 → 计数从头来
@@ -5195,6 +5240,11 @@ object MazeLoop {
                 AppState.addLog("$what：格子直调失败（$err）→ 退回坐标点击")
                 tap(input, t.optInt("x"), t.optInt("y"), what)
             }
+            // ★★2026-11-20（台账）：记下这次投递 —— 之后每轮先看它，没结清就不许再点同一个目标。
+            moveTargetId = nk
+            moveTargetFrom = curB
+            moveTargetAt = nowE
+            AppState.addLog("[移动] 投递 目标=$nk（出发=$curB）")
             nodeSaidAt[nk] = now                                         // 同一节点 30s 内只"重点"一次（PC 6425）
             // ★不再盲等 800ms：先**抓确认框出现**（2~4ms/拍），出现即点确认，再**抓它开始消失**；
             //   没有框（直接移动/进战斗）就短等回主循环。
