@@ -1202,6 +1202,11 @@ object MazeLoop {
      */
     private const val NODE_TAP_GAP_MS = 150L
     private const val NODE_TAP_BACKOFF_MS = 450L
+    /** ★★2026-11-20（用户发现"前进确认有时会弹两次"）：同一节点**一轮最多快速点 3 下**。
+     *  每一下都会真的提交一次移动请求 ⇒ 点太多会让「是否前往」排成两条。
+     *  3 下都没反应（多半是换区动画在吞输入）⇒ 停 [NODE_TAP_BURST_COOLDOWN_MS] 再开一轮，别继续投。 */
+    private const val NODE_TAP_BURST_MAX = 3
+    private const val NODE_TAP_BURST_COOLDOWN_MS = 2_000L
 
     /**
      * ★2026-11-10（用户方案）：点地图节点后「抓出现 + 抓消失」两步确认。
@@ -1213,7 +1218,10 @@ object MazeLoop {
      *   · [MOVE_NO_DIALOG_SETTLE_MS]：没有确认框时给游戏推进画面的短静置（原来固定 800ms）。
      */
     private const val MOVE_CONFIRM_WAIT_MS = 500L
-    private const val MOVE_CONFIRM_NO_PTR_MS = 260L
+    /** ★★2026-11-20（用户"前进确认有时弹两次"）：无框宽限 260→900ms。
+     *  确认框常在 300~700ms 后才弹（换区/慢帧更久）；宽限只有 260ms 时会误判"没框"⇒ 重试点节点
+     *  ⇒ 又提交一次移动请求 ⇒ 弹两次。给到 900ms 后，绝大多数情况一次点击就等到框，不再重复投。 */
+    private const val MOVE_CONFIRM_NO_PTR_MS = 900L
     private const val MOVE_CONFIRM_POLL_MS = 60L
     private const val MOVE_CONFIRM_GONE_MS = 450L
     private const val MOVE_NO_DIALOG_SETTLE_MS = 300L
@@ -4421,11 +4429,24 @@ object MazeLoop {
         val dx = chosen.optInt("decideX")
         val dy = chosen.optInt("decideY")
         val onScreen = dx in 0 until scrW && dy in 0 until scrH
+        // ★★2026-11-20（用户）：三张卡是**依次出现**的 —— 只等"目标那张"落位不够：
+        //   后面的卡还没进屏时，按 btnX 排出来的顺序会错位 ⇒ 选中/直调下标错 ⇒ 选错卡（UI 错位）。
+        //   ⇒ 要求**所有**卡的「决定」坐标都在屏内（等最后一张也进来）才动手。
+        val allCardsOnScreen = cards.all {
+            val x = it.optInt("decideX")
+            val y = it.optInt("decideY")
+            x in 0 until scrW && y in 0 until scrH
+        }
         // ★★2026-11-20（实测回退 cs112）：屏幕外卡片（decideY=819 > 屏高720）直调**虽能触发**，
         //   但会把卡片卡在滑入动画里、后续页面操作不了 ⇒ 补点 ⇒ 205（session_112948 两次复现）。
         //   ⇒ 无论直调还是坐标点击，屏外一律**先等落位**（本轮 return），不再用 canDirect 跳过。
         //   agent 侧 cs113 也恢复 `_pathBtnNow` 的"不在屏内就拒"——双保险。
-        if (!onScreen) {
+        if (!onScreen || !allCardsOnScreen) {
+            if (!onScreen && n == 1) {
+                AppState.addLog("[!] $kind 页「决定」坐标 ($dx,$dy) 在屏外（大概在滑动动画中）→ 等下一轮重读")
+            } else if (!allCardsOnScreen && n <= 3) {
+                AppState.addLog("… $kind 页：还有卡片没进屏（三张依次出现）→ 等齐再选")
+            }
             if (n == 1) {
                 AppState.addLog("[!] $kind 页「决定」坐标 ($dx,$dy) 在屏外（大概在滑动动画中）→ 等下一轮重读")
             }
@@ -4903,6 +4924,16 @@ object MazeLoop {
             val now = System.currentTimeMillis()
             val last = nodeTapAt[nk] ?: 0L
             if (now - last > 30_000) nodeTapN[nk] = 0                    // 很久没碰过 → 计数从头来
+            // ★★2026-11-20（用户："前进确认有时会弹两次"）：同一节点**一轮最多快速点 3 下**。
+            //   每一下都真的提交一次移动请求 ⇒ 点太多会让「是否前往」排两条。
+            //   3 下仍没反应（多半是换区动画在吞输入）⇒ 停 2s 再开一轮。
+            if ((nodeTapN[nk] ?: 0) >= NODE_TAP_BURST_MAX) {
+                if (now - last < NODE_TAP_BURST_COOLDOWN_MS) {
+                    delay(150)
+                    return true
+                }
+                nodeTapN[nk] = 0
+            }
             val gap = minOf(NODE_TAP_GAP_MS * (1 + (nodeTapN[nk] ?: 0)), NODE_TAP_BACKOFF_MS)
             if (now - last < gap) {
                 delay(150)                                               // 刚点过 → 等游戏把它打开，别重复点
@@ -9750,6 +9781,24 @@ object MazeLoop {
             dlgTapN = 1
         }
         dlgTapAt = now
+        // ★★2026-11-20（用户："钓鱼结束收获用的还是 tap"）：结果/收获类单按钮弹窗**先直调**。
+        //   `DialogCommonBig`(获得印记/道具/遗物) 和 `DialogCommonMiddle`(收到角色) 的 OneButtonWhite
+        //   都有固定路径 ⇒ 直调不投坐标、不受入场动画与叠层影响。
+        //   ★只在这一签名的**第一次**尝试时直调（dlgTapN==1），失败就退回坐标点击，避免重复投 onClick。
+        if (dlgTapN == 1 && hit.optString("name") == "OneButtonWhite") {
+            val oneKey = when (top.removeSuffix("(Clone)")) {
+                "DialogCommonBig" -> "ResultBig|OneButtonWhite"
+                "DialogCommonMiddle" -> "SelectConfirm|OneButtonWhite"
+                else -> null
+            }
+            if (oneKey != null) {
+                val pr = runCatching { AgentApi.labPathPress(oneKey) }.getOrNull()
+                if (pr?.optBoolean("ok") == true) {
+                    AppState.addLog("对话框「OneButtonWhite」（直调 $oneKey）")
+                    return true
+                }
+            }
+        }
         tap(input, hit.optInt("x"), hit.optInt("y"), "对话框「${hit.optString("name")}」")
         return true
     }
