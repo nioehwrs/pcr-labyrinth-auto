@@ -234,8 +234,14 @@ object MazeLoop {
 
     // ── 商店「动画链」时间参数（2026-11-10 用户方案：买/刷新/关闭都按 弹窗出现→消失 推进） ──
 
-    /** 首下点击后，等"确认框出现"的上限（新框以顶层指针变化识别） */
-    private const val SHOP_ANIM_BOX_WAIT_MS = 1_000L
+    /**
+     * 首下点击后，等"确认框出现"的上限（新框以顶层指针变化识别）。
+     * ★这是"最长等多久"而非"固定等多久"：awaitNewBox 一发现新框就立即返回 ⇒ 快设备零影响。
+     * ★2026-11-21 提 1000→5000（redroid 11 反馈商店购买出错）：实测确认框弹出延迟 ~1.7s，
+     *   旧 1s 超时会让链断在半路、确认框随后被通用兜底乱点 ⇒ 选角色页读不到、游戏被点回标题页。
+     *   放到 5s 给更慢的设备留余量；代价只在"真点空/无确认"时多等（极少发生）。
+     */
+    private const val SHOP_ANIM_BOX_WAIT_MS = 5_000L
 
     /**
      * 点确认后，等"框开始消失"的探测窗口；没开始消失就用新坐标补点。
@@ -3792,8 +3798,26 @@ object MazeLoop {
         //   购买子链白等 15s；下一轮重读才是正确的 (492,525)。多等一轮（~0.5s）换掉这段空转。
         if (freshQuota) return
         val coin = (sh.opt("coin") as? Number)?.toInt() ?: 0
+        // ★★2026-11-21（用户方案）：**第四步·购买顺序从商店后往前**（买哪些/每层遗物序都不动，只改执行顺序）。
+        //   已购商品会被游戏归位到货架末尾 ⇒ 从后往前买时，未购件的 page/idx 不变；即便某件因
+        //   快照延迟被重复选中，第二次指向的也是"另一件未购商品"而非刚买那件 ⇒ 避开对同一件
+        //   连发两次购买请求（redroid 11 那次 205：链断→本地清单没扣→又选了同一个 #7）。
+        //   排序键 = 商店坐标 r/page 降序、r 同则 c/idx 降序（page*3+idx = shopSlotOf）。
+        val pickedBackToFront = picked.sortedByDescending { it0 ->
+            val page = (it0.opt("page") as? Number)?.toInt() ?: 0
+            val idx = (it0.opt("idx") as? Number)?.toInt() ?: 0
+            page * ShopPlan.SHOP_GROUP_SIZE + idx
+        }
+        if (pickedBackToFront.size > 1 && n == 1) {
+            AppState.addLog("商店：购买顺序按货架从后往前（防重复购）：" +
+                pickedBackToFront.joinToString(",") { it0 ->
+                    val p = (it0.opt("page") as? Number)?.toInt() ?: 0
+                    val c = (it0.opt("idx") as? Number)?.toInt() ?: 0
+                    "r${p}c${c}"
+                })
+        }
         // ① 先买：计划里第一个「未买 && 可买(availability==1) && 钱够」
-        val tgt = picked.firstOrNull {
+        val tgt = pickedBackToFront.firstOrNull {
             !Py.truthy(it.opt("isSold")) &&
                 (it.opt("availability") as? Number)?.toInt() == 1 &&
                 ((it.opt("price") as? Number)?.toInt() ?: 0) <= coin
