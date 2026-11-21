@@ -125,8 +125,11 @@ object Feedback {
             .post(form)
             .build()
         val text = exec(req, "创建 issue")
-        val url = runCatching { org.json.JSONObject(text).optString("html_url") }.getOrDefault("")
-        Sent(issueUrl = url.ifBlank { "https://gitee.com/$OWNER/$REPO/issues" }, attachUrl = attachUrl)
+        val o = runCatching { org.json.JSONObject(text) }.getOrNull()
+        val url = o?.optString("html_url").orEmpty()
+        // ★成功必须有真实 issue 地址（含 /issues/ 段）；拿不到就是没建成，不能拿列表页糊弄
+        if (url.isBlank() || !url.contains("/issues/")) throw bizFail(text, "创建 issue 失败：服务端没返回 issue 地址")
+        Sent(issueUrl = url, attachUrl = attachUrl)
     }
 
     // ────────────────────────── 内部：附件仓库 ──────────────────────────
@@ -136,7 +139,9 @@ object Feedback {
         val listReq = Request.Builder()
             .url("$API/repos/$FB_OWNER/$FB_REPO/releases?access_token=$token&per_page=100")
             .get().build()
-        val arr = runCatching { JSONArray(exec(listReq, "读取附件仓库")) }.getOrDefault(JSONArray())
+        val listText = exec(listReq, "读取附件仓库")
+        val arr = runCatching { JSONArray(listText) }.getOrNull()
+            ?: throw bizFail(listText, "读取附件仓库失败：服务端返回格式异常")
         for (i in 0 until arr.length()) {
             val r = arr.optJSONObject(i) ?: continue
             if (r.optString("tag_name") == FB_TAG) return r.optLong("id")
@@ -151,7 +156,7 @@ object Feedback {
         val req = Request.Builder().url("$API/repos/$FB_OWNER/$FB_REPO/releases").post(form).build()
         val text = exec(req, "创建附件 Release")
         val id = runCatching { org.json.JSONObject(text).optLong("id") }.getOrDefault(0L)
-        if (id <= 0L) throw Failed("附件仓库没准备好（需要仓库里至少有一个提交才能建 Release）")
+        if (id <= 0L) throw bizFail(text, "附件仓库没准备好（需要仓库里至少有一个提交才能建 Release）")
         return id
     }
 
@@ -171,9 +176,9 @@ object Feedback {
             .post(mp).build()
         val text = exec(req, "上传诊断包")
         val o = runCatching { org.json.JSONObject(text) }.getOrNull()
-        return o?.optString("browser_download_url").orEmpty().ifBlank {
-            "https://gitee.com/$FB_OWNER/$FB_REPO/releases/download/$FB_TAG/$name"
-        }
+        val url = o?.optString("browser_download_url").orEmpty()
+        if (url.isBlank()) throw bizFail(text, "上传诊断包失败：服务端没返回下载地址")
+        return url
     }
 
     // ────────────────────────── 内部：正文 / 请求 ──────────────────────────
@@ -220,6 +225,19 @@ object Feedback {
             sb.appendLine("- [$zipName]($attachUrl)")
         }
         return sb.toString()
+    }
+
+    /**
+     * HTTP 2xx 但业务没成功时，把服务端返回的错误消息抠出来给人看。
+     * Gitee 失败响应形如 `{"message":"Not Found Project"}`，解析不到就带一段原文，避免干巴巴一句"失败"。
+     */
+    private fun bizFail(text: String, what: String): Failed {
+        val msg = runCatching {
+            val o = org.json.JSONObject(text)
+            o.optString("message").ifBlank { o.optString("error") }
+        }.getOrDefault("").replace(Regex("\\s+"), " ").take(200)
+        val brief = text.replace(Regex("\\s+"), " ").take(160)
+        return Failed(if (msg.isNotBlank()) "$what：$msg" else "$what（响应：$brief）")
     }
 
     private fun exec(req: Request, what: String): String {

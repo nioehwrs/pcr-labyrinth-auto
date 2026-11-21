@@ -1087,18 +1087,21 @@ object MazeLoop {
             if (!inBattleNow && now >= sceneHoldUntil &&
                 ((top.isNotEmpty() && !ownSkip) || idle >= DLG_FORCE_AFTER_IDLE)
             ) {
-                // ★★结算后加速（2026-10-22 用户改版）：**不挑页面**。只要 [CenterTapGate] 已开
-                //   （= 本局过了结算分数页），每轮先点一次屏幕中心；**每 3 轮**才做一次"真检测"
-                //   （奖励页的 dialog 检测一次 3~4s，每轮都查反而更慢）。检测轮继续往下走白名单/宽名单。
+                // ★★结算后加速（2026-11-21 改版）：cs125 写内存加速后，3/4 屏（演出壳/FullSize）
+                //   **不再点中心**，靠演出自己推进；其余结算后页面（Big 等）仍每轮点中心、每 3 轮真检测。
+                //   ★探针（cs128，见上方探针块）保持原样继续采集，为将来换直调用——与点中心是两件事。
                 //   关闭点见 [CenterTapGate.reset]：刷初始前 / 杀进程 / 本局开始与结束。
                 if (CenterTapGate.isActive() && top.isNotEmpty()) {
-                    val n2 = tries.getOrPut("$tag|ctap", { 0 })
-                    tries["$tag|ctap"] = n2 + 1
-                    if (n2 % 3 != 2) {
-                        tap(input, scrW / 2, scrH / 2, "结算后加速·点中心（第 ${n2 + 1} 次）")
-                        idle = 0
-                        delay(900)
-                        continue
+                    val shell = top.removeSuffix("(Clone)")
+                    if (shell != "DialogAnimationViewer" && shell != "DialogCommonFullSize") {
+                        val n2 = tries.getOrPut("$tag|ctap", { 0 })
+                        tries["$tag|ctap"] = n2 + 1
+                        if (n2 % 3 != 2) {
+                            tap(input, scrW / 2, scrH / 2, "结算后加速·点中心（第 ${n2 + 1} 次）")
+                            idle = 0
+                            delay(900)
+                            continue
+                        }
                     }
                 }
                 if (top.isNotEmpty() && dlgOpenMiss == top) {
@@ -1694,6 +1697,11 @@ object MazeLoop {
      *  ★2026-11-14（用户）：2 → 4 —— 这页点中心只是推进，多点几下无害。 */
     private const val REWARD_CENTER_MAX = 4
 
+    /** ★cs128：结算尾段探针的目标壳类（每个**新顶框类**只探一次；见主循环探针块注释） */
+    private val LAB_TAIL_PROBE_SHELLS = setOf(
+        "DialogAnimationViewer", "DialogCommonFullSize", "DialogCommonBig",
+    )
+
     /** ★刷开局算好的**每区最优路线**（`RerollState` 的 `routePerArea`）：移动分支要用它，
      *  不能再只在开局那一次传（见 [handleMove] 里的说明）。 */
     private var rerollRoutes: Map<Int, List<Int>>? = null
@@ -1709,11 +1717,6 @@ object MazeLoop {
      *  必须盖过换屏动画（①→②约 0.5~1s），否则窗口外判"没生效"→ 主循环重进 → pressFn 的已投标记
      *  会放行坐标兜底，等于变相多点。 */
     private const val LAB_RESULT_PROBE_ROUNDS = 6
-
-    /** ★cs128：结算尾段探针的目标壳类（每个**新顶框类**只探一次；见主循环探针块注释） */
-    private val LAB_TAIL_PROBE_SHELLS = setOf(
-        "DialogAnimationViewer", "DialogCommonFullSize", "DialogCommonBig",
-    )
 
     /** ★弹窗点击熔断（2026-10-17）：同一颗按钮最多连点 [DLG_TAP_MAX] 次（防"幽灵弹窗"无限连点）。
      *  ★2026-11-14（用户）：3 → **8** —— 这类"提前点/点空再点"是安全动作，代价只是一次 tap；
@@ -10348,6 +10351,23 @@ object MazeLoop {
         AppState.addLog("[诊断] $where 按钮(${names.size})=${names.joinToString(",").take(300)}")
     }
 
+    /** ★探针用：JSONArray 里的对象字段拼成紧凑字符串（字段名/名字 + 坐标） */
+    private fun jArrCompact(o: JSONObject, key: String, fields: List<String>): String {
+        val arr = o.optJSONArray(key) ?: return ""
+        val out = ArrayList<String>()
+        for (i in 0 until arr.length()) {
+            val it = arr.optJSONObject(i) ?: continue
+            val s = fields.joinToString("/") { f ->
+                jStr(it, f).ifEmpty {
+                    val n = (it.opt(f) as? Number)
+                    if (n != null && n.toDouble() % 1.0 == 0.0) n.toInt().toString() else jStr(it, f)
+                }
+            }
+            if (s.isNotBlank()) out.add(s)
+        }
+        return out.joinToString("、")
+    }
+
     /** LTD（`labStatus.choices`）里的候选简报：`序号:rewardId`，最多 6 条 —— 遗物选择排障用。
      *  它和"卡片上的 id"是**两条独立读法**（`LabyrinthStatus.Choices` vs 卡片 `choiceInfo`），
      *  两边都对得上 ⇒ 读数正常；只有卡片那侧是垃圾 ⇒ 是卡片路径坏了（2026-10-17 那次就是这个形状）。
@@ -10369,23 +10389,6 @@ object MazeLoop {
     private fun jStr(o: JSONObject, key: String): String {
         val v = o.opt(key) ?: return ""
         return if (v === JSONObject.NULL) "" else v.toString()
-    }
-
-    /** ★探针用：JSONArray 里的对象字段拼成紧凑字符串（字段名/名字 + 坐标） */
-    private fun jArrCompact(o: JSONObject, key: String, fields: List<String>): String {
-        val arr = o.optJSONArray(key) ?: return ""
-        val out = ArrayList<String>()
-        for (i in 0 until arr.length()) {
-            val it = arr.optJSONObject(i) ?: continue
-            val s = fields.joinToString("/") { f ->
-                jStr(it, f).ifEmpty {
-                    val n = (it.opt(f) as? Number)
-                    if (n != null && n.toDouble() % 1.0 == 0.0) n.toInt().toString() else jStr(it, f)
-                }
-            }
-            if (s.isNotBlank()) out.add(s)
-        }
-        return out.joinToString("、")
     }
 
     /**

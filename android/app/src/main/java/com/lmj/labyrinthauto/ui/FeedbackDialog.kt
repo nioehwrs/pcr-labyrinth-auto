@@ -172,6 +172,11 @@ fun FeedbackDialog(initialPack: DiagPack.Result? = null, onDismiss: () -> Unit) 
 
                 error?.let {
                     Spacer(Modifier.height(8.dp))
+                    Text(
+                        "提交失败（内容没丢，可改好再试）：",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
                     Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
                 }
 

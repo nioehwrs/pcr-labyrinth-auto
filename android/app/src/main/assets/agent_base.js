@@ -4959,9 +4959,69 @@ function _resPathOne(spec) {
  *
  * @return `{ok,kind:"win",stage:"later",x,y,label,comp,compCls}` / `{ok:false,err}`
  */
+/**
+ * ★cs129（2026-11-21）：迷宫结算壳按钮**纯字段槽直取**，绝不扫 UI 树。
+ *
+ * 背景（诊断包 lab-diag_20261121_202746，2026-11-21 用户实测卡结算）：原 `_resBtnScan("lab")`
+ * 第一步 `_walkForRoot` 在这页的大子树上一次 **4092ms** ⇒ `battleResultPress` 首段
+ * `T_FAST=3s` 超时 ⇒ 被当成"没投出去"退坐标 ⇒ ②屏第一下点早了、一次性闸门不让重试
+ * ⇒ 卡住等人工。项目注释早就记着"迷宫结算页 UI 树很大 ⇒ 一次 3.1~3.7s"。
+ *
+ * 按钮就在对象字段里（dump.cs 实证）：
+ *   PartsLabyrinthResultItemView+0x48 = CustomUIButton nextButton
+ *   PartsLabyrinthResultScoreView+0x68 = CustomUIButton closeButton
+ * 判屏/选哪套偏移完全复用 `labResultSnapshot`（同源，避开 cs128 那次"两套偏移读错屏"）。
+ * ★失败就返回失败——**不退化到全树遍历**（用户 2026-11-21 明确要求）。
+ */
+function _labBtnByField(out) {
+  try {
+    const snap = labResultSnapshot();
+    if (!snap || !snap.ok || !snap.which) {
+      out.err = "lab-field: 判屏失败 " + (snap ? (snap.err || "no-which") : "snap=null");
+      return out;
+    }
+    const want = snap.which;                       // "next" | "close"
+    const k = findClass("DialogLabyrinthResult");
+    let d = (k && !k.isNull()) ? _instCacheGet("labResult", "DialogLabyrinthResult", _labResultValid) : null;
+    if (!d && k && !k.isNull()) {
+      const cd = _compInDialogs(k);
+      if (ptrOk(cd) && _labResultValid(cd)) d = cd;
+    }
+    if (!d) { out.err = "lab-field: 没有结算对话框实例"; return out; }
+    // 跟 labResultSnapshot 用**同一套**偏移，否则读到隐藏那份（cs128 教训）
+    const useB = String(snap.offsets || "").indexOf("0x248") >= 0;
+    const part = d.add(want === "close" ? (useB ? 0x250 : 0x110)
+                                        : (useB ? 0x248 : 0x108)).readPointer();
+    if (!ptrOk(part)) { out.err = "lab-field: part 空（" + want + "）"; return out; }
+    const btn = part.add(want === "close" ? 0x68 : 0x48).readPointer();
+    if (!ptrOk(btn)) { out.err = "lab-field: button 空（" + want + "）"; return out; }
+    const cn = klassNameOf(btn);
+    if (cn.indexOf("CustomUIButton") < 0 && cn.indexOf("UIButton") < 0) {
+      out.err = "lab-field: 按钮字段不是 UIButton（" + cn + "）";
+      return out;
+    }
+    out.comp = String(btn);
+    out.compCls = cn;
+    out.node = (want === "close") ? "CloseButton" : "NextButton";
+    out.screen = want;
+    out.x = snap.x; out.y = snap.y;
+    out.stage = "field";
+    try {
+      const go = _inv(btn, "get_gameObject");
+      const uk = findClass("CustomUILabel");
+      const lb = (uk && !uk.isNull() && ptrOk(go)) ? _compInChildren(go, uk) : ptr(0);
+      out.label = ptrOk(lb) ? (_str1(_inv(lb, "get_text")) || "") : "";
+    } catch (e) {}
+    out.ok = true;
+    return out;
+  } catch (e) { out.err = "" + e; return out; }
+}
+
 function _resBtnScan(cls, kind) {
   const out = { ok: false, kind: kind, stage: "scan", label: null, node: null, err: null };
   try {
+    // ★cs129：迷宫结算壳走字段槽直取（零树遍历）；失败直接返回，不退化到全树扫
+    if (kind === "lab") return _labBtnByField(out);
     const base = _dlgRootByName(cls);
     if (!base) { out.err = "no-dialog:" + cls; return out; }
     // ★不能把类名当 rootName 传给 `_findNodeP`：`_subtreeRoot` 只认 battle/view/footer/
@@ -10068,11 +10128,6 @@ rpc.exports = {
     try { return labDlgPairSnapshot(); }
     catch (e) { return { ok: false, top: "", ptr: null, path: "err", ms: 0, err: String(e) }; }
   }),
-  // ★cs128：结算尾段探针（见 [probeShell] 注释）——只读，app 侧每个新顶框类调一次
-  probeShell: _rpcSafe(function () {
-    try { return probeShell(); }
-    catch (e) { return { ok: false, top: "", err: String(e), ms: 0 }; }
-  }),
   // ★★弹窗「箱体」轻读（2026-11-10）：指针 + 关闭/出现 tween + 7 个按钮槽位，一次 ~5~8ms。
   //   商店动画链用（新框出现 → 点确认 → 开始消失 → 下一个框）。
   labDlgBox: _rpcSafe(function () {
@@ -10346,6 +10401,11 @@ rpc.exports = {
       out.queued = true; out.id = id;
       return out;
     } catch (e) { out.err = String(e); return out; }
+  }),
+  // ★cs128：结算尾段探针（见 [probeShell] 注释）——只读，app 侧每个新顶框类调一次
+  probeShell: _rpcSafe(function () {
+    try { return probeShell(); }
+    catch (e) { return { ok: false, top: "", err: String(e), ms: 0 }; }
   }),
   // 迷宫结算页（打完最终 Boss 的 RESULT ①②屏）：主按钮坐标（从对象现算）+ 结算数值
   labResult: _rpcSafe(function () { try { return labResultSnapshot(); } catch (e) { return null; } }),
