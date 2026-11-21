@@ -5,6 +5,7 @@ import android.os.SystemClock
 import com.lmj.labyrinthauto.core.AppState
 import com.lmj.labyrinthauto.core.CenterTapGate
 import com.lmj.labyrinthauto.core.LabBtnStore
+import com.lmj.labyrinthauto.core.LogicTokenStore
 import com.lmj.labyrinthauto.core.LogFile
 import com.lmj.labyrinthauto.core.OverlayStatus
 import com.lmj.labyrinthauto.core.TapDelayStore
@@ -360,10 +361,12 @@ object MazeLoop {
         pendingEventRetreat = null            // ★条件 2：上局命中的断言不能带到本局
         saidLogicMode2 = false
         eventRuleTracker = EventRetreatRule.Tracker()   // ★条件 2：断言进度每局从头算
-        logicEngine.reset()                  // ★逻辑模式：8 个 token 每局从 0 开始
+        logicEngine.reset()                  // ★逻辑模式：8 个 token 每局从 0 开始（若是同局续接，下面 fire 时会按 enterId 读回）
         logicEngine.rules = RerollSettings.loadLogicRules(ctx)  // 开局读一次（中途改配置下局生效，token 语义才稳定）
         nodeEventFacts.clear()
         logicFiredNode = null                // ★本局每个节点都能各 fire 一次
+        logicRestoreTried = false            // ★cs128：续局恢复每局只试一次（见 [logicRuleFire]）
+        logicEnterId = -1L
         MazeRetreat.resetReason()            // ★上局的撤退原因不能串到本局（归档 tag 要用）
         if (!input.isAvailable()) {
             AppState.addLog("停手：点击后端不可用")
@@ -1043,6 +1046,37 @@ object MazeLoop {
             ) {
                 CenterTapGate.activate("已过结算分数页（$top）")
             }
+            // ★cs128 探针（2026-11-21 用户："加探针吧，验证一次花的时间比较多"）：结算尾段的
+            //   演出壳/FullSize/Big 每个**新顶框类**只探一次（[AgentApi.probeShell] 只读、不点）。
+            //   一次采集"3/4 页能不能直调"的全部信息：字段槽按钮 + 直调候选方法 + 对象字段 + 壳内按钮节点。
+            if (labResultSeen && top.isNotEmpty()) {
+                val shell = top.removeSuffix("(Clone)")
+                if (shell in LAB_TAIL_PROBE_SHELLS && tries.getOrPut("$tag|probe_$shell", { 0 }) == 0) {
+                    tries["$tag|probe_$shell"] = 1
+                    val pr = runCatching { AgentApi.probeShell() }.getOrNull()
+                    if (pr?.optBoolean("ok") == true) {
+                        val ms = pr.optJSONArray("methods") ?: JSONArray()
+                        val methods = (0 until ms.length()).joinToString(",") { ms.optString(it) }
+                        AppState.addLog(
+                            "[探针] $shell（comp=${pr.optString("compCls")}）" +
+                                "字段槽按钮=[${jArrCompact(pr, "buttons", listOf("name", "x", "y"))}]" +
+                                "｜直调候选=[$methods]",
+                        )
+                        AppState.addLog("[探针] $shell 节点=[${jArrCompact(pr, "nodes", listOf("name", "x", "y"))}]")
+                        val flds = pr.optJSONArray("fields") ?: JSONArray()
+                        val sb = StringBuilder()
+                        for (i in 0 until flds.length()) {
+                            sb.append(flds.optString(i)).append("；")
+                            if ((i + 1) % 8 == 0 || i == flds.length() - 1) {
+                                AppState.addLog("[探针] $shell 字段: ${sb.trimEnd('；')}")
+                                sb.setLength(0)
+                            }
+                        }
+                    } else {
+                        AppState.addLog("[探针] $shell 失败：${pr?.optString("err").orEmpty().ifEmpty { "无回包" }}")
+                    }
+                }
+            }
             // ★同一条避让：场景刚切换时不查通用弹窗（`dialog()` 要走 DialogArea 子树 ✗ 也属重活）。
             if (!inBattleNow && now >= sceneHoldUntil &&
                 ((top.isNotEmpty() && !ownSkip) || idle >= DLG_FORCE_AFTER_IDLE)
@@ -1670,6 +1704,11 @@ object MazeLoop {
      *  会放行坐标兜底，等于变相多点。 */
     private const val LAB_RESULT_PROBE_ROUNDS = 6
 
+    /** ★cs128：结算尾段探针的目标壳类（每个**新顶框类**只探一次；见主循环探针块注释） */
+    private val LAB_TAIL_PROBE_SHELLS = setOf(
+        "DialogAnimationViewer", "DialogCommonFullSize", "DialogCommonBig",
+    )
+
     /** ★弹窗点击熔断（2026-10-17）：同一颗按钮最多连点 [DLG_TAP_MAX] 次（防"幽灵弹窗"无限连点）。
      *  ★2026-11-14（用户）：3 → **8** —— 这类"提前点/点空再点"是安全动作，代价只是一次 tap；
      *  阈值太小会把"动画还没结束"的正常弹窗误判成幽灵弹窗（商店买完遗物卡死就是这个）。 */
@@ -1865,6 +1904,16 @@ object MazeLoop {
 
     /** ★逻辑模式：已经 fire 过的节点（`area:blockId`），每个节点只触发一次 */
     private var logicFiredNode: String? = null
+
+    /**
+     * ★cs128：token 续局恢复（2026-11-21 用户："不能一次跑完导致 token 丢失"）。
+     * 每局只尝试一次：第一次 fire 时按当前 enterId 比对 [LogicTokenStore] 落盘快照——
+     * 同局（服务器那局还在、App 重启续接）⇒ 读回 token + firedNode；新局 ⇒ 从 0 开始。
+     */
+    private var logicRestoreTried = false
+
+    /** 本局的 enterId（从 fire 时的 st 取；落盘快照用） */
+    private var logicEnterId = -1L
 
     /** ★策略=等待接手：这些节点关闭自动组队/自动开战，等用户自己操作 */
     private val manualTeamNodes = HashSet<String>()
@@ -3057,6 +3106,10 @@ object MazeLoop {
      *
      * ★每个节点只 fire 一次（[logicFiredNode] = `area:blockId`）：同一节点多轮回地图不重复触发，
      * 换节点（blockId 变）才再 fire。规则在开局时读入 [logicEngine]（中途改配置下局生效）。
+     *
+     * ★★cs128 续局（2026-11-21 用户报障）：**每次节点 fire 后把 token + firedNode 按 enterId 落盘**
+     * （[LogicTokenStore]）；重启 App 续接同一局时第一次 fire 前按 enterId 读回，token 接着算
+     * （T1=2 → 下个节点 3，不再从 1 开始）、同一节点也不重复 fire。新局 enterId 不同 ⇒ 从 0。
      */
     private fun logicRuleFire(st: org.json.JSONObject) {
         if (pendingEventRetreat != null) return
@@ -3067,10 +3120,38 @@ object MazeLoop {
         val area = (st.opt("area") as? Number)?.toInt() ?: -1
         val blockId = st.optString("blockId", "")
         val nodeKey = "$area:$blockId"
+
+        // ★续局恢复：每局第一次 fire 时按 enterId 比对落盘快照（同局读回 / 新局从 0）
+        val eid = (st.opt("enterId") as? Number)?.toLong() ?: -1L
+        if (eid > 0L) logicEnterId = eid
+        if (!logicRestoreTried) {
+            logicRestoreTried = true
+            val snap = LogicTokenStore.load(ctx)
+            if (snap != null && eid > 0L && snap.enterId == eid) {
+                for (i in 0 until LogicRule.TOKEN_COUNT) {
+                    logicEngine.tokens[i] = snap.tokens[i].coerceIn(LogicRule.TOKEN_MIN, LogicRule.TOKEN_MAX)
+                }
+                logicFiredNode = snap.firedNode.ifEmpty { null }
+                AppState.addLog(
+                    "凹分条件 2（逻辑）续局恢复：enterId=$eid ｜ ${logicEngine.tokensState()} ｜ " +
+                        "上次 fire 节点=${logicFiredNode ?: "无"}",
+                )
+            } else if (snap != null && eid > 0L) {
+                AppState.addLog(
+                    "凹分条件 2（逻辑）新局：enterId=$eid（快照是 ${snap.enterId}）→ token 从 0 开始",
+                )
+                LogicTokenStore.clear(ctx)
+            }
+        }
+
         if (nodeKey == logicFiredNode) return
         logicFiredNode = nodeKey
         val fired = logicEngine.fire(LogicRule.Ctx(area, nodeEventFacts))
         nodeEventFacts.clear()
+        // ★写穿落盘：每个节点 fire 后都存（含"无命中"的节点——firedNode 也要记，防重启重复 fire）
+        if (logicEnterId > 0L) {
+            LogicTokenStore.save(ctx, logicEnterId, logicEngine.tokens, logicFiredNode ?: "")
+        }
         if (fired.isEmpty()) {
             if (!saidLogicMode2) {
                 saidLogicMode2 = true
@@ -8217,6 +8298,10 @@ object MazeLoop {
                     )
                     true
                 } else {
+                    // 没投出去（agent 报错/超时没回包）："直调后等推进"的窗口没有意义（压根没投）
+                    // ⇒ 把已投时刻回拨到窗口之外，下一轮 pressFn 直接走坐标兜底，不再干等 3s。
+                    // （agent cs128 给迷宫结算壳加了优先快查，首查 ~3.5s 的慢调用应基本消失）
+                    tries["$tag|dirat_$scr"] = nowS - LAB_RESULT_DIRECT_WAIT_S
                     null
                 }
             } else if (!tries.containsKey(coordKey)) {
@@ -10260,6 +10345,23 @@ object MazeLoop {
     private fun jStr(o: JSONObject, key: String): String {
         val v = o.opt(key) ?: return ""
         return if (v === JSONObject.NULL) "" else v.toString()
+    }
+
+    /** ★探针用：JSONArray 里的对象字段拼成紧凑字符串（字段名/名字 + 坐标） */
+    private fun jArrCompact(o: JSONObject, key: String, fields: List<String>): String {
+        val arr = o.optJSONArray(key) ?: return ""
+        val out = ArrayList<String>()
+        for (i in 0 until arr.length()) {
+            val it = arr.optJSONObject(i) ?: continue
+            val s = fields.joinToString("/") { f ->
+                jStr(it, f).ifEmpty {
+                    val n = (it.opt(f) as? Number)
+                    if (n != null && n.toDouble() % 1.0 == 0.0) n.toInt().toString() else jStr(it, f)
+                }
+            }
+            if (s.isNotBlank()) out.add(s)
+        }
+        return out.joinToString("、")
     }
 
     /**

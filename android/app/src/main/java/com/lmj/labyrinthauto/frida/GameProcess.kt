@@ -124,12 +124,19 @@ object GameProcess {
      */
     suspend fun launch(ctx: Context, pkg: String = targetPkg): Boolean {
         val comp = resolveLauncherComponent(pkg)
+        // ★cs128 诊断（2026-11-21 反馈：雷电 Android 9 上"助手调起游戏黑屏、手动点图标正常"）——
+        //   两条路启动的 Activity 可能不同：手动点图标走 PackageManager.getLaunchIntentForPackage，
+        //   助手走 `cmd package resolve-activity` 取第一行含 '/' 的组件。把**解析结果**、**实际命令**
+        //   和 **am start 输出**都写进日志，下次这类反馈一眼就能看出是不是调起了黑屏代理 Activity。
+        AppState.addLog("游戏启动组件：${comp ?: "（resolve 没出组件 → 走 MAIN/LAUNCHER intent）"}（$pkg）")
+        AppState.addLog("对照·手动点图标会启动：${launcherIntentComponent(ctx, pkg)}")
         val cmd = if (comp != null) {
             "am start -n $comp"
         } else {
             "am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p $pkg"
         }
         val r = RootShell.exec(cmd, 20_000L)
+        AppState.addLog("调起游戏：$cmd → exit=${r.exit} 输出：${r.text.take(180).replace('\n', ' ')}")
         val failed = r.exit == -1 ||
             r.text.contains("Error", ignoreCase = true) ||
             r.text.contains("Exception", ignoreCase = true) ||
@@ -160,4 +167,10 @@ object GameProcess {
         "cmd package resolve-activity --brief -c android.intent.category.LAUNCHER $pkg",
         12_000L,
     ).out.lineSequence().map { it.trim() }.firstOrNull { it.contains("/") }
+
+    /** ★cs128：系统 Launcher 点的那颗（手动启动走它）——与本类 resolve 结果对照用，只读不启动。 */
+    fun launcherIntentComponent(ctx: Context, pkg: String): String {
+        val i = ctx.packageManager.getLaunchIntentForPackage(pkg) ?: return "（无 launcher intent）"
+        return "${i.component?.flattenToShortString()} / action=${i.action} cats=${i.categories?.joinToString(",")}"
+    }
 }

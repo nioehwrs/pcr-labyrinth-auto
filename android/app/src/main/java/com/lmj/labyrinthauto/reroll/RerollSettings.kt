@@ -474,6 +474,29 @@ object RerollSettings {
             .putInt("tapProbeMs", v).apply()
     }
 
+    // ────────────────────────── 直调点前等待（2026-11-21 用户）──────────────────────────
+    /**
+     * ★与 [TAP_PROBE_STEPS] **共用同一组按钮**的另一组五档（0/100/150/200/250ms）：
+     *  只作用于**直调**（`pressFn`）在真正投递 onClick **之前**的等待，坐标点击与此无关。
+     *  · 原五档仍只管"点完探页面变没变"的间隔；这一组管"点下去之前先等多久"，两套互不影响。
+     *  · 默认 0（最快档）= 直调立刻投递，即当前行为；慢设备想稳一点就往后选。
+     *  · 顺序与 [TAP_PROBE_STEPS] / [TAP_PROBE_LABELS] 一一对应（index 相同）。
+     */
+    val DIRECT_LEAD_STEPS: List<Int> = listOf(0, 100, 150, 200, 250)
+    const val DIRECT_LEAD_DEFAULT = 0
+
+    fun loadDirectLeadMs(context: Context): Int {
+        val v = context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+            .getInt("directLeadMs", DIRECT_LEAD_DEFAULT)
+        return if (v in DIRECT_LEAD_STEPS) v else DIRECT_LEAD_DEFAULT
+    }
+
+    fun saveDirectLeadMs(context: Context, ms: Int) {
+        val v = if (ms in DIRECT_LEAD_STEPS) ms else DIRECT_LEAD_DEFAULT
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()
+            .putInt("directLeadMs", v).apply()
+    }
+
     fun loadCredentials(context: Context): Pair<String, String> {
         val sp = context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
         // 老版本的明文在这里会被 SecureStore 原地升级成密文

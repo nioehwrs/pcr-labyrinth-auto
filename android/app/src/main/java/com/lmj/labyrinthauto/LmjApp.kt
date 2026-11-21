@@ -42,6 +42,12 @@ class LmjApp : Application() {
                 com.lmj.labyrinthauto.reroll.RerollSettings.loadTapProbeMs(this).toLong(),
             )
         }
+        // ★直调投递前等待（2026-11-21）：与上面共用同一组按钮的另一组五档，启动时一并注入
+        runCatching {
+            com.lmj.labyrinthauto.logic.TapCheck.setDirectLeadMs(
+                com.lmj.labyrinthauto.reroll.RerollSettings.loadDirectLeadMs(this).toLong(),
+            )
+        }
         runCatching { LogFile.init(this) }
         // ★组队记录（2026-10-24）：每次编队一行 JSON → logs/team_runs.jsonl（PC 组队记录页可直接读）
         runCatching { TeamRunLog.init(this) }

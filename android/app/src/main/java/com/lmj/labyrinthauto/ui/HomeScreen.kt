@@ -1523,7 +1523,7 @@ private fun ConditionRow(
 // ────────────────────────── 条件 2 · 逻辑模式编辑器（2026-11-18）──────────────────────────
 // 一座小型规则引擎的 UI：每条规则 =「如果 条件A（且/或 条件B）→ 动作」。
 // 条件原子 = 遇到事件（族 + 可选结果） / 变量(T1..T8、当前层数) [比较] 整数；
-// 动作 = 撤退 / token += -= =。规则只在**节点结束时按顺序触发**（见 [LogicRule]）。
+// 动作 = 撤退 / token 加、减、设为。规则只在**节点结束时按顺序触发**（见 [LogicRule]）。
 
 /** 逻辑模式规则列表编辑器 */
 @Composable
@@ -1569,7 +1569,7 @@ private fun LogicRuleEditor(
     }
 }
 
-/** 一条逻辑规则（可换条件类型/连接符/动作） */
+/** 一条逻辑规则（★2026-11-21 用户："整条规则自然放到一行"——不折行，窄屏横向滚动） */
 @Composable
 private fun LogicRuleRow(
     index: Int,
@@ -1578,104 +1578,92 @@ private fun LogicRuleRow(
     onEdit: (LogicRule.Rule) -> Unit,
     onDelete: () -> Unit,
 ) {
-    Column(
+    Row(
         Modifier
             .fillMaxWidth()
+            .horizontalScroll(rememberScrollState())
             .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(6.dp))
-            .padding(8.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp),
+            .padding(horizontal = 6.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("#${index + 1}", style = MaterialTheme.typography.labelMedium)
-            Spacer(Modifier.width(6.dp))
-            Text("如果", style = MaterialTheme.typography.bodySmall)
-        }
-        // 条件 A
+        Text("#${index + 1}", style = MaterialTheme.typography.labelMedium)
+        Spacer(Modifier.width(4.dp))
+        Text("如果", style = MaterialTheme.typography.bodySmall)
+        Spacer(Modifier.width(4.dp))
+        // 条件 A（一行内紧凑版：不带"条件A"前缀，序号已经分得清）
         LogicAtomRow(
             atom = rule.a,
             families = families,
-            label = "条件A",
+            label = "",
             onEdit = { onEdit(rule.copy(a = it)) },
         )
-        // 连接符 + 可选条件 B
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(
-                onClick = {
-                    if (rule.b == null) {
-                        // 加一个默认条件 B（T1 = 0），并默认「且」
-                        onEdit(rule.copy(b = LogicRule.Atom.CompareAtom(LogicRule.Variable.Tok(0), LogicRule.Op.EQ, 0),
-                            combine = LogicRule.Combine.AND))
-                    } else {
-                        onEdit(rule.copy(b = null))
-                    }
-                },
-                modifier = Modifier.size(26.dp),
-            ) {
-                Icon(
-                    if (rule.b == null) Icons.Filled.Add else Icons.Filled.Remove,
-                    contentDescription = if (rule.b == null) "加第二个条件" else "去掉第二个条件",
-                    modifier = Modifier.size(14.dp),
-                )
-            }
-            if (rule.b != null) {
-                Text("连接：", style = MaterialTheme.typography.bodySmall)
-                tinyEnumDropdown(
-                    items = LogicRule.Combine.entries,
-                    selected = rule.combine,
-                    label = { it.cn },
-                    onPick = { onEdit(rule.copy(combine = it)) },
-                )
-            }
+        Spacer(Modifier.width(2.dp))
+        // 第二个条件的加/减按钮（原来是单独一行，现在并进来）
+        IconButton(
+            onClick = {
+                if (rule.b == null) {
+                    onEdit(rule.copy(b = LogicRule.Atom.CompareAtom(LogicRule.Variable.Tok(0), LogicRule.Op.EQ, 0),
+                        combine = LogicRule.Combine.AND))
+                } else {
+                    onEdit(rule.copy(b = null))
+                }
+            },
+            modifier = Modifier.size(22.dp),
+        ) {
+            Icon(
+                if (rule.b == null) Icons.Filled.Add else Icons.Filled.Remove,
+                contentDescription = if (rule.b == null) "加第二个条件" else "去掉第二个条件",
+                modifier = Modifier.size(13.dp),
+            )
         }
-        rule.b?.let { bAtom ->
+        if (rule.b != null) {
+            tinyEnumDropdown(
+                items = LogicRule.Combine.entries,
+                selected = rule.combine,
+                label = { it.cn },
+                onPick = { onEdit(rule.copy(combine = it)) },
+            )
             LogicAtomRow(
-                atom = bAtom,
+                atom = rule.b!!,
                 families = families,
-                label = "条件B",
+                label = "",
                 onEdit = { onEdit(rule.copy(b = it)) },
             )
         }
-        // 动作
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("则 →", style = MaterialTheme.typography.bodySmall)
-            Spacer(Modifier.width(4.dp))
+        Spacer(Modifier.width(4.dp))
+        Text("→", style = MaterialTheme.typography.bodySmall)
+        Spacer(Modifier.width(4.dp))
+        tinyEnumDropdown(
+            items = listOf(true, false),
+            selected = rule.act is LogicRule.Act.Retreat,
+            label = { if (it) "撤退" else "改 token" },
+            onPick = { retreat ->
+                onEdit(rule.copy(act = if (retreat) LogicRule.Act.Retreat
+                    else LogicRule.Act.TokAct(0, LogicRule.TokOp.ADD, 1)))
+            },
+        )
+        val tok = rule.act as? LogicRule.Act.TokAct
+        if (tok != null) {
             tinyEnumDropdown(
-                items = listOf(true, false),
-                selected = rule.act is LogicRule.Act.Retreat,
-                label = { if (it) "撤退" else "改 token" },
-                onPick = { retreat ->
-                    onEdit(rule.copy(act = if (retreat) LogicRule.Act.Retreat
-                        else LogicRule.Act.TokAct(0, LogicRule.TokOp.ADD, 1)))
-                },
+                items = (0 until LogicRule.TOKEN_COUNT).toList(),
+                selected = tok.i,
+                label = { LogicRule.tokenName(it) },
+                onPick = { onEdit(rule.copy(act = tok.copy(i = it))) },
             )
-            val tok = rule.act as? LogicRule.Act.TokAct
-            if (tok != null) {
-                tinyEnumDropdown(
-                    items = (0 until LogicRule.TOKEN_COUNT).toList(),
-                    selected = tok.i,
-                    label = { LogicRule.tokenName(it) },
-                    onPick = { onEdit(rule.copy(act = tok.copy(i = it))) },
-                )
-                tinyEnumDropdown(
-                    items = LogicRule.TokOp.entries,
-                    selected = tok.op,
-                    label = { it.cn },
-                    onPick = { onEdit(rule.copy(act = tok.copy(op = it))) },
-                )
-                tinyNumField(value = tok.n) {
-                    onEdit(rule.copy(act = tok.copy(n = it.coerceIn(-99, 99))))
-                }
-            }
-            Spacer(Modifier.weight(1f))
-            IconButton(onClick = onDelete) {
-                Icon(Icons.Filled.Close, contentDescription = "删除这条规则", modifier = Modifier.size(18.dp))
+            tinyEnumDropdown(
+                items = LogicRule.TokOp.entries,
+                selected = tok.op,
+                label = { it.cn },
+                onPick = { onEdit(rule.copy(act = tok.copy(op = it))) },
+            )
+            tinyNumField(value = tok.n) {
+                onEdit(rule.copy(act = tok.copy(n = it.coerceIn(-99, 99))))
             }
         }
-        Text(
-            LogicRule.ruleText(rule),
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        Spacer(Modifier.width(2.dp))
+        IconButton(onClick = onDelete, modifier = Modifier.size(22.dp)) {
+            Icon(Icons.Filled.Close, contentDescription = "删除这条规则", modifier = Modifier.size(15.dp))
+        }
     }
 }
 
@@ -1688,7 +1676,9 @@ private fun LogicAtomRow(
     onEdit: (LogicRule.Atom) -> Unit,
 ) {
     Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(label, style = MaterialTheme.typography.labelSmall, modifier = Modifier.width(38.dp))
+        if (label.isNotEmpty()) {
+            Text(label, style = MaterialTheme.typography.labelSmall, modifier = Modifier.width(38.dp))
+        }
         tinyEnumDropdown(
             items = listOf(true, false),
             selected = atom is LogicRule.Atom.EventAtom,
@@ -2026,14 +2016,19 @@ private fun TapProbeCard(context: Context) {
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        // ★2026-11-21：这一组按钮同时管两套值（index 一一对应）——
+        //   ① 原五档 = 点完探页面变没变的间隔；② 新五档 = 直调投递前的等待（0/100/150/200/250ms）。
         FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             RerollSettings.TAP_PROBE_STEPS.forEachIndexed { i, step ->
+                val lead = RerollSettings.DIRECT_LEAD_STEPS[i]
                 FilterChip(
                     selected = ms == step,
                     onClick = {
                         ms = step
                         RerollSettings.saveTapProbeMs(context, step)
                         com.lmj.labyrinthauto.logic.TapCheck.setProbeMs(step.toLong())
+                        RerollSettings.saveDirectLeadMs(context, lead)
+                        com.lmj.labyrinthauto.logic.TapCheck.setDirectLeadMs(lead.toLong())
                     },
                     label = { Text(RerollSettings.TAP_PROBE_LABELS[i], style = MaterialTheme.typography.labelSmall) },
                 )

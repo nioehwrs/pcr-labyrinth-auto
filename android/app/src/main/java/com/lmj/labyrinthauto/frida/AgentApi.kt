@@ -713,6 +713,14 @@ object AgentApi {
         obj("labDlgClosing", timeoutMs = timeoutMs)
 
     /**
+     * ★cs128：结算尾段**探针**（2026-11-21，用户"加探针吧，验证一次花的时间比较多"）——
+     * 顶框 + 字段槽按钮 + 直调候选方法 + 对象字段 + 壳内按钮节点（只读、不点）。
+     * app 侧在"结算后加速"阶段每个**新顶框类**调一次；结果打日志供定 3/4 页直调方案。
+     */
+    suspend fun probeShell(timeoutMs: Long = 8_000L): JSONObject? =
+        obj("probeShell", timeoutMs = timeoutMs)
+
+    /**
      * ★★通用确认框「**出现**」轻读（2026-11-10）：顶层对话框指针 + `top` + `TwoButtonLeft/Right`。
      *
      * `ok=true` ⇒ 两颗按钮都在（结构上就是「取消/确认」），`right` 是可直接点的确认坐标；

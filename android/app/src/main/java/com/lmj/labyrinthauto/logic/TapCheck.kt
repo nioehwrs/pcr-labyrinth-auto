@@ -58,11 +58,26 @@ object TapCheck {
      */
     private const val DIRECT_PROBE_MS = 60L
 
+    /**
+     * ★2026-11-21：直调**投递前**的等待（0/100/150/200/250ms），与点击节奏五档共用同一组按钮。
+     *  · 只作用于真正要调 `pressFn` 的那一拍，探测轮次不等；
+     *  · 原五档（probeMs）管"点完探页面变没变"的间隔，本值管"点下去之前先等多久"，互不影响；
+     *  · 默认 0 = 立刻投递（当前行为）。由 LmjApp 启动 + 设置页改档时注入。
+     */
+    @Volatile
+    private var directLeadMsValue = 0L
+
     fun setProbeMs(ms: Long) {
         probeMsValue = ms.coerceIn(150L, 350L)
     }
 
     fun currentProbeMs(): Long = probeMsValue
+
+    fun setDirectLeadMs(ms: Long) {
+        directLeadMsValue = ms.coerceIn(0L, 250L)
+    }
+
+    fun currentDirectLeadMs(): Long = directLeadMsValue
 
     /**
      * 一次 probe 的结果。
@@ -178,6 +193,10 @@ object TapCheck {
                     // ★★已经直调过了 ⇒ **只探测、绝不再投**（直调多点会真的重复执行游戏逻辑）
                     attempt++
                 } else {
+                    // ★★2026-11-21：直调**投递前**等待（与点击节奏共用按钮的另一组五档 0/100/150/200/250ms）。
+                    //   只在这一拍真要点时等，探测轮次（上面 directFired>=pressMax）不等；
+                    //   在 pressFn 真正读按钮/Execute 之前 ⇒ 给慢设备/入场动画一段稳定时间。
+                    if (directLeadMsValue > 0L) delay(directLeadMsValue)
                     // ★直调：null = 这一刻不该点（页面在切 / 按钮没定位到）⇒ 跳过并重试，不消耗 retries
                     val fired = runCatching { pressFn() }.getOrNull()
                     if (fired == null) {

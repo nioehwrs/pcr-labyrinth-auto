@@ -82,9 +82,13 @@ object LogicRule {
         data class CompareAtom(val v: Variable, val op: Op = Op.EQ, val n: Int = 0) : Atom()
     }
 
-    /** token 改动方式 */
+    /**
+     * token 改动方式。
+     * ★2026-11-21 用户："+= / -= 是编程语言，换成自然一点" ⇒ 显示文案改「加/减/设为」。
+     * `key`（add/sub/set）是存档与协议字段，**保持不变**，老规则照常读。
+     */
     enum class TokOp(val key: String, val cn: String) {
-        ADD("add", "+="), SUB("sub", "-="), SET("set", "="),
+        ADD("add", "加"), SUB("sub", "减"), SET("set", "设为"),
         ;
 
         companion object {
