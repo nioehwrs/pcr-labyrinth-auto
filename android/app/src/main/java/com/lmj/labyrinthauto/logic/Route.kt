@@ -190,11 +190,12 @@ object Route {
     }
 
     fun pickNode(nodes: List<JSONObject>, nxt: Collection<Int>?, screenW: Int, screenH: Int): JSONObject? {
+        // ★★2026-11-22（用户）：**彻底不看坐标** —— 直调 `onClickPanel` 不吃坐标，
+        //   坐标只用于"拖进视野"的兜底；之前 `y in 0..screenH` 在横屏设备上恒失败
+        //   （`H` 取了 pixelHeight=1920，y 全偏），导致明明可前往却"未找到屏内节点"。
+        //   screenW/screenH 参数保留（调用方还在传），这里不再用。
         val cand = nodes.filter { n ->
-            val x = (n.opt("x") as? Number)?.toInt()
-            val y = (n.opt("y") as? Number)?.toInt()
-            nodeClickable(n) && x != null && y != null &&
-                x in 0..screenW && y in 0..screenH &&
+            nodeClickable(n) &&
                 (nxt.isNullOrEmpty() || (n.opt("blockId") as? Number)?.toInt() in nxt)
         }
         if (cand.isEmpty()) return null

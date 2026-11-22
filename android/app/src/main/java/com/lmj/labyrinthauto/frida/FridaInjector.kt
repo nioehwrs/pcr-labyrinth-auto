@@ -92,7 +92,8 @@ object FridaInjector {
      *   立刻返回失败让注入循环 kill + launch（不再傻等 [READY_TIMEOUT_MS] 的 120s）。
      *   正常冷启动 2~5s 内就会映射，15s 留足慢设备余量。
      */
-    private const val IL2CPP_MAP_STUCK_MS = 15_000L
+    // ★2026-11-22：15s→45s —— 慢模拟器（D 状态加载大 so）15 秒常常不够，会被误判"卡死"而反复杀进程重启。
+private const val IL2CPP_MAP_STUCK_MS = 45_000L
 
     /** 轮询 maps 的间隔（PC 版 0.5s；这里是设备内 `su -c`，稍缓一点免得频繁起进程） */
     private const val MAPS_POLL_MS = 800L
@@ -978,7 +979,11 @@ object FridaInjector {
                 val st = RootShell.exec("awk '{print \$3}' /proc/$pid/stat", 3_000L, direct = true)
                 val state = st.out.trim()
                 if (state.isEmpty()) return "进程提前退出（pid $pid 的 /proc 没了）"
-                if (state == "T" || state == "D" || state == "t" || state == "Z" || state == "X") {
+                // ★★2026-11-22（用户反馈"启动反复重启/手点却能进"）：**`D` 状态不能当僵死**——
+                //   D = 不可中断睡眠，启动时加载大 so / 资源是**正常表现**（慢模拟器上持续十几秒）。
+                //   原来 3s 就判死 ⇒ force-stop 打断加载 ⇒ 再启动更慢 ⇒ 恶性循环（日志实测 4 次）。
+                //   D 交给下面的 `IL2CPP_MAP_STUCK_MS` 兜底；T/t（ptrace 挂起）、Z/X（僵尸/死）才是真坏。
+                if (state == "T" || state == "t" || state == "Z" || state == "X") {
                     return "进程僵死/已退出（pid $pid 状态=$state）"
                 }
             }

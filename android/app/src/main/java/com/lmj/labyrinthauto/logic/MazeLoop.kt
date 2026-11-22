@@ -1114,7 +1114,11 @@ object MazeLoop {
                         if (spd != null) {
                             AppState.addLog("[加速] $shell Animator=${spd.optInt("count")} speed=50（${spd.optString("err")}）")
                         }
-                        val dc = runCatching { AgentApi.obj("labDumpComps", timeoutMs = 15_000L) }.getOrNull()
+                        // ★★2026-11-22：**2 屏不采组件** —— 它的壳挂在 canvas 下，`_walkForRoot` 会遍历
+                        //   4936 个节点（实测 3649ms）。3 屏的壳是独立壳（55 节点），照常采。
+                        val dc = if (shell == "DialogAnimationViewer") {
+                            runCatching { AgentApi.obj("labDumpComps", timeoutMs = 15_000L) }.getOrNull()
+                        } else null
                         if (dc != null) {
                             val hits = dc.optJSONArray("hits") ?: JSONArray()
                             AppState.addLog(
@@ -5232,27 +5236,32 @@ object MazeLoop {
         logMapSignals(st)                                  // ★诊断：回地图后每 250ms 打一行信号
         // ★★2026-11-20（用户）：**换区滑场 / 角色移动动画在跑 ⇒ 现在点节点只会被吞**（还会排多个确认框）。
         //   直接读 `ViewLabyrinthMap` 的协程句柄（`labMapBusy`，几 ms）⇒ 动画期间这一轮不点。
-        if (moveBusyNow()) {
-            val nowB = SystemClock.elapsedRealtime()
-            if (nowB - moveBusySaidAt > 3_000L) {
-                moveBusySaidAt = nowB
-                AppState.addLog("… 地图动画在跑（$lastBusyTag）→ 等它结束再点节点")
-            }
-            delay(150)
-            return true
-        }
+        // ★★2026-11-22（用户）：**先读节点** —— 只要地图上已经有"可前往且已点亮"的节点，就说明能走了，
+        //   不必死等 `inAnimation`（换区滑场动画 ~4s，实测动画没完节点就已就绪）。
+        //   这复用了事件结束判定用的"可前进"信号（panelState==4 + anim=selectable_idle）。
         val nodesArr = AgentApi.labNodes()
         // ★别用 optJSONObject(Int)：各 org.json 实现里这个重载不一样（Android 运行时 / 单测的 json-java
         //   甚至会被解析成 "optJSONObject(String)"）→ 统一走 opt(i) as? JSONObject
         val nodes = if (nodesArr == null) emptyList()
         else (0 until nodesArr.length()).mapNotNull { nodesArr.opt(it) as? JSONObject }
+        // ★★2026-11-22（用户）：**没有"可前往且已点亮"的节点 + 换区动画在跑 ⇒ 才等**。
+        //   有节点就直接往下走（动画没完也能直调，直调不吃坐标）。
+        if (nodes.none { Route.nodeClickable(it) } && moveBusyNow()) {
+            val nowB = SystemClock.elapsedRealtime()
+            if (nowB - moveBusySaidAt > 3_000L) {
+                moveBusySaidAt = nowB
+                AppState.addLog("… 换区动画在跑（$lastBusyTag）且暂无可用节点 → 等")
+            }
+            delay(150)
+            return true
+        }
         val nxt = intListOf(st, "next")
         val sel = nodes.filter {
             // ★2026-11-22：不只看 panelState==4（拓扑），还要"已点亮"（anim=selectable_idle）——
             //   事件/选择/弹窗期间节点是暗的、点不动，此时不该抢跑去点。
+            //   ★**不再要求屏幕坐标**：直调 `onClickPanel` 不需要坐标（用户 2026-11-22）。
             Route.nodeClickable(it) &&
-                (nxt.isEmpty() || (it.opt("blockId") as? Number)?.toInt() in nxt) &&
-                (it.opt("x") as? Number) != null
+                (nxt.isEmpty() || (it.opt("blockId") as? Number)?.toInt() in nxt)
         }
         // ① 优先按路线走：路线里当前节点的下一站（那颗必须是"可前往"且在屏内）
         var t: JSONObject? = null
@@ -5272,10 +5281,12 @@ object MazeLoop {
                 // ★凹分检测（2026-11-01）：站在 5 层商店、下一步就要去 5 层 Boss ——
                 //   此时角色数/遗物数已定，分数能提前算；不够就撤退，别往 50801 点下去。
                 if (cur == NODE_SHOP_5F && want == NODE_BOSS_5F && scoreChaseCheck(input)) return true
+                // ★优先有坐标的（可拖进视野），没有也接受——直调不需要坐标
                 t = nodes.firstOrNull {
                     (it.opt("blockId") as? Number)?.toInt() == want &&
-                        Route.nodeClickable(it) &&
-                        (it.opt("x") as? Number) != null
+                        Route.nodeClickable(it) && (it.opt("x") as? Number) != null
+                } ?: nodes.firstOrNull {
+                    (it.opt("blockId") as? Number)?.toInt() == want && Route.nodeClickable(it)
                 }
                 if (t == null) {
                     AppState.addLog("[!] 路线下一站 B$want 当前不可点（panelState/屏内不符）→ 回退按类型优先级挑")
@@ -5386,8 +5397,8 @@ object MazeLoop {
             return true
         }
         AppState.addLog(
-            // ★x/y 现在只有"可前往(4)/当前所在(0)"这两类才有（agent 侧省掉了其余状态的坐标计算 ✓）
-            "→ 未找到屏内可前往节点（panelState==4 且在屏内）；可前往=$nxt；全部节点=" +
+            // ★2026-11-22：不再要求"屏内"（直调不吃坐标）——只有真的没有"可前往且已点亮"的节点才会走到这
+            "→ 未找到可前往节点（可前往+已点亮）；可前往=$nxt；全部节点=" +
                 nodes.take(12).joinToString("、") {
                     "${it.opt("blockId")}/${it.opt("panelState")}" +
                         ((it.opt("x") as? Number)?.let { v -> "/$v" } ?: "")
@@ -6375,9 +6386,9 @@ object MazeLoop {
                         //  （物理多 ⇒ 物理防御贯穿；魔法多 ⇒ 魔法防御贯穿；平局默认物理）。
                         sess.sortTarget = exeqSortTarget(plan.target)
                         AppState.addLog("特别装备：目标队输出系别 → 排序选「${sess.sortTarget}」")
-                        // 第 1 队（nowSelectParty<=0）才允许「使用其他角色已装备」；第 2/3 队取消勾选防抢装备
-                        val nsp = pt.opt("nowSelectParty")
-                        sess.exShare = !(nsp is Int) || nsp <= 0
+                        // ★2026-11-22（用户）：BOSS 战只有**一队**穿 EX，第 2/3 队不再处理 ⇒ 恒共享。
+                        //   （原来按 `nowSelectParty` 判第几队，第 2/3 队会去"取消勾选"，但本作只有一队。）
+                        sess.exShare = true
                         if (sess.exShare) sess.team1Sig = sig
                         sess.opened = true
                         sess.openedAt = System.currentTimeMillis()
@@ -6875,6 +6886,20 @@ object MazeLoop {
                     //   ③页的排序项是 `PartsUnitSortTypeToggle`，agent 侧会自动改走无参 `OnClick()`。
                     if (!exeqDirectOk) {
                         // 直调已判定不可用（旧版 agent）⇒ 退回坐标点击
+                        return@xyAt tap(input, act.btn.optInt("x"), act.btn.optInt("y"), rule.what)
+                    }
+                    // ★★2026-11-22（实机探测确认）：复选框是 `UIToggle`（GameObject "Toggle"），
+                    //   直调 `CustomUIButton.onClick` **不切 value**（连点 3 次仍 false）——
+                    //   真正的直调是 `UIToggle.set_value(bool)`（实测一次生效、复读校验通过）。
+                    if (rule.btnKey == "check") {
+                        val want = !rule.what.contains("取消")
+                        val r = runCatching {
+                            AgentApi.obj("labExCheckSet", listOf<Any?>(want), timeoutMs = EXEQ_READ_FULL_MS)
+                        }.getOrNull()
+                        if (r?.optBoolean("ok") == true) return@xyAt true
+                        AppState.addLog(
+                            "特别装备：勾选直调失败（${r?.optString("err").orEmpty().ifEmpty { "无回包" }}）→ 退回坐标点击",
+                        )
                         return@xyAt tap(input, act.btn.optInt("x"), act.btn.optInt("y"), rule.what)
                     }
                     val pr = AgentApi.labExPress(rule.btnKey, sess.tapBtnId, timeoutMs = EXEQ_READ_FULL_MS)

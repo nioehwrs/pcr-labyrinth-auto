@@ -5244,7 +5244,12 @@ function battleResultPathBtn(noScan) {
   //     所以 node-inactive 一定放行给扫描，由扫描按"只认激活层级"拿到真按钮。
   //   ★app 侧只在**本场还没认过按钮**（第一页）时传 noScan；第二页（已认过）传 allowScan。
   if (noScan) {
-    const notPlaced = (a.err === "offscreen") || (b.err === "offscreen") || (c.err === "offscreen");
+    // ★2026-11-22 实测（BOSS 战 11:31）：`RES_BOSS_SUB` 未落位时返回 **node-inactive**，
+    //   此时下面的 f/g 子树扫描实测也是 no-node（白烧 3.3s）。BOSS/EX 页**只有一份壳**、
+    //   不存在普通战那种"残留壳"问题 ⇒ 这里把 c 的 node-inactive 也当未落位。
+    //   （a/b 保持只认 offscreen：普通战可能命中残留壳的 inactive 按钮，真按钮在别处 active。）
+    const notPlaced = (a.err === "offscreen") || (b.err === "offscreen") ||
+                      (c.err === "offscreen") || (c.err === "node-inactive");
     if (notPlaced) {
       return { ok: false, err: "noScan(未落位): " + a.err + " / " + b.err + " / " + c.err };
     }
@@ -10211,14 +10216,9 @@ rpc.exports = {
   }),
   // 地图上所有节点面板：blockId / panelState / 屏幕坐标
   labNodes: _rpcSafe(function () {
-    // ★1.5s TTL（见 [NODES_TTL_MS] 注释）；空结果不缓存
-    const _n = Date.now();
-    if (g_nodesCache && (_n - g_nodesAt) < NODES_TTL_MS) return g_nodesCache;
-    try {
-      const r = labNodesSnapshot();
-      if (r && r.length) { g_nodesCache = r; g_nodesAt = Date.now(); }
-      return r;
-    } catch (e) { return null; }
+    // ★★2026-11-22（用户）：**去掉 1.5s 缓存** —— 现在只对 state 0/4 算坐标，读一次几十毫秒；
+    //   缓存反而让"换区完成/事件结束"的状态滞后最多 1.5s，影响发现可前往节点的速度。
+    try { return labNodesSnapshot(); } catch (e) { return null; }
   }),
   // ★2026-11-22 调试：节点 UI 标记（panelState + Cursor/LockMark/ParentObject 是否激活）
   //   用来判断"事件/选择进行中地图节点是否真的可点"——panelState=4 只是拓扑连通，不一定能点。
@@ -10828,6 +10828,78 @@ rpc.exports = {
   // ★★**按需读按钮**（2026-11-08）：三连页"这一步只点一个按钮" ⇒ 只读那一个 + 当前签名。
   //   返回 {sig, top, btn:{name,x,y,id}} —— **不读**整包（labels/terms/toggles/按钮全家桶）。
   labExBtn: _rpcSafe(function (key, preferId) { try { return labExBtn(key || "", preferId || ""); } catch (e) { return { sig: null, top: null, btn: null, err: String(e) }; } }),
+  // ★★2026-11-22（实测）：EX ②页「选择其他角色装备中的特别装备」复选框**真正的直调** ——
+  //   它是 `UIToggle`（GameObject 名 "Toggle"），直调 `CustomUIButton.onClick` **不切 value**；
+  //   必须调 `UIToggle.set_value(bool)`（实测一次生效）。复读 value 校验后返回。
+  labExCheckSet: _rpcSafe(function (v) {
+    try {
+      const b = labExBtn("check");
+      if (!b || !b.btn) return { ok: false, err: "no-check-btn" };
+      const p = ptr(b.btn.btnPtr);
+      if (!ptrOk(p)) return { ok: false, err: "bad-ptr" };
+      const go = _inv(p, "get_gameObject");
+      if (!ptrOk(go)) return { ok: false, err: "no-go" };
+      const kk = findClass("UIToggle");
+      if (!kk || kk.isNull()) return { ok: false, err: "no-UIToggle" };
+      const tg = _compSelfTry(go, kk);
+      if (!ptrOk(tg)) return { ok: false, err: "no-toggle-inst" };
+      const k2 = g_il2cpp.object_get_class(tg);
+      const m = _findMethodNP(k2, "set_value", 1) || findMethodAny(k2, "set_value");
+      if (!m) return { ok: false, err: "no-set_value" };
+      const abuf = Memory.alloc(8); abuf.writeU8(v ? 1 : 0);
+      const args = Memory.alloc(8); args.writePointer(abuf);
+      const ex = Memory.alloc(8); ex.writePointer(ptr(0));
+      g_il2cpp.runtime_invoke(m, tg, args, ex);
+      if (!ex.readPointer().isNull()) return { ok: false, err: "set_value ex" };
+      let now = null;
+      try { const r = _inv(tg, "get_value"); if (r && !r.isNull()) now = (r.add(0x10).readU8() !== 0); } catch (e) {}
+      return { ok: now === !!v, value: now, via: "UIToggle.set_value" };
+    } catch (e) { return { ok: false, err: String(e) }; }
+  }),
+  // ★2026-11-22 调试：探测 EX ②页 check 复选框的真实组件（是否有 UIToggle、能否 set_value 直调）
+  labExCheckProbe: _rpcSafe(function (doToggle) {
+    const out = { ok: false, comps: [], err: null };
+    try {
+      const b = labExBtn("check");
+      if (!b || !b.btn) { out.err = "no-check-btn:" + (b && b.err); return out; }
+      const p = ptr(b.btn.btnPtr);
+      if (!ptrOk(p)) { out.err = "bad-ptr"; return out; }
+      out.btnPtr = String(p);
+      out.btnCls = klassNameOf(p);
+      out.x = b.btn.x; out.y = b.btn.y;
+      const go = _inv(p, "get_gameObject");
+      if (!ptrOk(go)) { out.err = "no-go"; return out; }
+      out.goName = _str(_inv(go, "get_name"));
+      for (const nm of ["UIToggle", "CustomUIButton", "UIButton", "BoxCollider", "UISprite", "UIWidget", "UITweener"]) {
+        const kk = findClass(nm);
+        if (!kk || kk.isNull()) continue;
+        let cc = null;
+        try { cc = _compSelfTry(go, kk); } catch (e) {}
+        if (!ptrOk(cc)) continue;
+        const rec = { comp: nm, ptr: String(cc) };
+        if (nm === "UIToggle") {
+          try { const r = _inv(cc, "get_value"); if (r && !r.isNull()) rec.value = (r.add(0x10).readU8() !== 0); } catch (e) {}
+          if (doToggle) {
+            try {
+              const k2 = g_il2cpp.object_get_class(cc);
+              const m = _findMethodNP(k2, "set_value", 1) || findMethodAny(k2, "set_value");
+              if (m) {
+                // ★bool 参数：先分配 1 字节缓冲写 1，参数数组里放**指向它的指针**
+                const abuf = Memory.alloc(8); abuf.writeU8(1);
+                const args = Memory.alloc(8); args.writePointer(abuf);
+                const ex = Memory.alloc(8); ex.writePointer(ptr(0));
+                g_il2cpp.runtime_invoke(m, cc, args, ex);
+                rec.setValueErr = ex.readPointer().isNull() ? null : "ex";
+              } else rec.setValueErr = "no-method";
+            } catch (e) { rec.setValueErr = String(e); }
+          }
+        }
+        out.comps.push(rec);
+      }
+      out.ok = out.comps.length > 0;
+    } catch (e) { out.err = String(e); }
+    return out;
+  }),
   // ★2026-11-22 调试：DialogArea 下同名对话框壳的清单（名字/active/在 DialogArea 的索引）
   labDlgRoots: _rpcSafe(function (cls) {
     try {
