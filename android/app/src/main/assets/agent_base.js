@@ -4786,6 +4786,21 @@ const RES_WIN_SUB = {
           "ButtonAnimator", "Button", "NextButton"],
   idxs: [0, 1, 4, 0, 1, 0, 0, 0],
 };
+// ★2026-11-22 实测（普通胜利**第二页** PartsQuestResultLater）：dlg 链 [6,0,0,0,5,1,0,0,3]
+//   ⇒ 相对 DialogQuestResultWin 壳 = [0,0,0,5,1,0,0,3]，按钮名 NextButtonLarge。
+//   names=null ⇒ 走 [_pathAt] 纯索引下降（不校验每层名字；实测最稳、最快）。
+const RES_WIN_LATER = {
+  cls: "DialogQuestResultWin", kind: "win", later: true,
+  names: null,
+  idxs: [0, 0, 0, 5, 1, 0, 0, 3],
+};
+// ★2026-11-22 实测（BOSS/EX **第二页**）：dlg 链 [5,0,0,0,5,1,0,0,3]
+//   ⇒ 相对 DialogLabyrinthExResult 壳 = [0,0,0,5,1,0,0,3]（与普通战第二页结构相同，只是壳不同）。
+const RES_BOSS_LATER = {
+  cls: "DialogLabyrinthExResult", kind: "exwin", dualKind: true, later: true,
+  names: null,
+  idxs: [0, 0, 0, 5, 1, 0, 0, 3],
+};
 //   BOSS/EX 胜利页（2026-11-18 15:24 取证，节点 30701）：DialogLabyrinthExResult →
 //     Main[0]/PartsFormer[1]/Main[0]/BottomParts[4]/BottomParent[0]/NextButton[0]
 //   kind 用 "exwin" 只为日志可辨；app 侧只按 "fail" 与否分胜负，这里会被当胜利。
@@ -4876,7 +4891,8 @@ function _dlgRootByName(clsName) {
         //   inactive 的旧 NextButton，点了毫无反应（连点 5 次无效的根因之一）。
         //   这里只认**激活**的那份；全都不激活时才退回第一份（保持原行为，给诊断用）。
         let actv = true;
-        try { actv = (_inv(go, "get_activeInHierarchy") === true); } catch (e2) { actv = true; }
+        // ★2026-11-22 BUG 修复：同 [_dlgRootsByName]，必须用 [_goActive]（_inv(...) 返回装箱指针）
+        try { const a = _goActive(go); actv = (a !== false); } catch (e2) { actv = true; }
         if (actv) return ch;
         if (!fallback) fallback = ch;
       }
@@ -4885,14 +4901,46 @@ function _dlgRootByName(clsName) {
   } catch (e) { return null; }
 }
 
-/** 按一条固定路径取结算按钮：`{ok,x,y,label,kind,base}` / `{ok:false,err}` */
-function _resPathOne(spec) {
-  const out = { ok: false, kind: spec.kind };
+/**
+ * ★2026-11-22（实测）：取 DialogArea 下**所有**同名对话框 transform（倒序=最上层优先）。
+ *   原来 [_dlgRootByName] 只返回一个，且"倒序第一份 active"仍可能是**残留壳**
+ *   （它 active=true、但内部按钮 inactive）⇒ 固定路径判 node-inactive，永远落到扫描。
+ *   实测（普通胜利第一页）：真按钮在 dlg[6]，而 `_dlgRootByName` 取到了另一份。
+ *   ⇒ 改成"逐个壳试路径，取第一个按钮真激活的"。
+ */
+function _dlgRootsByName(clsName) {
+  const out = [];
   try {
-    const base = _dlgRootByName(spec.cls);
-    if (!base) { out.err = "no-dialog:" + spec.cls; return out; }
-    out.base = spec.cls;
-    const btnTr = _descendFixed(base, spec.names, spec.idxs);
+    if (!g_dialogArea || g_dialogArea.isNull() ||
+        _str(_inv(_inv(g_dialogArea, "get_gameObject"), "get_name")) !== "DialogArea") {
+      g_dialogArea = _findDialogAreaTr();
+    }
+    if (!g_dialogArea || g_dialogArea.isNull()) return out;
+    const cc = _childCountOf(g_dialogArea);
+    for (let i = cc - 1; i >= 0; i--) {                    // 倒序 = 最上层优先
+      const ch = _inv1i(g_dialogArea, "GetChild", i);
+      if (!ch || ch.isNull()) continue;
+      const go = _inv(ch, "get_gameObject");
+      if (!go || go.isNull()) continue;
+      const nm = _str(_inv(go, "get_name"));
+      if (nm === clsName || nm.indexOf(clsName) === 0) {   // 兼容 "...(Clone)"
+        let actv = true;
+        // ★2026-11-22 BUG 修复：`_inv(...)` 返回**装箱对象指针**，不是 JS true ⇒ 必须用 [_goActive]
+        //   （读 +0x10 的字节）。原来写成 `_inv(...) === true` 恒为 false ⇒ 固定路径恒判 inactive。
+        try { const a = _goActive(go); actv = (a !== false); } catch (e2) {}
+        out.push({ tr: ch, active: actv, idx: i });
+      }
+    }
+  } catch (e) {}
+  return out;
+}
+
+/** 在**指定壳**上按一条固定路径取结算按钮（[_resPathOne] 的单壳版） */
+function _resPathOneAt(spec, base) {
+  const out = { ok: false, kind: spec.kind, base: spec.cls };
+  try {
+    // names=null ⇒ 纯索引下降（第二页 PartsQuestResultLater 用，结构名不稳定）
+    const btnTr = spec.names ? _descendFixed(base, spec.names, spec.idxs) : _pathAt(base, spec.idxs);
     if (!btnTr) { out.err = "path-miss:" + spec.cls; return out; }
     const env = _camEnv();
     if (!env) { out.err = "no-cam"; return out; }
@@ -4927,11 +4975,14 @@ function _resPathOne(spec) {
     //   不校验就会每次都点到那颗"看不见的旧按钮"（连点 5 次毫无反应，comp 指针一直不变）。
     try {
       const goA = _inv(btnTr, "get_gameObject");
-      if (ptrOk(goA) && _inv(goA, "get_activeInHierarchy") !== true) {
+      // ★2026-11-22 BUG 修复：`_inv(...)` 返回装箱指针，不能和 `true` 比 ⇒ 用 [_goActive]。
+      //   原来这里恒判"未激活"⇒ 固定路径永远失败、一直落到树扫描（stage 一直 scan）。
+      if (ptrOk(goA) && _goActive(goA) === false) {
         out.err = "node-inactive"; return out;
       }
     } catch (eA) {}
     out.ok = true; out.x = x; out.y = y; out.label = label;
+    if (spec.later) out.stage = "later";
     // ★直调用（2026-11-18）：把**按钮组件**一起带出去 —— 坐标给坐标点击用，组件指针给直调用。
     //   取法同 `_pressNow`：本构建没有 `GetComponent(Type)` ⇒ 走 `_compSelfTry`（先查自己再查子节点）。
     try {
@@ -4948,6 +4999,29 @@ function _resPathOne(spec) {
     } catch (e2) {}
   } catch (e) { out.err = String(e); }
   return out;
+}
+
+/**
+ * 按一条固定路径取结算按钮：`{ok,x,y,label,kind,base}` / `{ok:false,err}`。
+ * ★2026-11-22：遍历**所有**同名壳（active 优先），取第一个按钮真激活的 —— 解决
+ *   "残留壳 active 但按钮 inactive"导致固定路径恒失效、永远扫树的问题。
+ *   全失败时返回**优先级最高那份**的错误（active 壳的错误更能反映真实状态，noScan 判断用得上）。
+ */
+function _resPathOne(spec) {
+  try {
+    const roots = _dlgRootsByName(spec.cls);
+    if (!roots || !roots.length) return { ok: false, kind: spec.kind, err: "no-dialog:" + spec.cls };
+    const actives = roots.filter(function (r) { return r.active; });
+    const inactives = roots.filter(function (r) { return !r.active; });
+    const order = actives.concat(inactives);
+    let firstErr = null;
+    for (let i = 0; i < order.length; i++) {
+      const o = _resPathOneAt(spec, order[i].tr);
+      if (o.ok) return o;
+      if (!firstErr) firstErr = o;
+    }
+    return firstErr || { ok: false, kind: spec.kind, err: "no-dialog:" + spec.cls };
+  } catch (e) { return { ok: false, kind: spec.kind, err: String(e) }; }
 }
 
 /**
@@ -5131,9 +5205,15 @@ function _resLaterOne() { return _resBtnScan("DialogQuestResultWin", "win"); }
 
 /**
  * ★2026-11-18：结算按钮的**固定层级路径**（主路径）——失败页 → 普通胜利页 → BOSS/EX 胜利页。
+ *
+ * ★★2026-11-21（用户："完全拒绝重扫描，只保留轻读取"）：新增 `noScan` —— 为 true 时**只做固定
+ *   路径（a/b/c）+ lab 字段槽快查，不做 d~h 的 `_resBtnScan` 子树遍历**。结算页刚出现、按钮还
+ *   没落位时，固定路径会返回 offscreen，此时再扫 200+ 节点子树**必然也找不到**，却是 1.5~2s 的
+ *   重活（把 agent 单通道堵住、连 gameFocused 都超时 = 用户体感的"胜利画面卡几秒"）。
+ *   app 侧把"静置后的快速轮询"全用 noScan（每拍几 ms），子树扫描只留给之后的全套兜底。
  * @return `{ok,kind:"fail"|"win"|"exwin",x,y,label,ms}` / `{ok:false,err,ms}`
  */
-function battleResultPathBtn() {
+function battleResultPathBtn(noScan) {
   // ★cs128：迷宫结算壳在前台时，a~g 的固定路径/扫描**全是白花**（no-dialog×5 + no-node×2，
   //   实测首查共 ~3.5s，把 app 侧 4s 直调窗口耗光 ⇒ pressFn 记"没投出去"干等 3s 才坐标兜底）。
   //   先便宜探一下壳在不在（get_gameObject 活性），在就直接试 lab —— 其余场合（战斗结算壳）
@@ -5148,8 +5228,27 @@ function battleResultPathBtn() {
   if (a.ok) return a;
   const b = _resPathOne(RES_WIN_SUB);
   if (b.ok) return b;
+  // ★2026-11-22：普通胜利**第二页**（PartsQuestResultLater / NextButtonLarge）固定路径
+  const b2 = _resPathOne(RES_WIN_LATER);
+  if (b2.ok) return b2;
   const c = _resPathOne(RES_BOSS_SUB);
   if (c.ok) return c;
+  // ★2026-11-22：BOSS/EX **第二页**（PartsQuestResultLater / NextButtonLarge）固定路径
+  const c2 = _resPathOne(RES_BOSS_LATER);
+  if (c2.ok) return c2;
+  // ★noScan：**只有"确实没落位"（三档任一 offscreen）才禁扫描** —— 这时按钮在屏外，
+  //   扫 200+ 节点子树必然也找不到，纯属重活（堵单通道 = 胜利画面卡几秒）。
+  //   ⚠**`node-inactive` 不能当"未就绪"跳过扫描**（2026-11-22 实机实测踩坑）：
+  //     固定路径可能命中**上一场残留壳的非激活按钮**（DialogArea 下同名壳有两份），
+  //     而真按钮在另一份壳里是 active 的 —— 此时跳过扫描会一直失败、白等到全套兜底。
+  //     所以 node-inactive 一定放行给扫描，由扫描按"只认激活层级"拿到真按钮。
+  //   ★app 侧只在**本场还没认过按钮**（第一页）时传 noScan；第二页（已认过）传 allowScan。
+  if (noScan) {
+    const notPlaced = (a.err === "offscreen") || (b.err === "offscreen") || (c.err === "offscreen");
+    if (notPlaced) {
+      return { ok: false, err: "noScan(未落位): " + a.err + " / " + b.err + " / " + c.err };
+    }
+  }
   // ★第二页（PartsQuestResultLater）：第一页的节点此时 inactive、会被上面挡掉，
   //   这里补上"结算第二页"的识别，否则 app 会误判成"不在结算页"而卡住。
   // ★固定路径失效（版本改了层级深度：实测真实 `NextButton` 在 d=13，而旧路径只有 8 层，
@@ -7169,6 +7268,24 @@ function labExBtn(key, preferId) {
     }
     res.btn = btn;
   } catch (e) { res.err = String(e); }
+  // ★2026-11-21（用户）：读出按钮**可用状态**（isEnabled）。①页「自动装备」在某些角色下是
+  //   **暗的**（没可装备的东西 ⇒ 禁用），直调 onClick 会绕过禁用检查（游戏真实点击走
+  //   `onDisabledClick`）⇒ 误触发。app 侧据此改成"点取消收尾"。非 UIButton 控件（③页 toggle）
+  //   没有该方法 ⇒ enabled 不置字段，app 侧 `has("enabled")` 为假、不误拦。
+  try {
+    if (res.btn && res.btn.btnPtr) {
+      const p = ptr(res.btn.btnPtr);
+      if (ptrOk(p)) {
+        const k = g_il2cpp.object_get_class(p);
+        const m = _findMethodNP(k, "get_isEnabled", 0) || findMethodAny(k, "get_isEnabled");
+        if (m) {
+          const ex = Memory.alloc(8); ex.writePointer(ptr(0));
+          const r = g_il2cpp.runtime_invoke(m, p, ptr(0), ex);
+          if (ex.readPointer().isNull() && r && !r.isNull()) res.enabled = (r.add(0x10).readU8() !== 0);
+        }
+      }
+    }
+  } catch (e) {}
   return res;
 }
 
@@ -10103,6 +10220,260 @@ rpc.exports = {
       return r;
     } catch (e) { return null; }
   }),
+  // ★2026-11-22 调试：节点 UI 标记（panelState + Cursor/LockMark/ParentObject 是否激活）
+  //   用来判断"事件/选择进行中地图节点是否真的可点"——panelState=4 只是拓扑连通，不一定能点。
+  labNodeMarks: _rpcSafe(function () {
+    const out = [];
+    try {
+      const ltd = _findLTD();
+      if (!ltd) return { err: "no-ltd", nodes: out };
+      const vm = _findVM(ltd);
+      if (!vm) return { err: "no-vm", nodes: out };
+      const partsMap = vm.add(0xD0).readPointer();
+      if (!ptrOk(partsMap)) return { err: "no-partsMap", nodes: out };
+      const listObj = partsMap.add(0x70).readPointer();
+      if (!ptrOk(listObj)) return { err: "no-list", nodes: out };
+      const count = _listCount(listObj);
+      for (let i = 0; i < count; i++) {
+        const panel = _listItem(listObj, i);
+        if (panel.isNull()) continue;
+        const pd = panel.add(0x70).readPointer();
+        if (!ptrOk(pd)) continue;
+        const mi = pd.add(0x10).readPointer();
+        if (!ptrOk(mi)) continue;
+        const rec = { blockId: decOI(mi.add(0x34)), panelState: panel.add(0x90).readS32() };
+        // ★currentAnimationName @0x78（String）：selectable_in = 正在点亮入场，selectable_idle = 稳定可点
+        try { const s = panel.add(0x78).readPointer(); rec.anim = ptrOk(s) ? (_str1(s) || "") : null; } catch (e) {}
+        // ★button @0x28（CustomUIButton）.isEnabled
+        try {
+          const b = panel.add(0x28).readPointer();
+          if (ptrOk(b)) {
+            const k2 = g_il2cpp.object_get_class(b);
+            const m = _findMethodNP(k2, "get_isEnabled", 0) || findMethodAny(k2, "get_isEnabled");
+            if (m) {
+              const ex = Memory.alloc(8); ex.writePointer(ptr(0));
+              const r = g_il2cpp.runtime_invoke(m, b, ptr(0), ex);
+              if (ex.readPointer().isNull() && r && !r.isNull()) rec.btnEnabled = (r.add(0x10).readU8() !== 0);
+            }
+          }
+        } catch (e) {}
+        out.push(rec);
+      }
+    } catch (e) { return { err: String(e), nodes: out }; }
+    return { count: out.length, nodes: out };
+  }),
+  // ★2026-11-22 调试：dump 最上层对话框子树的**动画组件**（找 3 屏演出的加速开关）
+  //   Animator.speed / Animation / UITweener / Spine 等。一次结算采一次，不依赖外部时机。
+  labDumpComps: _rpcSafe(function () {
+    const out = { top: "", nodes: 0, hits: [], err: null };
+    try {
+      const t = _topDialogGo(true);
+      if (!t || !t.go || t.go.isNull()) return { err: "no-top" };
+      out.top = String(t.name || "");
+      const names = ["Animator", "Animation", "UIPlayTween", "UITweener", "TweenAlpha",
+                     "TweenScale", "CustomUIButton", "UIButton", "UIWidget", "ParticleSystem",
+                     "CustomUISpinePlayer", "CustomUIAnimationPlayer", "CustomUIEffect"];
+      const classes = {};
+      for (const nm of names) { const k = findClass(nm); if (k && !k.isNull()) classes[nm] = k; }
+      // ★根只认**壳自己的 Transform**；取不到就**直接放弃**（绝不回退 canvas——实测 canvas 5364 节点、
+      //   `_walkForRoot` 3.8s，会与结算重活叠加把游戏线程堵死）
+      let rootTr = null;
+      try { rootTr = _dlgRootByName(out.top); } catch (e) {}
+      if (!ptrOk(rootTr)) { out.err = "no-shell-root:" + out.top; return out; }
+      const list = (ptrOk(rootTr) ? _walkForRoot("dumpComps_" + out.top, rootTr) : null) || [];
+      out.nodes = list.length;
+      // ★限制节点数：4936 个 × 13 类会卡死；只扫前 400 个 active 节点
+      for (let i = 0; i < list.length && out.hits.length < 60 && i < 400; i++) {
+        const nd = list[i];
+        if (!nd || !nd.tr || nd.active !== true) continue;
+        let go = null;
+        try { go = _inv(nd.tr, "get_gameObject"); } catch (e) { continue; }
+        if (!ptrOk(go)) continue;
+        for (const nm in classes) {
+          // ★用 _compSelfTry（和 labExBtn 同款、实测可用），不用 GetComponent(Type)
+          let c = null;
+          try { c = _compSelfTry(go, classes[nm]); } catch (e) {}
+          if (!ptrOk(c)) continue;
+          const rec = { node: nd.name, comp: nm };
+          if (nm === "Animator") {
+            try { const r = _inv(c, "get_speed"); if (r && !r.isNull()) rec.speed = r.add(0x10).readFloat(); } catch (e) {}
+            try { const r = _inv(c, "get_enabled"); if (r && !r.isNull()) rec.enabled = (r.add(0x10).readU8() !== 0); } catch (e) {}
+          } else if (nm === "UIWidget") {
+            try { const r = _inv(c, "get_alpha"); if (r && !r.isNull()) rec.alpha = r.add(0x10).readFloat(); } catch (e) {}
+          } else if (nm === "UITweener" || nm === "UIPlayTween" || nm === "TweenAlpha" || nm === "TweenScale") {
+            try { const r = _inv(c, "get_enabled"); if (r && !r.isNull()) rec.enabled = (r.add(0x10).readU8() !== 0); } catch (e) {}
+            try { const r = _inv(c, "get_duration"); if (r && !r.isNull()) rec.dur = r.add(0x10).readFloat(); } catch (e) {}
+          }
+          out.hits.push(rec);
+          break;
+        }
+      }
+    } catch (e) { out.err = String(e); }
+    return out;
+  }),
+  // ★2026-11-22（用户"2/3屏加速做掉"）：把当前顶框子树里所有 **Animator.speed** 设大，
+  //   Spine/Animation 瞬间播完 —— 3 屏（演出壳）/2 屏（滚分）实测都是 Animator 驱动（speed=1.0）。
+  //   用 runtime_invoke 调 `set_speed(float)`（Animator.speed 是 native 属性、无托管字段可直写）。
+  labSpeedupAnim: _rpcSafe(function (speed) {
+    const sp = (typeof speed === "number" && speed > 0) ? speed : 50;
+    const out = { ok: false, top: "", count: 0, err: null };
+    try {
+      const t = _topDialogGo(true);
+      if (!t || !t.go || t.go.isNull()) { out.err = "no-top"; return out; }
+      out.top = String(t.name || "");
+      // ★只认壳自己的 Transform（不回退 canvas：全树遍历会卡死游戏线程）
+      let rootTr = null;
+      try { rootTr = _dlgRootByName(out.top); } catch (e) {}
+      if (!ptrOk(rootTr)) { out.err = "no-shell-root:" + out.top; return out; }
+      const kA = findClass("Animator");
+      if (!kA || kA.isNull()) { out.err = "no-Animator"; return out; }
+      const mSet = _findMethodNP(kA, "set_speed", 1);
+      if (!mSet) { out.err = "no-set_speed"; return out; }
+      const ex = Memory.alloc(8);
+      const args = Memory.alloc(8);
+      const fbuf = Memory.alloc(8);
+      fbuf.writeFloat(sp);
+      args.writePointer(fbuf);
+      const scan = function (tr, depth) {
+        // ★深度/数量都收紧（_compSelfTry 是 GetComponentInChildren，逐节点调很贵）
+        if (!ptrOk(tr) || depth > 4 || out.count >= 20) return;
+        let go = null;
+        try { go = _inv(tr, "get_gameObject"); } catch (e) { return; }
+        if (!ptrOk(go)) return;
+        let actv = true;
+        try { const a = _goActive(go); actv = (a !== false); } catch (e) {}
+        if (actv) {
+          let c = null;
+          try { c = _compSelfTry(go, kA); } catch (e) {}
+          if (ptrOk(c)) {
+            try {
+              ex.writePointer(ptr(0));
+              g_il2cpp.runtime_invoke(mSet, c, args, ex);
+              if (ex.readPointer().isNull()) out.count++;
+            } catch (e) {}
+          }
+        }
+        const cc = _childCountOf(tr);
+        for (let i = 0; i < cc && i < 40 && out.count < 20; i++) {
+          let ch = null;
+          try { ch = _inv1i(tr, "GetChild", i); } catch (e2) { continue; }
+          scan(ch, depth + 1);
+        }
+      };
+      scan(rootTr, 0);
+      out.ok = out.count > 0;
+    } catch (e) { out.err = String(e); }
+    return out;
+  }),
+  // ★2026-11-22 调试：**全 canvas** 扫描"当前正在播放"的特效/动画组件 —— 用来定位"通关庆祝动画"
+  //   （它没有 Dialog 壳、也不占 mapBusy 句柄，只能从 canvas 下 active 的对象里找）。
+  //   只试 4 类（ParticleSystem/Animator/CustomUISpinePlayer/CustomUIAnimationPlayer），限制 800 节点避免卡死。
+  labDumpActiveFx: _rpcSafe(function () {
+    const out = { root: "", nodes: 0, hits: [], err: null };
+    try {
+      let rootTr = null;
+      try { rootTr = _pathAt("canvas"); } catch (e) {}
+      if (!ptrOk(rootTr)) { out.err = "no-canvas"; return out; }
+      const names = ["ParticleSystem", "Animator", "CustomUISpinePlayer", "CustomUIAnimationPlayer"];
+      const classes = {};
+      for (const nm of names) { const k = findClass(nm); if (k && !k.isNull()) classes[nm] = k; }
+      // ★★只扫**两层**（canvas 直接子 + 它们的子节点）：全 canvas 约 5000 节点、_rawWalk 每节点 ~5 次
+      //   invoke ⇒ 2.5 万次 ≈ 5~10s，远超庆祝 4s 窗口。两层约 100~300 次 ≈ 100~300ms ✓
+      const scan = function (tr, depth) {
+        if (!ptrOk(tr) || depth > 2 || out.hits.length >= 40) return;
+        let go = null;
+        try { go = _inv(tr, "get_gameObject"); } catch (e) { return; }
+        if (!ptrOk(go)) return;
+        let actv = true;
+        try { const a = _goActive(go); actv = (a !== false); } catch (e) {}
+        if (!actv) return;
+        out.nodes++;
+        let nm0 = "";
+        try { nm0 = _str(_inv(go, "get_name")) || ""; } catch (e) {}
+        for (const nm in classes) {
+          let c = null;
+          try { c = _compSelfTry(go, classes[nm]); } catch (e) {}
+          if (!ptrOk(c)) continue;
+          const rec = { node: nm0, comp: nm, depth: depth };
+          if (nm === "Animator") {
+            try { const r = _inv(c, "get_speed"); if (r && !r.isNull()) rec.speed = r.add(0x10).readFloat(); } catch (e) {}
+          }
+          if (nm === "ParticleSystem") {
+            try { const r = _inv(c, "get_isPlaying"); if (r && !r.isNull()) rec.playing = (r.add(0x10).readU8() !== 0); } catch (e) {}
+          }
+          out.hits.push(rec);
+          break;
+        }
+        const cc = _childCountOf(tr);
+        for (let i = 0; i < cc && i < 80; i++) {
+          let ch = null;
+          try { ch = _inv1i(tr, "GetChild", i); } catch (e2) { continue; }
+          scan(ch, depth + 1);
+        }
+      };
+      scan(rootTr, 0);
+    } catch (e) { out.err = String(e); }
+    return out;
+  }),
+  // ★2026-11-22 调试：指定 blockId 面板的**全部字段**（含 private/父类）+ 组件 enabled/alpha
+  labNodeFields: _rpcSafe(function (bId) {
+    const out = { blockId: bId, cls: null, fields: [], comps: [] };
+    try {
+      const ltd = _findLTD(); if (!ltd) return { err: "no-ltd" };
+      const vm = _findVM(ltd); if (!vm) return { err: "no-vm" };
+      const partsMap = vm.add(0xD0).readPointer(); if (!ptrOk(partsMap)) return { err: "no-partsMap" };
+      const listObj = partsMap.add(0x70).readPointer(); if (!ptrOk(listObj)) return { err: "no-list" };
+      const count = _listCount(listObj);
+      let panel = null;
+      for (let i = 0; i < count; i++) {
+        const p = _listItem(listObj, i);
+        if (p.isNull()) continue;
+        const pd = p.add(0x70).readPointer(); if (!ptrOk(pd)) continue;
+        const mi = pd.add(0x10).readPointer(); if (!ptrOk(mi)) continue;
+        if (decOI(mi.add(0x34)) === bId) { panel = p; break; }
+      }
+      if (!panel) { out.err = "not-found"; return out; }
+      out.cls = klassNameOf(panel);
+      const k = g_il2cpp.object_get_class(panel);
+      let c = k;
+      for (let d = 0; d < 3 && c && !c.isNull(); d++) {
+        const iter = Memory.alloc(Process.pointerSize); iter.writePointer(ptr(0));
+        while (true) {
+          const f = g_il2cpp.class_get_fields(c, iter);
+          if (f.isNull()) break;
+          const fn = g_il2cpp.field_get_name(f);
+          if (fn.isNull()) continue;
+          const off = g_il2cpp.field_get_offset(f).toNumber();
+          let v = "";
+          try {
+            const pp = panel.add(off);
+            try { const r = pp.readPointer(); v = ptrOk(r) ? ("ptr→" + klassNameOf(r)) : "null"; }
+            catch (e) { try { v = "i32=" + pp.readS32(); } catch (e2) {} }
+          } catch (e) {}
+          out.fields.push("[" + off.toString(16) + "] " + fn.readUtf8String() + " = " + v);
+        }
+        c = g_il2cpp.class_get_parent(c);
+      }
+      // 组件 enabled / alpha（UIButton.isEnabled / BoxCollider.enabled / UIWidget.alpha）
+      const go = _inv(panel, "get_gameObject");
+      if (ptrOk(go)) {
+        for (const nm of ["CustomUIButton", "UIButton", "BoxCollider", "UIWidget"]) {
+          const kk = findClass(nm);
+          if (!kk || kk.isNull()) continue;
+          const cc = _compSelfTry(go, kk);
+          if (!ptrOk(cc)) { out.comps.push(nm + "=缺"); continue; }
+          let en = null, aa = null;
+          try { const r = _inv(cc, "get_enabled"); if (r && !r.isNull()) en = (r.add(0x10).readU8() !== 0); } catch (e) {}
+          if (nm === "UIButton" || nm === "CustomUIButton") {
+            try { const r = _inv(cc, "get_isEnabled"); if (r && !r.isNull()) en = (r.add(0x10).readU8() !== 0); } catch (e) {}
+          }
+          try { const r = _inv(cc, "get_alpha"); if (r && !r.isNull()) aa = r.add(0x10).readFloat(); } catch (e) {}
+          out.comps.push(nm + " enabled=" + en + " alpha=" + aa);
+        }
+      }
+    } catch (e) { out.err = String(e); }
+    return out;
+  }),
   // 当前通用对话框按钮（获得道具/提示/移动确认）：{open, buttons:[{name,x,y}], darkFilters}
   // ★可选参数 `topCls`（2026-10-17）= 调用方看到的 `pageTop`，供"学到的索引路径"额外比对顶框类名。
   //   `learned=true` 表示这次是**走学习路径**（零遍历）得出的结果。
@@ -10173,10 +10544,10 @@ rpc.exports = {
   battleResultMem: _rpcSafe(function () { try { return battleResultMem(); } catch (e) { return { ok: false, err: String(e) }; } }),
   // ★2026-11-18：结算按钮的**固定层级路径**（失败页 + 胜利页，两条都写死）
   //   比字段读省一个数量级：几次 GetChild + 1 次坐标换算，不扫字段、不扫树。
-  battleResultPath: _rpcSafe(function () {
+  battleResultPath: _rpcSafe(function (noScan) {
     const t0 = Date.now();
     try {
-      const r = battleResultPathBtn();
+      const r = battleResultPathBtn(!!noScan);   // ★noScan=true：只固定路径、不扫子树
       if (r) r.ms = Date.now() - t0;          // ★实测耗时
       return r;
     } catch (e) { return { ok: false, err: String(e), ms: Date.now() - t0 }; }
@@ -10457,6 +10828,46 @@ rpc.exports = {
   // ★★**按需读按钮**（2026-11-08）：三连页"这一步只点一个按钮" ⇒ 只读那一个 + 当前签名。
   //   返回 {sig, top, btn:{name,x,y,id}} —— **不读**整包（labels/terms/toggles/按钮全家桶）。
   labExBtn: _rpcSafe(function (key, preferId) { try { return labExBtn(key || "", preferId || ""); } catch (e) { return { sig: null, top: null, btn: null, err: String(e) }; } }),
+  // ★2026-11-22 调试：DialogArea 下同名对话框壳的清单（名字/active/在 DialogArea 的索引）
+  labDlgRoots: _rpcSafe(function (cls) {
+    try {
+      const rs = _dlgRootsByName(cls || "");
+      const out = [];
+      for (const r of rs) {
+        let nm = null;
+        try { nm = _str(_inv(_inv(r.tr, "get_gameObject"), "get_name")); } catch (e) {}
+        out.push({ name: nm, active: r.active, idx: r.idx });
+      }
+      return { cls: cls, count: out.length, roots: out };
+    } catch (e) { return { err: String(e) }; }
+  }),
+  // ★2026-11-21 调试：读三连页某按钮的可用状态（探测"暗的按钮"）。
+  //   initEnable=CustomUIButton+0x178；isEnabled=UIButton.get_isEnabled()；goActive=GameObject 激活
+  labExBtnState: _rpcSafe(function (key, preferId) {
+    try {
+      const b = labExBtn(key || "", preferId || "");
+      const out = { key: key, top: b.top, sig: b.sig, btn: b.btn, err: b.err,
+                    initEnable: null, isEnabled: null, isPressed: null, goActive: null };
+      if (b.btn && b.btn.btnPtr) {
+        const p = ptr(b.btn.btnPtr);
+        if (ptrOk(p)) {
+          try { out.initEnable = p.add(0x178).readU8() !== 0; } catch (e) {}
+          try { out.isPressed = p.add(0x17A).readU8() !== 0; } catch (e) {}
+          try {
+            const k = g_il2cpp.object_get_class(p);
+            const m = _findMethodNP(k, "get_isEnabled", 0) || findMethodAny(k, "get_isEnabled");
+            if (m) {
+              const ex = Memory.alloc(8); ex.writePointer(ptr(0));
+              const r = g_il2cpp.runtime_invoke(m, p, ptr(0), ex);
+              if (ex.readPointer().isNull() && r && !r.isNull()) out.isEnabled = (r.add(0x10).readU8() !== 0);
+            }
+          } catch (e) {}
+          try { const g = _inv(p, "get_gameObject"); if (ptrOk(g)) out.goActive = _goActive(g); } catch (e) {}
+        }
+      }
+      return out;
+    } catch (e) { return { err: String(e) }; }
+  }),
   // ★cs103：特别装备三连页**按 key 直调**（两段式）。key 同 labExBtn：
   //   ThreeButtonLeft/Center/Right、TwoButtonRight、prio0、check、sort:<选项名>
   labExPress: _rpcSafe(function (key, preferId) {
@@ -12623,9 +13034,16 @@ function labNodesSnapshot(diag) {
       if (!ss) continue;
       x = Math.round(ss.x); y = Math.round(H - ss.y);
     }
+    // ★2026-11-22 实测：`PartsLabyrinthPanel.currentAnimationName @0x78` 是"节点是否点亮"的权威标志。
+    //   事件/遗物选择/弹窗**整个期间**可前往节点（panelState=4）的 anim 是空 ⇒ 暗、不可点；
+    //   地图真正就绪后变 **`selectable_idle`** ⇒ 亮、可点。（已走=clear / 当前=current_normal_idle）
+    let anim = "";
+    try { const s = panel.add(0x78).readPointer(); anim = ptrOk(s) ? (_str1(s) || "") : ""; } catch (e) {}
     res.push({
       blockId: decOI(mi.add(0x34)), blockType: mi.add(0x40).readS32(),
-      panelState: st0, x: x, y: y,
+      panelState: st0, x: x, y: y, anim: anim,
+      // ★直接给"现在能不能点"：可前往 + 已点亮
+      selectable: (st0 === 4 && (anim === "selectable_idle" || anim === "selectable_animation_idle")),
     });
   }
   res.sort((a, b) => a.blockId - b.blockId);

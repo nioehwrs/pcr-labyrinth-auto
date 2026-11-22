@@ -171,12 +171,29 @@ object Route {
      *
      * @param nxt 状态里的 `next` 列表（当前节点的后继）；空 = 不按它过滤
      */
+    /**
+     * ★2026-11-22（用户实测）：节点**现在能不能点**。
+     *
+     * `panelState==4` 只是"拓扑上有路"——事件/遗物选择/弹窗期间它一样是 4，但节点是**暗的、点不动**。
+     * 真正的判据是 `PartsLabyrinthPanel.currentAnimationName`：
+     *   · `""`（空）      = 还没点亮（处理中）⇒ 不能点
+     *   · `selectable_idle` = 已点亮 ⇒ 可点
+     *   （已走过=clear / 当前所在=current_normal_idle）
+     * 兼容：旧数据/单测里没有 `anim` 字段时按原逻辑放行（只看 panelState）。
+     */
+    fun nodeClickable(n: JSONObject): Boolean {
+        val st = (n.opt("panelState") as? Number)?.toInt()
+        if (st != NODE_SELECTABLE) return false
+        if (!n.has("anim")) return true
+        val a = n.optString("anim")
+        return a == "selectable_idle" || a == "selectable_animation_idle"
+    }
+
     fun pickNode(nodes: List<JSONObject>, nxt: Collection<Int>?, screenW: Int, screenH: Int): JSONObject? {
         val cand = nodes.filter { n ->
-            val st = (n.opt("panelState") as? Number)?.toInt()
             val x = (n.opt("x") as? Number)?.toInt()
             val y = (n.opt("y") as? Number)?.toInt()
-            st == NODE_SELECTABLE && x != null && y != null &&
+            nodeClickable(n) && x != null && y != null &&
                 x in 0..screenW && y in 0..screenH &&
                 (nxt.isNullOrEmpty() || (n.opt("blockId") as? Number)?.toInt() in nxt)
         }

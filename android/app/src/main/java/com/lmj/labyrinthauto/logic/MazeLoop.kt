@@ -300,6 +300,8 @@ object MazeLoop {
         appCtx = ctx.applicationContext          // ★给 [LabBtnStore]（按钮路径跨局回喂）用
         // ★「结算后点中心」是**本局**语义：每局开始先关（2026-10-22 用户：第二局开局选角色被误点）
         labResultSeen = false
+        fxDumps = 0
+        fxAt = 0L
         CenterTapGate.reset("新的一局开始")
         // ★演出加速补丁跟随 agent 会话（写一次持续整个会话）；agent 若重连，重新打一次
         labSpeedupOk = false
@@ -1052,6 +1054,27 @@ object MazeLoop {
             ) {
                 CenterTapGate.activate("已过结算分数页（$top）")
             }
+            // ★2026-11-22 探针：BOSS/EX 结算点完「下一步」→ DialogLabyrinthResult 之间有一段
+            //   **地图层的通关庆祝动画**（日志实证 ~4.5s、无 Dialog 壳）。每 300ms 采一次
+            //   `labMapBusy`，看哪个句柄在跑（unitMove/areaSlide/finish/inAnimation/mapModeFinish）。
+            if (((st.opt("blockId") as? Number)?.toInt() ?: -1) == 50801 &&
+                !labResultSeen && !inBattleNow && now - celebrateAt >= 300L
+            ) {
+                celebrateAt = now
+                val b = runCatching { AgentApi.labMapBusy() }.getOrNull()
+                if (b != null && b.optBoolean("ok")) {
+                    fun bit(k: String): Int = if (b.optBoolean(k)) 1 else 0
+                    AppState.addLog(
+                        "[庆祝] unitMove=${bit("unitMove")} slide=${bit("areaSlide")} finish=${bit("finish")} " +
+                            "inAnim=${b.opt("inAnimation")} mapMode=${bit("isMapViewMode")} " +
+                            "notFired=${bit("moveEventNotFired")} forceClear=${bit("isForcePlayPanelClearAnimation")} " +
+                            "phase=${bit("phaseActive")} anim=${bit("animActive")}",
+                    )
+                }
+                // ★★2026-11-22 回滚：这里原来每秒调 `labDumpActiveFx` 扫 canvas 找通关庆祝特效，
+                //   实测在 BOSS 战（blockId=50801）期间与结算页重活叠加 ⇒ **游戏主循环冻住 80s**
+                //   （10:46 那局自愈重启）。庆祝动画改走别的手段，这里不再做任何扫描。
+            }
             // ★cs128 探针（2026-11-21 用户："加探针吧，验证一次花的时间比较多"）：结算尾段的
             //   演出壳/FullSize/Big 每个**新顶框类**只探一次（[AgentApi.probeShell] 只读、不点）。
             //   一次采集"3/4 页能不能直调"的全部信息：字段槽按钮 + 直调候选方法 + 对象字段 + 壳内按钮节点。
@@ -1081,6 +1104,33 @@ object MazeLoop {
                     } else {
                         AppState.addLog("[探针] $shell 失败：${pr?.optString("err").orEmpty().ifEmpty { "无回包" }}")
                     }
+                    // ★2026-11-22（用户）：3 屏演出壳额外 dump **动画组件**（找能否用 Animator.speed 加速，
+                    //   免去"必须点中心才能跳过"）。一次结算采一次，不依赖外部时机。
+                    if (shell == "DialogAnimationViewer" || shell == "DialogLabyrinthResult") {
+                        // ★2026-11-22（用户"2/3屏加速做掉"）：把壳内 Animator.speed 设大 ⇒ Spine/滚分瞬间播完。
+                        val spd = runCatching {
+                            AgentApi.obj("labSpeedupAnim", listOf<Any?>(50.0), timeoutMs = 4_000L)
+                        }.getOrNull()
+                        if (spd != null) {
+                            AppState.addLog("[加速] $shell Animator=${spd.optInt("count")} speed=50（${spd.optString("err")}）")
+                        }
+                        val dc = runCatching { AgentApi.obj("labDumpComps", timeoutMs = 15_000L) }.getOrNull()
+                        if (dc != null) {
+                            val hits = dc.optJSONArray("hits") ?: JSONArray()
+                            AppState.addLog(
+                                "[组件] ${dc.optString("top")} 节点=${dc.optInt("nodes")} 命中=${hits.length()}",
+                            )
+                            for (i in 0 until minOf(hits.length(), 20)) {
+                                val h = hits.optJSONObject(i) ?: continue
+                                val extra = buildString {
+                                    if (h.has("speed")) append(" speed=").append(h.optDouble("speed"))
+                                    if (h.has("dur")) append(" dur=").append(h.optDouble("dur"))
+                                    if (h.has("alpha")) append(" alpha=").append(h.optDouble("alpha"))
+                                }
+                                AppState.addLog("[组件] ${h.optString("node")} → ${h.optString("comp")}$extra")
+                            }
+                        }
+                    }
                 }
             }
             // ★同一条避让：场景刚切换时不查通用弹窗（`dialog()` 要走 DialogArea 子树 ✗ 也属重活）。
@@ -1092,16 +1142,17 @@ object MazeLoop {
                 //   ★探针（cs128，见上方探针块）保持原样继续采集，为将来换直调用——与点中心是两件事。
                 //   关闭点见 [CenterTapGate.reset]：刷初始前 / 杀进程 / 本局开始与结束。
                 if (CenterTapGate.isActive() && top.isNotEmpty()) {
-                    val shell = top.removeSuffix("(Clone)")
-                    if (shell != "DialogAnimationViewer" && shell != "DialogCommonFullSize") {
-                        val n2 = tries.getOrPut("$tag|ctap", { 0 })
-                        tries["$tag|ctap"] = n2 + 1
-                        if (n2 % 3 != 2) {
-                            tap(input, scrW / 2, scrH / 2, "结算后加速·点中心（第 ${n2 + 1} 次）")
-                            idle = 0
-                            delay(900)
-                            continue
-                        }
+                    // ★★2026-11-22 修复（用户实测"3/4 屏动画还是原速"）：**不要再排除 3/4 屏**。
+                    //   cs125 只压了②屏滚分/宝箱参数，`DialogAnimationViewer`（演出壳）和
+                    //   `DialogCommonFullSize` 的演出**根本没被加速**，只能靠点中心跳过；
+                    //   之前被排除后动画原速播完，还要再被 dialog()/findTextIn 吃掉十几秒。
+                    val n2 = tries.getOrPut("$tag|ctap", { 0 })
+                    tries["$tag|ctap"] = n2 + 1
+                    if (n2 % 3 != 2) {
+                        tap(input, scrW / 2, scrH / 2, "结算后加速·点中心（第 ${n2 + 1} 次）")
+                        idle = 0
+                        delay(900)
+                        continue
                     }
                 }
                 if (top.isNotEmpty() && dlgOpenMiss == top) {
@@ -1521,12 +1572,13 @@ object MazeLoop {
     /**
      * ★静置之后"**轻量轮询**"的次数上限（2026-11-17 用户：间隔 200ms）。
      *
-     * 每次只调一次 `battleResultBtn`（缓存校验 / 学习，实测 ~100ms）—— **不重试、不读字段、不扫树**。
-     * 3000ms 静置 + (200ms 间隔 × 10 拍) ⇒ 覆盖到 ~5s（按钮实测 3.5~4.5s active）。
-     * **每次命中就清零**（胜利结算有两页，第二页的「下一步」同样享受轻量轮询）；
-     * 用完仍未命中 ⇒ 升级到**全套**探测（[BATTLE_READY_GAP_MS] 1.2s 一次）继续找，绝不停。
+     * ★2026-11-21（用户）：每拍现在只做**固定路径（noScan，几 ms）**，不扫树。
+     *   配额 10 → **50**（200ms × 50 ≈ 10s）⇒ "整体读取（含子树扫描）延迟到认出结算页 ~10s 后才做"，
+     *   避免按钮未落位时反复白烧 1.5~2s 的重扫描（就是"胜利画面卡几秒"的元凶）。
+     *   **每次命中就清零**（胜利结算有两页，第二页同样享受轻量轮询）；
+     *   用完仍未命中 ⇒ 升级到**全套**探测（[BATTLE_READY_GAP_MS] 1.2s 一次，含子树扫描）继续找，绝不停。
      */
-    private const val RESULT_PROBE_FAST_MAX = 10
+    private const val RESULT_PROBE_FAST_MAX = 50
 
     /** ★轻量轮询的间隔（2026-11-17 用户：200ms） */
     private const val RESULT_LIGHT_GAP_MS = 200L
@@ -1594,6 +1646,12 @@ object MazeLoop {
 
     /** 场景刚切换时，到这个时刻之前**不做重活**（探测 / 弹窗遍历） */
     private var sceneHoldUntil = 0L
+    /** ★2026-11-22 探针：通关庆祝动画采样节流（每 300ms 一行 [庆祝]） */
+    private var celebrateAt = 0L
+    /** ★2026-11-22 探针：庆祝期间"canvas 两层特效扫描"已做几次（诊断计数） */
+    private var fxDumps = 0
+    /** ★2026-11-22 探针：上次特效扫描时间（**1s 节流**——两层扫描 100~300ms，4s 窗口能抓 4 次） */
+    private var fxAt = 0L
 
     /** 场景切换后的避让时长。★三次卡死（00:42 / 02:01 / 08:58）都发生在 `view` 切换后 ~2s 内，
      *  元凶都是"大范围遍历（全树 / 战斗画布 / DialogArea）+ 游戏正在加载场景"撞在一起 ⇒ 进程冻住。
@@ -1700,6 +1758,8 @@ object MazeLoop {
     /** ★cs128：结算尾段探针的目标壳类（每个**新顶框类**只探一次；见主循环探针块注释） */
     private val LAB_TAIL_PROBE_SHELLS = setOf(
         "DialogAnimationViewer", "DialogCommonFullSize", "DialogCommonBig",
+        // ★2026-11-22：加结算②屏（滚分）——排查"按钮抢在滚分结束前出现 ⇒ 看不到分数"
+        "DialogLabyrinthResult",
     )
 
     /** ★刷开局算好的**每区最优路线**（`RerollState` 的 `routePerArea`）：移动分支要用它，
@@ -5188,7 +5248,9 @@ object MazeLoop {
         else (0 until nodesArr.length()).mapNotNull { nodesArr.opt(it) as? JSONObject }
         val nxt = intListOf(st, "next")
         val sel = nodes.filter {
-            (it.opt("panelState") as? Number)?.toInt() == Route.NODE_SELECTABLE &&
+            // ★2026-11-22：不只看 panelState==4（拓扑），还要"已点亮"（anim=selectable_idle）——
+            //   事件/选择/弹窗期间节点是暗的、点不动，此时不该抢跑去点。
+            Route.nodeClickable(it) &&
                 (nxt.isEmpty() || (it.opt("blockId") as? Number)?.toInt() in nxt) &&
                 (it.opt("x") as? Number) != null
         }
@@ -5212,7 +5274,7 @@ object MazeLoop {
                 if (cur == NODE_SHOP_5F && want == NODE_BOSS_5F && scoreChaseCheck(input)) return true
                 t = nodes.firstOrNull {
                     (it.opt("blockId") as? Number)?.toInt() == want &&
-                        (it.opt("panelState") as? Number)?.toInt() == Route.NODE_SELECTABLE &&
+                        Route.nodeClickable(it) &&
                         (it.opt("x") as? Number) != null
                 }
                 if (t == null) {
@@ -6679,13 +6741,33 @@ object MazeLoop {
             // ── ③ 查**转移表**：这一步做什么、去哪（★只用轻量签名 ⇒ 几十 ms）──
             //   表的一条规则 = **（当前页, 条件）→（动作, 目标页）**；
             //   签名里已经带了页内关键状态（change/row/checked/sel）⇒ 不用等整包就知道目标页。
-            val rule = exeqRuleOf(sigNow, sess)
+            var rule = exeqRuleOf(sigNow, sess)
             if (rule == null) {
                 // ★没命中任何规则 ⇒ 页内状态读不全（change/checked/row/sel 拿不到）⇒ 本轮不点，等一下再读
                 if (sess.n < 2) {
                     AppState.addLog("    [!] $page 页：读不到页内状态（change/checked/row/sel）→ 本轮不点")
                 }
                 delay(EXEQ_POLL_MS); continue
+            }
+            // ★★2026-11-21（用户）：①页「自动装备」在某些角色下是**暗的**（没可装备的东西 ⇒ 禁用）。
+            //   直调 `onClick` 会**绕过禁用检查**（游戏真实点击走 `onDisabledClick`）⇒ 误触发。
+            //   ⇒ 此时**直接点「取消」收尾**，与「装备确定」暗时的口径一致（算作 EX 装备部分完成）。
+            //   探测只在①页且这一步本是"点自动装备"时做一次（~10ms），其余步骤零开销。
+            if (rule.page == EXEQ_PAGE_PARTY && rule.btnKey == "ThreeButtonCenter") {
+                val pb = runCatching {
+                    AgentApi.labExBtn("ThreeButtonCenter", sess.tapBtnId, timeoutMs = EXEQ_READ_FULL_MS)
+                }.getOrNull()
+                if (pb != null && pb.has("enabled") && !pb.optBoolean("enabled", true)) {
+                    rule = ExeqRule(
+                        page = EXEQ_PAGE_PARTY,
+                        cond = { _, _ -> true },
+                        what = "取消（自动装备是暗的）",
+                        target = EXEQ_OFF_PAGE,
+                        btnKey = "ThreeButtonLeft",
+                        isFinal = true,
+                    )
+                    exeqSay(sess, "「自动装备」是暗的（该角色没可装备的东西）→ 点「取消」收尾，算装备完成")
+                }
             }
             // ★"此刻该等"（刚点完「自动装备」、页面正在切到②）⇒ 不点，等一下再看（省一次读）
             if (rule.waitWhile?.invoke(sess) == true) { delay(EXEQ_POLL_MS); continue }
@@ -8454,19 +8536,43 @@ object MazeLoop {
     private suspend fun captureScoreShot(score: String) {
         val safeScore = score.filter { it.isDigit() }.ifEmpty { "x" }
         val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val dir = "/sdcard/Pictures/Screenshots"
-        val path = "$dir/score_${safeScore}_$ts.png"
+        // ★2026-11-22（用户）：MuMu 的**共享图片目录**是 /sdcard/Screenshots（不是 Pictures/Screenshots），
+        //   存这里才会出现在电脑的共享文件夹里。
+        val pubDir = "/sdcard/Screenshots"
+        val privDir = "/sdcard/Android/data/com.lmj.labyrinthauto/files/shots"
+        val name = "score_${safeScore}_$ts.png"
+        val pub = "$pubDir/$name"
+        val priv = "$privDir/$name"
         val t0 = SystemClock.elapsedRealtime()
-        // 一条命令做完：建目录 → 截 PNG → 用 stat 报大小（screencap 本身不输出）
-        val r = RootShell.exec("mkdir -p $dir; screencap -p $path; stat -c %s $path", 8_000L)
+        // ★2026-11-22（用户"根本找不到图，加检测"）：一条命令做完 建目录 → 截图 → 复制到 App 私有目录
+        //   → `ls -l` 报两份文件的真实详情（存在与否/大小/权限/所有者）。screencap 的 stderr 也一并带回。
+        val r = RootShell.exec(
+            "mkdir -p $pubDir $privDir; " +
+                "screencap -p $pub 2>&1; rc=\$?; " +
+                "cp -f $pub $priv 2>&1; " +
+                "echo \"---rc=\$rc---\"; " +
+                "ls -l $pub $priv 2>&1",
+            10_000L,
+        )
         val ms = SystemClock.elapsedRealtime() - t0
-        val size = r.out.lineSequence().map { it.trim() }.lastOrNull { it.isNotEmpty() }
-            ?.toLongOrNull() ?: 0L
-        if (r.exit == 0 && size > 0L) {
-            AppState.addLog("迷宫结算：分数截图已存 $path（${size / 1024}KB，${ms}ms）")
+        val lines = r.out.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
+        val rcLine = lines.firstOrNull { it.startsWith("---rc=") } ?: ""
+        val lsLines = lines.filter { it.contains(".png") }
+        val pubSize = lsLines.firstOrNull { it.contains("$pubDir/") }
+            ?.split(Regex("\\s+"))?.getOrNull(4)?.toLongOrNull() ?: 0L
+        val privSize = lsLines.firstOrNull { it.contains("$privDir/") }
+            ?.split(Regex("\\s+"))?.getOrNull(4)?.toLongOrNull() ?: 0L
+        if (pubSize > 0L) {
+            AppState.addLog(
+                "迷宫结算：分数截图已存 $pub（${pubSize / 1024}KB，${ms}ms）" +
+                    "｜私有副本 ${privSize / 1024}KB",
+            )
         } else {
-            AppState.addLog("[!] 分数截图失败（exit=${r.exit}，${ms}ms）${r.text.take(80)}")
+            AppState.addLog("[!] 分数截图失败（exit=${r.exit} $rcLine，${ms}ms）")
         }
+        // 诊断：把 ls 的真实结果原样打出来（用户"找不到图"时据此判断到底写没写、写哪了）
+        for (ln in lsLines.take(4)) AppState.addLog("[截图诊断] $ln")
+        if (lsLines.isEmpty()) AppState.addLog("[截图诊断] ls 无 png 输出，原始=${lines.takeLast(3).joinToString(" | ")}")
     }
 
     /**
@@ -8600,8 +8706,8 @@ object MazeLoop {
      *
      * @return (win, fail)；两者都 null = 这一刻读不到（调用方这拍不点、继续探）
      */
-    private suspend fun battleResultPick(bot: Int): Pair<JSONObject?, JSONObject?>? =
-        battleResultPathPick(bot)
+    private suspend fun battleResultPick(bot: Int, allowScan: Boolean = true): Pair<JSONObject?, JSONObject?>? =
+        battleResultPathPick(bot, allowScan)
 
     /**
      * ★★2026-11-18（用户要求提为**主路径**）：失败页「重新挑战」的**固定层级路径**读数。
@@ -8612,12 +8718,17 @@ object MazeLoop {
      *
      * @return `(null, {x,y,text})` = 命中「重新挑战」；`null` = 这条路径不通（交给后面的档）
      */
-    private suspend fun battleResultPathPick(bot: Int): Pair<JSONObject?, JSONObject?>? {
+    private suspend fun battleResultPathPick(
+        bot: Int,
+        allowScan: Boolean = true,
+    ): Pair<JSONObject?, JSONObject?>? {
         // ★2026-11-18：带上 errOut —— `obj()` 在"没连上/超时/agent 报错"时只返回 null，
         //   不传 errOut 就完全静默（这轮日志里一条"固定路径"都没有，就是被这么吞掉的）。
         var callErr = ""
         val r = AgentApi.obj(
             "battleResultPath",
+            // ★2026-11-21：allowScan=false ⇒ noScan，agent 只走固定路径、不扫子树（快速轮询用）
+            if (allowScan) emptyList() else listOf<Any?>(true),
             timeoutMs = AgentApi.T_SLOW,
             errOut = { callErr = it },
         )
@@ -8936,7 +9047,12 @@ object MazeLoop {
             now - battleProbeAt >= RESULT_LIGHT_GAP_MS
         ) {
             battleProbeAt = now
-            val p = battleResultPick(bot)
+            // ★2026-11-21（用户）：快速轮询阶段**第一页只做固定路径、不扫子树**（noScan）——
+            //   按钮未落位时固定路径返回 offscreen/node-inactive，扫子树必然也找不到，却是
+            //   1.5~2s 的重活（堵住单通道 ⇒ 胜利画面卡几秒）。
+            //   ★第二页（本场已认过一次按钮 battleBtnSaid）**没有固定路径、只能靠扫描** ⇒
+            //     这一页要传 allowScan=true（否则第二页永远找不到）。
+            val p = battleResultPick(bot, allowScan = battleBtnSaid)
             if (p == null) {
                 resultProbeN++
             } else {
