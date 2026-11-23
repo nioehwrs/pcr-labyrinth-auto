@@ -944,9 +944,23 @@ class AutoForegroundService : Service() {
             //   且代际 >= 本次 kill 时发布。裸 connected 只证明有 socket —— 残留进程里 eternalize 的
             //   脚本重连、或 domain 还没建好，都会让上层带着错状态往下跑（启动阶段的结构性缺口）。
             FridaInjector.start(applicationContext)
-            val ready = withTimeoutOrNull(90_000L) {
-                FridaInjector.readyGen.first { it >= restartGen }
-            } != null
+            // ★就绪窗口（2026-11-23 定稿）：90s 按「当前这代进程」算。注入自愈会杀掉重开
+            //   （GameProcess.kills bump），而前一代的失败已把原窗口烧掉大半 —— 不重置的话，
+            //   会出现"下层刚把 agent 拉起来（回连+il2cpp 就绪）、上层恰好到期宣布失败"的
+            //   时间顺序冲突（15:55 首局实测：agent 就绪比到期晚 <1s，整轮被误杀，0/15）。
+            //   每次自愈重开 → deadline 重置 90s；一直不重开且不就绪 → 90s 后照旧停手。
+            var ready = false
+            var readyDeadline = android.os.SystemClock.elapsedRealtime() + 90_000L
+            var seenKills = GameProcess.kills
+            while (android.os.SystemClock.elapsedRealtime() < readyDeadline) {
+                if (FridaInjector.readyGen.value >= restartGen) { ready = true; break }
+                if (GameProcess.kills != seenKills) {
+                    seenKills = GameProcess.kills
+                    readyDeadline = android.os.SystemClock.elapsedRealtime() + 90_000L
+                    AppState.addLog("…注入自愈重开了游戏进程 → 就绪窗口重置 90s（按新进程算）")
+                }
+                delay(500)
+            }
             if (!ready) {
                 AppState.addLog("重启后 90s 内 agent 没就绪（冷启动/注入/il2cpp domain？）→ 本局停手，不碰迷宫")
                 AppState.addLog("诊断：注入循环停在「${FridaInjector.stage}」；上层已放弃，下层可能仍在自愈（看上面的注入日志）")
