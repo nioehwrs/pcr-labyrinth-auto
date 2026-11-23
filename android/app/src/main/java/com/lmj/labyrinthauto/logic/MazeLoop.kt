@@ -9584,6 +9584,7 @@ object MazeLoop {
      */
     private suspend fun recoverAfterRestart(input: InputBackend, tag: String = "自愈"): Boolean {
         AppState.addLog("$tag：等游戏在前台 + agent 回连…")
+        val pid0 = FridaInjector.gamePid()          // ★换代判据基线：进函数时的游戏 pid（可能已是 -1=刚杀）
         val t0 = SystemClock.elapsedRealtime()
         while (SystemClock.elapsedRealtime() - t0 < STUCK_BACK_MS) {
             if (Foreground.isGameForeground(GameProcess.pkg()) && AgentBridge.connected.value) break
@@ -9597,6 +9598,9 @@ object MazeLoop {
         //   老代码据此判"不在迷宫" ⇒ 去走「黎明界 top」；而实际就停在 **264 地图**上 ⇒ 导航把 264 当
         //   未知页面白等 16 轮 ⇒ 停手，**本局直接废掉** ✗（日志 12:10:55）。
         //   现在先重读几秒；仍读不到就当"仍在迷宫"——真正的判据是下面 `labStatus` 读不读得到 ✓
+        //   ★2026-11-23 修正（16:17 实测整轮被废）：这条宽限**只适用于进程没换**的纯重注入。
+        //     杀进程重开后游戏必然回 SPLASH/TITLE（B 服要点一下屏幕 SDK 才登录），此时"读不到"
+        //     恰恰说明在标题页 —— 也判"仍在迷宫"就会跳过导航、停在标题页干等 60s 停手 ✗。
         var vid = -1
         val tv0 = SystemClock.elapsedRealtime()
         while (SystemClock.elapsedRealtime() - tv0 < 6_000L) {
@@ -9604,7 +9608,11 @@ object MazeLoop {
             if (vid > 0) break
             delay(300)
         }
-        val inMaze = if (vid > 0) Navigator.isLabyrinthView(vid) else true
+        val procRestarted = run {
+            val pidNew = FridaInjector.gamePid()
+            pid0 <= 0 || pidNew <= 0 || pidNew != pid0
+        }
+        val inMaze = if (vid > 0) Navigator.isLabyrinthView(vid) else !procRestarted
         if (!inMaze) {
             AppState.addLog("$tag：当前在 ${Navigator.viewLabel(vid)}（不在迷宫内）→ 重新走「${if (vid == 1 || vid == 2) "点屏幕登录 → " else ""}黎明界 top → 出发」")
             if (!Navigator.goToLabyrinthTop(input)) return false

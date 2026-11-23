@@ -3388,6 +3388,12 @@ function _dropWalkCaches(why) {
     g_walkCache = null; g_walkAt = 0;
     for (const k in g_rootWalk) { try { delete g_rootWalk[k]; } catch (e) {} }
     g_resBtns.win = null; g_resBtns.fail = null;   // 结算按钮指针 ⇒ 换页必然要重学
+    // ★2026-11-23 盲读根因修复：换 view = UI 树重建（游戏内重启回标题 264→77→1→2→5→259→264
+    //   尤其彻底），DialogArea 也可能被销毁重建。旧指针的"名字仍叫 DialogArea"自校验拦不住——
+    //   Unity 延迟销毁，旧对象 get_name 依旧返回 "DialogArea" ⇒ 死指针一直被当活的用
+    //   （childCount 读 0 ⇒ 顶框=无/buttons=[]/选人结构没读到 ⇒ 开局选角干等 20min，14:42/16:15 两例）。
+    //   换 view 时强制重找一次（BFS 200~800ms，换页本来就有过场，一次性成本可接受）。
+    g_dialogArea = null;
   } catch (e) {}
 }
 globalThis.getViewId = function () {
@@ -10818,6 +10824,10 @@ rpc.exports = {
       g_partyTabsCache = null;
       g_choiceCache = null; g_choiceFailAt = 0;
       g_lab = null;
+      _dropWalkCaches("labResetCaches");   // ★2026-11-23：连 g_dialogArea（对话框扫描根）一起丢 ——
+                                           //   上一版只清实例/TTL 缓存，够不着盲读根因（DialogArea 死指针），
+                                           //   60s 中间档清完重读照样盲（16:16:11 实测）。walk 缓存一并丢，
+                                           //   正合"丢缓存重解析"语义。
       return { ok: true, cleared: n };
     } catch (e) { return { ok: false, err: String(e) }; }
   }),
