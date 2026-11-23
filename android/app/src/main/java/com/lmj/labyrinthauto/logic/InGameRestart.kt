@@ -23,9 +23,10 @@ import kotlinx.coroutines.delay
  *   4. ★到 3 就返回（转场与 reroll 并行）；之后 Navigator 从 SPLASH/TITLE 点屏幕中心
  *      （`TAP_CENTER_VIEWS` 两态都点）→ SDK 自动登录 → HOME(5)，约 12~17s（B 服实测全自动）
  *
- * 渠道适配（用户交代）：B 服回标题后再登录**始终自动**；部分渠道服冷启动自动登录、
- * 但游戏内重启后的 SDK 登录会弹**手动确认窗** → Navigator 的标题页停留超时会 kill 自愈
- * （等效回退冷启动），只是每局白等几十秒 —— 所以留了 `RerollSettings.loadInGameRestart` 开关。
+ * 渠道适配（2026-11-23 用户定稿：游戏内重启是唯一正常路径，**不提供改用冷启动的开关**）：
+ * B 服回标题后再登录**始终自动**；部分渠道服冷启动自动登录、但游戏内重启后的 SDK 登录
+ * 会弹**手动确认窗** → Navigator 的标题页停留超时会 kill 自愈（等效回退冷启动），
+ * 只是每局白等几十秒。这类渠道临时不适配 → 引导用户发反馈。
  */
 object InGameRestart {
 

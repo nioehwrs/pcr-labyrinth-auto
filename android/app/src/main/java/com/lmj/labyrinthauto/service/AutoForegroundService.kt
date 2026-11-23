@@ -443,9 +443,7 @@ class AutoForegroundService : Service() {
                                         //   ★旧路径"杀进程→重新登录→retire"保留作兜底（旧流程下客户端会话被冷启动
                                         //     自动登录挤掉，retire 拿旧会话必失败，必须重登后再撤）。
                                         var viaGame = false
-                                        if (RerollSettings.loadInGameRestart(applicationContext) &&
-                                            FridaInjector.gamePid() > 0
-                                        ) {
+                                        if (FridaInjector.gamePid() > 0) {
                                             viaGame = InGameRestart.backToTopFromMaze()
                                             if (!viaGame) {
                                                 AppState.addLog("撤退（游戏内）没成（不在迷宫页/返回键点不动/agent 断了）→ 回退杀进程重新登录撤退")
@@ -855,8 +853,10 @@ class AutoForegroundService : Service() {
         //   任何一步没成都自动回退下面的杀进程冷启动，行为与旧版完全一致。
         //   ⚠回标题后客户端停在登录前状态（会话已断）⇒ reroll 的 API 登录照常可用；
         //     reroll 期间客户端一直停在标题页不动，刷完再由 Navigator 点屏幕触发 SDK 登录。
+        //   （2026-11-23 用户定稿：游戏内重启是**唯一**正常路径，不再提供"改用冷启动"的开关；
+        //     杀进程冷启动只作为异常兜底保留 —— 回标题失败/游戏不在前台等。）
         var viaTitle = false
-        if (RerollSettings.loadInGameRestart(applicationContext)) {
+        run {
             FridaInjector.autoRecover = true        // 链路期间注入循环照常自愈
             viaTitle = InGameRestart.returnToTitle(applicationContext)
             if (!viaTitle) AppState.addLog("游戏内重启没成 → 回退杀进程冷启动")

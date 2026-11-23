@@ -17,8 +17,7 @@ import com.lmj.labyrinthauto.reroll.RerollSettings
  *
  * | 刷开局方式 | 撤退动作 | 谁负责 |
  * |---|---|---|
- * | 接口刷 · 游戏内重启开 | 按现场收敛回 259：失败页直调撤退链（结束→撤退无报酬→二重确认）；预览页/裸地图 HUD 撤退链（LabyrinthRetireButton→确认）；编组页取消后落预览页同前；仅迷宫子菜单走返回键（旧局由下一局 reroll 的 API 清） | [com.lmj.labyrinthauto.logic.InGameRestart.backToTopFromMaze]；没成 → 服务层杀进程 → 重新登录 → `labyrinth/retire` 兜底 |
- * | 接口刷 · 游戏内重启关 | 不点任何 UI | 服务层：杀进程 → 重新登录 → `labyrinth/retire` |
+ * | 接口刷 | 按现场收敛回 259：失败页直调撤退链（结束→撤退无报酬→二重确认）；预览页/裸地图 HUD 撤退链（LabyrinthRetireButton→确认）；编组页取消后落预览页同前；仅迷宫子菜单走返回键（旧局由下一局 reroll 的 API 清） | [com.lmj.labyrinthauto.logic.InGameRestart.backToTopFromMaze]；没成 → 服务层杀进程 → 重新登录 → `labyrinth/retire` 兜底 |
  * | 局内刷 | 就地按现场撤（失败页/地图/选人面板/其他面板） | [InGameReroll.retreatNow] |
  * | 局内刷 · 撤不干净 | 标记下一局不沿用 → 下一局接管时再撤一次；仍失败则整轮停止（留人工） | 本模块 |
  *
