@@ -97,7 +97,12 @@ class BilibiliGameProtocolGateway(
                 else -> GameLoginResult.Rejected(message)
             }
         } catch (failure: IOException) {
-            GameLoginResult.NetworkFailure("游戏服务器网络请求失败")
+            // ★2026-11-22：把 HTTP 状态码带出来（execute 里非 2xx 也是 IOException("HTTP xxx")）——
+            //   原来写死"网络请求失败"把 429 限流 / 5xx 全吞成同一句，定位不了真因。
+            GameLoginResult.NetworkFailure(
+                failure.message?.takeIf { it.isNotBlank() }?.let { "游戏服务器网络请求失败：$it" }
+                    ?: "游戏服务器网络请求失败",
+            )
         } catch (failure: Throwable) {
             GameLoginResult.ProtocolFailure(
                 failure.message.orEmpty().ifBlank { "游戏服务器响应无法解析" }.take(MAX_MESSAGE_LENGTH),

@@ -49,6 +49,7 @@ tools/lmj_*.png
 tools/lmj_*.json
 # 一次性对比分析的输出目录（同 tools/out/）
 tools/out_*/
+tools/lab-diag/
 # 从设备拉回的历史 run 日志（可能含账号信息）与诊断临时产物，不入库
 tools/logs_pull/
 tools/mem_watch.csv

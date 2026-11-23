@@ -21,6 +21,7 @@ import com.lmj.labyrinthauto.core.AppState
 import com.lmj.labyrinthauto.core.CrashGuard
 import com.lmj.labyrinthauto.core.LogFile
 import com.lmj.labyrinthauto.core.OverlayStatus
+import com.lmj.labyrinthauto.core.RunJournal
 import com.lmj.labyrinthauto.frida.AbiRepair
 import com.lmj.labyrinthauto.frida.AgentApi
 import com.lmj.labyrinthauto.frida.AgentBridge
@@ -31,6 +32,7 @@ import com.lmj.labyrinthauto.frida.RootShell
 import com.lmj.labyrinthauto.input.Foreground
 import com.lmj.labyrinthauto.input.InputBackend
 import com.lmj.labyrinthauto.input.InputBackends
+import com.lmj.labyrinthauto.logic.InGameRestart
 import com.lmj.labyrinthauto.logic.MazeLoop
 import com.lmj.labyrinthauto.logic.MazeSummary
 import com.lmj.labyrinthauto.logic.RunRecord
@@ -50,6 +52,8 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
@@ -271,11 +275,18 @@ class AutoForegroundService : Service() {
                     //   单公会模式下这张表是空的（不切公会）。
                     //   ★换公会 = 改**刷开局的「初始公会」**（`RerollConfig.guildId`），而每次刷开局都会
                     //     `loadConfig()` 现读 ⇒ 局间改它就生效，不涉及任何游戏内 UI 操作。
-                    val multi = RerollSettings.loadMultiGuild(applicationContext)
+                    // ★断点续跑（2026-11-23 RunJournal）：journal 还在 = 上次运行**没走正常收尾**
+                    //   （正常结束/手动停止/异常都会清掉它）→ 用里面的计划快照接着跑，**不读当前设置**
+                    //   （防止中断期间用户改了局数/公会分配，恢复出来对不上）。恢复单元 = 整局。
+                    val savedRun = RunJournal.load(applicationContext)
+                    val resumePlan = savedRun?.takeIf { it.idx in 1 until it.total }
+                    val multi = resumePlan?.guildPlan?.isNotEmpty()
+                        ?: RerollSettings.loadMultiGuild(applicationContext)
                     val guildRuns = RerollSettings.loadGuildRuns(applicationContext)
                     // ★未开放的新公会（6..10）：单公会模式直接拦，多公会模式从计划里剔除
                     //   （开放时刻按 UTC+8 判定，见 RerollSettings.newGuildsEnabled）
-                    if (!multi) {
+                    //   （恢复局不拦 —— 计划当初开跑前已校验过）
+                    if (!multi && resumePlan == null) {
                         val curGuild = RerollSettings.loadConfig(applicationContext).guildId
                         if (!RerollSettings.guildEnabled(curGuild)) {
                             AppState.addLog(
@@ -284,14 +295,16 @@ class AutoForegroundService : Service() {
                             return@launch
                         }
                     }
-                    val guildPlan: List<Int> = if (multi) {
-                        RerollSettings.enabledGuildIds().flatMap { g ->
-                            List(guildRuns.getOrElse(g) { 0 }.coerceAtLeast(0)) { g }
+                    val guildPlan: List<Int> = resumePlan?.guildPlan
+                        ?: if (multi) {
+                            RerollSettings.enabledGuildIds().flatMap { g ->
+                                List(guildRuns.getOrElse(g) { 0 }.coerceAtLeast(0)) { g }
+                            }
+                        } else {
+                            emptyList()
                         }
-                    } else {
-                        emptyList()
-                    }
-                    val total = if (multi) guildPlan.size else RerollSettings.loadMazeRuns(applicationContext)
+                    val total = resumePlan?.total
+                        ?: if (multi) guildPlan.size else RerollSettings.loadMazeRuns(applicationContext)
                     if (total <= 0) {
                         AppState.addLog(
                             if (multi) "各公会局数都是 0 —— 至少要给一个公会给 1 局"
@@ -300,7 +313,12 @@ class AutoForegroundService : Service() {
                         return@launch
                     }
                     val totalTxt = "$total"
-                    if (multi) {
+                    if (resumePlan != null) {
+                        AppState.addLog(
+                            "── 断点续跑：上次运行被外力中断，已完成 ${resumePlan.idx}/${resumePlan.total} 局" +
+                                "（成功 ${resumePlan.done}）→ 从第 ${resumePlan.idx + 1} 局继续 ──",
+                        )
+                    } else if (multi) {
                         AppState.addLog(
                             "── 多公会模式：共 $total 局 ── " +
                                 RerollSettings.enabledGuildIds()
@@ -313,18 +331,38 @@ class AutoForegroundService : Service() {
                     // ★每轮运行单独一份 session（2026-11-02 用户）：否则同一次 app 启动里
                     //   连着跑「1 局」和「3 局」，日志页会并成"成功 4/3 局 · 有未完成"
                     LogFile.rotateSession()
-                    AppState.addLog("── 一键黎明界：运行 $totalTxt 次 ──")
+                    AppState.addLog(
+                        if (resumePlan == null) "── 一键黎明界：运行 $totalTxt 次 ──"
+                        else "── 一键黎明界：续跑剩余 ${total.toInt() - resumePlan.idx} 局 ──",
+                    )
 
                     // 冷启动兜底：确保前台服务 + watcher + frida 注入都起来了（已在前台则空转返回）
                     startIfNeeded()
 
-                    var done = 0
-                    var idx = 0
+                    // ★武装看门狗（root，2026-11-23）：armed 标记 + 守护循环 —— 从这一刻起 app
+                    //   被恐慌杀掉会由 root 守护自动 monkey 拉回，再走 MainActivity 的
+                    //   autoResumeIfInterrupted 读 journal 续跑。journal 一并落盘（计划 + 起点局号）。
+                    val runStartedAt = System.currentTimeMillis()
+                    RunJournal.save(
+                        applicationContext,
+                        RunJournal.State(total, guildPlan, resumePlan?.idx ?: 0, resumePlan?.done ?: 0, runStartedAt),
+                    )
+                    RunJournal.arm(applicationContext)
+
+                    var done = resumePlan?.done ?: 0
+                    var idx = resumePlan?.idx ?: 0
                     // ★2026-11-11（用户反馈：撤退重开被顶号 6002）：本轮是否"被中止/没跑完"。
                     //   还原装备要走游戏 API 登录，会挤掉正在操作的客户端 ⇒ 人工中止时**不立即还原**，
                     //   只保留 pending，下次开跑前再补（那时脚本要接管，不会和玩家抢登录态）。
                     var endedByStop = false
                     MazeSummary.reset()                 // ★整轮开始：清掉上一轮的汇总
+                    // ★恢复局强制完整刷开局（2026-11-23 用户提醒：状态转移链不认识"从中间开始"的状态）：
+                    //   两个 force 标志都置位 ⇒ 跳过"沿用已合格开局" / takeoverCurrentMaze 分支，
+                    //   刷开局链条从"杀进程重启游戏"的头部进入 —— 游戏必然归零到已知状态。
+                    if (resumePlan != null) {
+                        RerollUseCase.forceRerollNext = true
+                        InGameReroll.forceRerollNext = true
+                    }
                     try {
                         while (isActive && idx < total) {
                             idx++
@@ -429,6 +467,13 @@ class AutoForegroundService : Service() {
                             // ★记下这局（成绩 + 奖励），供整轮结束汇总
                             MazeSummary.add(RunRecord(idx, MazeLoop.lastScore, MazeLoop.lastRewards))
                             AppState.addLog("════ 第 $idx 局完成 ✓（累计成功 $done 次）════")
+                            // ★推进账本（2026-11-23）：下一局从这里接续。
+                            //   轮中被杀时这里没机会跑 → journal 停在上一局 → 恢复时本局作废重跑
+                            //   （每局本来就从全新刷开局开始，无需保留轮内状态）。
+                            RunJournal.save(
+                                applicationContext,
+                                RunJournal.State(total, guildPlan, idx, done, runStartedAt),
+                            )
                             // ★2026-11-15：局内刷开局模式下，第1局结束**不**把游戏推后台——
                             // 局内刷依赖游戏内"进行中迷宫局"的 client 状态（黎明界 top 的"挑战中"标志），
                             // 一旦推后台，模拟器回收进程 / B 服超时回收进行中迷宫局会让该会话断裂，
@@ -452,6 +497,13 @@ class AutoForegroundService : Service() {
                             LogFile.endRun(done = false, tag = "ABORT_EXIT", reason = "异常：${t.message}")
                         }
                     } finally {
+                        // ★任何退出路径（自然跑完 / 失败 break / 手动停止取消 / 异常）都撤防：
+                        //   清账本 + 删 armed 标记（看门狗循环 10s 内自我退出）。被外力杀掉时
+                        //   这里没机会跑 = 标记还在 = 恰好是续跑信号（2026-11-23 RunJournal）。
+                        //   ★停止取消走到这里时协程已取消 ⇒ 包 NonCancellable，撤防必须真正执行。
+                        withContext(NonCancellable) {
+                            runCatching { RunJournal.disarm(applicationContext) }
+                        }
                         // ★整轮运行**结束**（自然跑完 / 某局失败 break / 手动停止取消 / 异常）：
                         //   第一格显示"运行结束 成功/计划"，其余两格清空，等级复位 IDLE
                         AppState.setMazeProgress(null)
@@ -768,35 +820,50 @@ class AutoForegroundService : Service() {
         //        ③ 客户端不在线时 reroll 登录不会把 API 会话挤掉。
         //   ⚠"刷"仍必须在"launch"之前（reroll 只改服务器状态，客户端要冷启动才能同步）。
         OverlayStatus.setFloor("刷开局中")
-        // 杀之前先关自愈：否则注入循环会自己 am start，把"已杀"状态又拉起来。
-        FridaInjector.autoRecover = false
-        GameProcess.beginExternalOp()
-        val oldPid = FridaInjector.gamePid()
-        try {
-            // ★架构闸门提前：`AbiRepair.ensure` 重装时会杀游戏，放在刷开局前最安全
-            //   （原来放在刷之后，若在这里重装会把刚刷好的开局流程打断）。
-            val abiFix = AbiRepair.ensure(GameProcess.pkg())
-            if (!abiFix.ok) {
-                AppState.addLog("⚠ 游戏架构修复没成：${abiFix.detail}")
-                if (abiFix.fatal) {
-                    AppState.addLog("⇒ 确定性原因（换包/装游戏/给 root 才能解决），本局不跑，避免白等/反复重启游戏")
-                    return false
+        val oldPid = FridaInjector.gamePid()      // 冷启动路径的"杀前 pid"（launch 后等新 pid 出现也要用）
+
+        // ★游戏内重启（2026-11-23）：先试 UI 链回标题（不杀进程 —— 冷启动把 ~1.9GB 资产重新灌进
+        //   guest，负载尖峰会触发 MuMu lmkd panic 杀本 app，见 [InGameRestart]）。
+        //   任何一步没成都自动回退下面的杀进程冷启动，行为与旧版完全一致。
+        //   ⚠回标题后客户端停在登录前状态（会话已断）⇒ reroll 的 API 登录照常可用；
+        //     reroll 期间客户端一直停在标题页不动，刷完再由 Navigator 点屏幕触发 SDK 登录。
+        var viaTitle = false
+        if (RerollSettings.loadInGameRestart(applicationContext)) {
+            FridaInjector.autoRecover = true        // 链路期间注入循环照常自愈
+            viaTitle = InGameRestart.returnToTitle(applicationContext)
+            if (!viaTitle) AppState.addLog("游戏内重启没成 → 回退杀进程冷启动")
+        }
+
+        if (!viaTitle) {
+            // 杀之前先关自愈：否则注入循环会自己 am start，把"已杀"状态又拉起来。
+            FridaInjector.autoRecover = false
+            GameProcess.beginExternalOp()
+            try {
+                // ★架构闸门提前：`AbiRepair.ensure` 重装时会杀游戏，放在刷开局前最安全
+                //   （原来放在刷之后，若在这里重装会把刚刷好的开局流程打断）。
+                val abiFix = AbiRepair.ensure(GameProcess.pkg())
+                if (!abiFix.ok) {
+                    AppState.addLog("⚠ 游戏架构修复没成：${abiFix.detail}")
+                    if (abiFix.fatal) {
+                        AppState.addLog("⇒ 确定性原因（换包/装游戏/给 root 才能解决），本局不跑，避免白等/反复重启游戏")
+                        return false
+                    }
                 }
-            }
-            if (oldPid > 0) {
-                AppState.addLog("上一局结束 → 先杀游戏进程（刷开局期间让系统回收）")
-                GameProcess.kill()
-                val goneAt = android.os.SystemClock.elapsedRealtime()
-                while (android.os.SystemClock.elapsedRealtime() - goneAt < 4_000L) {
-                    val p = FridaInjector.gamePid()
-                    if (p <= 0 || p != oldPid) break
-                    delay(300)
+                if (oldPid > 0) {
+                    AppState.addLog("上一局结束 → 先杀游戏进程（刷开局期间让系统回收）")
+                    GameProcess.kill()
+                    val goneAt = android.os.SystemClock.elapsedRealtime()
+                    while (android.os.SystemClock.elapsedRealtime() - goneAt < 4_000L) {
+                        val p = FridaInjector.gamePid()
+                        if (p <= 0 || p != oldPid) break
+                        delay(300)
+                    }
                 }
+                // ★主动断旧 agent 连接：否则 connected 滞后为 true 时，注入循环会误判「进程还活着」
+                AgentBridge.noteStale("上一局结束，准备刷开局")
+            } finally {
+                GameProcess.endExternalOp()
             }
-            // ★主动断旧 agent 连接：否则 connected 滞后为 true 时，注入循环会误判「进程还活着」
-            AgentBridge.noteStale("上一局结束，准备刷开局")
-        } finally {
-            GameProcess.endExternalOp()
         }
 
         // ① 刷开局（登录 → enter/retire 循环；验证码出现会自动挂起等用户在弹窗解完）
@@ -804,6 +871,24 @@ class AutoForegroundService : Service() {
         if (!RerollUseCase.reroll(applicationContext)) {
             AppState.addLog("刷开局未成功（含验证码未过 / 未刷到合格开局）→ 本局不进入迷宫")
             return false
+        }
+
+        // ②（游戏内重启路径）进程没死、agent 还连着：不用 launch、不用等 readyGen，
+        //    直接让 Navigator 从标题页点屏幕触发 SDK 登录，一路走到黎明界 top。
+        //    （个别渠道服 SDK 会弹手动确认窗 → Navigator 标题页停留超时 kill 自愈，等效冷启动兜底。）
+        if (viaTitle) {
+            OverlayStatus.setFloor("进入迷宫中")
+            return try {
+                if (Navigator.currentViewId() == 264) {
+                    AppState.addLog("已在迷宫地图 → 直接进状态机")
+                    MazeLoop.run(input, applicationContext)
+                } else {
+                    if (!enterMazeWithRetry(input)) return false
+                    MazeLoop.run(input, applicationContext)
+                }
+            } finally {
+                FridaInjector.autoRecover = false
+            }
         }
 
         // ② 启动游戏同步新开局（冷启动才会读到刷好的局）→ 等 agent 就绪

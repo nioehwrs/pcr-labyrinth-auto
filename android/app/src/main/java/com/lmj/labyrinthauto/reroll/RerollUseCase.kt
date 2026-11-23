@@ -9,6 +9,7 @@ import com.lmj.labyrinthauto.net.bilibili.BilibiliGameSession
 import com.lmj.labyrinthauto.net.labyrinth.BilibiliLabyrinthApi
 import com.lmj.labyrinthauto.net.labyrinth.LabyrinthOperationResult
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.delay
 
 /**
  * 把「登录 → 刷开局 → 存结果」串成一个对 UI 友好的编排层：
@@ -18,6 +19,10 @@ import kotlinx.coroutines.CompletableDeferred
  *  - [reroll] 是给「一键黎明界」用的阻塞版：验证码出现时会挂起，直到用户在验证码弹窗里解完。
  */
 object RerollUseCase {
+    /** ★2026-11-22：刷开局登录的**网络类失败**重试次数/间隔（网关瞬时非 2xx 或抖动）。 */
+    private const val LOGIN_RETRY_MAX = 3
+    private const val LOGIN_RETRY_DELAY_MS = 1_500L
+
     private var client: LabyrinthLoginClient? = null
     private var session: BilibiliGameSession? = null
     /** 验证码等待中的挂起点（[submitCaptcha] 解出后唤醒，[reroll] 才能继续） */
@@ -57,7 +62,9 @@ object RerollUseCase {
         AppState.setRerollBusy(true)
         AppState.setRerollStatus(if (acct.isChannel) "正在登录渠道服…" else "正在登录 B 站…")
         client = LabyrinthLoginClient(context, acct)
-        return when (val r = client!!.login()) {
+        // ★2026-11-22：登录网络类失败重试（网关瞬时非 2xx/429 抖动），见 [loginWithRetry]
+        val (r, attempts) = loginWithRetry("刷开局")
+        return when (r) {
             is LoginOutcome.Session -> {
                 session = r.session
                 AppState.setRerollStatus("登录成功，开始刷开局")
@@ -73,13 +80,46 @@ object RerollUseCase {
                 ok
             }
             is LoginOutcome.Failure -> {
-                AppState.addLog("刷开局登录失败：${r.message}")
+                AppState.addLog("刷开局登录失败${if (attempts > 1) "（重试 $attempts 次后）" else ""}：${r.message}")
                 AppState.setRerollStatus("登录失败：${r.message}")
                 AppState.setRerollBusy(false)
                 false
             }
         }
     }
+
+    /**
+     * ★2026-11-22：登录的**网络类失败**重试（网关瞬时非 2xx/429 抖动）——
+     *  实测第 3 局开头刷开局登录回"网络请求失败"800ms 即返，直接把整轮停在第 2 局。
+     *  [reroll]（开头拿 session）与 [reloginForReroll]（enter 失败后重登）共用。
+     *  ⚠只对网络类失败重试；账号/凭证/验证码/维护这类重试也没用，照旧直接失败。
+     *  @return 最终 outcome + 实际尝试次数（供调用方写日志）。
+     */
+    private suspend fun loginWithRetry(label: String): Pair<LoginOutcome, Int> {
+        var attempt = 0
+        while (true) {
+            attempt++
+            val r = client!!.login()
+            if (r is LoginOutcome.Failure && isRetryableLoginFailure(r.message) &&
+                attempt <= LOGIN_RETRY_MAX
+            ) {
+                AppState.addLog(
+                    "${label}登录失败（第 $attempt 次）：${r.message} → ${LOGIN_RETRY_DELAY_MS / 1000}s 后重试",
+                )
+                AppState.setRerollStatus("${label}登录网络波动，${LOGIN_RETRY_DELAY_MS / 1000}s 后重试（$attempt/$LOGIN_RETRY_MAX）")
+                delay(LOGIN_RETRY_DELAY_MS)
+            } else {
+                return r to attempt
+            }
+        }
+    }
+
+    /** 网络类失败才重试；账号/凭证/验证码/维护/被拒这类重试也没用。 */
+    private fun isRetryableLoginFailure(message: String): Boolean =
+        message.contains("网络请求失败") ||
+            message.contains("Empty response") ||
+            message.contains("超时") ||
+            message.contains("timeout", ignoreCase = true)
 
     /**
      * ★**仅重新登录**（不刷开局），返回 true = [session] 已刷新。
@@ -130,14 +170,17 @@ object RerollUseCase {
         }
         AppState.setRerollStatus(if (acct.isChannel) "刷开局重试：重新登录渠道服…" else "刷开局重试：重新登录 B 站…")
         client = LabyrinthLoginClient(context, acct)
-        val api = when (val r = client!!.login()) {
+        // ★2026-11-22：重登也走网络重试（与 [reroll] 共用）——enter 失败触发重登时若碰上
+        //   网关瞬时抖动，不再直接放弃；重登成功后照旧 top()+retire() 清挂起旧局。
+        val (r, attempts) = loginWithRetry("刷开局重试：")
+        val api = when (r) {
             is LoginOutcome.Session -> {
                 session = r.session
                 AppState.addLog("刷开局重试：重新登录成功 → 继续刷开局")
                 BilibiliLabyrinthApi(r.session)
             }
             is LoginOutcome.Failure -> {
-                AppState.addLog("刷开局重试：重新登录失败（${r.message}）")
+                AppState.addLog("刷开局重试：重新登录失败${if (attempts > 1) "（重试 $attempts 次后）" else ""}（${r.message}）")
                 return null
             }
             is LoginOutcome.CaptchaNeeded -> {

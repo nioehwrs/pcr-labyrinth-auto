@@ -59,6 +59,13 @@ class MainActivity : ComponentActivity() {
         //   → 把当前页 DialogArea 节点树落到 files/tree_<tag>.json（服务不导出，只能从 Activity 进）
         maybeDumpTree(intent)
 
+        // ★断点续跑（2026-11-23 RunJournal）：App 被看门狗 monkey 拉回（或用户重新打开）且
+        //   上次运行没走正常收尾（journal + armed 标记都在）→ 自动起服务续跑剩余的局。
+        //   服务在跑（用户开着 app 看进度）时不动。
+        lifecycleScope.launch {
+            runCatching { com.lmj.labyrinthauto.core.RunJournal.autoResumeIfInterrupted(applicationContext) }
+        }
+
         // ★模型组件不再在这里探测（2026-11-14）：下载/校验/加载已统一由 ComponentPrep 负责，
         //   失败即"组件未就绪"，不需要额外的启动自检（原来那套每次启动白跑约 2 秒并刷日志）。
 

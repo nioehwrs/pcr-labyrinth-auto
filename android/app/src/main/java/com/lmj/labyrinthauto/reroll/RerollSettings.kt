@@ -307,6 +307,22 @@ object RerollSettings {
     fun loadShopUseDp(context: Context): Boolean =
         context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getBoolean("shopUseDp", true)
 
+    /**
+     * ★局间是否用「游戏内重启」（UI 链回标题，不杀进程，见 [com.lmj.labyrinthauto.logic.InGameRestart]）
+     * 代替每局开头的 `GameProcess.kill()` 冷启动（2026-11-23 接入，仅接口刷模式生效）。
+     * 默认开启；任何一步没成自动回退杀进程。部分渠道服回标题后的 SDK 登录要手动确认
+     * （会白等几十秒再自愈冷启动）—— 遇到这种渠道就把开关关掉。
+     */
+    fun loadInGameRestart(context: Context): Boolean =
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getBoolean("inGameRestart", true)
+
+    fun saveInGameRestart(context: Context, on: Boolean) {
+        context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean("inGameRestart", on)
+            .apply()
+    }
+
     // ───────────────── ★凹分模式（2026-11-01 用户需求）─────────────────
     // 目的：监测最终分数，主动放弃那些分数不够的局。
     // 检测点只有一处 —— **5 层 Boss 之前的商店（节点 50701）购物之后**：5 层 Boss 本身分数固定，

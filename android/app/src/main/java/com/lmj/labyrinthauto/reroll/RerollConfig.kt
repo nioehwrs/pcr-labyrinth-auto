@@ -33,11 +33,12 @@ data class RerollConfig(
     val areaPlan: String = "",
     /**
      * 每轮 enter/retire 之间小睡几毫秒。
-     * ★2026-11-12（用户）：默认改 **0** —— autopcr 原版就是「enter → retire → top」纯串行、
-     *   没有任何 sleep，节流靠请求往返本身；这里再额外加 150ms 属于多余保守。
-     *   想放慢可在设置里调大（老用户已保存的值不受影响）。
+     * ★2026-11-22（用户）：默认改 **100ms** —— 对照实验：0ms 时 7 秒连刷 21 次 enter/retire，
+     *   紧接着 guest Android 触发 device is not responding 清场（助手被 SIGKILL）。
+     *   加 100ms 让系统喘口气，把 21 次/7s 降到约 21 次/9s，验证是否为刷太猛所致。
+     *   （此前 2026-11-12 曾改 0，autopcr 原版无 sleep；这次是带目的的对照，若证实无关可改回。）
      */
-    val sleepBetweenMs: Long = 0L,
+    val sleepBetweenMs: Long = 100L,
 ) {
     companion object {
         const val MODE_CLASSIC = 0

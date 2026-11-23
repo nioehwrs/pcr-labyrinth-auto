@@ -302,6 +302,8 @@ object MazeLoop {
         labResultSeen = false
         fxDumps = 0
         fxAt = 0L
+        outTailNode = 0
+        outSpeedDone = false
         CenterTapGate.reset("新的一局开始")
         // ★演出加速补丁跟随 agent 会话（写一次持续整个会话）；agent 若重连，重新打一次
         labSpeedupOk = false
@@ -785,6 +787,9 @@ object MazeLoop {
             // ★悬浮窗状态（2026-10-17 用户）：每轮先刷"第几层 + 在干什么"，放在这里（tag 之后、
             //   所有 `continue` 之前）⇒ 连迷宫结算页那种提前 continue 的分支也不会停在旧文字上 ✓
             overlayTick(st, stt)
+            // ★★2026-11-22：旧区结束(out)动画加速 —— 区尾节点结算完回地图那几秒密集探测
+            //   （BOSS 战期间 stt=6 不满足，不轮询；新区入场/area 由 [moveBusyNow] 的 inAnimation 分支管）
+            speedOldAreaExit(st, stt)
             // tag（PC 6004）：带 view —— statusType 在换页时可能不变，只看状态会漏判"页面已换"
             // ★2026-10-27：`viewClass` 为空时原来退化成**裸数字**（日志里出现 `view=29`，
             //   排查时完全看不出是战斗页）。现在走 Navigator 的名字表 ⇒ `view=BATTLE(29)`。
@@ -949,12 +954,20 @@ object MazeLoop {
                     //   "上次没点「装备确定」就走了"的缺口 —— 否则 EX 页留在屏幕上，
                     //   后面所有操作都在**错的页面**上做（2026-11-08 实测 10:29:36~10:29:45）。
                     val es = exeqSess()
-                    // ★2026-11-20：刚提前收工（「装备确定」已确认投递成功）⇒ 给关闭动画留 2s 放行窗口，
-                    //   别在 EX 容器还在退场时又接管一遍（否则等于没省时间，还会重启一次流程）。
-                    if (es.earlyExitAt > 0 && System.currentTimeMillis() - es.earlyExitAt < 2_000L) {
-                        idle = 0
-                        delay(POLL_MS)
-                        continue
+                    // ★★2026-11-22（0.7.16 Boss 空二队卡 EX 页反馈）改成**状态判断**：
+                    //   壳（EX 容器）从顶层消失后才能再接管 —— 壳真没了 exTop 为空、压根进不到这里；
+                    //   能走到这说明壳还在退场动画 ⇒ 继续放行，绝不当成"EX 又开了"重走一遍
+                    //   （旧版只放行固定 2s，慢设备动画实测最长 11s ⇒ 2s 后误接管，
+                    //     在已切到的空二队上又走三连页、没角色可装备 ⇒ 卡在特殊装备页）。
+                    //   ★不再靠时间"猜"壳消失没有；只有壳异常赖着不走才在 EXEQ_CLOSE_GUARD_MS 后
+                    //     清标志、恢复接管兜底（仍受 EXEQ_FB_MAX 保护，不会无限循环）。
+                    if (es.earlyExitAt > 0) {
+                        if (System.currentTimeMillis() - es.earlyExitAt < EXEQ_CLOSE_GUARD_MS) {
+                            idle = 0
+                            delay(POLL_MS)
+                            continue
+                        }
+                        es.earlyExitAt = 0     // 壳迟迟不退 ⇒ 放行到期，允许兜底重接管收掉它
                     }
                     es.fbN++
                     if (es.fbN > EXEQ_FB_MAX) {
@@ -1652,6 +1665,8 @@ object MazeLoop {
     private var sceneHoldUntil = 0L
     /** ★2026-11-22 探针：通关庆祝动画采样节流（每 300ms 一行 [庆祝]） */
     private var celebrateAt = 0L
+    /** ★2026-11-22：距上次"结算页重压演出参数"的时间（LabyrinthDefineData 可能每次结算重建） */
+    private var labSpeedupAtResult = 0L
     /** ★2026-11-22 探针：庆祝期间"canvas 两层特效扫描"已做几次（诊断计数） */
     private var fxDumps = 0
     /** ★2026-11-22 探针：上次特效扫描时间（**1s 节流**——两层扫描 100~300ms，4s 窗口能抓 4 次） */
@@ -1806,6 +1821,13 @@ object MazeLoop {
     private var moveBusySince = 0L
     /** ★2026-11-20：本次 busy 已被判成误报（放行到 busy 消失为止，避免反复判） */
     private var moveBusyFalseReport = false
+    /** ★2026-11-22：本次换区三段动画加速的完成掩码（bit0/1/2=trans/area/result；busy 消失清零） */
+    private var mapSpeedDone = 0
+    private var mapSpeedRetryAt = 0L
+    /** ★2026-11-22：旧区结束(out)动画加速——已进入的区尾节点（结算完回地图那几秒密集探测） */
+    private var outTailNode = 0
+    private var outSpeedDone = false
+    private var outSpeedRetryAt = 0L
     /** ★2026-11-20：`inAnimation` 持续多久就判"粘住"。
      *  实测换区从 `inAnim=true`（20101 出现）到消失约 **7.6s**（session_164525 16:47:11.8→19.4）
      *  ⇒ 设 9s 覆盖正常换区，同时保留"真粘住也不永久卡死"的兜底。 */
@@ -1881,6 +1903,7 @@ object MazeLoop {
         if (!busy) {
             moveBusySince = 0L
             moveBusyFalseReport = false
+            mapSpeedDone = 0                               // 换区结束 → 下次换区重新补设
             return false
         }
         // 诊断：换区过渡动画在跑
@@ -1888,6 +1911,33 @@ object MazeLoop {
         if (moveBusyFalseReport) return false              // 本轮 busy 已判误报 → 一直放行
         val now = SystemClock.elapsedRealtime()
         if (moveBusySince == 0L) moveBusySince = now
+        // ★★2026-11-22：换区三段动画加速（trans/area/result）。inAnimation 上升沿起、busy 期间
+        //   有限重试：`area`/`result` 是播放时动态创建的，上升沿那一刻常 no-comp（实测），
+        //   补几次才能抓到（16:58 的 [1/7]→[3/7] 就是重试抓到 area）。掩码记已设上的段，
+        //   全齐(0x07) 或 busy 消失即停；agent 指针缓存让已设段重复调用零 invoke。
+        //   trans（新区入场）上升沿就有 ⇒ 第一次即设上；旧区结束(out clip)在 busy 之前、仍漏。
+        if (mapSpeedDone != 0x03 && now - mapSpeedRetryAt >= 400L) {
+            mapSpeedRetryAt = now
+            val ts = runCatching {
+                AgentApi.obj("labMapTransitionSpeed", listOf<Any?>(20.0), timeoutMs = 3_000L)
+            }.getOrNull()
+            if (ts != null) {
+                val parts = ts.optJSONObject("parts")
+                val keys = listOf("trans", "area")
+                var mask = 0
+                fun part(k: String): String {
+                    val p = parts?.optJSONObject(k)
+                    if (p != null && p.optBoolean("ok")) {
+                        mask = mask or (1 shl keys.indexOf(k))
+                        return "$k=${p.optDouble("speed")}"
+                    }
+                    return "$k=×${p?.optString("err") ?: "?"}"
+                }
+                val line = keys.joinToString(" ") { part(it) }
+                mapSpeedDone = mask
+                AppState.addLog("… 换区动画加速 [$mask/3] $line")
+            }
+        }
         if (now - moveBusySince > MOVE_BUSY_MAX_MS) {
             moveBusyFalseReport = true
             AppState.addLog(
@@ -1896,6 +1946,39 @@ object MazeLoop {
             return false
         }
         return true
+    }
+
+    /**
+     * ★★2026-11-22：旧区结束（transition 的 **out** clip）动画加速。
+     *
+     * 难点：out 动画在**旧区最后一个节点结算完、回地图那几秒**才建对象（`CreateTransitionOutAnimation`
+     * → createParts 动态 Instantiate），比 `inAnimation=true`（新区入场）早得多。抓 inAnimation 上升沿
+     * 时 out 早已播完 ⇒ 需要单独的窗口。
+     *
+     * 窗口判据（用户口径）：站过区尾节点 → 等 `statusType==0`（结算完回地图）且**顶框清空**（结算弹窗关完）
+     * → 这几秒密集探测设速。BOSS 战那几十秒 stt=6 不满足，完全不轮询 ⇒ 性能友好。
+     *
+     * 只设 trans 段（+0x28 的 Animator）—— out/in 是不同 prefab、不同 Animator 指针，各自独立；
+     * agent 侧指针缓存保证同一对象只 invoke 一次。
+     */
+    private suspend fun speedOldAreaExit(st: JSONObject, stt: Int) {
+        val bid = jStr(st, "blockId").toIntOrNull() ?: return
+        val tailNodes = setOf(10601, 20601, 30701, 40701)
+        if (bid in tailNodes && !outSpeedDone) outTailNode = bid       // 记住进了哪个区尾
+        if (outTailNode == 0 || outSpeedDone) return
+        // 必须：结算完回地图(stt==0) + 顶框清空 —— 这才是 out 对象刚建好的窗口
+        if (stt != 0 || jStr(st, "pageTop").isNotEmpty()) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - outSpeedRetryAt < 300L) return
+        outSpeedRetryAt = now
+        val ts = runCatching {
+            AgentApi.obj("labMapTransitionSpeed", listOf<Any?>(20.0), timeoutMs = 3_000L)
+        }.getOrNull() ?: return
+        val trans = ts.optJSONObject("parts")?.optJSONObject("trans")
+        if (trans != null && trans.optBoolean("ok")) {
+            outSpeedDone = true
+            AppState.addLog("… 旧区 $outTailNode 结束动画加速 trans=${trans.optDouble("speed")}")
+        }
     }
 
     /** 上次见到的"游戏被杀次数"（[GameProcess.kills]）；一变 ⇒ 说明游戏被重建过，清编队/装备缓存 */
@@ -2080,6 +2163,12 @@ object MazeLoop {
      *   实测过渡态最长 11s（见 6229 注释）——直调已确认投递成功就无需再等动画。
      *   关闭即回退成"等容器消失"的老行为（改常量或改成 false 重编译）。 */
     private const val EXEQ_EARLY_EXIT = true
+    /** ★2026-11-22：提前收工后、EX 容器退场动画未结束期间的"放行"上限。
+     *  原来的固定 2s 太短——实测过渡态最长 11s，慢设备上 2s 后壳还在，兜底门就误判
+     *  "EX 又开了"重新接管，在已切到的空二队上又走一遍三连页 ⇒ 卡在特殊装备页（0.7.16 反馈）。
+     *  现在改成状态判断：壳真消失了 exTop 为空、兜底门压根进不来（天然放行）；
+     *  只有壳异常赖着不走才在 15s 后清标志、恢复正常兜底（仍受 EXEQ_FB_MAX 保护）。 */
+    private const val EXEQ_CLOSE_GUARD_MS = 15_000L
     private const val EXEQ_FB_MAX = 3              // ★主循环兜底接管 EX 页的次数上限（超了 ⇒ 让用户手动关）
     private const val EXEQ_RETRY_WAIT_MS = 300L      // "这一轮点了没生效"时的等待（别把 agent 读爆）
     private const val EXEQ_AUTO_WAIT_MS = 900L       // 点完「自动装备」后等页面切到②的上限（超了 ⇒ 再点一次）
@@ -2166,7 +2255,8 @@ object MazeLoop {
          *  用于 [EXEQ_EARLY_EXIT] 提前收工（确认点上了才敢不等容器消失）。 */
         var finalPressOk: Boolean = false,
         /** ★2026-11-20：提前收工的时刻（非 0 = 刚跳过"等容器消失"）——
-         *  主循环兜底据此刻意放行 2s，别在关闭动画期间又接管一遍。 */
+         *  主循环兜底据此放行：EX 壳真消失后 exTop 为空进不来兜底门（天然放行），
+         *  壳还在退场动画就继续放行，直到 [EXEQ_CLOSE_GUARD_MS] 超时才恢复接管。 */
         var earlyExitAt: Long = 0L,
     )
 
@@ -6654,6 +6744,7 @@ object MazeLoop {
         sess.tapY = -1
         sess.tapN = 0
         sess.finalPressOk = false                    // ★2026-11-20：新一轮重置"最后一击已确认"
+        sess.earlyExitAt = 0                         // ★2026-11-22：新一轮重置"等壳消失"标志（否则旧值误伤新流程）
         sess.stall = 0                               // ★连续失败计数（新一轮清零）
         sess.sayN = 0                                // ★诊断日志节流（新一轮清零）
         sess.pending = true                          // ★"流程进行中"（收尾处靠它判"异常收手"）
@@ -7996,7 +8087,9 @@ object MazeLoop {
                     // ★2026-11-19（用户）：与另两条**同构** —— 点前现读坐标。
                     //   agent 现在会把失败页的「下一步」按标签判成 `failnext`，固定路径能直接命中；
                     //   某一拍读不到（过渡态 offscreen）就这拍不点、下一拍再取，不会用过期坐标硬点。
-                    pressFn = { battleResultPressOrTap(input, wantWin = true, what = "下一步（失败页）") },
+                    pressFn = oncePerResultPage("下一步（失败页）") {
+                        battleResultPressOrTap(input, wantWin = true, what = "下一步（失败页）")
+                    },
                     pressMax = RESULT_PRESS_MAX,
                     directFast = false,   // ★结算页 pressFn 直调失败会退坐标，保留慢节奏防 lmkd 连点事故
                     from = RESULT_FROM,
@@ -8359,12 +8452,41 @@ object MazeLoop {
         //   · 直调投出 [LAB_RESULT_DIRECT_WAIT_S]s 没推进 → pressFn 内退**一次**坐标兜底（[labResultCoord]）；
         //     直调+坐标都投过仍没推进 → [LAB_RESULT_BOTH_SPENT_S]s 后停手交人工（见 [labResultPressFn]）。
         val wantScr = jStr(r, "which").ifEmpty { "next" }
+        // ★★2026-11-22（用户）：**在 1 屏压一次就够** —— 滚分协程是在 2 屏 `SetData()` 时才启动、
+        //   启动那一刻才读时长；1→2 屏之间有几秒，趁这时把时长压到 0.05，协程启动就读到 0.05。
+        //   （结算页第一次出现必然是 1 屏 which="next"，所以这里压 = 1 屏压；每局只压一次。）
+        if (labSpeedupAtResult == 0L) {
+            labSpeedupAtResult = SystemClock.elapsedRealtime()
+            val sp = runCatching { AgentApi.labSpeedup() }.getOrNull()
+            if (sp?.optBoolean("ok") == true) {
+                val n = sp.optJSONArray("params")?.length() ?: 0
+                AppState.addLog("… 结算①屏压演出参数（$n 项 → 0.05s，赶在滚分协程启动前）")
+            }
+        }
         if (wantScr == "close") {
             // ★②屏处理前：分数还没读到就先用内存补 + 截图留证（2026-10-23 / 2026-11-10，只做一次）
             if (tries.getOrPut("$tag|shot", { 0 }) == 0) {
                 tries["$tag|shot"] = 1
                 maybeFillScoreFromLtd("关闭前")
-                captureScoreShot(score)
+                // ★★2026-11-22（用户"滚分还是没加速到"）：**等分数文本稳定再截图** ——
+                //   滚分协程读的参数不好保证生效（`LabyrinthDefineData` 实例/缓存），干脆自适应：
+                //   文本连续两次相同 = 滚完了 ⇒ 截图。滚得快几乎不等，最慢 2s 兜底。
+                var prev = ""
+                val w0 = SystemClock.elapsedRealtime()
+                while (SystemClock.elapsedRealtime() - w0 < 2_000L) {
+                    val rr = runCatching { AgentApi.labResult() }.getOrNull()
+                    val tx = rr?.optJSONObject("text")?.optString("score").orEmpty()
+                    if (tx.isNotEmpty() && tx == prev) break
+                    if (tx.isNotEmpty()) prev = tx
+                    delay(120)
+                }
+                if (prev.isNotEmpty()) {
+                    AppState.addLog("… 截图前等分数稳定：$prev（${SystemClock.elapsedRealtime() - w0}ms）")
+                }
+                // 文件名优先界面文本，其次内存口径总分（否则是 score_x）
+                captureScoreShot(
+                    prev.ifEmpty { score.ifEmpty { lastScore["总分"]?.toString().orEmpty() } },
+                )
             }
             // ②「关闭」→ 出壳（演出壳/白名单弹窗由通用分支接管）⇒ expect 空 = 离开结算壳就算完成
             tapAndCheck(
@@ -8461,7 +8583,9 @@ object MazeLoop {
                     } else {
                         val (lab, pxy) = c
                         if (lab == "关闭") maybeFillScoreFromLtd("关闭前")
-                        if (lab == "关闭") captureScoreShot(score)
+                        if (lab == "关闭") {
+                            captureScoreShot(score.ifEmpty { lastScore["总分"]?.toString().orEmpty() })
+                        }
                         tries["$tag|rtaps"] = (tries["$tag|rtaps"] ?: 0) + 1
                         AppState.addLog("迷宫结算：点了「$lab」(${pxy.first},${pxy.second})")
                         tap(input, pxy.first, pxy.second, "结算·$lab", learnKey = "settle|result")
@@ -8671,6 +8795,46 @@ object MazeLoop {
         val bot = (scrH * 0.85).toInt()
         val (w, f) = battleResultPick(bot) ?: return null
         return btnXYOf(if (wantWin) w else f)
+    }
+
+    /**
+     * ★★2026-11-22（用户口径）：**同一结算页只直调一次，之后纯等** —— 包在 `pressFn` 外面做页签名去重。
+     *
+     * 背景：胜利结算是**一壳两页**（first `NextButton` → later `NextButtonLarge`，同 `DialogQuestResultWin`
+     * 壳）⇒ `TapCheck` 用窗口名判不出换页，历史上靠 `pressMax=12` 连投推进，实测每场都出现
+     * `直调 2 轮`——直调没有"点不到"，重复投就是**真的重复执行 onClick**（有副作用的页危险）。
+     *
+     * 判据用 agent 现成的 `battleResultPath(noScan)`（固定路径、4~16ms、零扫描）：
+     *   · first 页命中 `RES_WIN_SUB` ⇒ stage 空 / node 空；
+     *   · later 页命中 `RES_WIN_LATER` ⇒ stage="later" / node 带 `NextButtonLarge`。
+     * 签名变了才算"换页"、放行下一次；同一签名重复出现一律返回 null（这一拍只探测、不投递）。
+     *
+     * @return 包装后的 `pressFn`：读不到签名 / 同页已投过 ⇒ null（不消耗 retries）；
+     *         真投递成功才记下签名。
+     */
+    private fun oncePerResultPage(what: String, inner: suspend () -> Boolean?): suspend () -> Boolean? {
+        val fired = mutableSetOf<String>()
+        return {
+            val pg = runCatching {
+                AgentApi.obj("battleResultPath", listOf<Any?>(true), AgentApi.T_FAST)
+            }.getOrNull()
+            val key = if (pg?.optBoolean("ok") == true) {
+                (pg.optString("stage").ifEmpty { "first" }) + "|" +
+                    pg.optString("kind") + "|" + pg.optString("node")
+            } else ""
+            if (key.isEmpty()) {
+                null                                  // 过渡态读不到页 ⇒ 这一拍不投
+            } else if (key in fired) {
+                null                                  // ★同页已经投过 ⇒ 只探测，绝不重复 Execute
+            } else {
+                val r = inner()
+                if (r == true) {
+                    fired += key
+                    AppState.addLog("$what：直调投递（页=$key → 已记 ${fired.size} 页，此后同页不再投）")
+                }
+                r
+            }
+        }
     }
 
     /**
@@ -9244,7 +9408,9 @@ object MazeLoop {
                 //   每次现取 ⇒ 既跟得上落位动画、又不依赖会过时的缓存坐标。
                 //   ⚠更早那版用 findTextIn(half=scrH/2,root=top) 探索 + 无标签校验 ⇒ 捞到干扰
                 //     节点 (1109,652) ⇒ 点空/抓不到。这里换成固定路径现读，见 [battleResultXY]。
-                pressFn = { battleResultPressOrTap(input, wantWin = true, what = "下一步") },
+                pressFn = oncePerResultPage("下一步") {
+                    battleResultPressOrTap(input, wantWin = true, what = "下一步")
+                },
                 pressMax = RESULT_PRESS_MAX,
                 directFast = false,   // ★结算页「下一步」pressFn 内部退坐标，保留 400ms 慢节奏防 lmkd 连点事故
                 from = RESULT_FROM,

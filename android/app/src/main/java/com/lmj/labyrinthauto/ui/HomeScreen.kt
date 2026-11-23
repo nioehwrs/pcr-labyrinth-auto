@@ -2477,6 +2477,26 @@ private fun RerollTab(
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
+                        // ★局间重启方式（2026-11-23）：接口刷时每局之间不杀游戏进程、走 UI 链回标题
+                        //   （冷启动灌资产的负载尖峰会触发模拟器把本 app 杀掉）。回退自动、失败无损。
+                        var inGameRestart by remember { mutableStateOf(RerollSettings.loadInGameRestart(context)) }
+                        ChoiceChips(
+                            "局间重启（接口刷）",
+                            listOf(
+                                "游戏内回标题（默认）" to 1,
+                                "杀进程冷启动" to 0,
+                            ),
+                            if (inGameRestart) 1 else 0,
+                        ) { v ->
+                            inGameRestart = v == 1
+                            RerollSettings.saveInGameRestart(context, inGameRestart)
+                        }
+                        Text(
+                            "游戏内：每局结束点「主菜单 → 回到标题画面」再刷开局，不重启游戏（更快更稳）。" +
+                                "个别渠道服回标题后登录要手动确认的，请选冷启动。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                         ChoiceChips(
                             "难度",
                             (1..5).map { "$it" to it },
