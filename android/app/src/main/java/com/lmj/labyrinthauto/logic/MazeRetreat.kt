@@ -17,7 +17,8 @@ import com.lmj.labyrinthauto.reroll.RerollSettings
  *
  * | 刷开局方式 | 撤退动作 | 谁负责 |
  * |---|---|---|
- * | 接口刷 | 不点任何 UI | 服务层：杀进程 → 重新登录 → `labyrinth/retire` |
+ * | 接口刷 · 游戏内重启开 | 按现场收敛回 259：失败页直调撤退链（结束→撤退无报酬→二重确认）；预览页/裸地图 HUD 撤退链（LabyrinthRetireButton→确认）；编组页取消后落预览页同前；仅迷宫子菜单走返回键（旧局由下一局 reroll 的 API 清） | [com.lmj.labyrinthauto.logic.InGameRestart.backToTopFromMaze]；没成 → 服务层杀进程 → 重新登录 → `labyrinth/retire` 兜底 |
+ * | 接口刷 · 游戏内重启关 | 不点任何 UI | 服务层：杀进程 → 重新登录 → `labyrinth/retire` |
  * | 局内刷 | 就地按现场撤（失败页/地图/选人面板/其他面板） | [InGameReroll.retreatNow] |
  * | 局内刷 · 撤不干净 | 标记下一局不沿用 → 下一局接管时再撤一次；仍失败则整轮停止（留人工） | 本模块 |
  *
@@ -82,8 +83,8 @@ object MazeRetreat {
         }
 
         if (RerollSettings.loadRerollMode(ctx) == RerollSettings.REROLL_API) {
-            // 接口刷：客户端此刻的会话多半已被冷启动挤掉，**必须**由服务层"先杀进程再用凭据重新登录"
-            AppState.addLog("撤退（接口刷）：交给服务层 杀进程 → 重新登录 → 调撤退接口")
+            // 接口刷：客户端活着（游戏内重启开着）就点返回回 259、旧局交给 API 撤；否则杀进程重登再撤 —— 都由服务层管
+            AppState.addLog("撤退（接口刷）：交给服务层（游戏内重启开 → 点返回回 259 + API 撤旧局；关 → 杀进程重登再撤）")
         } else {
             val ok = InGameReroll.retreatNow(input)
             if (ok) {

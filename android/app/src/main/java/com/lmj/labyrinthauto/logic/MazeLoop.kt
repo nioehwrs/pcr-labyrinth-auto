@@ -556,6 +556,8 @@ object MazeLoop {
         val pageRounds = HashMap<String, Int>() // PC: disp_rounds：本页已过的轮数（换页清零，弹窗节流用）
         val waitSaid = HashSet<String>()        // PC: _WAIT_SAID(491)："只等不点"每个状态只说一次
         val stallDiag = HashSet<String>()       // ★"页面停但帧在涨"的取证去重（换页清空；只打日志、不动作）
+        val stallCacheFix = HashSet<String>()   // ★盲读中间档：现场停 ≥150s 清一次 agent 读缓存（换页清空）
+        val stallBlindHeal = HashSet<String>()  // ★盲读兜底：现场停 ≥300s 请求自愈重启（换页清空）
         var idle = 0                            // PC: idle：连续"无有效动作"的轮数（弹窗兜底闸门用）
         stopRequested = false                   // handler 判定"卡死了"→ 请求收工（字段见类底部）
         lastPickedSig = null
@@ -876,6 +878,21 @@ object MazeLoop {
                 ) {
                     AppState.addLog("ⓘ 页面已停 ${(now - tagAt) / 1000}s，但游戏帧还在涨 ⇒ 非卡死（handler 没动作），取证一次：")
                     dumpStuckDiag(st)
+                }
+                // ★盲读升级（2026-11-23 首轮实测第 7 局）：开局选角色页干等 15min+ —— 现场"帧在涨"，
+                //   现有看门狗永远不触发；取证里 darkFilters=1（弹窗背板在）但 open=false、选人结构读不到
+                //   ⇒ 回标题重建 UI 后 agent 的对话框扫描根失效（读数盲区）。分两级处置：
+                //   ① ≥60s：labResetCaches 清 agent 侧缓存重读（中间档，比重启便宜 30~40s）；
+                //   ② ≥120s：请求自愈重启（走 0.4 的标准自愈：杀进程 + recoverAfterRestart，缓存全清）。
+                if (FridaInjector.autoRecover && !st.optBoolean("inBattle", false)) {
+                    val stallMs = now - tagAt
+                    if (stallMs >= STALL_CACHE_MS && stallCacheFix.add(tag)) {
+                        AppState.addLog("ⓘ 现场已停 ${stallMs / 1000}s ⇒ 先清 agent 侧读缓存重读（盲读中间档，不重启）")
+                        runCatching { AgentApi.labResetCaches() }
+                    }
+                    if (stallMs >= STALL_BLIND_HEAL_MS && stallBlindHeal.add(tag)) {
+                        selfHealReason = "现场停 ${stallMs / 1000}s 无变化（疑似对话框读数盲区，帧在涨）"
+                    }
                 }
             }
 
@@ -1363,6 +1380,12 @@ object MazeLoop {
 
     /** 页面停了这么久、但游戏帧还在涨 ⇒ 打一次现场取证（**不重启**：只说明 handler 没动作） */
     private const val STALL_DIAG_MS = 60_000L
+
+    /** ★盲读中间档：现场停这么久 ⇒ 先清一次 agent 读缓存重读（不重启，见主循环"盲读升级"） */
+    private const val STALL_CACHE_MS = 60_000L
+
+    /** ★盲读兜底：现场停这么久 ⇒ 请求自愈重启（"帧在涨"的看门狗抓不到的读数盲区，见主循环） */
+    private const val STALL_BLIND_HEAL_MS = 120_000L
 
     /** ★卡死自愈：杀掉后等"游戏回到前台 + agent 回连"的上限 */
     private const val STUCK_BACK_MS = 90_000L

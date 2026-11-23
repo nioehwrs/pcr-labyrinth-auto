@@ -436,18 +436,29 @@ class AutoForegroundService : Service() {
                                     MazeLoop.retreatRequested = false
                                     AppState.addLog("════ 第 $idx 局按策略撤退 → 本局作废，继续下一局 ════")
                                     if (RerollSettings.loadRerollMode(applicationContext) == RerollSettings.REROLL_API) {
-                                        // ★API 刷（2026-10-19 三修，用户纠正了"客户端在线被拒"的错误推断）：
-                                        //   客户端不维持登录态、别处登录无条件挤下线 ⇒ 每局开始"reroll 登录 →
-                                        //   杀进程重启游戏"后，**客户端冷启动自动登录已把 API 会话挤掉**。
-                                        //   所以此刻 retire 拿旧会话必失败（"连接中断。回到标题界面。"）。
-                                        //   正确顺序：杀进程（清失败页）→ **用保存的凭据重新登录**（挤掉客户端
-                                        //   ——局已作废无所谓）→ retire。
-                                        GameProcess.kill()
-                                        delay(1_000)
-                                        if (RerollUseCase.ensureLogin(applicationContext)) {
-                                            RerollUseCase.retire()
+                                        // ★API 刷（2026-11-23 游戏内重启之后，用户定稿）：**不做 UI 撤退** ——
+                                        //   客户端活着且 agent 连着时，只需把页面从迷宫（264 地图等）用左上角返回
+                                        //   带回 259，下一局 runOneMaze 的游戏内重启链（回标题 → reroll）照常接管；
+                                        //   服务器上的旧局由 reroll 开局的 top()+retire 清（skipResume=true 无条件撤）。
+                                        //   ★旧路径"杀进程→重新登录→retire"保留作兜底（旧流程下客户端会话被冷启动
+                                        //     自动登录挤掉，retire 拿旧会话必失败，必须重登后再撤）。
+                                        var viaGame = false
+                                        if (RerollSettings.loadInGameRestart(applicationContext) &&
+                                            FridaInjector.gamePid() > 0
+                                        ) {
+                                            viaGame = InGameRestart.backToTopFromMaze()
+                                            if (!viaGame) {
+                                                AppState.addLog("撤退（游戏内）没成（不在迷宫页/返回键点不动/agent 断了）→ 回退杀进程重新登录撤退")
+                                            }
                                         }
-                                        // ★无论 retire 成败：下一局不许沿用（作废局的路线本来就合格，
+                                        if (!viaGame) {
+                                            GameProcess.kill()
+                                            delay(1_000)
+                                            if (RerollUseCase.ensureLogin(applicationContext)) {
+                                                RerollUseCase.retire()
+                                            }
+                                        }
+                                        // ★无论走哪条：下一局不许沿用（作废局的路线本来就合格，
                                         //   沿用 = 再进一遍打不过的图 → 死循环）
                                         RerollUseCase.forceRerollNext = true
                                     }
@@ -484,7 +495,20 @@ class AutoForegroundService : Service() {
                             }
                         }
                     } catch (ce: kotlinx.coroutines.CancellationException) {
-                        throw ce                            // 「停止」是正常取消，不算异常
+                        // 「停止」是正常取消，不算异常。★但 TimeoutCancellationException 也是它的子类
+                        //   （2026-11-23 实锤：0.7.19 第 19/30 局杀进程后，某个内部 withTimeout 的超时
+                        //   冒到这一层被当成"手动停止"**无声结束**——悬浮窗直接"运行结束 18/30"，
+                        //   session 日志一行不留、run 日志也不打 ABORT 归档，复盘时完全断档）。
+                        //   ⇒ 只有协程真的被取消（手动停止 / 服务销毁）才原样抛；
+                        //     否则按异常中止留痕（与 [selfCheck] 1115 行同一判据）。
+                        if (!currentCoroutineContext().isActive) throw ce
+                        AppState.addLog(
+                            "════ 运行异常中止（内部取消/超时）：${ce.javaClass.simpleName}: ${ce.message} " +
+                                "—— 协程并未被停止，多半是某处 withTimeout 超时冒上来了（查最近一条日志的下文）",
+                        )
+                        runCatching {
+                            LogFile.endRun(done = false, tag = "ABORT_EXIT", reason = "内部取消/超时：${ce.message}")
+                        }
                     } catch (t: Throwable) {
                         // ★★2026-10-23（MuMu 15 "闪退"的真凶）：这里原来**只有 try/finally、没有 catch**
                         //   ⇒ `runOneMaze` 抛的任何异常（当时是"查不到游戏包 ⇒ 读不到签名"）都会冒到
@@ -596,7 +620,11 @@ class AutoForegroundService : Service() {
                             },
                         )
                     } catch (ce: kotlinx.coroutines.CancellationException) {
-                        throw ce                            // 「停止」是正常取消
+                        // ★同 runFull 那处的坑：内部 withTimeout 的超时会伪装成"手动停止"静默结束
+                        //   （2026-11-23 实锤）。只有协程真的被取消才原样抛，否则留痕按异常收尾。
+                        if (!currentCoroutineContext().isActive) throw ce
+                        AppState.addLog("════ 刷开局异常中止（内部取消/超时）：${ce.javaClass.simpleName}: ${ce.message}")
+                        LogFile.endRun(done = false, tag = "ABORT_EXIT", reason = "内部取消/超时：${ce.message}")
                     } catch (e: Throwable) {
                         // ★同样不能让异常带走进程（2026-10-23）：原来这里 `throw e` ⇒ 未捕获 ⇒ 整个
                         //   app 闪退（和 runFull 那个是同一个坑的两处）。

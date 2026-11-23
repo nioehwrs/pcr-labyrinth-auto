@@ -1,6 +1,7 @@
 package com.lmj.labyrinthauto.logic
 
 import android.content.Context
+import org.json.JSONObject
 import com.lmj.labyrinthauto.core.AppState
 import com.lmj.labyrinthauto.frida.AgentApi
 import com.lmj.labyrinthauto.frida.GameProcess
@@ -81,7 +82,7 @@ object InGameRestart {
         }
 
         // ② 主菜单（footer 右下 ButtonMenu → MENU(77)）
-        val r1 = AgentApi.pressNode("^ButtonMenu$")
+        val r1 = pressStep("^ButtonMenu$")
         if (r1?.optBoolean("ok") != true) {
             AppState.addLog("游戏内重启：ButtonMenu 直调没成（${r1?.optString("err") ?: "无响应"}）")
             return false
@@ -92,7 +93,7 @@ object InGameRestart {
         }
 
         // ③ 回到标题（MENU 页左下 BackTitle → 弹确认框）
-        val r2 = AgentApi.pressNode("^BackTitle$")
+        val r2 = pressStep("^BackTitle$")
         if (r2?.optBoolean("ok") != true) {
             AppState.addLog("游戏内重启：BackTitle 直调没成（${r2?.optString("err") ?: "无响应"}）")
             return false
@@ -103,7 +104,7 @@ object InGameRestart {
         }
 
         // ④ 确认（DialogCommonSmall 两键版，右键 = 确认）
-        val r3 = AgentApi.pressNode("^TwoButtonRight$", "dialog")
+        val r3 = pressStep("^TwoButtonRight$", "dialog")
         if (r3?.optBoolean("ok") != true) {
             AppState.addLog("游戏内重启：确认键直调没成（${r3?.optString("err") ?: "无响应"}）")
             return false
@@ -116,6 +117,9 @@ object InGameRestart {
             AppState.addLog("游戏内重启：确认后 ${TITLE_WAIT_MS / 1000}s 内转场没启动（现在 ${Navigator.viewLabel(AgentApi.viewId())}）")
             return false
         }
+        // ⑥ ★进程没动 ⇒ agent 侧的实例/TTL 缓存（上一局的 dialog / LTD 指针）全部失效 —— 清一遍。
+        //   重注入路径 agent 全新无缓存，这里补齐对齐；回标题后 UI 整个重建，旧指针本来也没用了。
+        runCatching { AgentApi.labResetCaches() }
         AppState.addLog("游戏内重启 → 回标题转场已启动（${(android.os.SystemClock.elapsedRealtime() - t0) / 1000}s，进程没动）")
         return true
     }
@@ -139,5 +143,174 @@ object InGameRestart {
             delay(300)
         }
         return false
+    }
+
+    /** 点返回后等到黎明界 top 的上限（转场几秒，留余量） */
+    private const val TOP_WAIT_MS = 12_000L
+
+    /**
+     * ★直调一步，带**投递超时重试**（2026-11-23 实测 0.7.21 首轮：10 次开局里 4 次
+     * "投递超时：游戏线程 4000ms 内没执行"→ 直接回退杀进程冷启动）。
+     *
+     * 根因：每局开始注入会话全拆重建（`自动黎明界结束 → 停止注入 → 进入自动黎明界 → 重注入同一个 pid`），
+     * 回标题链恰好顶着"agent 刚回连、游戏主线程还在忙 frida 脚本加载"的窗口投递 —— 4s 太紧。
+     * ⇒ 超时放宽到 10s + 投递超时再重试一次（等 3s 让游戏线程喘口气）；
+     *   节点真找不到这类失败不重试（回退语义不变）。
+     */
+    private suspend fun pressStep(nameRe: String, root: String? = null): JSONObject? {
+        var last: JSONObject? = null
+        repeat(2) { i ->
+            if (i > 0) {
+                AppState.addLog("游戏内重启：${nameRe.removeSurrounding("^", "$")} 投递超时 → 3s 后重试")
+                delay(3_000)
+            }
+            last = AgentApi.pressNode(nameRe, root, probe = false, timeoutMs = 10_000L)
+            if (last?.optBoolean("ok") == true) return last
+            if (last?.optString("err")?.contains("投递超时") != true) return last
+        }
+        return last
+    }
+
+    /** 现场收敛循环的轮数上限（编组页→预览页→地图→259，每层一步，留足余量） */
+    private const val CONVERGE_ROUNDS = 10
+
+    /**
+     * ★接口刷「撤退重跑」的游戏内路径（2026-11-23 用户定稿+实机验证）：把客户端从迷宫内**带回黎明界
+     * top(259)**，进程全程不动。失败页/预览页/裸地图都走**真撤退**（HUD 撤退链/失败页链，
+     * 服务器局当场作废）；只有迷宫子菜单走返回键（旧局由下一局 reroll 开局 `top()+retire` 清）。
+     *
+     * 撤退触发点不止地图一种，按现场分派（全部直调、不用坐标 tap）：
+     *  · **战斗失败页**（FAIL_3_TIMES，`handleQuestFailed` 触发时正停在 DialogQuestFailed）→
+     *    [retreatFromFailPageDirect]：「结束」→「撤退（无报酬）」→ 二重确认 → 259（2026-11-23 实测闭环）；
+     *  · **编组页**（NO_PLAN，连续算不出队伍）→ `labPartyBtn("cancel")` 丢弃 → 回预览页
+     *    （2026-11-23 实测：onClickCancel 直调有效，落 264+预览页）；
+     *  · **战斗预览页 / 裸地图**（DialogQuestDetail / 264）→ [retreatViaHud]。
+     *    ★头部返回 `btn_back` 关不掉预览页（实测：onHeaderBackKey 执行了 ex=0x0 但盖层不动）；
+     *    裸地图也统一走 HUD 撤退（同一个按钮、同一串调用，2026-11-23 用户拍板）——
+     *    真撤退当场作废服务器局，不再依赖"下一局 reroll 顺带清"；
+     *  · **迷宫子菜单**（260~263/265，HUD 不在）→ `btn_back` 回 259，旧局由下一局 reroll 的 API 清；
+     *  · 顶层是别的通用弹窗（DialogCommon*）→ 认不出，不猜，回退。
+     *
+     * 预览页/编组页现场的撤退走 **HUD 撤退按钮**（[retreatViaHud]）：`LabyrinthRetireButton`
+     * （PartsLabyrinthMapInformation.onClickRetireButton）在盖层下也是激活的，两键确认一次
+     * （右键）直接落 259 —— 2026-11-23 在预览页开着时实测闭环。
+     *
+     * @return true = 已回 259（页面已收敛，可继续游戏内重启链/等 reroll）；false = 调用方回退杀进程路径
+     */
+    suspend fun backToTopFromMaze(): Boolean {
+        repeat(CONVERGE_ROUNDS) { round ->
+            val vid = AgentApi.viewId()
+            if (vid == 259) {
+                AppState.addLog("撤退（游戏内）：已回黎明界 top（进程没动${if (round == 0) "" else "，收敛 $round 步"}）")
+                return true
+            }
+            val top = AgentApi.uiSig()?.optString("top").orEmpty().removeSuffix("(Clone)")
+            when {
+                top.startsWith("DialogQuestFailed") -> {
+                    if (!retreatFromFailPageDirect()) return false
+                }
+                top.startsWith("DialogCommonPartyEdit") -> {
+                    val r = AgentApi.labPartyBtn("cancel")
+                    if (r?.optBoolean("ok") != true) {
+                        AppState.addLog("撤退（游戏内）：编组页「取消」直调没成（${r?.optString("err") ?: "无响应"}）→ 回退")
+                        return false
+                    }
+                }
+                top.startsWith("DialogQuestDetail") -> {
+                    if (!retreatViaHud()) return false
+                }
+                top.startsWith("DialogCommon") -> {
+                    AppState.addLog("撤退（游戏内）：顶层是未识别的通用弹窗（$top）→ 不猜，回退")
+                    return false
+                }
+                vid == 264 -> {
+                    // 裸地图：HUD 撤退（与预览页同一条链、同一个按钮，真撤退）
+                    if (!retreatViaHud()) return false
+                }
+                vid in 260..265 -> {
+                    val r = pressStep("^btn_back$")
+                    if (r?.optBoolean("ok") != true) {
+                        AppState.addLog("撤退（游戏内）：迷宫页返回键直调没成（${r?.optString("err") ?: "无响应"}）→ 回退")
+                        return false
+                    }
+                }
+                else -> {
+                    AppState.addLog("撤退（游戏内）：现场认不出（${Navigator.viewLabel(vid)}/top=$top）→ 回退")
+                    return false
+                }
+            }
+            delay(800)      // 每收敛一层给转场一点时间，下一轮重新读现场
+        }
+        AppState.addLog("撤退（游戏内）：$CONVERGE_ROUNDS 轮没收敛到 259（现在 ${Navigator.viewLabel(AgentApi.viewId())}）→ 回退")
+        return false
+    }
+
+    /**
+     * HUD 撤退链（2026-11-23 实测，全程 EventDelegate.Execute ok/ex=0x0）：
+     * `LabyrinthRetireButton`（PartsLabyrinthMapInformation.onClickRetireButton，盖层下也激活）
+     * → 两键确认窗「确认」（`TwoButtonRight`，只有一层）→ 259。真撤退（无报酬作废服务器局）。
+     * 预览页与裸地图共用这条链（按钮是地图 HUD 自己的部件，现场一致，无需区分）。
+     */
+    private suspend fun retreatViaHud(): Boolean {
+        val r = pressStep("^LabyrinthRetireButton$")
+        if (r?.optBoolean("ok") != true) {
+            AppState.addLog("撤退（游戏内）：HUD「撤退」直调没成（${r?.optString("err") ?: "无响应"}）→ 回退")
+            return false
+        }
+        if (!waitTopDialog("DialogCommonSmall", STEP_WAIT_MS)) {
+            AppState.addLog("撤退（游戏内）：点了 HUD「撤退」但确认窗没弹出来 → 回退")
+            return false
+        }
+        val c = pressStep("^TwoButtonRight$", "dialog")
+        if (c?.optBoolean("ok") != true) {
+            AppState.addLog("撤退（游戏内）：撤退确认直调没成（${c?.optString("err") ?: "无响应"}）→ 回退")
+            return false
+        }
+        if (!waitViewIn(setOf(259), TOP_WAIT_MS)) {
+            AppState.addLog("撤退（游戏内）：HUD 撤退后 ${TOP_WAIT_MS / 1000}s 没回 259（现在 ${Navigator.viewLabel(AgentApi.viewId())}）→ 回退")
+            return false
+        }
+        return true
+    }
+
+    /**
+     * 战斗失败页的直调撤退链（2026-11-23 实测，全程 EventDelegate.Execute ok/ex=0x0）：
+     * 「结束」（`UIButton_UnitList` → DialogQuestFailed.onClickEndButton，节点名误导）
+     * → 三键确认窗「撤退（无报酬）」（`ThreeButtonCenter` → DialogCommonSmall.onClickCenterButton）
+     * → 二重确认「确认」（`TwoButtonRight` → onClickRightButton，4s 内出现才点）
+     * → 等 259。
+     */
+    private suspend fun retreatFromFailPageDirect(): Boolean {
+        val end = pressStep("^UIButton_UnitList$", "dialog")
+        if (end?.optBoolean("ok") != true) {
+            AppState.addLog("撤退（游戏内）：失败页「结束」直调没成（${end?.optString("err") ?: "无响应"}）→ 回退")
+            return false
+        }
+        if (!waitTopDialog("DialogCommonSmall", STEP_WAIT_MS)) {
+            AppState.addLog("撤退（游戏内）：点了「结束」但确认窗没弹出来 → 回退")
+            return false
+        }
+        val c = pressStep("^ThreeButtonCenter$", "dialog")
+        if (c?.optBoolean("ok") != true) {
+            AppState.addLog("撤退（游戏内）：「撤退（无报酬）」直调没成（${c?.optString("err") ?: "无响应"}）→ 回退")
+            return false
+        }
+        // 二重确认：4s 内弹出 DialogCommonSmall 就点右键；没弹（直接落 259）也无妨。只点一次。
+        val t0 = android.os.SystemClock.elapsedRealtime()
+        var confirmed = false
+        while (android.os.SystemClock.elapsedRealtime() - t0 < 4_000L && !confirmed) {
+            if (AgentApi.viewId() == 259) break
+            val sig = AgentApi.uiSig()
+            if (sig?.optString("top").orEmpty().startsWith("DialogCommonSmall")) {
+                pressStep("^TwoButtonRight$", "dialog")
+                confirmed = true
+            }
+            delay(300)
+        }
+        if (!waitViewIn(setOf(259), TOP_WAIT_MS)) {
+            AppState.addLog("撤退（游戏内）：失败页撤退后 ${TOP_WAIT_MS / 1000}s 没回 259（现在 ${Navigator.viewLabel(AgentApi.viewId())}）→ 回退")
+            return false
+        }
+        return true
     }
 }

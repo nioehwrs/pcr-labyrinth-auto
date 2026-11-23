@@ -339,7 +339,7 @@ private const val IL2CPP_MAP_STUCK_MS = 45_000L
         fun agentAliveFor(pid: Int): Boolean =
             pid > 0 && AgentBridge.connected.value && boundPid == pid && boundGen == GameProcess.kills
 
-        /** 开闸 / 关闸都过一遍：上一局的失败计数、pid 误读、残留标记一律不带进下一局。 */
+        /** 全量重置（重注入路径用）：连同 bound 信息一起清。 */
         fun resetLoopState() {
             lastPid = -1
             pidMisses = 0
@@ -360,6 +360,29 @@ private const val IL2CPP_MAP_STUCK_MS = 45_000L
             _readyGen.value = -1
         }
 
+        /**
+         * ★软重置（2026-11-23，用户："同一个 pid 没必要拆"）：只清上一局的**失败计数 / 自愈状态**，
+         * **保留 `lastPid` / `boundPid` / `boundGen`** —— 局间不杀进程后，同一个 pid 重拆重注入
+         * 纯属浪费（~2s），还会把回标题链的直调投进"agent 刚回连、游戏主线程忙"的窗口
+         * （实测 10 次开局 4 次"投递超时"→ 白白回退杀进程）。bound 信息是否真的可用由
+         * 开闸时的 reuse 检查决定（语义 = `agentAliveFor`：在线 + kill 代际没变）。
+         */
+        fun softResetLoopState() {
+            pidMisses = 0
+            launchTries = 0
+            injectFails = 0
+            injectCycles = 0
+            pidChangeTries = 0
+            agentLostSince = 0L
+            lastReinjectAt = 0L
+            reinjectN = 0
+            reinjectDead = false
+            forceLaunch = false
+            stalePid = -1
+            saidPidOdd = 0
+            firstSeen.clear()
+        }
+
         while (true) {
             // ★注入只服务于「自动黎明界」：总闸关着就**待命** —— 不调起游戏、不注入、不自愈、不读页。
             //   这样"助手开着"也绝不碰游戏进程（用户 2026-10-16 要求：关着时没必要注入）。
@@ -368,7 +391,8 @@ private const val IL2CPP_MAP_STUCK_MS = 45_000L
                     wasRecover = false
                     serverReady = false
                     abiBlocked = false               // 下次进城重新给一次机会（用户可能换了包 / 给了 root）
-                    resetLoopState()
+                    // ★软重置：保留 bound 信息 —— 关闸期间游戏没死的话，开闸直接沿用现有注入。
+                    softResetLoopState()
                     stage = "待命（未跑迷宫）"
                     AppState.addLog("自动黎明界结束 → 停止注入/自愈，之后不再碰游戏进程（待命）")
                 }
@@ -380,9 +404,21 @@ private const val IL2CPP_MAP_STUCK_MS = 45_000L
                 wasRecover = true
                 abiChecked = false               // 新一轮进城 → 重新确认一次游戏架构
                 abiBlocked = false
-                resetLoopState()
-                stage = "接管中"
-                AppState.addLog("进入自动黎明界 → 接管游戏进程（调起 → 等就绪 → 注入；崩溃/卡死自愈）")
+                // ★沿用检查（2026-11-23，用户："同一个 pid 没必要拆"）：上一局进程没被 kill
+                //   （代际没变）、agent 还在线 ⇒ 完整沿用现有注入，只清失败计数。
+                //   任何一条不满足（杀过进程 / agent 掉了）⇒ 全量重置走重注入，行为同旧版。
+                val reusePid = boundPid
+                val canReuse = reusePid > 0 && boundGen == GameProcess.kills && AgentBridge.connected.value
+                if (canReuse) {
+                    softResetLoopState()
+                    lastPid = reusePid           // 本拍 pid == lastPid ⇒ 跳过"等映射 / 重注入"
+                    stage = "沿用现有注入（pid=$reusePid）"
+                    AppState.addLog("上一局进程没动（pid=$reusePid）且 agent 在线 → 沿用现有注入，不重拆重注")
+                } else {
+                    resetLoopState()
+                    stage = "接管中"
+                    AppState.addLog("进入自动黎明界 → 接管游戏进程（调起 → 等就绪 → 注入；崩溃/卡死自愈）")
+                }
             }
 
             // ★窗口内不再"整体停摆"：serverReady / 架构闸门 / 等就绪 / 注入都照常做，
