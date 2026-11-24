@@ -1608,12 +1608,16 @@ private fun LogicRuleRow(
                     onEdit(rule.copy(b = null))
                 }
             },
-            modifier = Modifier.size(22.dp),
+            modifier = Modifier
+                .size(22.dp)
+                .background(MaterialTheme.colorScheme.primaryContainer, CircleShape)
+                .border(1.dp, MaterialTheme.colorScheme.primary, CircleShape),
         ) {
             Icon(
                 if (rule.b == null) Icons.Filled.Add else Icons.Filled.Remove,
                 contentDescription = if (rule.b == null) "加第二个条件" else "去掉第二个条件",
-                modifier = Modifier.size(13.dp),
+                modifier = Modifier.size(14.dp),
+                tint = MaterialTheme.colorScheme.primary,
             )
         }
         if (rule.b != null) {
@@ -1720,9 +1724,7 @@ private fun LogicAtomRow(
                 tinyEnumDropdown(
                     items = listOf(true, false),
                     selected = atom.v is LogicRule.Variable.Tok,
-                    label = { isTok ->
-                        if (isTok) LogicRule.tokenName((atom.v as? LogicRule.Variable.Tok)?.i ?: 0) else "当前层数"
-                    },
+                    label = { isTok -> if (isTok) "变量" else "当前层数" },
                     onPick = { isTok ->
                         val nv = if (isTok) LogicRule.Variable.Tok((atom.v as? LogicRule.Variable.Tok)?.i ?: 0)
                         else LogicRule.Variable.Area
