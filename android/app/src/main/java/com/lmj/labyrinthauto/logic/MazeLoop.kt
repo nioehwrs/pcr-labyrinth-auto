@@ -99,6 +99,11 @@ object MazeLoop {
      *  ★2026-11-14（用户）：2 → 4 —— 点空/点早再点一次是安全动作，别卡在同一坐标上干等。 */
     private const val REL_TAP_MAX = 4
 
+    /** ★同一节点两级直调后的跨轮去重窗口（2026-11-24 用户）：偶发通信失败时**游戏自己约 20s 后重试**，
+     *  我们的 4s 期望超时重投正好插在中间 ⇒ 同一移动请求投 2~3 次 ⇒ 205 回标题（candy boy 7h 反馈）。
+     *  60s 覆盖游戏自重试且有兜底（真丢了 60s 后放行重投一次），不在窗口内因"期望页没出现"重投。 */
+    private const val MOVE_REPOST_GUARD_MS = 60_000L
+
     /** PC 版 `MAZE_DIALOG_CONFIRM`(324)：通用弹窗"确定/关闭"白名单（按顺序找，命中即点；认不出不猜） */
     private val DIALOG_CONFIRM = listOf(
         "OneButtonWhite", "OneButtonBlue", "TwoButtonRight",
@@ -421,6 +426,7 @@ object MazeLoop {
         switchArmed = false                          // 切屏保护每局重新按阶段开启（见字段注释）
         evSnapId = null                              // 事件效果快照（跨局必须清，见 [settleEventDiff]）
         relicChoiceTries.clear()
+        movePostedAt.clear()                    // ★跨局清空：节点编号复用（下一局又到 10101），60s 去重不能跨局
         partyScroll.clear()                     // 编队页"滚动找缺员"的每页状态（本局重来）
         partyScrollNodeKey = null               // ★2026-11-15：换局 ⇒ 滑动方向/减速状态从头算
         partyTeams.clear()                      // 多分队：本进程已确认过的各队
@@ -587,6 +593,7 @@ object MazeLoop {
                 idle = 0
                 tries.clear()
                 pageRounds.clear()
+                movePostedAt.clear()            // 重连/自愈后旧进程的移动请求已作废，去重台账跟着清
                 resetBattleTimers()
                 AppState.addLog("[✓] 已重连并回到迷宫 → 继续跑本局")
                 continue
@@ -722,6 +729,7 @@ object MazeLoop {
                     idle = 0
                     tries.clear()
                     pageRounds.clear()
+                    movePostedAt.clear()        // 自愈新进程：旧请求全部作废
                     resetBattleTimers()
                     if (!recoverAfterRestart(input)) {
                         AppState.addLog("[✗] 自愈重启后没能回到迷宫 → 停手")
@@ -2434,7 +2442,7 @@ object MazeLoop {
 
     // ── 跨轮的"点击节流"记录（PC `_NODE_SAID_AT`，按节点记、**不清**）──
     //   ★2026-11-20：`nodeTapAt/nodeTapN` 已删（重复投递改由状态判据接管，见 [handleMove] 文档）。
-    private val nodeSaidAt = HashMap<Int, Long>()
+    private val movePostedAt = HashMap<Int, Long>()   // 同一节点两级直调的投递时间（跨轮去重，见 MOVE_REPOST_GUARD_MS）
 
 
     /** PC `drag_count`(5966)：本节点已拖动次数（**换页清零**，见 maze_loop 6013） */
@@ -5424,6 +5432,16 @@ object MazeLoop {
             //     · [awaitLeaveNode]：点完等 `blockId/statusType` 变化（expect），没变就是被吞。
             //   而且 `awaitMoveConfirm`+`awaitLeaveNode` 是**同步阻塞**的，主循环不会在中间插入决策，
             //   重复投递的间隔天然由它们保证（约 3.8s），不需要额外时间窗。
+            // ★★2026-11-24（candy boy 205 反馈根因）——跨轮去重：同一节点的两级直调（节点+确认）投过
+            //   就记时间，窗口内**只等不重投**（"确认框已关=请求已生效"的判据见 TapCheck 的 left）；
+            //   原 nodeSaidAt 全仓只写不读，注释里的"30s 内只重点一次"从未生效 ⇒ 4s 期望超时后主循环
+            //   连投 3 次同一移动请求（01:41:54/59/01:42:04）⇒ 第二次起 205 失去目标 ⇒ 回标题 7h。
+            //   ★不清 nodeSaidAt：它本来就是死字段，这里改名成真正生效的 movePostedAt。
+            if (nowE - (movePostedAt[nk] ?: 0L) < MOVE_REPOST_GUARD_MS) {
+                OverlayStatus.setState("等待节点$nk 响应")
+                return true
+            }
+            movePostedAt[nk] = nowE
             val bt = (t.opt("blockType") as? Number)?.toInt()
             val what = "前进到节点$nk[${Route.LAB_BLOCK_TYPE[bt] ?: Py.str(bt)}]$rt"
             OverlayStatus.setState("前往节点$nk")      // ★悬浮窗（细于 overlayTick 的默认描述）
@@ -5446,7 +5464,6 @@ object MazeLoop {
                 "[移动] 投递 目标=$nk（出发=$curB，期望页面=" +
                     (if (targetPages.isEmpty()) "任意" else targetPages.joinToString("/")) + "）",
             )
-            nodeSaidAt[nk] = now                                         // 同一节点 30s 内只"重点"一次（PC 6425）
             val nkx = t.optInt("x")
             val nky = t.optInt("y")
             // ① 点节点：直调优先（失败才退坐标），**expect = 确认框**
