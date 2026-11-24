@@ -77,6 +77,13 @@ object FridaInjector {
     private const val IL2CPP_READY_TIMEOUT_MS = 30_000L
 
     /**
+     * ★2026-11-24（雷电连崩 3 次反馈）：状态闸门（so r-xp + global-metadata + 前台）全满足后
+     * **再静置 2s** 才 attach —— 避开 il2cpp_init 刚完成、引擎还在跑初始化最脆弱的窗口。
+     * 与旧版"从游戏打开瞬间算 6s"的区别：那是猜时间（好设备白等/慢设备不够），这是状态到位才等。
+     */
+    private const val INJECT_SETTLE_MS = 2_000L
+
+    /**
      * ★2026-11-12：注入前最多等这么久「前台变成游戏」。
      *   启动时会先弹 `com.android.permissioncontroller`（权限页）抢前台，游戏在后台时注入容易把游戏带走。
      *   这是**状态判定**（前台包名），不是固定 sleep；等到就立刻注入。
@@ -847,15 +854,28 @@ private const val IL2CPP_MAP_STUCK_MS = 45_000L
             //   ② 再等**前台真的变成游戏**（权限页/系统页会抢前台，后台启动时注入容易把游戏带走）。
             //   两个状态都满足就立刻注入，不再固定 sleep。
             val pkg = runCatching { GameProcess.pkg() }.getOrNull().orEmpty()
+            var fgOk = false
             if (pkg.isNotEmpty()) {
-                val fgOk = waitFrontGame(pkg, FRONT_WAIT_BEFORE_INJECT_MS)
-                AppState.addLog(
-                    "$KEY_SO 已映射（游戏起了 ${ms / 1000}s）+ 前台${if (fgOk) "=游戏" else "仍不是游戏（照常注入）"}" +
-                        " → 立即注入（il2cpp 就绪由 agent 自己等）",
-                )
-            } else {
-                AppState.addLog("$KEY_SO 已映射（游戏起了 ${ms / 1000}s）→ 立即注入（就绪由 agent 自己等）")
+                fgOk = waitFrontGame(pkg, FRONT_WAIT_BEFORE_INJECT_MS)
             }
+            // ★★2026-11-24（雷电连崩 3 次反馈）：状态判据全满足后**再静置 2s**才注入 ——
+            //   映射/前台只是"初始化基本就位"，引擎最初 2~3s 仍是最脆弱窗口（11-24 雷电三次
+            //   都在"起了 3s → 立即注入"时进程直接 died: fore TOP；旧做法"从打开瞬间算 6s"
+            //   被用户否掉：死板、好设备白等）。这里保留状态判据、只在它刚满足时加 2s 缓冲。
+            delay(INJECT_SETTLE_MS)
+            // 静置期间崩了 ⇒ 别再 attach（那正是 "Unable to write to process memory: No such process"）
+            // verifyMainPid：null=pidof 超时不确定（别误判成死）；false=真没了；true=还在。
+            val alive = if (pkg.isNotEmpty()) verifyMainPid(pid, pkg) else fastPid(pkg) == pid
+            if (alive == false) {
+                val why = "注入静置 ${INJECT_SETTLE_MS}ms 期间游戏进程 $pid 退出（r-xp/前台刚就绪就崩）"
+                AppState.addLog(why)
+                AppState.setFridaStatus(why.take(60))
+                return why
+            }
+            AppState.addLog(
+                "$KEY_SO 已映射（游戏起了 ${ms / 1000}s）+ 前台${if (pkg.isEmpty()) "?" else if (fgOk) "=游戏" else "仍不是游戏（照常注入）"}" +
+                    " → 静置 ${INJECT_SETTLE_MS / 1000}s 后注入（il2cpp 就绪由 agent 自己等）",
+            )
             return null
         }
         val age = SystemClock.elapsedRealtime() - startedAt
@@ -987,7 +1007,7 @@ private const val IL2CPP_MAP_STUCK_MS = 45_000L
                     if (md.out.contains("global-metadata.dat")) {
                         AppState.addLog(
                             "…$KEY_SO 已映射 + global-metadata 已加载" +
-                                "（+${SystemClock.elapsedRealtime() - md0}ms）→ 注入",
+                                "（+${SystemClock.elapsedRealtime() - md0}ms）→ 可注入状态（静置 ${INJECT_SETTLE_MS / 1000}s 后 attach）",
                         )
                         return null
                     }
