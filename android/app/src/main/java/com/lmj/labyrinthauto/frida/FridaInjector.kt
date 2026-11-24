@@ -78,12 +78,12 @@ object FridaInjector {
 
     /**
      * ★2026-11-24（雷电连崩反馈）：状态闸门（so r-xp + global-metadata + 前台）全满足后
-     * **再静置 4s** 才 attach —— 避开 il2cpp_init 刚完成、引擎还在跑初始化最脆弱的窗口。
-     * 从 2s 调到 4s：实测 2s 仍崩的那次 metadata 只用了 206ms 就出现（引擎初始化刚起步），
-     * 而成功的那次 metadata 用了 2441ms（自然多等了 2.2s）—— "快就绪"反而是危险信号。
+     * **再静置 2s** 才 attach —— 避开 il2cpp_init 刚完成、引擎还在跑初始化最脆弱的窗口。
+     * ★曾试过 4s：根因后来定位为「助手自己把活着的游戏杀了再重开」（见 InGameRestart.returnToTitle
+     *   ⓪前置），不是注入窗口太短 —— 4s 只是徒增每局启动时间，已回退到 2s 保留小缓冲。
      * 与旧版"从游戏打开瞬间算 6s"的区别：那是猜时间，这是状态到位才等，好设备也不白等太多。
      */
-    private const val INJECT_SETTLE_MS = 4_000L
+    private const val INJECT_SETTLE_MS = 2_000L
 
     /**
      * ★2026-11-12：注入前最多等这么久「前台变成游戏」。

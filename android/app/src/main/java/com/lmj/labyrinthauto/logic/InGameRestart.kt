@@ -57,6 +57,15 @@ object InGameRestart {
     suspend fun returnToTitle(ctx: Context): Boolean {
         val t0 = android.os.SystemClock.elapsedRealtime()
 
+        // ⓪前置（2026-11-24 雷电"看到进游戏了又被杀"）：先探一次 agent ——
+        //   agent 读不到页面（-1）= 进程没在跑 / 刚 am start 还没注入 ⇒ 此刻根本没有 UI 链可走。
+        //   旧代码在这里还先 am start 把游戏带起来、再读 -1 判失败 ⇒ 上层杀进程 ⇒ 再 am start，
+        //   用户就看到"游戏起来了又被杀、然后重新黑屏"。直接返回 false 让上层一步到位冷启动。
+        if (AgentApi.viewId() < 0) {
+            AppState.addLog("游戏内重启：agent 读不到页面（没连/进程不在）→ 不调起、直接回退冷启动")
+            return false
+        }
+
         // ⓪ 游戏必须在前台（上一局正常退出后助手会被带回前台）：am start 幂等 ——
         //   进程活着就只是把窗口顶上来，**不会**重启进程、不触发资产重载。
         val pkg = GameProcess.pkg()
@@ -75,8 +84,15 @@ object InGameRestart {
             }
         }
 
-        // ① 入口页：必须看得到导航条（agent 没连上时 viewId 会回 -1，同样在这里拦住）
+        // ① 入口页：必须看得到导航条（agent 没连上时 viewId 会回 -1，已在 ⓪前置拦住）
         val vid = AgentApi.viewId()
+        // ★已经在 SPLASH(1)/TITLE(2)（上次回标题的转场还没走完、或刚冷启动停在标题页）
+        //   ⇒ 目标已达，**直接返回成功**，不再杀进程重开（2026-11-24 省一轮黑屏，总时间更短）。
+        //   上层拿到 true 会跳过 kill/launch，直接 reroll + Navigator 点屏幕登录，语义正确。
+        if (vid == VIEW_SPLASH || vid == VIEW_TITLE) {
+            AppState.addLog("游戏内重启：已在 ${Navigator.viewLabel(vid)}（标题页/转场中）→ 无需回标题，直接继续")
+            return true
+        }
         if (vid !in FOOTER_VIEWS) {
             AppState.addLog("游戏内重启：当前页 ${Navigator.viewLabel(vid)} 看不到导航条 → 走不了 UI 链")
             return false
