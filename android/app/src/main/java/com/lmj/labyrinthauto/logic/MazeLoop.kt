@@ -8111,7 +8111,12 @@ object MazeLoop {
 
     /** PC `handle_battle_node` 的失败页分支（3771~3801）：点底部右那颗「重新挑战」并记账（≤3 次）。 */
     private suspend fun handleQuestFailed(input: InputBackend, st: JSONObject) {
-        val (win, fail) = battleResultBtns(wide = true, deep = true)
+        // ★2026-11-24：失败页探测阶段**只走固定路径轻读**（noScan），不做 d~h 子树扫描 ——
+        //   扫描是 1.5~8s 的重活，会堵住 agent 单通道 ⇒ viewId 等轻调用连续超时 ⇒ 被误判"agent 掉线"
+        //   ⇒ 原地重注入 ⇒ 恢复逻辑不认识战斗中间态 ⇒ 卡死（0.7.24 用户反馈实测链）。
+        //   按钮还没落位时轻读会返回 null，这一拍不点、下一拍再读即可；树遍历兜底仍保留在
+        //   battleResultBtns 里（读得到就不会走到），不影响"固定路径失效"时的兜底。
+        val (win, fail) = battleResultBtns(wide = true, deep = true, pathNoScan = true)
         // ★失败页也抓一次（与胜利页共用"一局一次"的标志）：这是同一段链路的另一条分支，
         //   而且失败页的按钮名/位置与胜利页不同，正需要对上偏移。
         //   ★只在 [AUTO_RESULT_DUMP] 打开时才抓（默认关，见那里的说明）。
@@ -9073,7 +9078,13 @@ object MazeLoop {
      * 「挑战/Retry」= 失败页「重新挑战」；「下一步/次へ」= 胜利页「下一步」。
      * 查询顺序 **最上层对话框 → 战斗画布 → 整棵树**（整棵树只在 deep 时查），只看 y ≥ 85% 屏高的"底部带"。
      */
-    private suspend fun battleResultBtns(wide: Boolean, deep: Boolean): Pair<JSONObject?, JSONObject?> {
+    private suspend fun battleResultBtns(
+        wide: Boolean,
+        deep: Boolean,
+        /** ★2026-11-24：true = 固定路径探测也走 noScan 轻读（失败页探测阶段用，避免重活堵通道）。
+         *  默认 false 保持 2b 全套兜底的原行为（那里本就该扫描找按钮）。 */
+        pathNoScan: Boolean = false,
+    ): Pair<JSONObject?, JSONObject?> {
         val bot = (scrH * 0.85).toInt()
         // ★★**第一优先：固定层级路径**（[battleResultPick] → [battleResultPathPick]，实测 4~16ms）。
         //   2026-11-18 四类结算页全命中后已删掉原缓存/字段读两档，只剩这一条快路径。
@@ -9085,11 +9096,18 @@ object MazeLoop {
         val readT0 = SystemClock.elapsedRealtime()
         for (i in 0 until RESULT_READ_TRIES) {
             // ★★2026-11-18：与点前现读**同一条链路**（[battleResultPick]）——检测与点击必须一致。
-            battleResultPick(bot)?.let { return it }
+            // ★2026-11-24：pathNoScan 时把 allowScan 关掉（= agent noScan），只走固定路径、不扫子树。
+            battleResultPick(bot, allowScan = !pathNoScan)?.let { return it }
             if (i == RESULT_READ_TRIES - 1) break
             if (SystemClock.elapsedRealtime() - readT0 >= RESULT_READ_BUDGET_MS) break
             delay(RESULT_READ_GAP_MS)
         }
+        // ★2026-11-24：noScan 轻读阶段**固定路径全灭就直接返回 (null,null)**，不往下走诊断+树遍历 ——
+        //   那两步（battleResultMem 字段读 / findTextIn 树遍历）都是 1.5~4s 重活，同样会堵 agent
+        //   单通道 ⇒ 假掉线（日志 12:24:21 findTextIn 4.4s 那次就是它）。按钮还没落位时
+        //   "这一拍读不到、下一拍再读"即可；真要兜底由 battleTick 的 2b 全套扫描（有占空比闸门+heavyUntil
+        //   让路保护）负责，不在失败页探测这条无保护链路里做。
+        if (pathNoScan) return null to null
         // ★2026-11-19（用户）：固定路径全灭 ⇒ 打一次**字段读诊断**（只读，不改判定）：
         //   把每个 CustomUIButton 的「层级路径 + 配对标签 + 坐标」列出来，
         //   用于取证"失败页显示【下一步】"这类路径未知的形态（同一顶框只打一次）。
@@ -9600,58 +9618,78 @@ object MazeLoop {
     }
 
     /**
-     * 卡死自愈②：杀进程后，等游戏被 [FridaInjector] 拉起来 + agent 回连，再确保回到迷宫内。
+     * agent 重连 / 杀进程后，确保回到迷宫能继续跑状态机。
      *
-     * 重启后游戏可能 ①直接续在迷宫里（最多情况：黎明界进度在服务器），也可能 ②停在首页/黎明界 top
-     * ——② 就照服务那边同一套走一遍「黎明界 top → 出发」（[Navigator.enterMaze] 只在"挑战中"才点出发，
-     * 所以在 259 上会 resume 这一局，不会新开）。
+     * ★2026-11-24（0.7.24 卡死复盘）：**不再用 viewId 猜"在不在迷宫"**——`BATTLE(29)+DialogQuestFailed`
+     *   这类战斗中间态也是迷宫流程的一部分，旧代码用 viewId 判成"不在迷宫" ⇒ 走 `goToLabyrinthTop` ⇒
+     *   那套导航不认识战斗中间态 ⇒ 25s 无推进再杀进程停手 ✗。现在：
+     *   - 唯一"能续跑"判据 = **`labStatus` 读得到**（迷宫状态机活着；战斗/结算页照样可读）；
+     *   - 读不到才收敛到**安全起点**：SPLASH/TITLE/HOME(1/2/5，导航本就认识) 直接走标准导航；
+     *     其余中间态一律杀进程冷启动，放弃当前局保住整轮。
+     *   ⇒ 只认识"一个安全起点"，不再需要认识每个页面。
      *
      * @return true = 已经回到迷宫、可以继续跑状态机；false = 超时/导航失败（调用方停手）
      */
     private suspend fun recoverAfterRestart(input: InputBackend, tag: String = "自愈"): Boolean {
-        AppState.addLog("$tag：等游戏在前台 + agent 回连…")
-        val pid0 = FridaInjector.gamePid()          // ★换代判据基线：进函数时的游戏 pid（可能已是 -1=刚杀）
-        val t0 = SystemClock.elapsedRealtime()
-        while (SystemClock.elapsedRealtime() - t0 < STUCK_BACK_MS) {
-            if (Foreground.isGameForeground(GameProcess.pkg()) && AgentBridge.connected.value) break
-            delay(1_000)
-        }
-        if (!Foreground.isGameForeground(GameProcess.pkg()) || !AgentBridge.connected.value) {
+        suspend fun waitFrontAndAgent(): Boolean {
+            val t = SystemClock.elapsedRealtime()
+            while (SystemClock.elapsedRealtime() - t < STUCK_BACK_MS) {
+                if (Foreground.isGameForeground(GameProcess.pkg()) && AgentBridge.connected.value) return true
+                delay(1_000)
+            }
             AppState.addLog("$tag：${STUCK_BACK_MS / 1000}s 内游戏/agent 没回来")
             return false
         }
-        // ★"读不到"≠"不在迷宫"（2026-10-17 实机）：刚重注入那一下 `currentViewId()` 常返回 -1/0，
-        //   老代码据此判"不在迷宫" ⇒ 去走「黎明界 top」；而实际就停在 **264 地图**上 ⇒ 导航把 264 当
-        //   未知页面白等 16 轮 ⇒ 停手，**本局直接废掉** ✗（日志 12:10:55）。
-        //   现在先重读几秒；仍读不到就当"仍在迷宫"——真正的判据是下面 `labStatus` 读不读得到 ✓
-        //   ★2026-11-23 修正（16:17 实测整轮被废）：这条宽限**只适用于进程没换**的纯重注入。
-        //     杀进程重开后游戏必然回 SPLASH/TITLE（B 服要点一下屏幕 SDK 才登录），此时"读不到"
-        //     恰恰说明在标题页 —— 也判"仍在迷宫"就会跳过导航、停在标题页干等 60s 停手 ✗。
-        var vid = -1
+
+        AppState.addLog("$tag：等游戏在前台 + agent 回连…")
+        if (!waitFrontAndAgent()) return false
+
+        // ★唯一续跑判据：迷宫状态读得到 = 迷宫流程还活着（含战斗/结算页，它们都是迷宫的一部分）。
+        //   用 labStatusLite（主循环分派读同款，~几 ms）——只要 LTD 在就非 null；比 labStatus 轻，
+        //   别在刚重连的脆弱窗口再塞一个 150~300ms 的重读。给 6s 宽限覆盖"UI 还没建好"。
         val tv0 = SystemClock.elapsedRealtime()
+        var labOk = false
         while (SystemClock.elapsedRealtime() - tv0 < 6_000L) {
+            if (AgentApi.labStatusLite() != null) { labOk = true; break }
+            delay(300)
+        }
+        if (labOk) {
+            AppState.addLog("$tag：迷宫状态可读 → 不猜页面，直接续跑当前局")
+            resetFrameWatch()               // agent 重连/new 进程 ⇒ 帧基线从头建立（旧基线会误判卡死）
+            return true
+        }
+
+        // labStatus 读不到 = 不在迷宫流程里。只认 SPLASH/TITLE/HOME(1/2/5) 这一个安全起点；
+        //   viewId 刚重连常短暂读不到（-1/0），给 3s 宽限；仍读不到就当非中间态、直接走导航
+        //   （战斗页 labStatus 可读，上一步已排除 ⇒ 这里读不到不可能是卡在战斗中间态）。
+        var vid = -1
+        val vv0 = SystemClock.elapsedRealtime()
+        while (SystemClock.elapsedRealtime() - vv0 < 3_000L) {
             vid = Navigator.currentViewId()
             if (vid > 0) break
             delay(300)
         }
-        val procRestarted = run {
-            val pidNew = FridaInjector.gamePid()
-            pid0 <= 0 || pidNew <= 0 || pidNew != pid0
+        val isSafeStart = vid <= 0 || vid == 1 || vid == 2 || vid == 5
+        if (!isSafeStart && FridaInjector.autoRecover) {
+            AppState.addLog(
+                "$tag：迷宫状态读不到、当前 ${Navigator.viewLabel(vid)} 不是安全起点 → " +
+                    "杀进程冷启动（放弃当前局，保住整轮连续运行）",
+            )
+            GameProcess.kill()
+            TapCheck.clearDedupe()          // 旧进程的直调请求全部作废
+            if (!waitFrontAndAgent()) return false
+            vid = Navigator.currentViewId()
         }
-        val inMaze = if (vid > 0) Navigator.isLabyrinthView(vid) else !procRestarted
-        if (!inMaze) {
-            AppState.addLog("$tag：当前在 ${Navigator.viewLabel(vid)}（不在迷宫内）→ 重新走「${if (vid == 1 || vid == 2) "点屏幕登录 → " else ""}黎明界 top → 出发」")
-            if (!Navigator.goToLabyrinthTop(input)) return false
-            // NOT_CHALLENGING（到了 259 却没有进行中的开局）也在这里收手：Navigator 已提示「请检查当前登录账号」
-            if (Navigator.enterMaze(input) != Navigator.EnterResult.ENTERED) return false
-        } else {
-            AppState.addLog("$tag：已在迷宫内（${Navigator.viewLabel(vid)}）→ 不重新导航，直接继续")
-        }
-        // 等迷宫状态可读（`labStatus` 有内容 = 真的续上了，这时回主循环才安全）
+        // 从安全起点走标准导航回迷宫（goToLabyrinthTop 认识 1/2/5；冷启动后停 TITLE）。
+        AppState.addLog("$tag：从 ${Navigator.viewLabel(vid)} 走「黎明界 top → 出发」回迷宫")
+        if (!Navigator.goToLabyrinthTop(input)) return false
+        // NOT_CHALLENGING（到了 259 却没有进行中的开局）也在这里收手：Navigator 已提示「请检查当前登录账号」
+        if (Navigator.enterMaze(input) != Navigator.EnterResult.ENTERED) return false
+        // 等迷宫状态可读（真的续上了，这时回主循环才安全）
         val t1 = SystemClock.elapsedRealtime()
         while (SystemClock.elapsedRealtime() - t1 < 60_000L) {
-            if (AgentApi.labStatus() != null) {
-                resetFrameWatch()          // 换了新游戏进程 ⇒ 帧基线从头建立（否则拿旧基线会立刻误判）
+            if (AgentApi.labStatusLite() != null) {
+                resetFrameWatch()
                 return true
             }
             delay(1_000)
@@ -10526,6 +10564,15 @@ object MazeLoop {
             if (now - dlgMoveAt < MOVE_CONFIRM_ONCE_MS) return true
             if (hit.optString("name") == "TwoButtonRight") dlgMoveAt = now
         }
+        // ★直调回包的 `via` = 已经对按钮触发过 onClick（EventDelegate.Execute / component.OnClick）。
+        //   ★2026-11-24（老虎机收据窗卡死复盘）：**via 非空但 ok=false（Execute 抛异常）时，onClick 可能
+        //   已经在游戏侧生效**（同 cs126 事件卡"收到的选择但状态机被打断"）——这时再退坐标点一次就是
+        //   第二次真实提交（用户看到点击光效、弹两个窗）。⇒ 判据从 `ok==true` 放宽到"via 非空"：
+        //   已触发过 onClick 就当作本次已投递、等页面自己变；只有 via 为空（没找到节点/组件/Execute，
+        //   onClick 确实没执行）才退坐标兜底。
+        fun delivered(pr: JSONObject?): Boolean =
+            pr != null && !pr.optString("via").isNullOrEmpty()
+
         // ★★2026-11-20（用户："钓鱼结束收获用的还是 tap"）：结果/收获类单按钮弹窗**先直调**。
         //   `DialogCommonBig`(获得印记/道具/遗物) 和 `DialogCommonMiddle`(收到角色) 的 OneButtonWhite
         //   都有固定路径 ⇒ 直调不投坐标、不受入场动画与叠层影响。
@@ -10542,6 +10589,10 @@ object MazeLoop {
                     AppState.addLog("对话框「OneButtonWhite」（直调 $oneKey）")
                     return true
                 }
+                if (delivered(pr)) {
+                    AppState.addLog("对话框「OneButtonWhite」（直调 $oneKey 已触发、Execute 抛异常 → 不补坐标）")
+                    return true
+                }
             } else if (top.removeSuffix("(Clone)") == "DialogCommonSmall") {
                 // ★2026-11-20（探测实测）：Small 壳上的 OneButtonWhite（如公会「遗物效果结果」通知窗）
                 //   没有稳定的 canvas 固定路径 ⇒ 用名字直调（root=dialog 只走激活节点，
@@ -10551,6 +10602,10 @@ object MazeLoop {
                     AppState.addLog("对话框「OneButtonWhite」（直调 pressNode@Small）")
                     return true
                 }
+                if (delivered(pr)) {
+                    AppState.addLog("对话框「OneButtonWhite」（直调 pressNode@Small 已触发、Execute 抛异常 → 不补坐标）")
+                    return true
+                }
             }
         }
         // ★移动确认框也走直调（`MoveConfirm|TwoButtonRight`），失败才坐标点击
@@ -10558,6 +10613,10 @@ object MazeLoop {
             val pr = runCatching { AgentApi.labPathPress("MoveConfirm|TwoButtonRight") }.getOrNull()
             if (pr?.optBoolean("ok") == true) {
                 AppState.addLog("确认框：前往（直调）")
+                return true
+            }
+            if (delivered(pr)) {
+                AppState.addLog("确认框：前往（直调已触发、Execute 抛异常 → 不补坐标）")
                 return true
             }
         }
