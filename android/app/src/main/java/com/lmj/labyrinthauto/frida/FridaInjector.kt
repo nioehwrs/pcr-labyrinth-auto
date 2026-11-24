@@ -77,11 +77,13 @@ object FridaInjector {
     private const val IL2CPP_READY_TIMEOUT_MS = 30_000L
 
     /**
-     * ★2026-11-24（雷电连崩 3 次反馈）：状态闸门（so r-xp + global-metadata + 前台）全满足后
-     * **再静置 2s** 才 attach —— 避开 il2cpp_init 刚完成、引擎还在跑初始化最脆弱的窗口。
-     * 与旧版"从游戏打开瞬间算 6s"的区别：那是猜时间（好设备白等/慢设备不够），这是状态到位才等。
+     * ★2026-11-24（雷电连崩反馈）：状态闸门（so r-xp + global-metadata + 前台）全满足后
+     * **再静置 4s** 才 attach —— 避开 il2cpp_init 刚完成、引擎还在跑初始化最脆弱的窗口。
+     * 从 2s 调到 4s：实测 2s 仍崩的那次 metadata 只用了 206ms 就出现（引擎初始化刚起步），
+     * 而成功的那次 metadata 用了 2441ms（自然多等了 2.2s）—— "快就绪"反而是危险信号。
+     * 与旧版"从游戏打开瞬间算 6s"的区别：那是猜时间，这是状态到位才等，好设备也不白等太多。
      */
-    private const val INJECT_SETTLE_MS = 2_000L
+    private const val INJECT_SETTLE_MS = 4_000L
 
     /**
      * ★2026-11-12：注入前最多等这么久「前台变成游戏」。
@@ -858,7 +860,7 @@ private const val IL2CPP_MAP_STUCK_MS = 45_000L
             if (pkg.isNotEmpty()) {
                 fgOk = waitFrontGame(pkg, FRONT_WAIT_BEFORE_INJECT_MS)
             }
-            // ★★2026-11-24（雷电连崩 3 次反馈）：状态判据全满足后**再静置 2s**才注入 ——
+            // ★★2026-11-24（雷电连崩反馈）：状态判据全满足后**再静置 [INJECT_SETTLE_MS]**才注入 ——
             //   映射/前台只是"初始化基本就位"，引擎最初 2~3s 仍是最脆弱窗口（11-24 雷电三次
             //   都在"起了 3s → 立即注入"时进程直接 died: fore TOP；旧做法"从打开瞬间算 6s"
             //   被用户否掉：死板、好设备白等）。这里保留状态判据、只在它刚满足时加 2s 缓冲。
