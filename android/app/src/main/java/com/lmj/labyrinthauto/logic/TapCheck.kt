@@ -40,6 +40,16 @@ import kotlinx.coroutines.delay
  */
 object TapCheck {
 
+    /** ★跨轮持久去重表（2026-11-24）：`dedupeKey → 上次真正投递的时刻`（elapsedRealtime）。
+     *  60s 覆盖"游戏自重试约 20s"且留兜底；换局/自愈重连由 [clearDedupe] 清空。 */
+    private const val DEDUPE_HOLD_MS = 60_000L
+    private val dedupeAt = HashMap<String, Long>()
+
+    /** 换局 / 自愈重连 / agent 重连时清空（旧请求全部作废，别挡新局的同名请求） */
+    fun clearDedupe() {
+        synchronized(dedupeAt) { dedupeAt.clear() }
+    }
+
     /**
      * ★探测间隔挡位（2026-11-17 用户）：点完探"页面变没变"的间隔，默认 150ms。
      *  取值范围见 [com.lmj.labyrinthauto.reroll.RerollSettings.TAP_PROBE_STEPS]（150/200/250/300/350）。
@@ -147,12 +157,27 @@ object TapCheck {
          *   ⇒ 保持 1：只投一次、之后只探测（把 [retries] 当纯探测窗口用）。日志仍打出 `直调N轮` 供观察。
          */
         pressMax: Int = 1,
+        /**
+         * ★★**跨轮持久去重 key**（2026-11-24）：给了它，同一 key 在 [DEDUPE_HOLD_MS] 内**只投一次**，
+         * 外层跨轮重入连 `pressFn()` 都不调（直接 false）—— 补上 `pressMax` 只在单次 run() 内有效的洞。
+         * 用途：通信类直调（战斗开始/选人/遗物）第一次已提交、期望页迟到时，外层重入会重复提交 ⇒ 205。
+         * ⚠key 必须带"请求身份"（如 `selectRelic@<卡签名>`）；胜利结算两屏下一步用不同 key 区分。
+         */
+        dedupeKey: String? = null,
         /** ★直调是否走加速档（默认 true）。结算页（pressFn 内部直调失败会退坐标）传 false 保留
          *   慢节奏——否则 settle 30ms + probe 密会重现 2026-11-13 的「1.4s 连点 7 下 → lmkd 杀进程」。
          *   纯直调页（选人/编组/EX/商店/门票）无需管。 */
         directFast: Boolean = true,
         verbose: Boolean = true,
     ): Boolean {
+        if (dedupeKey != null) {
+            val now = android.os.SystemClock.elapsedRealtime()
+            val last = synchronized(dedupeAt) { dedupeAt[dedupeKey] ?: 0L }
+            if (now - last < DEDUPE_HOLD_MS) {
+                if (verbose) AppState.addLog("⤷ [去重] $what（$dedupeKey）${(now - last) / 1000}s 内已投过 → 本轮不再提交")
+                return false
+            }
+        }
         // ══ 2026-11-20 直调加速档（用户：直调无点穿风险，坐标时代的等待对它是纯浪费）══
         //   · skipFirstHits（首点前只读一拍等坐标落位）、effSettle（首探前等页面稳定）、
         //     probeMs×2（EX 防"点穿到动画中按钮"）——这些都是坐标点击的护栏，直调一概不需要。
@@ -208,6 +233,12 @@ object TapCheck {
                     attempt++
                     if (!fired) return false
                     directFired++
+                    // ★★只有 pressFn 真正投递成功（fired=true）才记去重时刻 ——
+                    //   上面 fired==null（页面在切/按钮没定位）的跳拍绝不能占住 key，
+                    //   否则外层重入会被 60s 去重挡死，本来没投出去却永远不让投。
+                    if (dedupeKey != null) {
+                        synchronized(dedupeAt) { dedupeAt[dedupeKey] = android.os.SystemClock.elapsedRealtime() }
+                    }
                 }
             } else {
                 if (xyAt != null) {

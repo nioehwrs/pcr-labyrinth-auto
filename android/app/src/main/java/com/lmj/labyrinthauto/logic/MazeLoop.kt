@@ -427,6 +427,7 @@ object MazeLoop {
         evSnapId = null                              // 事件效果快照（跨局必须清，见 [settleEventDiff]）
         relicChoiceTries.clear()
         movePostedAt.clear()                    // ★跨局清空：节点编号复用（下一局又到 10101），60s 去重不能跨局
+        TapCheck.clearDedupe()                  // ★跨局清空通信直调去重表（同 key 不能挡下一局）
         partyScroll.clear()                     // 编队页"滚动找缺员"的每页状态（本局重来）
         partyScrollNodeKey = null               // ★2026-11-15：换局 ⇒ 滑动方向/减速状态从头算
         partyTeams.clear()                      // 多分队：本进程已确认过的各队
@@ -594,6 +595,7 @@ object MazeLoop {
                 tries.clear()
                 pageRounds.clear()
                 movePostedAt.clear()            // 重连/自愈后旧进程的移动请求已作废，去重台账跟着清
+                TapCheck.clearDedupe()          // 通信直调去重同理（旧进程的请求已作废）
                 resetBattleTimers()
                 AppState.addLog("[✓] 已重连并回到迷宫 → 继续跑本局")
                 continue
@@ -730,6 +732,7 @@ object MazeLoop {
                     tries.clear()
                     pageRounds.clear()
                     movePostedAt.clear()        // 自愈新进程：旧请求全部作废
+                    TapCheck.clearDedupe()      // 通信直调去重同理
                     resetBattleTimers()
                     if (!recoverAfterRestart(input)) {
                         AppState.addLog("[✗] 自愈重启后没能回到迷宫 → 停手")
@@ -5105,6 +5108,8 @@ object MazeLoop {
                         return@press null
                     },
                     probeState = { selProbe("DialogLabyrinthSelection") },
+                    // ★2026-11-24 跨轮去重：同一张卡的同一个选择请求 60s 内只提交一次（外层重入不再投）
+                    dedupeKey = "$kind@$cid",
                 )
             }
             // ★★印记节点三选一专用：选完卡之后会**连弹两次**（收到印记 → 收到角色），
@@ -5742,6 +5747,8 @@ object MazeLoop {
                 if (xy == null) return@press null
                 tap(input, xy.first, xy.second, "选择遗物：${c.opt("rewardId")}")
             },
+            // ★2026-11-24 跨轮去重：同一张遗物卡 60s 内只提交一次（外层重入不再投）
+            dedupeKey = "selectRelic@${c.opt("rewardId")}@$n",
         )
         if (tapped) {
             relicChoiceTries[tag] = sig to n
@@ -6734,6 +6741,8 @@ object MazeLoop {
                                     dec.optInt("x"), dec.optInt("y"), "战斗开始",
                                 )
                             },
+                            // ★2026-11-24 跨轮去重：同一场开战 60s 内只提交一次（外层重入不再投）
+                            dedupeKey = "battleStart@party",
                         )
                         return PARTY_STEP_EXITED
                     }
@@ -9894,6 +9903,8 @@ object MazeLoop {
         pressFn: (suspend () -> Boolean?)? = null,
         /** ★直调最多真投几次（默认 1，不可放开：2026-11-20 放开到 4 实测复现 205，见 [TapCheck.run]） */
         pressMax: Int = 1,
+        /** ★跨轮持久去重 key（2026-11-24）：同 key 60s 内只投一次，见 [TapCheck.run] */
+        dedupeKey: String? = null,
         /** ★直调是否走加速档；结算页（pressFn 内部退坐标）传 false 保留慢节奏，见 [TapCheck.run] */
         directFast: Boolean = true,
     ): Boolean = TapCheck.run(
@@ -9911,6 +9922,7 @@ object MazeLoop {
         skipFirstHits = skipFirstHits,
         pressFn = pressFn,
         pressMax = pressMax,
+        dedupeKey = dedupeKey,
         directFast = directFast,
         verbose = TRANS_VERBOSE,
     )
