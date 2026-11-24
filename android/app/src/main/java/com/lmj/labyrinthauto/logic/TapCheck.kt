@@ -170,6 +170,13 @@ object TapCheck {
         directFast: Boolean = true,
         verbose: Boolean = true,
     ): Boolean {
+        // ★成功时立刻清 key（2026-11-24 编组页空等 60s 反馈）：请求已确认生效 ⇒ 不再挡后续
+        //   同 key 的正常操作（下一局/特别装备后重进编组页都会复用 `battleStart@party`）。
+        //   只有 run 返回 false（没确认成功）时 key 才留着挡外层重入 —— 那才是去重要防的场景。
+        fun confirmed(): Boolean {
+            if (dedupeKey != null) synchronized(dedupeAt) { dedupeAt.remove(dedupeKey) }
+            return true
+        }
         if (dedupeKey != null) {
             val now = android.os.SystemClock.elapsedRealtime()
             val last = synchronized(dedupeAt) { dedupeAt[dedupeKey] ?: 0L }
@@ -307,7 +314,7 @@ object TapCheck {
             if (left) break
         }
         if (!left) return false
-        if (expect.isEmpty()) return true
+        if (expect.isEmpty()) return confirmed()
 
         // ── 阶段 2：**停手**，只等目标页面出现 ──
         //   "离开前一个页面就结束点击，但要等到后一个页面出现，才算状态机完成"（2026-11-07 用户）
@@ -329,7 +336,7 @@ object TapCheck {
                             "用时 ${android.os.SystemClock.elapsedRealtime() - t0}ms",
                     )
                 }
-                return true
+                return confirmed()
             }
             if (t in expect) {
                 if (verbose) {
@@ -338,7 +345,7 @@ object TapCheck {
                             "用时 ${android.os.SystemClock.elapsedRealtime() - t0}ms",
                     )
                 }
-                return true
+                return confirmed()
             }
             // ② 特殊目标 `@battle`：进战斗后**没有对话框**（labTop 是空串），只能用 inBattle 判
             if ("@battle" in expect && runCatching { AgentApi.labInBattle() }.getOrDefault(false)) {
@@ -348,7 +355,7 @@ object TapCheck {
                             "用时 ${android.os.SystemClock.elapsedRealtime() - t0}ms",
                     )
                 }
-                return true
+                return confirmed()
             }
             delay(100)
         }
